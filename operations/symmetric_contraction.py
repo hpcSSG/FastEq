@@ -111,6 +111,7 @@ class SymmetricContraction(torch.nn.Module):
         math_dtype: Optional[torch.dtype] = None,
         original_mace: bool = False,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
@@ -156,6 +157,7 @@ class SymmetricContraction(torch.nn.Module):
             device=device,
             math_dtype=math_dtype or dtype,
             use_fallback=use_fallback,
+            use_fasteq=use_fasteq,
         )
 
     def extra_repr(self) -> str:

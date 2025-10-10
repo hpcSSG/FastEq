@@ -22,8 +22,26 @@ import torch.fx
 import cuequivariance as cue
 import cuequivariance_torch as cuet
 
+#from .utils import load_kernel_from_lib
+
 logger = logging.getLogger(__name__)
 
+#my_stc_fwd = load_kernel_from_lib("stc_fwd").forward
+#my_stc_bwd = load_kernel_from_lib("stc_bwd").backward
+
+class FastSymmetricTensorContractionFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
+        x0_g = x0[i0]
+        out = my_stc_fwd(x1.contiguous(), x0_g.contiguous(), coeffs_tensor.contiguous(), paths_tensor.contiguous(), path_lens_tensor.contiguous())
+        ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor = ctx.saved_tensors
+        grad_x1 = my_stc_bwd(grad_out.contiguous(), x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
+        return grad_x1, None, None, None, None, None
 
 class SymmetricTensorProduct(torch.nn.Module):
     """
@@ -41,6 +59,7 @@ class SymmetricTensorProduct(torch.nn.Module):
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
@@ -70,6 +89,7 @@ class SymmetricTensorProduct(torch.nn.Module):
             device=device,
             math_dtype=math_dtype,
             use_fallback=use_fallback,
+            use_fasteq=use_fasteq,
         )
 
     def forward(self, x0: torch.Tensor) -> torch.Tensor:
@@ -116,6 +136,7 @@ class IWeightedSymmetricTensorProduct(torch.nn.Module):
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
@@ -133,11 +154,11 @@ class IWeightedSymmetricTensorProduct(torch.nn.Module):
         self.has_cuda = False
 
         if use_fallback is False:
-            self.f = CUDAKernel(descriptors, device, math_dtype)
+            self.f = CUDAKernel(descriptors, device, math_dtype, use_fasteq)
             self.has_cuda = True
         elif use_fallback is None:
             try:
-                self.f = CUDAKernel(descriptors, device, math_dtype)
+                self.f = CUDAKernel(descriptors, device, math_dtype, use_fasteq)
                 self.has_cuda = True
             except NotImplementedError as e:
                 logger.info(f"Failed to initialize CUDA implementation: {e}")
@@ -225,6 +246,7 @@ class CUDAKernel(torch.nn.Module):
         ds: list[cue.SegmentedTensorProduct],
         device: Optional[torch.device],
         math_dtype: torch.dtype,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
@@ -308,6 +330,19 @@ class CUDAKernel(torch.nn.Module):
         self.u = d_max.operands[0].size // d_max.operands[0].num_segments
         self.descriptors = ds_
 
+        # ================= FastEq need =================
+        self.use_fasteq = use_fasteq
+        self.path_segment_indices = path_segment_indices
+        self.path_coefficients = path_coefficients        
+        paths = self.path_segment_indices
+        coeffs = self.path_coefficients
+        self.coeffs_tensor = torch.tensor(coeffs, dtype=torch.float64, device="cuda")
+        self.path_lens_tensor = torch.tensor([len(p) for p in paths], dtype=torch.int, device="cuda")
+        max_len = max(len(p) for p in paths)
+        padded_paths = [p + [0] * (max_len - len(p)) for p in paths]
+        self.paths_tensor = torch.tensor(padded_paths, dtype=torch.int, device="cuda")
+        # ================================================
+
     def forward(
         self, x0: torch.Tensor, i0: torch.Tensor, x1: torch.Tensor
     ) -> torch.Tensor:
@@ -332,8 +367,13 @@ class CUDAKernel(torch.nn.Module):
             logger.debug(
                 f"Calling SymmetricTensorContraction: {self.descriptors}, input shapes: {x0.shape}, {i0.shape}, {x1.shape}"
             )
-        out: torch.Tensor = self.f(x1, x0, i0)
-        out = out.reshape(out.shape[0], out.shape[1] * self.u)
+
+        if self.use_fasteq:
+            print("================ call my symmetric tensor product ============")
+            out = FastSymmetricTensorContractionFunction.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
+        else:
+            out: torch.Tensor = self.f(x1, x0, i0)
+            out = out.reshape(out.shape[0], out.shape[1] * self.u)
         return out
 
 

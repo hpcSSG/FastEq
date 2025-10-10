@@ -154,6 +154,7 @@ class EquivariantTensorProduct(torch.nn.Module):
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
@@ -232,6 +233,7 @@ class EquivariantTensorProduct(torch.nn.Module):
                         device=device,
                         math_dtype=math_dtype,
                         use_fallback=use_fallback,
+                        use_fasteq=use_fasteq,
                     )
                 )
             elif e.num_inputs == 2:
@@ -241,6 +243,7 @@ class EquivariantTensorProduct(torch.nn.Module):
                         device=device,
                         math_dtype=math_dtype,
                         use_fallback=use_fallback,
+                        use_fasteq=use_fasteq,
                     )
                 )
             else:
@@ -251,6 +254,7 @@ class EquivariantTensorProduct(torch.nn.Module):
                 device=device,
                 math_dtype=math_dtype,
                 use_fallback=use_fallback,
+                use_fasteq=use_fasteq,
             )
             self.tp = TPDispatcher(tp, tp.descriptor)
 

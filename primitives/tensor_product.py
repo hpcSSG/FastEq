@@ -61,6 +61,7 @@ class TensorProduct(torch.nn.Module):
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
         self.descriptor = descriptor
@@ -70,6 +71,8 @@ class TensorProduct(torch.nn.Module):
         self.has_cuda = False
         self.f = None
         self.num_operands = descriptor.num_operands
+
+        self.use_fasteq = use_fasteq
 
         if use_fallback is False:
             self.f = _tensor_product_cuda(descriptor, device, math_dtype)
