@@ -22,26 +22,41 @@ import torch.fx
 import cuequivariance as cue
 import cuequivariance_torch as cuet
 
-#from .utils import load_kernel_from_lib
+from .utils import load_kernel_from_lib
+import time
 
 logger = logging.getLogger(__name__)
 
-#my_stc_fwd = load_kernel_from_lib("stc_fwd").forward
-#my_stc_bwd = load_kernel_from_lib("stc_bwd").backward
+def make_FastSymmetricTensorContractionFunction(my_stc_fwd, my_stc_bwd):
+    
+    class FastSymmetricTensorContractionFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
+            x0_g = x0[i0]
+            out = my_stc_fwd(
+                x1.contiguous(),
+                x0_g.contiguous(),
+                coeffs_tensor.contiguous(),
+                paths_tensor.contiguous(),
+                path_lens_tensor.contiguous(),
+            )
+            ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
+            return out
 
-class FastSymmetricTensorContractionFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
-        x0_g = x0[i0]
-        out = my_stc_fwd(x1.contiguous(), x0_g.contiguous(), coeffs_tensor.contiguous(), paths_tensor.contiguous(), path_lens_tensor.contiguous())
-        ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor = ctx.saved_tensors
-        grad_x1 = my_stc_bwd(grad_out.contiguous(), x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
-        return grad_x1, None, None, None, None, None
+        @staticmethod
+        def backward(ctx, grad_out):
+            x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor = ctx.saved_tensors
+            grad_x1 = my_stc_bwd(
+                grad_out.contiguous(),
+                x1,
+                x0_g,
+                coeffs_tensor,
+                paths_tensor,
+                path_lens_tensor,
+            )
+            return grad_x1, None, None, None, None, None
+    
+    return FastSymmetricTensorContractionFunction
 
 class SymmetricTensorProduct(torch.nn.Module):
     """
@@ -329,7 +344,8 @@ class CUDAKernel(torch.nn.Module):
         ).to(device=device)
         self.u = d_max.operands[0].size // d_max.operands[0].num_segments
         self.descriptors = ds_
-
+        
+        start = time.perf_counter()
         # ================= FastEq need =================
         self.use_fasteq = use_fasteq
         self.path_segment_indices = path_segment_indices
@@ -341,7 +357,13 @@ class CUDAKernel(torch.nn.Module):
         max_len = max(len(p) for p in paths)
         padded_paths = [p + [0] * (max_len - len(p)) for p in paths]
         self.paths_tensor = torch.tensor(padded_paths, dtype=torch.int, device="cuda")
+
+        my_stc_fwd = load_kernel_from_lib("stc_fwd").forward
+        my_stc_bwd = load_kernel_from_lib("stc_bwd").backward
+        self.FastSTCFunc = make_FastSymmetricTensorContractionFunction(my_stc_fwd, my_stc_bwd)
         # ================================================
+        end = time.perf_counter()
+        print(f"fasteq 初始化耗时: {(end - start)*1000:.3f} ms")
 
     def forward(
         self, x0: torch.Tensor, i0: torch.Tensor, x1: torch.Tensor
@@ -370,7 +392,7 @@ class CUDAKernel(torch.nn.Module):
 
         if self.use_fasteq:
             print("================ call my symmetric tensor product ============")
-            out = FastSymmetricTensorContractionFunction.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
+            out = self.FastSTCFunc.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
         else:
             out: torch.Tensor = self.f(x1, x0, i0)
             out = out.reshape(out.shape[0], out.shape[1] * self.u)
