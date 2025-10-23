@@ -30,7 +30,7 @@ include_directories(${TORCH_INSTALL_PREFIX}/include)
 add_library(${PROJECT_NAME} SHARED
     fctp_fused2_fwd.cu
     fctp_fused3_fwd.cu
-    fctp_fused3_fwd_opt.cu
+    fctp_fused3_bwd.cu
     fctp_spmm_fwd.cu
     fctp_spmm_bwd.cu
     stc_fwd.cu

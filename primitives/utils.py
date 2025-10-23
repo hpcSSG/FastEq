@@ -45,7 +45,7 @@ def make_FastFullyConnectedTensorProductFunction():
             slices = [ope.segment_slices() for ope in descriptor.operands]
              
             outputs = []
-            bjuw_list = []
+            #bjuw_list = []
             if num_inputs > 0 and descriptor.num_paths > 0:
 
                 slices = [ope.segment_slices() for ope in descriptor.operands]
@@ -70,7 +70,7 @@ def make_FastFullyConnectedTensorProductFunction():
 
                     '''
                     # replace out = torch.einsum(formula, c_tensor, *segments)
-                    # for fctp ，einsum formula=ijk,Zuvw,Ziu,Zjv->Zkw, segments[0].shape=torch.Size([1, 96, 10, 96]), segments[1].shape=torch.Size([736, 7, 96]), segments[2].shape=torch.Size([736, 1, 10])
+                    # for fctp, einsum formula=ijk,Zuvw,Ziu,Zjv->Zkw, segments[0].shape=torch.Size([1, 96, 10, 96]), segments[1].shape=torch.Size([736, 7, 96]), segments[2].shape=torch.Size([736, 1, 10])
 
                     torch.cuda.synchronize()
                     start_time = time.perf_counter() * 1000
@@ -81,6 +81,7 @@ def make_FastFullyConnectedTensorProductFunction():
 
                     bjuw_list.append(bjuw)
                     bijw = torch.einsum("biu,bjuw->bijw", a_seg, bjuw)
+                    # out = torch.einsum("bijw,ijk->bkw", bijw, c_tensor)
                     out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
                     
                     torch.cuda.synchronize()
@@ -99,21 +100,10 @@ def make_FastFullyConnectedTensorProductFunction():
                     execution_time_ms = end_time - start_time
                     print(f"einsum1 + einsum2 + einsum3 cuda cost: {execution_time_ms}")
                     '''
-                    
-                    torch.cuda.synchronize()
-                    start_time = time.perf_counter() * 1000
                     K = I
-                    out_ref = torch.ops.fused_fctp3_opt.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous(), K)
-                    torch.cuda.synchronize()
-                    end_time = time.perf_counter() * 1000
-                    execution_time_ms = end_time - start_time
-                    print(f"einsum1 + einsum2 + einsum3 cuda fused cost: {execution_time_ms}")
-
-                    print("max abs diff:", (out_ref - out).abs().max().item())
-
-                    #out = torch.einsum("bijw,ijk->bkw", bijw, c_tensor)
+                    out = torch.ops.fctp_fused3_fwd.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous(), K)
+                    #print("max abs diff:", (out_ref - out).abs().max().item())
                     
-
                     seg_shape = descriptor.get_segment_shape(-1, path)
                     outputs += [
                         out.reshape(out.shape[: out.ndim - len(seg_shape)] + (prod(seg_shape),))
@@ -162,7 +152,7 @@ def make_FastFullyConnectedTensorProductFunction():
             ctx.cg_indices = cg_indices
             ctx.cg_values = cg_values
             ctx.c_tensors = c_tensors
-            ctx.bjuw_list = bjuw_list
+            #ctx.bjuw_list = bjuw_list
             ctx.segment_lengths = segment_lengths
             ctx.math_dtype = math_dtype
 
@@ -178,7 +168,7 @@ def make_FastFullyConnectedTensorProductFunction():
             c_tensor_list = ctx.c_tensors
             segment_lengths = ctx.segment_lengths
             math_dtype = ctx.math_dtype
-            bjuw_list = ctx.bjuw_list
+            #bjuw_list = ctx.bjuw_list
 
             grad_a = torch.zeros_like(a)
 
@@ -204,20 +194,25 @@ def make_FastFullyConnectedTensorProductFunction():
                 w_seg = segments[0].reshape(segments[0].shape[1:])
                 a_seg = segments[1]
                 b_seg = segments[2]
-                grad_out_seg = grad_out_seg.reshape(grad_out_seg.shape[0], c_tensor_list[path_idx].shape[-1], -1)
+                K = len(ctx.cg_indices[path_idx])
+                grad_out_seg = grad_out_seg.reshape(grad_out_seg.shape[0], K, -1)
 
-                # print(f"b.shape={b_seg.shape}, w.shape={w_seg.shape}, grad_out.shape={grad_out_seg.shape}")
+                #print(f"b.shape={b_seg.shape}, w.shape={w_seg.shape}, grad_out.shape={grad_out_seg.shape}")
                 # ======== 逐步 einsum 的 backward ========
                 # grad_a_seg = torch.einsum("ijk,bjv,uvw,bkw->biu", c_tensor_list[path_idx], b_seg, w_seg, grad_out_seg)
 
                 #grad_bijw = torch.einsum("bkw,ijk->bijw", grad_out_seg, c_tensor_list[path_idx])
                 
+                '''
                 grad_bijw = torch.ops.fctp_spmm_bwd.backward(grad_out_seg.contiguous(),
                                                     ctx.cg_indices[path_idx].contiguous(), 
                                                     ctx.cg_values[path_idx].contiguous()
                                                     )
                 
                 grad_a_seg = torch.einsum("bijw,bjuw->biu", grad_bijw, bjuw_list[path_idx])
+                '''
+
+                grad_a_seg = torch.ops.fctp_fused3_bwd.backward(b_seg.contiguous(), w_seg.contiguous(), grad_out_seg.contiguous(), ctx.cg_indices[path_idx].contiguous(), ctx.cg_values[path_idx].contiguous())
 
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)

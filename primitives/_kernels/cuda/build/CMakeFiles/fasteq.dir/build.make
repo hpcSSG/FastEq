@@ -97,18 +97,18 @@ CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.s"
 	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
 
-CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o: CMakeFiles/fasteq.dir/flags.make
-CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o: ../fctp_fused3_fwd_opt.cu
-CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CUDA object CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o"
-	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o -MF CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_fused3_fwd_opt.cu -o CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o
+CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o: ../fctp_fused3_bwd.cu
+CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CUDA object CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o -MF CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_fused3_bwd.cu -o CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o
 
-CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.i: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.i"
+CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.i"
 	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
 
-CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.s: cmake_force
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.s"
+CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.s"
 	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
 
 CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o: CMakeFiles/fasteq.dir/flags.make
@@ -213,7 +213,7 @@ CMakeFiles/fasteq.dir/cwtp_bwd.cu.s: cmake_force
 fasteq_OBJECTS = \
 "CMakeFiles/fasteq.dir/fctp_fused2_fwd.cu.o" \
 "CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.o" \
-"CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o" \
+"CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o" \
 "CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o" \
 "CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o" \
 "CMakeFiles/fasteq.dir/stc_fwd.cu.o" \
@@ -227,7 +227,7 @@ fasteq_EXTERNAL_OBJECTS =
 
 bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_fused2_fwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.o
-bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o
+bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_fused3_bwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/stc_fwd.cu.o
