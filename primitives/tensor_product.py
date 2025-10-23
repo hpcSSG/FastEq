@@ -186,7 +186,7 @@ class TensorProduct(torch.nn.Module):
         if self.op_name == "tp_fully_connected":
             self.cg_indices: list[torch.Tensor] = []
             self.cg_values:  list[torch.Tensor] = []
-            self.c_tensors:  list[torch.Tensor] = []
+            #self.c_tensors:  list[torch.Tensor] = []
             device = "cuda"
 
             with torch.no_grad():
@@ -208,15 +208,15 @@ class TensorProduct(torch.nn.Module):
                     # 注册 buffer（会随 .to(device) 与 state_dict 管理）
                     name_idx = f"cg_indices_{i}"
                     name_val = f"cg_values_{i}"
-                    name_c   = f"c_tensor_{i}"
+                    #name_c   = f"c_tensor_{i}"
 
                     self.register_buffer(name_idx, idx, persistent=True)
                     self.register_buffer(name_val, vals, persistent=True)
-                    self.register_buffer(name_c,  disable_type_conv(coeffs), persistent=True)
+                    #self.register_buffer(name_c,  disable_type_conv(coeffs), persistent=True)
 
                     self.cg_indices.append(getattr(self, f"cg_indices_{i}"))
                     self.cg_values.append(getattr(self, f"cg_values_{i}"))
-                    self.c_tensors.append(getattr(self, f"c_tensor_{i}"))
+                    #self.c_tensors.append(getattr(self, f"c_tensor_{i}"))
 
         self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
         self.FastEquiLinearFunction = make_FastEquiLinearFunction()
@@ -340,7 +340,6 @@ class TensorProduct(torch.nn.Module):
                 out = self.FastFCTPFunc.apply(
                     inputs[0], inputs[1], inputs[2],
                     self.descriptor,
-                    self.c_tensors,
                     self.cg_indices,
                     self.cg_values,
                     torch.float64,

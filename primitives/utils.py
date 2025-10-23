@@ -38,7 +38,7 @@ def load_kernel(name: str):
 def make_FastFullyConnectedTensorProductFunction():
     class FullyConnectedTensorProductFunction(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, w, a, b, descriptor, c_tensors, cg_indices, cg_values, math_dtype):
+        def forward(ctx, w, a, b, descriptor, cg_indices, cg_values, math_dtype):
             
             inputs = [w, a, b]
             num_inputs = len(inputs)
@@ -151,7 +151,7 @@ def make_FastFullyConnectedTensorProductFunction():
             ctx.descriptor = descriptor
             ctx.cg_indices = cg_indices
             ctx.cg_values = cg_values
-            ctx.c_tensors = c_tensors
+            #ctx.c_tensors = c_tensors
             #ctx.bjuw_list = bjuw_list
             ctx.segment_lengths = segment_lengths
             ctx.math_dtype = math_dtype
@@ -165,16 +165,14 @@ def make_FastFullyConnectedTensorProductFunction():
             """
             w, a, b, *outputs = ctx.saved_tensors
             descriptor = ctx.descriptor
-            c_tensor_list = ctx.c_tensors
+            #c_tensor_list = ctx.c_tensors
             segment_lengths = ctx.segment_lengths
             math_dtype = ctx.math_dtype
             #bjuw_list = ctx.bjuw_list
 
             grad_a = torch.zeros_like(a)
-
             # 1. 拆分 grad_out 按 segment_lengths
             grad_segments = torch.split(grad_out, segment_lengths, dim=-1)
-
 
             # 2. 遍历路径，将对应 segment 的梯度反向回传
             for path_idx, path in enumerate(descriptor.paths):
@@ -197,13 +195,13 @@ def make_FastFullyConnectedTensorProductFunction():
                 K = len(ctx.cg_indices[path_idx])
                 grad_out_seg = grad_out_seg.reshape(grad_out_seg.shape[0], K, -1)
 
+                '''
+
                 #print(f"b.shape={b_seg.shape}, w.shape={w_seg.shape}, grad_out.shape={grad_out_seg.shape}")
                 # ======== 逐步 einsum 的 backward ========
                 # grad_a_seg = torch.einsum("ijk,bjv,uvw,bkw->biu", c_tensor_list[path_idx], b_seg, w_seg, grad_out_seg)
 
                 #grad_bijw = torch.einsum("bkw,ijk->bijw", grad_out_seg, c_tensor_list[path_idx])
-                
-                '''
                 grad_bijw = torch.ops.fctp_spmm_bwd.backward(grad_out_seg.contiguous(),
                                                     ctx.cg_indices[path_idx].contiguous(), 
                                                     ctx.cg_values[path_idx].contiguous()
@@ -217,7 +215,7 @@ def make_FastFullyConnectedTensorProductFunction():
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
 
-            return None, grad_a, None, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
+            return None, grad_a, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
     return FullyConnectedTensorProductFunction
 
 
