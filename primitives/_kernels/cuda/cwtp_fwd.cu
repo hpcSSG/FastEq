@@ -8,10 +8,7 @@
 
 __constant__ int kOff[4]  = {0, 1, 4, 9};   // 前缀和：0,1,4,9；sum=16
 
-// -----------------------------------------------------------------------------
-// BU_LOOPK 版本：线程按 (b,u) 并行，只读一次 x[b,u]；每个 k 选择对应 path 的 w[b,p,u]
-// 写出 out[b,k,u]，提升对 x/w 的复用、减少访存
-// -----------------------------------------------------------------------------
+// 线性化 b：b = blockIdx.y + blockIdx.z * gridDim.y
 __global__ void cwtp_kernel_bu_loopk(
     const double* __restrict__ x,   // [B, U]
     const double* __restrict__ y,   // [B, dim_sum]
@@ -20,27 +17,25 @@ __global__ void cwtp_kernel_bu_loopk(
     int B, int U, int dim_sum)
 {
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (b >= B || u >= U) return;
+    const unsigned int b = blockIdx.y + blockIdx.z * gridDim.y;  // 线性化 batch
+    if (b >= (unsigned)B || u >= U) return;
 
     // 读一次 x[b,u]
-    const double xv = x[(size_t)b * U + u];
+    const size_t off_x  = (size_t)b * U + u;
+    const double xv     = x[off_x];
 
     // 便捷指针
-    const double* __restrict__ y_b   = y   + (size_t)b * dim_sum;         // y[b,0]
-    double*       __restrict__ out_b = out + (size_t)b * dim_sum * U + u;  // out[b,0,u]
+    const double* __restrict__ y_b   = y   + (size_t)b * dim_sum;           // y[b,0]
+    double*       __restrict__ out_b = out + (size_t)b * dim_sum * U + u;   // out[b,0,u]
 
     // 阈值（根据 kOff）
     const int o1 = kOff[1];  // 1
     const int o2 = kOff[2];  // 4
     const int o3 = kOff[3];  // 9
 
-    // 按 k 循环写出；dim_sum=16 时可让编译器展开
-#pragma unroll
-    for (int k = 0; k < 16; ++k) {   // 若 dim_sum 非 16，可改为 for (int k=0;k<dim_sum;++k)
-        if (k >= dim_sum) break;
-
-        // 选择 path p（P==4 的三段阈值判断）
+    // 按 k 循环写出；与 dim_sum 解耦
+    // 如果你的 dim_sum 常为 16，编译器仍会很好地展开这个小循环
+    for (int k = 0; k < dim_sum; ++k) {
         int p;
         if      (k < o1) p = 0;
         else if (k < o2) p = 1;
@@ -48,13 +43,64 @@ __global__ void cwtp_kernel_bu_loopk(
         else             p = 3;
 
         // 读 w[b,p,u]；按 u 连续访问，合并读
-        const double wv = w[(size_t)b * (4 * U) + p * U + u];
-
-        // 读 y[b,k]（按 k 前进，缓存命中率较高）
+        const double wv = w[(size_t)b * (4 * U) + (size_t)p * U + u];
         const double yv = y_b[k];
 
         // out[b,k,u] = x[b,u] * w[b,p,u] * y[b,k]
         out_b[(size_t)k * U] = xv * wv * yv;
+    }
+}
+
+template <typename T>
+static inline T ceil_div(T a, T b) { return (a + b - 1) / b; }
+
+static inline void launch_cwtp_kernel_once(
+    const double* x, const double* y, const double* w, double* out,
+    int B, int U, int dim_sum, cudaStream_t stream)
+{
+    const int threads = 256;
+    dim3 blockDim(threads, 1, 1);
+
+    // grid.x 覆盖 U；grid.y / grid.z 线性化覆盖 B（兼容 B > 65535）
+    const unsigned int maxY = 65535u;
+    const unsigned int gy   = (B <= (int)maxY) ? (unsigned)B : maxY;
+    unsigned int gz         = ceil_div((unsigned)B, maxY);
+
+    // 保护：极端超大 B 时（> 65535*65535）避免非法配置（外层会分批处理）
+    if (gz > 65535u) gz = 65535u;
+
+    dim3 gridDim(ceil_div(U, threads), gy, gz);
+
+    cwtp_kernel_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
+        x, y, w, out, B, U, dim_sum);
+}
+
+// 分批 launch：当 B 极端巨大时使用（> 65535*65535）
+static inline void launch_cwtp_kernel_chunked(
+    const double* x, const double* y, const double* w, double* out,
+    int B, int U, int dim_sum, cudaStream_t stream)
+{
+    const int threads = 256;
+    dim3 blockDim(threads, 1, 1);
+    const int maxY = 65535;
+
+    for (int start = 0; start < B; ) {
+        // 本批大小（用 grid.y；grid.z=1）
+        const int chunk = std::min(maxY, B - start);
+
+        // 我们在 kernel 内仍用线性化 b，但这里选择 z=1，y=chunk 更简单
+        dim3 gridDim(ceil_div(U, threads), (unsigned)chunk, 1);
+
+        // 偏移量通过把指针推进来实现（避免在 kernel 增加参数）
+        const double* x_ptr   = x   + (size_t)start * U;
+        const double* y_ptr   = y   + (size_t)start * dim_sum;
+        const double* w_ptr   = w   + (size_t)start * (4 * U);
+        double*       out_ptr = out + (size_t)start * (size_t)dim_sum * U;
+
+        cwtp_kernel_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
+            x_ptr, y_ptr, w_ptr, out_ptr, /*B=*/chunk, U, dim_sum);
+
+        start += chunk;
     }
 }
 
@@ -81,21 +127,26 @@ at::Tensor cwtp_forward(
     // 输出 [B, dim_sum, U]
     at::Tensor out = at::empty({B, dim_sum, U}, x.options()).contiguous();
 
-    // 启动配置：grid.y=B，grid.x 覆盖 U
-    const int threads = 256;
-    dim3 blockDim(threads);
-    dim3 gridDim((U + threads - 1) / threads, B);
     cudaStream_t cur_stream = c10::cuda::getCurrentCUDAStream(x.device().index()).stream();
 
-    cwtp_kernel_bu_loopk<<<gridDim, blockDim, 0, cur_stream>>>(
-        x.data_ptr<double>(),
-        y.data_ptr<double>(),
-        w.data_ptr<double>(),
-        out.data_ptr<double>(),
-        B, U, dim_sum);
-    out = out.reshape({B, dim_sum * U});
+    // 若 B 不超过 65535*65535：一次 launch 覆盖
+    const uint64_t B64 = static_cast<uint64_t>(B);
+    const uint64_t LIM = 65535ull * 65535ull;
+    if (B64 <= LIM) {
+        launch_cwtp_kernel_once(
+            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
+            out.data_ptr<double>(), B, U, dim_sum, cur_stream);
+    } else {
+        // 极端大 B：分批
+        launch_cwtp_kernel_chunked(
+            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
+            out.data_ptr<double>(), B, U, dim_sum, cur_stream);
+    }
+
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;  // [B, dim_sum * U]
+
+    // 如需原先的扁平输出
+    return out.reshape({B, dim_sum * U});
 }
 
 TORCH_LIBRARY(cwtp_fwd, m)

@@ -38,116 +38,6 @@ def prod(numbers: List[int]):
     else:
         return math.prod(numbers)
 
-def _my_fctp(
-    inputs: List[torch.Tensor],
-    descriptor: cue.SegmentedTensorProduct,
-    cg_indices: List[torch.Tensor],
-    cg_values: List[torch.Tensor],
-    device: Optional[torch.device],
-    math_dtype: Optional[torch.dtype],
-) -> torch.nn.Module:
-    """
-    batch support of this function:
-    - at least one input operand should have a batch dimension (ndim=2)
-    - the output operand will have a batch dimension (ndim=2)
-    """
-
-    #descriptor = descriptor.remove_zero_paths()
-    #descriptor = descriptor.remove_empty_segments()
-
-    num_inputs = descriptor.num_operands - 1
-
-    '''
-    operand_segment_offsets=[ [s.start for s in ope.segment_slices()] for ope in descriptor.operands]
-    operand_segment_shapes=[ope.segments for ope in descriptor.operands]
-    coefficients_shape = []
-    for _, path in enumerate(descriptor.paths):
-        coefficients_shape.append(path.coefficients.shape)
-
-    if path.coefficients.shape:
-        dim = path.coefficients.shape[0]
-    else:
-        dim = 1
-    '''
-
-    if num_inputs > 0 and descriptor.num_paths > 0:
-
-        slices = [ope.segment_slices() for ope in descriptor.operands]
-
-        outputs = []
-
-        for path_idx, path in enumerate(descriptor.paths):
-            segments = []
-            for oid in range(num_inputs):
-                seg_shape = descriptor.get_segment_shape(oid, path)
-                inp = inputs[oid][..., slices[oid][path.indices[oid]]]
-                if len(seg_shape) > 0:
-                    inp = inp.reshape(inputs[oid].shape[:-1] + seg_shape)
-                else:
-                    inp = inp.reshape(inputs[oid].shape[:-1])
-                segments.append(inp.to(dtype=math_dtype))
-            
-            _, U, V, W = segments[0].shape
-            w_seg = segments[0].reshape(U, V, W)
-            a_seg = segments[1]
-            b_seg = segments[2]
-            #print(f"einsum formula={formula}, segments[0].shape={segments[0].shape}, segments[1].shape={segments[1].shape}, segments[2].shape={segments[2].shape}")
-
-            '''
-            c_tensor = disable_type_conv(
-                torch.tensor(path.coefficients, dtype=math_dtype, device=device)
-            )
-            '''
-            
-            # replace out = torch.einsum(formula, c_tensor, *segments)
-            # for fctp ，einsum formula=ijk,Zuvw,Ziu,Zjv->Zkw, segments[0].shape=torch.Size([1, 96, 10, 96]), segments[1].shape=torch.Size([736, 7, 96]), segments[2].shape=torch.Size([736, 1, 10])
-            # einsum1 cost 0.7ms, einsum2 cost 0.7ms, einsum3 cost 0.4ms
-            
-            bjuw = torch.einsum("bjv,uvw->bjuw", b_seg, w_seg)
-            bijw = torch.einsum("biu,bjuw->bijw", a_seg, bjuw)
-            #out = torch.einsum("bijw,ijk->bkw", bijw, c_tensor)
-            out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
-
-            seg_shape = descriptor.get_segment_shape(-1, path)
-            outputs += [
-                out.reshape(out.shape[: out.ndim - len(seg_shape)] + (prod(seg_shape),))
-            ]
-        
-        if len(outputs) == 0:
-            raise NotImplementedError("No FX implementation for empty paths")
-
-        def _sum(tensors, *, shape=None, like=None):
-            if len(tensors) == 0:
-                return like.new_zeros(shape)
-            out = tensors[0]
-            for t in tensors[1:]:
-                out = torch.add(out, t)
-            return out
-
-        batch_shape = outputs[0].shape[:-1]
-        output = torch.cat(
-            [
-                _sum(
-                    [
-                        out
-                        for out, path in zip(outputs, descriptor.paths)
-                        if path.indices[-1] == i
-                    ],
-                    shape=batch_shape + (prod(descriptor.operands[-1][i]),),
-                    like=outputs[0],
-                )
-                for i in range(descriptor.operands[-1].num_segments)
-            ],
-            dim=-1,
-        )
-
-
-    else:
-        raise NotImplementedError(
-            "No FX implementation for empty paths and non-empty inputs"
-        )
-    return output
-
 def _my_tensor_product_fx(
     inputs: List[torch.Tensor],
     descriptor: cue.SegmentedTensorProduct,
@@ -294,23 +184,6 @@ class TensorProduct(torch.nn.Module):
         self.op_name = op_name
         
         if self.op_name == "tp_fully_connected":
-            '''
-            for _, path in enumerate(descriptor.paths):
-                if path.coefficients.ndim < 3:
-                    continue
-                coeffs_tensor = torch.from_numpy(path.coefficients)
-                cg_indices = torch.nonzero(coeffs_tensor, as_tuple=False)
-                cg_values = coeffs_tensor[cg_indices[:,0], cg_indices[:,1], cg_indices[:,2]]
-                cg_indices_tensor = torch.tensor(cg_indices, dtype=torch.int, device=device)
-                cg_values_tensor = torch.tensor(cg_values, dtype=torch.float64, device=device)
-                self.cg_indices_tensor_list.append(cg_indices_tensor)
-                self.cg_values_tensor_list.append(cg_values_tensor)
-
-                c_tensor = disable_type_conv(
-                    torch.tensor(path.coefficients, dtype=math_dtype, device=device)
-                )
-            self.c_tensor_list.append(c_tensor)
-            '''
             self.cg_indices: list[torch.Tensor] = []
             self.cg_values:  list[torch.Tensor] = []
             self.c_tensors:  list[torch.Tensor] = []
@@ -345,15 +218,8 @@ class TensorProduct(torch.nn.Module):
                     self.cg_values.append(getattr(self, f"cg_values_{i}"))
                     self.c_tensors.append(getattr(self, f"c_tensor_{i}"))
 
-        #fctp_spmm_fwd = load_kernel("fctp_spmm_fwd").forward
-        #fctp_spmm_bwd = load_kernel("fctp_spmm_bwd").backward
         self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
-        
-        #fused_gemm = load_kernel("equi_linear").fused_gemm
         self.FastEquiLinearFunction = make_FastEquiLinearFunction()
-
-        #cwtp_fwd = load_kernel("cwtp_fwd").forward
-        #cwtp_bwd = load_kernel("cwtp_bwd").backward
         self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
         # ================================================
 
@@ -480,8 +346,6 @@ class TensorProduct(torch.nn.Module):
                     self.cg_values,
                     torch.float64,
                 )
-                
-                #out = _my_fctp(inputs, self.descriptor, self.cg_indices, self.cg_values, inputs[0].device, torch.float64)
             elif self.op_name == "tp_channel_wise":
                 print("== call my channel-wise tensor product ==")
                 out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])

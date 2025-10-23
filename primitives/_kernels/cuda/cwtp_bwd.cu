@@ -10,15 +10,9 @@ __constant__ int kOff[4]  = {0, 1, 4, 9};  // 前缀和；与前向一致
 
 // -----------------------------------------------------------------------------
 // 反向 kernel：与前向同样的 (b,u) 并行、loop over k 的访存与复用策略
-// 输入：
-//   x:        [B, U]
-//   y:        [B, dim_sum]
-//   w:        [B, 4*U]
-//   grad_out: [B, dim_sum, U]  (对 out 的上游梯度)
-// 输出：
-//   dx: [B, U]
-//   dy: [B, dim_sum]     (atomicAdd 聚合所有 u)
-//   dw: [B, 4*U]
+// 输入： x:[B,U], y:[B,dim_sum], w:[B,4*U], grad_out:[B,dim_sum,U]
+// 输出： dx:[B,U], dy:[B,dim_sum], dw:[B,4*U]
+// 兼容 B > 65535：b = blockIdx.y + blockIdx.z * gridDim.y
 // -----------------------------------------------------------------------------
 __global__ void cwtp_kernel_bwd_bu_loopk(
     const double* __restrict__ x,
@@ -31,17 +25,25 @@ __global__ void cwtp_kernel_bwd_bu_loopk(
     int B, int U, int dim_sum)
 {
     const int u = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (b >= B || u >= U) return;
+    const unsigned int b = blockIdx.y + blockIdx.z * gridDim.y;  // 线性化 b
+    if (b >= (unsigned)B || u >= U) return;
 
-    // 便捷基址
-    const double  xv     = x[(size_t)b * U + u];                         // x[b,u]
-    const double* y_b    = y  + (size_t)b * dim_sum;                     // y[b,0]
-    const double* go_bu  = grad_out + (size_t)b * dim_sum * U + u;       // grad_out[b,0,u]
-    const double* w_b    = w  + (size_t)b * (4 * U);                     // w[b,0,u] 起点
-    double*       dx_b   = dx + (size_t)b * U;                           // dx[b,0]
-    double*       dy_b   = dy + (size_t)b * dim_sum;                     // dy[b,0]
-    double*       dw_b   = dw + (size_t)b * (4 * U);                     // dw[b,0,u] 起点
+    // 基址
+    const size_t off_x   = (size_t)b * U + u;                // x[b,u]
+    const size_t off_y   = (size_t)b * dim_sum;              // y[b,0]
+    const size_t off_go  = (size_t)b * dim_sum * U + u;      // grad_out[b,0,u]
+    const size_t off_w   = (size_t)b * (4 * U);              // w[b,0,0] 起点
+    const size_t off_dx  = (size_t)b * U;                    // dx[b,0]
+    const size_t off_dy  = (size_t)b * dim_sum;              // dy[b,0]
+    const size_t off_dw  = (size_t)b * (4 * U);              // dw[b,0,0]
+
+    const double  xv     = x[off_x];
+    const double* y_b    = y  + off_y;
+    const double* go_bu  = grad_out + off_go;
+    const double* w_b    = w  + off_w;
+    double*       dx_b   = dx + off_dx;
+    double*       dy_b   = dy + off_dy;
+    double*       dw_b   = dw + off_dw;
 
     // 阈值（与前向一致）
     const int o1 = kOff[1];  // 1
@@ -55,21 +57,17 @@ __global__ void cwtp_kernel_bwd_bu_loopk(
     double dw_acc2 = 0.0;
     double dw_acc3 = 0.0;
 
-#pragma unroll
-    for (int k = 0; k < 16; ++k) { // 若 dim_sum != 16，可自动被 break 限制
-        if (k >= dim_sum) break;
-
-        // path 选择（与前向一致）
+    // 注意：按实际 dim_sum 迭代
+    for (int k = 0; k < dim_sum; ++k) {
         int p;
         if      (k < o1) p = 0;
         else if (k < o2) p = 1;
         else if (k < o3) p = 2;
         else             p = 3;
 
-        // 取常用值
-        const double yv = y_b[k];                            // y[b,k]
-        const double wv = w_b[p * U + u];                    // w[b,p,u]
-        const double g  = go_bu[(size_t)k * U];              // grad_out[b,k,u]
+        const double yv = y_b[k];                 // y[b,k]
+        const double wv = w_b[(size_t)p * U + u]; // w[b,p,u]
+        const double g  = go_bu[(size_t)k * U];   // grad_out[b,k,u]
 
         // dx 累加： sum_k g * w * y
         dx_acc += g * wv * yv;
@@ -86,11 +84,67 @@ __global__ void cwtp_kernel_bwd_bu_loopk(
     }
 
     // 写回（无竞争）
-    dx_b[u]                 = dx_acc;
-    dw_b[0 * U + u]         = dw_acc0;
-    dw_b[1 * U + u]         = dw_acc1;
-    dw_b[2 * U + u]         = dw_acc2;
-    dw_b[3 * U + u]         = dw_acc3;
+    dx_b[u]          = dx_acc;
+    dw_b[0 * U + u]  = dw_acc0;
+    dw_b[1 * U + u]  = dw_acc1;
+    dw_b[2 * U + u]  = dw_acc2;
+    dw_b[3 * U + u]  = dw_acc3;
+}
+
+template <typename T>
+static inline T ceil_div(T a, T b) { return (a + b - 1) / b; }
+
+// 单次 launch：B 拆到 (grid.y, grid.z)，兼容 B ≤ 65535*65535
+static inline void launch_cwtp_bwd_once(
+    const double* x, const double* y, const double* w, const double* grad_out,
+    double* dx, double* dy, double* dw,
+    int B, int U, int dim_sum, cudaStream_t stream)
+{
+    const int threads = 256;
+    dim3 blockDim(threads, 1, 1);
+
+    const unsigned int maxY = 65535u;
+    const unsigned int gy   = (B <= (int)maxY) ? (unsigned)B : maxY;
+    unsigned int gz         = ceil_div((unsigned)B, maxY);
+    if (gz > 65535u) gz = 65535u;  // 极端保护，>时改走分批
+
+    dim3 gridDim(ceil_div(U, threads), gy, gz);
+
+    cwtp_kernel_bwd_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
+        x, y, w, grad_out, dx, dy, dw, B, U, dim_sum);
+}
+
+// 分批 launch：当 B > 65535*65535 或根据策略强制分批时使用
+static inline void launch_cwtp_bwd_chunked(
+    const double* x, const double* y, const double* w, const double* grad_out,
+    double* dx, double* dy, double* dw,
+    int B, int U, int dim_sum, cudaStream_t stream)
+{
+    const int threads = 256;
+    dim3 blockDim(threads, 1, 1);
+    const int maxY = 65535;
+
+    for (int start = 0; start < B; ) {
+        const int chunk = std::min(maxY, B - start);
+
+        // 指针推进，kernel 内仍按 b 从 0..chunk-1 线性化（此处 z=1，y=chunk）
+        const double* x_ptr   = x   + (size_t)start * U;
+        const double* y_ptr   = y   + (size_t)start * dim_sum;
+        const double* w_ptr   = w   + (size_t)start * (4 * U);
+        const double* go_ptr  = grad_out + (size_t)start * (size_t)dim_sum * U;
+
+        double* dx_ptr        = dx + (size_t)start * U;
+        double* dy_ptr        = dy + (size_t)start * dim_sum;
+        double* dw_ptr        = dw + (size_t)start * (4 * U);
+
+        dim3 gridDim(ceil_div(U, threads), (unsigned)chunk, 1);
+
+        cwtp_kernel_bwd_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
+            x_ptr, y_ptr, w_ptr, go_ptr, dx_ptr, dy_ptr, dw_ptr,
+            /*B=*/chunk, U, dim_sum);
+
+        start += chunk;
+    }
 }
 
 // ---------------------------------- C++ 封装 ----------------------------------
@@ -122,24 +176,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> cwtp_backward(
 
     // 分配梯度张量
     auto opts = x.options();
-    at::Tensor dx = at::empty({B, U}, opts).contiguous();               // 逐线程唯一写
-    at::Tensor dy = at::zeros({B, dim_sum}, opts).contiguous();         // 需 atomicAdd -> 置零
-    at::Tensor dw = at::empty({B, P * U}, opts).contiguous();           // 逐线程唯一写
+    at::Tensor dx = at::empty({B, U}, opts).contiguous();        // 逐线程唯一写
+    at::Tensor dy = at::zeros({B, dim_sum}, opts).contiguous();  // atomicAdd -> 置零
+    at::Tensor dw = at::empty({B, P * U}, opts).contiguous();    // 逐线程唯一写
 
-    // 启动配置与前向一致
-    const int threads = 256;
-    dim3 blockDim(threads);
-    dim3 gridDim((U + threads - 1) / threads, B);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(x.device().index()).stream();
 
-    cwtp_kernel_bwd_bu_loopk<<<gridDim, blockDim>>>(
-        x.data_ptr<double>(),
-        y.data_ptr<double>(),
-        w.data_ptr<double>(),
-        grad_out.data_ptr<double>(),
-        dx.data_ptr<double>(),
-        dy.data_ptr<double>(),
-        dw.data_ptr<double>(),
-        B, U, dim_sum);
+    // B 不超过 65535*65535：一次 launch；否则分批
+    const uint64_t B64 = static_cast<uint64_t>(B);
+    const uint64_t LIM = 65535ull * 65535ull;
+    if (B64 <= LIM) {
+        launch_cwtp_bwd_once(
+            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
+            grad_out.data_ptr<double>(),
+            dx.data_ptr<double>(), dy.data_ptr<double>(), dw.data_ptr<double>(),
+            B, U, dim_sum, stream);
+    } else {
+        launch_cwtp_bwd_chunked(
+            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
+            grad_out.data_ptr<double>(),
+            dx.data_ptr<double>(), dy.data_ptr<double>(), dw.data_ptr<double>(),
+            B, U, dim_sum, stream);
+    }
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {dx, dy, dw};
