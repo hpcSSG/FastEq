@@ -40,16 +40,16 @@ CMAKE_CUDA_COMPILER:FILEPATH=/usr/local/cuda/bin/nvcc
 CMAKE_CUDA_FLAGS:STRING=
 
 //Flags used by the CUDA compiler during DEBUG builds.
-CMAKE_CUDA_FLAGS_DEBUG:STRING=-g
+CMAKE_CUDA_FLAGS_DEBUG:STRING=
 
 //Flags used by the CUDA compiler during MINSIZEREL builds.
-CMAKE_CUDA_FLAGS_MINSIZEREL:STRING=-O1 -DNDEBUG
+CMAKE_CUDA_FLAGS_MINSIZEREL:STRING=
 
 //Flags used by the CUDA compiler during RELEASE builds.
-CMAKE_CUDA_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+CMAKE_CUDA_FLAGS_RELEASE:STRING=
 
 //Flags used by the CUDA compiler during RELWITHDEBINFO builds.
-CMAKE_CUDA_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
+CMAKE_CUDA_FLAGS_RELWITHDEBINFO:STRING=
 
 //CXX compiler
 CMAKE_CXX_COMPILER:FILEPATH=/usr/bin/c++
@@ -477,7 +477,7 @@ Caffe2_DIR:PATH=/public-data/malixian/conda/fasteq/lib/python3.10/site-packages/
 DEBUG:BOOL=OFF
 
 //Path to a library.
-LIBNVTOOLSEXT:FILEPATH=/usr/lib/x86_64-linux-gnu/libnvToolsExt.so
+LIBNVTOOLSEXT:FILEPATH=/usr/local/cuda/lib64/libnvToolsExt.so
 
 //The directory containing a CMake configuration file for MKLDNN.
 MKLDNN_DIR:PATH=MKLDNN_DIR-NOTFOUND
@@ -502,15 +502,6 @@ fasteq_IS_TOP_LEVEL:STATIC=ON
 
 //Value Computed by CMake
 fasteq_SOURCE_DIR:STATIC=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda
-
-//Value Computed by CMake
-fused_gmm_BINARY_DIR:STATIC=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build
-
-//Value Computed by CMake
-fused_gmm_IS_TOP_LEVEL:STATIC=ON
-
-//Value Computed by CMake
-fused_gmm_SOURCE_DIR:STATIC=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda
 
 //Path to a library.
 kineto_LIBRARY:FILEPATH=kineto_LIBRARY-NOTFOUND
@@ -852,15 +843,12 @@ FIND_PACKAGE_MESSAGE_DETAILS_Python3:INTERNAL=[/public-data/malixian/conda/faste
 FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
 //Details about finding Torch
 FIND_PACKAGE_MESSAGE_DETAILS_Torch:INTERNAL=[/public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/lib/libtorch.so][/public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include;/public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include][v()]
+//Path to a program.
+_Python3_CONFIG:INTERNAL=/public-data/malixian/conda/fasteq/bin/python3.10-config
 _Python3_DEVELOPMENT_EMBED_SIGNATURE:INTERNAL=5bd2612d2cf773bdb19cf4eda8f43617
 _Python3_DEVELOPMENT_MODULE_SIGNATURE:INTERNAL=a97cecddec4df92f379b747a91fcbbb9
-//Path to a program.
-_Python3_EXECUTABLE:INTERNAL=/public-data/malixian/conda/fasteq/bin/python3.10
 //Path to a file.
 _Python3_INCLUDE_DIR:INTERNAL=/public-data/malixian/conda/fasteq/include/python3.10
-//Python3 Properties
-_Python3_INTERPRETER_PROPERTIES:INTERNAL=Python;3;10;18;64;;cpython-310-x86_64-linux-gnu;/public-data/malixian/conda/fasteq/lib/python3.10;/public-data/malixian/conda/fasteq/lib/python3.10;/public-data/malixian/conda/fasteq/lib/python3.10/site-packages;/public-data/malixian/conda/fasteq/lib/python3.10/site-packages
-_Python3_INTERPRETER_SIGNATURE:INTERNAL=73a5f113c3b29d94941bc30a71aac33d
 //Path to a library.
 _Python3_LIBRARY_RELEASE:INTERNAL=/public-data/malixian/conda/fasteq/lib/libpython3.10.so
 //Result of TRY_COMPILE

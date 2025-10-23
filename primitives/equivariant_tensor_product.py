@@ -155,6 +155,7 @@ class EquivariantTensorProduct(torch.nn.Module):
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         use_fasteq: bool = False,
+        op_name: Optional[str] = "",
     ):
         super().__init__()
 
@@ -185,6 +186,8 @@ class EquivariantTensorProduct(torch.nn.Module):
         del layout
 
         self.etp = e
+
+        self.op_name = op_name
 
         transpose_in = torch.nn.ModuleList()
         for layout_used, input_expected in zip(layout_in, e.inputs):
@@ -255,6 +258,7 @@ class EquivariantTensorProduct(torch.nn.Module):
                 math_dtype=math_dtype,
                 use_fallback=use_fallback,
                 use_fasteq=use_fasteq,
+                op_name=op_name,
             )
             self.tp = TPDispatcher(tp, tp.descriptor)
 

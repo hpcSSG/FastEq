@@ -54,6 +54,7 @@ class Linear(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
         irreps_in, irreps_out = default_irreps(irreps_in, irreps_out)
@@ -88,9 +89,11 @@ class Linear(torch.nn.Module):
             layout=layout,
             layout_in=layout_in,
             layout_out=layout_out,
+            op_name = "equi_linear",
             device=device,
             math_dtype=math_dtype,
             use_fallback=use_fallback,
+            use_fasteq=use_fasteq,
         )
 
     def extra_repr(self) -> str:

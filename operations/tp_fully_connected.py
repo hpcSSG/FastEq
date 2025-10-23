@@ -61,6 +61,7 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
         irreps_in1, irreps_in2, irreps_out = default_irreps(
@@ -100,9 +101,11 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             layout=layout,
             layout_in=(cue.ir_mul, layout_in1, layout_in2),
             layout_out=layout_out,
+            op_name = "tp_fully_connected",
             device=device,
             math_dtype=math_dtype,
             use_fallback=use_fallback,
+            use_fasteq=use_fasteq,
         )
 
     def extra_repr(self) -> str:

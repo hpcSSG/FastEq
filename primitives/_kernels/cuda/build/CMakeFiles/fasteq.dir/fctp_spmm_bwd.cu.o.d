@@ -1,4 +1,4 @@
-CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/stc_bwd.cu \
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_spmm_bwd.cu \
     /usr/include/stdc-predef.h \
     /usr/local/cuda/include/cuda_runtime.h \
     /usr/local/cuda/include/crt/host_config.h \
@@ -225,6 +225,11 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /usr/include/c++/11/bits/stl_heap.h \
     /usr/include/c++/11/bits/stl_tempbuf.h \
     /usr/include/c++/11/bits/uniform_int_dist.h \
+    /usr/local/cuda/include/cuda.h \
+    /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
+    /usr/include/stdint.h \
+    /usr/include/x86_64-linux-gnu/bits/wchar.h \
+    /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/extension.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/all.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/autograd.h \
@@ -243,10 +248,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DeviceType.h \
     /usr/include/c++/11/cstddef \
     /usr/include/c++/11/cstdint \
-    /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
-    /usr/include/stdint.h \
-    /usr/include/x86_64-linux-gnu/bits/wchar.h \
-    /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
     /usr/include/c++/11/ostream \
     /usr/include/c++/11/ios \
     /usr/include/c++/11/iosfwd \
@@ -3642,7 +3643,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/ATen.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Device.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Dispatch.h \
-    /usr/local/cuda/include/cuda.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/ScalarOps.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/TensorIndexing.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/NativeFunctions.h \

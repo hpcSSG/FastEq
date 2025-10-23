@@ -154,6 +154,7 @@ class SymmetricContraction(torch.nn.Module):
             layout=layout,
             layout_in=layout_in,
             layout_out=layout_out,
+            op_name = "symmetric_contraction",
             device=device,
             math_dtype=math_dtype or dtype,
             use_fallback=use_fallback,

@@ -1,4 +1,4 @@
-CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/stc_bwd.cu \
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/cwtp_bwd.cu \
     /usr/include/stdc-predef.h \
     /usr/local/cuda/include/cuda_runtime.h \
     /usr/local/cuda/include/crt/host_config.h \
@@ -225,28 +225,19 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /usr/include/c++/11/bits/stl_heap.h \
     /usr/include/c++/11/bits/stl_tempbuf.h \
     /usr/include/c++/11/bits/uniform_int_dist.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/extension.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/all.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/autograd.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/autograd.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/variable.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/utils/python_stub.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/Export.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/macros/Export.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/macros/cmake_macros.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/cpp_hook.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/function_hook.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Tensor.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/Tensor.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/TensorBody.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Device.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DeviceType.h \
-    /usr/include/c++/11/cstddef \
-    /usr/include/c++/11/cstdint \
+    /usr/local/cuda/include/cuda.h \
     /usr/lib/gcc/x86_64-linux-gnu/11/include/stdint.h \
     /usr/include/stdint.h \
     /usr/include/x86_64-linux-gnu/bits/wchar.h \
     /usr/include/x86_64-linux-gnu/bits/stdint-uintn.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAStream.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DeviceGuard.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Device.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DeviceType.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/macros/Export.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/macros/cmake_macros.h \
+    /usr/include/c++/11/cstddef \
+    /usr/include/c++/11/cstdint \
     /usr/include/c++/11/ostream \
     /usr/include/c++/11/ios \
     /usr/include/c++/11/iosfwd \
@@ -352,23 +343,67 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /usr/include/c++/11/bits/sstream.tcc \
     /usr/include/c++/11/variant \
     /usr/include/c++/11/bits/parse_numbers.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Layout.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Backend.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DispatchKey.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/DeviceGuardImplInterface.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Stream.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Registry.h \
+    /usr/include/c++/11/mutex \
+    /usr/include/c++/11/chrono \
+    /usr/include/c++/11/ratio \
+    /usr/include/c++/11/ctime \
+    /usr/include/c++/11/bits/std_mutex.h \
+    /usr/include/c++/11/bits/unique_lock.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Type.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/InlineDeviceGuard.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/VirtualGuardImpl.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Optional.h \
+    /usr/include/c++/11/optional \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAFunctions.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/GPUTrace.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/PyInterpreter.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DispatchKeySet.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DispatchKey.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Metaprogramming.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeList.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeTraits.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/llvmMathExtras.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/bit_cast.h \
     /usr/include/c++/11/climits \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Layout.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Backend.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/MemoryFormat.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/ArrayRef.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Deprecated.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/SmallVector.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/AlignOf.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymIntArrayRef.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymInt.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymBool.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymNodeImpl.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/intrusive_ptr.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/MaybeOwned.h \
+    /usr/include/c++/11/numeric \
+    /usr/include/c++/11/bits/stl_numeric.h \
+    /usr/include/c++/11/pstl/glue_numeric_defs.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/python_stub.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAException.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDADeviceAssertionHost.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMacros.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/impl/cuda_cmake_macros.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMiscFunctions.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/irange.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeSafeSignMath.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/extension.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/all.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/autograd.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/autograd.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/variable.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/Export.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/cpp_hook.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/autograd/function_hook.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Tensor.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/Tensor.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/TensorBody.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/QScheme.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Stream.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Scalar.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/OptionalRef.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/ScalarType.h \
@@ -382,7 +417,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /usr/local/cuda/include/cuda_bf16.hpp \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/BFloat16-inl.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Float8_e4m3fn.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeSafeSignMath.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/floating_point_utils.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Float8_e4m3fn-inl.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Float8_e4m3fnuz.h \
@@ -781,30 +815,13 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/quint2x4.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/quint4x2.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/quint8.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymBool.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymNodeImpl.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Optional.h \
-    /usr/include/c++/11/optional \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/intrusive_ptr.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/MaybeOwned.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymFloat.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymInt.h \
-    /usr/include/c++/11/numeric \
-    /usr/include/c++/11/bits/stl_numeric.h \
-    /usr/include/c++/11/pstl/glue_numeric_defs.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeCast.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/ScalarTypeToTypeMeta.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/typeid.h \
-    /usr/include/c++/11/mutex \
-    /usr/include/c++/11/chrono \
-    /usr/include/c++/11/ratio \
-    /usr/include/c++/11/ctime \
-    /usr/include/c++/11/bits/std_mutex.h \
-    /usr/include/c++/11/bits/unique_lock.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/IdWrapper.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/TypeIndex.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/ConstexprCrc.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/irange.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Storage.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Allocator.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/ThreadLocalDebugInfo.h \
@@ -815,8 +832,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /usr/include/c++/11/shared_mutex \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/PyObjectSlot.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/HermeticPyObjectTLS.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/PyInterpreter.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/SymIntArrayRef.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/ExclusivelyOwned.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/TensorImpl.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/InferenceMode.h \
@@ -827,8 +842,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/SizesAndStrides.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/WrapDimMinimal.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Flags.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Registry.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/Type.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/accumulate.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/util/safe_numerics.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/UndefinedTensorImpl.h \
@@ -1316,10 +1329,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/functional.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/jit_type.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/core/rref_interface.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/DeviceGuard.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/DeviceGuardImplInterface.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/InlineDeviceGuard.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/VirtualGuardImpl.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/Event.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/InlineEvent.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/StreamGuard.h \
@@ -3642,7 +3651,6 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/ATen.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Device.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/Dispatch.h \
-    /usr/local/cuda/include/cuda.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/ScalarOps.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/TensorIndexing.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/ATen/NativeFunctions.h \
@@ -5613,12 +5621,4 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.o : /home/malixian/repos/cuequivariance_torch/p
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/schema_matching.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/versioned_symbols.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/tree_views.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/torch.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAStream.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAFunctions.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/GPUTrace.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAException.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDADeviceAssertionHost.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMacros.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/impl/cuda_cmake_macros.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMiscFunctions.h
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/torch.h

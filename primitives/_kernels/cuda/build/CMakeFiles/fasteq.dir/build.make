@@ -69,10 +69,38 @@ include CMakeFiles/fasteq.dir/progress.make
 # Include the compile flags for this target's objects.
 include CMakeFiles/fasteq.dir/flags.make
 
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o: ../fctp_spmm_fwd.cu
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CUDA object CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o -MF CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_spmm_fwd.cu -o CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o
+
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.i"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
+
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.s"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o: ../fctp_spmm_bwd.cu
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CUDA object CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o -MF CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_spmm_bwd.cu -o CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o
+
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.i"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
+
+CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.s"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+
 CMakeFiles/fasteq.dir/stc_fwd.cu.o: CMakeFiles/fasteq.dir/flags.make
 CMakeFiles/fasteq.dir/stc_fwd.cu.o: ../stc_fwd.cu
 CMakeFiles/fasteq.dir/stc_fwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_1) "Building CUDA object CMakeFiles/fasteq.dir/stc_fwd.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CUDA object CMakeFiles/fasteq.dir/stc_fwd.cu.o"
 	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/stc_fwd.cu.o -MF CMakeFiles/fasteq.dir/stc_fwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/stc_fwd.cu -o CMakeFiles/fasteq.dir/stc_fwd.cu.o
 
 CMakeFiles/fasteq.dir/stc_fwd.cu.i: cmake_force
@@ -86,7 +114,7 @@ CMakeFiles/fasteq.dir/stc_fwd.cu.s: cmake_force
 CMakeFiles/fasteq.dir/stc_bwd.cu.o: CMakeFiles/fasteq.dir/flags.make
 CMakeFiles/fasteq.dir/stc_bwd.cu.o: ../stc_bwd.cu
 CMakeFiles/fasteq.dir/stc_bwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CUDA object CMakeFiles/fasteq.dir/stc_bwd.cu.o"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CUDA object CMakeFiles/fasteq.dir/stc_bwd.cu.o"
 	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/stc_bwd.cu.o -MF CMakeFiles/fasteq.dir/stc_bwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/stc_bwd.cu -o CMakeFiles/fasteq.dir/stc_bwd.cu.o
 
 CMakeFiles/fasteq.dir/stc_bwd.cu.i: cmake_force
@@ -97,23 +125,75 @@ CMakeFiles/fasteq.dir/stc_bwd.cu.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/stc_bwd.cu.s"
 	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
 
+CMakeFiles/fasteq.dir/equi_linear.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/equi_linear.cu.o: ../equi_linear.cu
+CMakeFiles/fasteq.dir/equi_linear.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building CUDA object CMakeFiles/fasteq.dir/equi_linear.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/equi_linear.cu.o -MF CMakeFiles/fasteq.dir/equi_linear.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/equi_linear.cu -o CMakeFiles/fasteq.dir/equi_linear.cu.o
+
+CMakeFiles/fasteq.dir/equi_linear.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/equi_linear.cu.i"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
+
+CMakeFiles/fasteq.dir/equi_linear.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/equi_linear.cu.s"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+
+CMakeFiles/fasteq.dir/cwtp_fwd.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/cwtp_fwd.cu.o: ../cwtp_fwd.cu
+CMakeFiles/fasteq.dir/cwtp_fwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building CUDA object CMakeFiles/fasteq.dir/cwtp_fwd.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/cwtp_fwd.cu.o -MF CMakeFiles/fasteq.dir/cwtp_fwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/cwtp_fwd.cu -o CMakeFiles/fasteq.dir/cwtp_fwd.cu.o
+
+CMakeFiles/fasteq.dir/cwtp_fwd.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/cwtp_fwd.cu.i"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
+
+CMakeFiles/fasteq.dir/cwtp_fwd.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/cwtp_fwd.cu.s"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.o: CMakeFiles/fasteq.dir/flags.make
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.o: ../cwtp_bwd.cu
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.o: CMakeFiles/fasteq.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Building CUDA object CMakeFiles/fasteq.dir/cwtp_bwd.cu.o"
+	/usr/local/cuda/bin/nvcc -forward-unknown-to-host-compiler $(CUDA_DEFINES) $(CUDA_INCLUDES) $(CUDA_FLAGS) -MD -MT CMakeFiles/fasteq.dir/cwtp_bwd.cu.o -MF CMakeFiles/fasteq.dir/cwtp_bwd.cu.o.d -x cu -c /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/cwtp_bwd.cu -o CMakeFiles/fasteq.dir/cwtp_bwd.cu.o
+
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Preprocessing CUDA source to CMakeFiles/fasteq.dir/cwtp_bwd.cu.i"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_PREPROCESSED_SOURCE
+
+CMakeFiles/fasteq.dir/cwtp_bwd.cu.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green "Compiling CUDA source to assembly CMakeFiles/fasteq.dir/cwtp_bwd.cu.s"
+	$(CMAKE_COMMAND) -E cmake_unimplemented_variable CMAKE_CUDA_CREATE_ASSEMBLY_SOURCE
+
 # Object files for target fasteq
 fasteq_OBJECTS = \
+"CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o" \
+"CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o" \
 "CMakeFiles/fasteq.dir/stc_fwd.cu.o" \
-"CMakeFiles/fasteq.dir/stc_bwd.cu.o"
+"CMakeFiles/fasteq.dir/stc_bwd.cu.o" \
+"CMakeFiles/fasteq.dir/equi_linear.cu.o" \
+"CMakeFiles/fasteq.dir/cwtp_fwd.cu.o" \
+"CMakeFiles/fasteq.dir/cwtp_bwd.cu.o"
 
 # External object files for target fasteq
 fasteq_EXTERNAL_OBJECTS =
 
+bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o
+bin/libfasteq.so: CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/stc_fwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/stc_bwd.cu.o
+bin/libfasteq.so: CMakeFiles/fasteq.dir/equi_linear.cu.o
+bin/libfasteq.so: CMakeFiles/fasteq.dir/cwtp_fwd.cu.o
+bin/libfasteq.so: CMakeFiles/fasteq.dir/cwtp_bwd.cu.o
 bin/libfasteq.so: CMakeFiles/fasteq.dir/build.make
 bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/libpython3.10.so
 bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/lib/libtorch.so
 bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/lib/libc10.so
 bin/libfasteq.so: /usr/lib/x86_64-linux-gnu/libcuda.so
 bin/libfasteq.so: /usr/local/cuda/lib64/libnvrtc.so
-bin/libfasteq.so: /usr/lib/x86_64-linux-gnu/libnvToolsExt.so
+bin/libfasteq.so: /usr/local/cuda/lib64/libnvToolsExt.so
 bin/libfasteq.so: /usr/local/cuda/lib64/libcudart.so
 bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/lib/libc10_cuda.so
 bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/lib/libc10_cuda.so
@@ -121,7 +201,7 @@ bin/libfasteq.so: /public-data/malixian/conda/fasteq/lib/python3.10/site-package
 bin/libfasteq.so: /usr/local/cuda/lib64/libcudart.so
 bin/libfasteq.so: /usr/local/cuda/lib64/libnvToolsExt.so
 bin/libfasteq.so: CMakeFiles/fasteq.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Linking CUDA shared library bin/libfasteq.so"
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --green --bold --progress-dir=/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_8) "Linking CUDA shared library bin/libfasteq.so"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/fasteq.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.

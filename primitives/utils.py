@@ -1,53 +1,292 @@
 import torch
-import os
+import os, math
+from typing import List
 
-from pathlib import Path
-from threading import Lock
 
-# ---- 全局状态控制 ----
-_LOADED_LIBS = set()
-_ENV_SET = False
-_LOCK = Lock()
+def prod(numbers: List[int]):
+    """
+    This method is a workaround for script() not recognizing math.prod()
+    """
+    if torch.jit.is_scripting():
+        product = 1
+        for num in numbers:
+            product *= num
+        return product
+    else:
+        return math.prod(numbers)
 
-'''
 # Set environment variables for CUDA
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 so_path = os.path.join(os.path.dirname(__file__), "_kernels/cuda/build/bin/", "libfasteq.so")
 torch.ops.load_library(so_path)
+
+'''
+_loaded_kernels = {}
+_loaded_kernels["stc_fwd"] = torch.ops.stc_fwd
+_loaded_kernels["stc_bwd"] = torch.ops.stc_bwd
+_loaded_kernels["cwtp_fwd"] = torch.ops.cwtp_fwd
+_loaded_kernels["cwtp_bwd"] = torch.ops.cwtp_bwd
+_loaded_kernels["fctp_spmm_fwd"] = torch.ops.fctp_spmm_fwd
+_loaded_kernels["fctp_spmm_bwd"] = torch.ops.fctp_spmm_bwd
+_loaded_kernels["equi_linear"] = torch.ops.equi_linear
 '''
 
-def load_fasteq_once():
-    global _ENV_SET
-    with _LOCK:
-        if not _ENV_SET:
-            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "9.0")
-            _ENV_SET = True
-
-        so_path = Path(__file__).parent / "_kernels" / "cuda" / "build" / "bin" / "libfasteq.so"
-        so_path = so_path.resolve()
-
-        if not so_path.exists():
-            raise FileNotFoundError(f"[ERROR] Shared library not found: {so_path}")
-
-        if str(so_path) not in _LOADED_LIBS:
-            torch.ops.load_library(str(so_path))
-            _LOADED_LIBS.add(str(so_path))
-            print(f"[INFO] Loaded CUDA extension: {so_path}")
-        else:
-            pass
-
-        return so_path
-
-load_fasteq_once()
-_loaded_kernels = {}
-def load_kernel_from_lib(name: str):
-    
+def load_kernel(name: str):
     if name not in _loaded_kernels:
-        print("Load CUDA kernel:", name)
-        if name == "stc_fwd":
-            _loaded_kernels[name] = torch.ops.stc_fwd
-        elif name == "stc_bwd":
-            _loaded_kernels[name] = torch.ops.stc_bwd
-        else:
-            raise ValueError(f"Unknown kernel name: {name}")
+        raise ValueError(f"Unknown kernel name: {name}")
     return _loaded_kernels[name]
+
+def make_FastFullyConnectedTensorProductFunction():
+    class FullyConnectedTensorProductFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w, a, b, descriptor, c_tensors, cg_indices, cg_values, math_dtype):
+            
+            inputs = [w, a, b]
+            num_inputs = len(inputs)
+            slices = [ope.segment_slices() for ope in descriptor.operands]
+             
+            outputs = []
+            bjuw_list = []
+            if num_inputs > 0 and descriptor.num_paths > 0:
+
+                slices = [ope.segment_slices() for ope in descriptor.operands]
+
+                for path_idx, path in enumerate(descriptor.paths):
+                    segments = []
+                    for oid in range(num_inputs):
+                        seg_shape = descriptor.get_segment_shape(oid, path)
+                        inp = inputs[oid][..., slices[oid][path.indices[oid]]]
+                        if len(seg_shape) > 0:
+                            inp = inp.reshape(inputs[oid].shape[:-1] + seg_shape)
+                        else:
+                            inp = inp.reshape(inputs[oid].shape[:-1])
+                        segments.append(inp.to(dtype=math_dtype))
+                    
+                    _, U, V, W = segments[0].shape
+                    w_seg = segments[0].reshape(U, V, W)
+                    a_seg = segments[1]
+                    b_seg = segments[2]
+                    #print(f"einsum formula={formula}, segments[0].shape={segments[0].shape}, segments[1].shape={segments[1].shape}, segments[2].shape={segments[2].shape}")
+                    
+                    # replace out = torch.einsum(formula, c_tensor, *segments)
+                    # for fctp ，einsum formula=ijk,Zuvw,Ziu,Zjv->Zkw, segments[0].shape=torch.Size([1, 96, 10, 96]), segments[1].shape=torch.Size([736, 7, 96]), segments[2].shape=torch.Size([736, 1, 10])
+                    # einsum1 cost 0.7ms, einsum2 cost 0.7ms, einsum3 cost 0.4ms
+                    
+                    # replace bjuw = torch.einsum("bjv,uvw->bjuw", b_seg, w_seg)
+                    nnz_idx = b_seg.argmax(dim=-1)              # [B, J]
+                    wT = w_seg.permute(1, 0, 2)                 # 转置为 [V, U, W] 方便索引
+                    bjuw = wT[nnz_idx]
+                    bjuw_list.append(bjuw)
+
+                    bijw = torch.einsum("biu,bjuw->bijw", a_seg, bjuw)
+                    #out = torch.einsum("bijw,ijk->bkw", bijw, c_tensor)
+                    out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
+
+                    seg_shape = descriptor.get_segment_shape(-1, path)
+                    outputs += [
+                        out.reshape(out.shape[: out.ndim - len(seg_shape)] + (prod(seg_shape),))
+                    ]
+                
+                    if len(outputs) == 0:
+                        raise NotImplementedError("No FX implementation for empty paths")
+
+                    def _sum(tensors, *, shape=None, like=None):
+                        if len(tensors) == 0:
+                            return like.new_zeros(shape)
+                        out = tensors[0]
+                        for t in tensors[1:]:
+                            out = torch.add(out, t)
+                        return out
+
+                    batch_shape = outputs[0].shape[:-1]
+
+                    segment_lengths = [
+                        prod(descriptor.operands[-1][i]) for i in range(descriptor.operands[-1].num_segments)
+                    ]
+
+                    final_output = torch.cat(
+                        [
+                            _sum(
+                                [
+                                    out
+                                    for out, path in zip(outputs, descriptor.paths)
+                                    if path.indices[-1] == i
+                                ],
+                                shape=batch_shape + (prod(descriptor.operands[-1][i]),),
+                                like=outputs[0],
+                            )
+                            for i in range(descriptor.operands[-1].num_segments)
+                        ],
+                        dim=-1,
+                    )
+            else:
+                raise NotImplementedError(
+                    "No FX implementation for empty paths and non-empty inputs"
+                )
+
+            # 保存中间量，用于 backward
+            ctx.save_for_backward(w, a, b, *outputs)
+            ctx.descriptor = descriptor
+            ctx.cg_indices = cg_indices
+            ctx.cg_values = cg_values
+            ctx.c_tensors = c_tensors
+            ctx.bjuw_list = bjuw_list
+            ctx.segment_lengths = segment_lengths
+            ctx.math_dtype = math_dtype
+
+            return final_output
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            """
+            Backward: 将 grad_out 拆分到 segment，再回传到每条路径的中间张量
+            """
+            w, a, b, *outputs = ctx.saved_tensors
+            descriptor = ctx.descriptor
+            c_tensor_list = ctx.c_tensors
+            segment_lengths = ctx.segment_lengths
+            math_dtype = ctx.math_dtype
+            bjuw_list = ctx.bjuw_list
+
+            grad_a = torch.zeros_like(a)
+
+            # 1. 拆分 grad_out 按 segment_lengths
+            grad_segments = torch.split(grad_out, segment_lengths, dim=-1)
+
+
+            # 2. 遍历路径，将对应 segment 的梯度反向回传
+            for path_idx, path in enumerate(descriptor.paths):
+                seg_idx = path.indices[-1]  # 对应 segment id
+                grad_out_seg = grad_segments[seg_idx]  # dL/d(segment_out)
+
+                # 取 forward 中 bijw、bjuw、w_seg 等中间量
+                out = outputs[path_idx]
+                slices = [ope.segment_slices() for ope in descriptor.operands]
+                segments = []
+                for oid, inp in enumerate([w, a, b]):
+                    seg_shape = descriptor.get_segment_shape(oid, path)
+                    seg_inp = inp[..., slices[oid][path.indices[oid]]]
+                    seg_inp = seg_inp.reshape(inp.shape[:-1] + seg_shape).to(dtype=math_dtype)
+                    segments.append(seg_inp)
+
+                w_seg = segments[0].reshape(segments[0].shape[1:])
+                a_seg = segments[1]
+                b_seg = segments[2]
+                grad_out_seg = grad_out_seg.reshape(grad_out_seg.shape[0], c_tensor_list[path_idx].shape[-1], -1)
+
+                # print(f"b.shape={b_seg.shape}, w.shape={w_seg.shape}, grad_out.shape={grad_out_seg.shape}")
+                # ======== 逐步 einsum 的 backward ========
+                # grad_a_seg = torch.einsum("ijk,bjv,uvw,bkw->biu", c_tensor_list[path_idx], b_seg, w_seg, grad_out_seg)
+
+                #grad_bijw = torch.einsum("bkw,ijk->bijw", grad_out_seg, c_tensor_list[path_idx])
+                
+                grad_bijw = torch.ops.fctp_spmm_bwd.backward(grad_out_seg.contiguous(),
+                                                    ctx.cg_indices[path_idx].contiguous(), 
+                                                    ctx.cg_values[path_idx].contiguous()
+                                                    )
+                
+                grad_a_seg = torch.einsum("bijw,bjuw->biu", grad_bijw, bjuw_list[path_idx])
+
+                # 累加到总梯度
+                grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
+
+            return None, grad_a, None, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
+    return FullyConnectedTensorProductFunction
+
+
+def make_FastEquiLinearFunction():
+    class FastEquiLinearFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w, x, descriptor, math_dtype=torch.float64):
+            num_paths = len(descriptor.paths)
+            # descriptor.operands[1] coresponse tensor x ((1, 96), (3, 96), (5, 96), (7, 96))
+            I_list = [segment[0] for segment in descriptor.operands[1]]
+            I_total = sum(I_list)
+            cg_val = descriptor.paths[0].coefficients
+            all_equal = True
+            for _, path in enumerate(descriptor.paths):
+                if cg_val != path.coefficients:
+                    all_equal = False
+            if not all_equal:
+                raise ValueError(f"coefficients value is different, causes accuracy problems")
+            
+            B, iu = x.shape
+            _, puv = w.shape
+            u = int(iu / I_total)
+            v = int(puv / num_paths / u)
+            x = x.view(B, I_total, u).contiguous()
+            w = w.view(num_paths, u, v).contiguous()
+
+            my_out = torch.ops.equi_linear.fused_gemm(x, w, I_list, cg_val).view(B, iu)
+
+            ctx.save_for_backward(w, x, my_out)
+            ctx.descriptor = descriptor
+            ctx.B = B
+            ctx.u = u
+            ctx.v = v 
+            ctx.I_total = I_total
+            ctx.num_paths = num_paths
+            ctx.I_list = I_list
+            ctx.cg_val = cg_val
+            return my_out
+        
+        @staticmethod
+        def backward(ctx, grad_out):
+            w, x, output = ctx.saved_tensors
+            wt = w.transpose(1, 2).contiguous() 
+            grad_out = grad_out.view(ctx.B, ctx.I_total, ctx.u).contiguous()
+            grad_x = torch.ops.equi_linear.fused_gemm(grad_out, wt, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
+            return None, grad_x, None, None
+    
+    return FastEquiLinearFunction
+
+
+def make_FastChannelWiseTensorProductFunction():
+    class FastChannelWiseTensorProductFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w, x, y):
+            """
+            cg系数矩阵在 channel_wise 这里为单位矩阵，理论上可省略
+            """
+            # w:[B, 4 * U], x:[B, U], y:[B, dim_sum=16], outputs:[B, U*dim_sum=96*16]
+            output = torch.ops.cwtp_fwd.forward(x.contiguous(), y.contiguous(), w.contiguous())
+            ctx.save_for_backward(w, x, y)
+            return output
+        
+        @staticmethod
+        def backward(ctx, grad_out):
+            w, x, y = ctx.saved_tensors
+            grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(x.contiguous(), y.contiguous(), w.contiguous(), grad_out.contiguous())
+
+            return grad_w, grad_x, grad_y  #  descriptor 不需要梯度
+    return FastChannelWiseTensorProductFunction
+
+def make_FastSymmetricTensorContractionFunction():
+    
+    class FastSymmetricTensorContractionFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
+            x0_g = x0[i0]
+            out = torch.ops.stc_fwd.forward(
+                x1.contiguous(),
+                x0_g.contiguous(),
+                coeffs_tensor.contiguous(),
+                paths_tensor.contiguous(),
+                path_lens_tensor.contiguous(),
+            )
+            ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor = ctx.saved_tensors
+            grad_x1 = torch.ops.stc_bwd.backward(
+                grad_out.contiguous(),
+                x1,
+                x0_g,
+                coeffs_tensor,
+                paths_tensor,
+                path_lens_tensor,
+            )
+            return grad_x1, None, None, None, None, None
+    
+    return FastSymmetricTensorContractionFunction

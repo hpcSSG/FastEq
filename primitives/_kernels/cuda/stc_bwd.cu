@@ -3,6 +3,7 @@
 #include <torch/torch.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
 
 #define CUDA_CHECK(expr) do { \
   cudaError_t _err = (expr);  \
@@ -116,8 +117,9 @@ at::Tensor stc_bwd_launcher(
     dim3 blockDim(u);
     dim3 gridDim(B);
     size_t shared_mem_bytes = sizeof(double) * (num_a * u + num_i * u);
+    cudaStream_t cur_stream = c10::cuda::getCurrentCUDAStream(grad_out.device().index()).stream();
 
-    stc_bwd<<<gridDim, blockDim, shared_mem_bytes>>>(
+    stc_bwd<<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
         grad_out.data_ptr<double>(),
         x1.data_ptr<double>(),
         x0_g.data_ptr<double>(),
@@ -131,10 +133,6 @@ at::Tensor stc_bwd_launcher(
 
     return grad_x1;
 }
-
-/* PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("backward", &stc_bwd_launcher,  "Symmetric Tensor Contraction Backward (grad wrt x1 only)");
-} */
 
 TORCH_LIBRARY(stc_bwd, m)
 {

@@ -28,8 +28,13 @@ include_directories(${TORCH_INSTALL_PREFIX}/include)
 
 # 添加文件，指定CUDA源文件
 add_library(${PROJECT_NAME} SHARED
+    fctp_spmm_fwd.cu
+    fctp_spmm_bwd.cu
     stc_fwd.cu
     stc_bwd.cu
+    equi_linear.cu
+    cwtp_fwd.cu
+    cwtp_bwd.cu
 )
 
 # 为目标设置编译和链接标志

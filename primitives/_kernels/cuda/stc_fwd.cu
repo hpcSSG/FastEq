@@ -3,6 +3,7 @@
 #include <torch/extension.h>
 #include <torch/script.h>
 #include <torch/torch.h>
+#include <c10/cuda/CUDAStream.h>
 
 __global__ void stc_fwd(
     const double* __restrict__ x1,        // [B, num_a, u] -> flattened
@@ -92,8 +93,9 @@ at::Tensor stc_fwd_launcher(
     dim3 blockDim(u);        // 每个线程处理一个 j
     dim3 gridDim(B);         // 每个 block 处理一个样本 b
     size_t shared_mem_bytes = sizeof(double) * (num_a * u + num_i * u);
+    cudaStream_t cur_stream = c10::cuda::getCurrentCUDAStream(x1.device().index()).stream();
 
-    stc_fwd<<<gridDim, blockDim, shared_mem_bytes>>>(
+    stc_fwd<<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
         x1.data_ptr<double>(),
         x0_g.data_ptr<double>(),
         coeffs.data_ptr<double>(),

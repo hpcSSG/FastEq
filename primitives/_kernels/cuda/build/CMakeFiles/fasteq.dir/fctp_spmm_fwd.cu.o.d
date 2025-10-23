@@ -1,4 +1,4 @@
-CMakeFiles/fused_gmm.dir/stc_fwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/stc_fwd.cu \
+CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o : /home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/fctp_spmm_fwd.cu \
     /usr/include/stdc-predef.h \
     /usr/local/cuda/include/cuda_runtime.h \
     /usr/local/cuda/include/crt/host_config.h \
@@ -5613,4 +5613,12 @@ CMakeFiles/fused_gmm.dir/stc_fwd.cu.o : /home/malixian/repos/cuequivariance_torc
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/schema_matching.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/versioned_symbols.h \
     /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/jit/frontend/tree_views.h \
-    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/torch.h
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/torch/csrc/api/include/torch/torch.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAStream.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAFunctions.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/core/impl/GPUTrace.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAException.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDADeviceAssertionHost.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMacros.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/impl/cuda_cmake_macros.h \
+    /public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch/include/c10/cuda/CUDAMiscFunctions.h

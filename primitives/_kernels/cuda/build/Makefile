@@ -129,6 +129,126 @@ fasteq/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/build
 .PHONY : fasteq/fast
 
+cwtp_bwd.o: cwtp_bwd.cu.o
+.PHONY : cwtp_bwd.o
+
+# target to build an object file
+cwtp_bwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_bwd.cu.o
+.PHONY : cwtp_bwd.cu.o
+
+cwtp_bwd.i: cwtp_bwd.cu.i
+.PHONY : cwtp_bwd.i
+
+# target to preprocess a source file
+cwtp_bwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_bwd.cu.i
+.PHONY : cwtp_bwd.cu.i
+
+cwtp_bwd.s: cwtp_bwd.cu.s
+.PHONY : cwtp_bwd.s
+
+# target to generate assembly for a file
+cwtp_bwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_bwd.cu.s
+.PHONY : cwtp_bwd.cu.s
+
+cwtp_fwd.o: cwtp_fwd.cu.o
+.PHONY : cwtp_fwd.o
+
+# target to build an object file
+cwtp_fwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_fwd.cu.o
+.PHONY : cwtp_fwd.cu.o
+
+cwtp_fwd.i: cwtp_fwd.cu.i
+.PHONY : cwtp_fwd.i
+
+# target to preprocess a source file
+cwtp_fwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_fwd.cu.i
+.PHONY : cwtp_fwd.cu.i
+
+cwtp_fwd.s: cwtp_fwd.cu.s
+.PHONY : cwtp_fwd.s
+
+# target to generate assembly for a file
+cwtp_fwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/cwtp_fwd.cu.s
+.PHONY : cwtp_fwd.cu.s
+
+equi_linear.o: equi_linear.cu.o
+.PHONY : equi_linear.o
+
+# target to build an object file
+equi_linear.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/equi_linear.cu.o
+.PHONY : equi_linear.cu.o
+
+equi_linear.i: equi_linear.cu.i
+.PHONY : equi_linear.i
+
+# target to preprocess a source file
+equi_linear.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/equi_linear.cu.i
+.PHONY : equi_linear.cu.i
+
+equi_linear.s: equi_linear.cu.s
+.PHONY : equi_linear.s
+
+# target to generate assembly for a file
+equi_linear.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/equi_linear.cu.s
+.PHONY : equi_linear.cu.s
+
+fctp_spmm_bwd.o: fctp_spmm_bwd.cu.o
+.PHONY : fctp_spmm_bwd.o
+
+# target to build an object file
+fctp_spmm_bwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.o
+.PHONY : fctp_spmm_bwd.cu.o
+
+fctp_spmm_bwd.i: fctp_spmm_bwd.cu.i
+.PHONY : fctp_spmm_bwd.i
+
+# target to preprocess a source file
+fctp_spmm_bwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.i
+.PHONY : fctp_spmm_bwd.cu.i
+
+fctp_spmm_bwd.s: fctp_spmm_bwd.cu.s
+.PHONY : fctp_spmm_bwd.s
+
+# target to generate assembly for a file
+fctp_spmm_bwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_bwd.cu.s
+.PHONY : fctp_spmm_bwd.cu.s
+
+fctp_spmm_fwd.o: fctp_spmm_fwd.cu.o
+.PHONY : fctp_spmm_fwd.o
+
+# target to build an object file
+fctp_spmm_fwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.o
+.PHONY : fctp_spmm_fwd.cu.o
+
+fctp_spmm_fwd.i: fctp_spmm_fwd.cu.i
+.PHONY : fctp_spmm_fwd.i
+
+# target to preprocess a source file
+fctp_spmm_fwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.i
+.PHONY : fctp_spmm_fwd.cu.i
+
+fctp_spmm_fwd.s: fctp_spmm_fwd.cu.s
+.PHONY : fctp_spmm_fwd.s
+
+# target to generate assembly for a file
+fctp_spmm_fwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_spmm_fwd.cu.s
+.PHONY : fctp_spmm_fwd.cu.s
+
 stc_bwd.o: stc_bwd.cu.o
 .PHONY : stc_bwd.o
 
@@ -186,6 +306,21 @@ help:
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
 	@echo "... fasteq"
+	@echo "... cwtp_bwd.o"
+	@echo "... cwtp_bwd.i"
+	@echo "... cwtp_bwd.s"
+	@echo "... cwtp_fwd.o"
+	@echo "... cwtp_fwd.i"
+	@echo "... cwtp_fwd.s"
+	@echo "... equi_linear.o"
+	@echo "... equi_linear.i"
+	@echo "... equi_linear.s"
+	@echo "... fctp_spmm_bwd.o"
+	@echo "... fctp_spmm_bwd.i"
+	@echo "... fctp_spmm_bwd.s"
+	@echo "... fctp_spmm_fwd.o"
+	@echo "... fctp_spmm_fwd.i"
+	@echo "... fctp_spmm_fwd.s"
 	@echo "... stc_bwd.o"
 	@echo "... stc_bwd.i"
 	@echo "... stc_bwd.s"

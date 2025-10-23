@@ -61,6 +61,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         math_dtype: Optional[torch.dtype] = None,
         use_fallback: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
         irreps_in1, irreps_in2 = default_irreps(irreps_in1, irreps_in2)
@@ -103,8 +104,10 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             layout_in=(cue.ir_mul, layout_in1, layout_in2),
             layout_out=layout_out,
             device=device,
+            op_name="tp_channel_wise",
             math_dtype=math_dtype,
             use_fallback=use_fallback,
+            use_fasteq=use_fasteq,
         )
 
     @torch.jit.ignore
