@@ -62,50 +62,57 @@ def make_FastFullyConnectedTensorProductFunction():
                         segments.append(inp.to(dtype=math_dtype))
                     
                     _, U, V, W = segments[0].shape
+                    B, I, U = segments[1].shape
+                    B, J, V = segments[2].shape
                     w_seg = segments[0].reshape(U, V, W)
                     a_seg = segments[1]
-                    b_seg = segments[2]
-                    #print(f"einsum formula={formula}, segments[0].shape={segments[0].shape}, segments[1].shape={segments[1].shape}, segments[2].shape={segments[2].shape}")
-                    
+                    b_seg = segments[2]                    
+
+                    '''
                     # replace out = torch.einsum(formula, c_tensor, *segments)
                     # for fctp ，einsum formula=ijk,Zuvw,Ziu,Zjv->Zkw, segments[0].shape=torch.Size([1, 96, 10, 96]), segments[1].shape=torch.Size([736, 7, 96]), segments[2].shape=torch.Size([736, 1, 10])
-                    # einsum1 cost 0.7ms, einsum2 cost 0.7ms, einsum3 cost 0.4ms
-                    
-                    # replace bjuw = torch.einsum("bjv,uvw->bjuw", b_seg, w_seg)
+
                     torch.cuda.synchronize()
                     start_time = time.perf_counter() * 1000
 
-                    nnz_idx = b_seg.argmax(dim=-1)              # [B, J]
-                    wT = w_seg.permute(1, 0, 2)                 # 转置为 [V, U, W] 方便索引
+                    nnz_idx = b_seg.argmax(dim=-1).to(torch.int32)              # [B, J]                 
+                    wT = w_seg.permute(1, 0, 2)
                     bjuw = wT[nnz_idx]
+
                     bjuw_list.append(bjuw)
-
-                    torch.cuda.synchronize()
-                    end_time = time.perf_counter() * 1000
-                    execution_time_ms = end_time - start_time
-                    print(f"einsum1 cost {execution_time_ms} ms")
-
-                    torch.cuda.synchronize()
-                    start_time = time.perf_counter() * 1000
-
                     bijw = torch.einsum("biu,bjuw->bijw", a_seg, bjuw)
-
+                    out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
+                    
                     torch.cuda.synchronize()
                     end_time = time.perf_counter() * 1000
                     execution_time_ms = end_time - start_time
-                    print(f"einsum2 cost {execution_time_ms} ms")
+                    print(f"einsum1 + einsum2 + einsum3 baseline cost: {execution_time_ms}")
 
 
                     torch.cuda.synchronize()
                     start_time = time.perf_counter() * 1000
+                    K = I
+                    bijw = torch.ops.fctp_fused2.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous())
+                    out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter() * 1000
+                    execution_time_ms = end_time - start_time
+                    print(f"einsum1 + einsum2 + einsum3 cuda cost: {execution_time_ms}")
+                    '''
+                    
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter() * 1000
+                    K = I
+                    out_ref = torch.ops.fused_fctp3_opt.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous(), K)
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter() * 1000
+                    execution_time_ms = end_time - start_time
+                    print(f"einsum1 + einsum2 + einsum3 cuda fused cost: {execution_time_ms}")
+
+                    print("max abs diff:", (out_ref - out).abs().max().item())
 
                     #out = torch.einsum("bijw,ijk->bkw", bijw, c_tensor)
-                    out = torch.ops.fctp_spmm_fwd.forward(bijw.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
-
-                    torch.cuda.synchronize()
-                    end_time = time.perf_counter() * 1000
-                    execution_time_ms = end_time - start_time
-                    print(f"einsum3 cost {execution_time_ms} ms")
+                    
 
                     seg_shape = descriptor.get_segment_shape(-1, path)
                     outputs += [

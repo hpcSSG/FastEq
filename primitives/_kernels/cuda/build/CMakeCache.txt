@@ -137,7 +137,7 @@ CMAKE_OBJCOPY:FILEPATH=/usr/bin/objcopy
 CMAKE_OBJDUMP:FILEPATH=/usr/bin/objdump
 
 //No help, variable specified on the command line.
-CMAKE_PREFIX_PATH:UNINITIALIZED=/public-data/malixian/conda/fasteq/lib/python3.10/site-packages/torch
+CMAKE_PREFIX_PATH:UNINITIALIZED=
 
 //Value Computed by CMake
 CMAKE_PROJECT_DESCRIPTION:STATIC=

@@ -201,6 +201,78 @@ equi_linear.cu.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/equi_linear.cu.s
 .PHONY : equi_linear.cu.s
 
+fctp_fused2_fwd.o: fctp_fused2_fwd.cu.o
+.PHONY : fctp_fused2_fwd.o
+
+# target to build an object file
+fctp_fused2_fwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused2_fwd.cu.o
+.PHONY : fctp_fused2_fwd.cu.o
+
+fctp_fused2_fwd.i: fctp_fused2_fwd.cu.i
+.PHONY : fctp_fused2_fwd.i
+
+# target to preprocess a source file
+fctp_fused2_fwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused2_fwd.cu.i
+.PHONY : fctp_fused2_fwd.cu.i
+
+fctp_fused2_fwd.s: fctp_fused2_fwd.cu.s
+.PHONY : fctp_fused2_fwd.s
+
+# target to generate assembly for a file
+fctp_fused2_fwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused2_fwd.cu.s
+.PHONY : fctp_fused2_fwd.cu.s
+
+fctp_fused3_fwd.o: fctp_fused3_fwd.cu.o
+.PHONY : fctp_fused3_fwd.o
+
+# target to build an object file
+fctp_fused3_fwd.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.o
+.PHONY : fctp_fused3_fwd.cu.o
+
+fctp_fused3_fwd.i: fctp_fused3_fwd.cu.i
+.PHONY : fctp_fused3_fwd.i
+
+# target to preprocess a source file
+fctp_fused3_fwd.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.i
+.PHONY : fctp_fused3_fwd.cu.i
+
+fctp_fused3_fwd.s: fctp_fused3_fwd.cu.s
+.PHONY : fctp_fused3_fwd.s
+
+# target to generate assembly for a file
+fctp_fused3_fwd.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd.cu.s
+.PHONY : fctp_fused3_fwd.cu.s
+
+fctp_fused3_fwd_opt.o: fctp_fused3_fwd_opt.cu.o
+.PHONY : fctp_fused3_fwd_opt.o
+
+# target to build an object file
+fctp_fused3_fwd_opt.cu.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.o
+.PHONY : fctp_fused3_fwd_opt.cu.o
+
+fctp_fused3_fwd_opt.i: fctp_fused3_fwd_opt.cu.i
+.PHONY : fctp_fused3_fwd_opt.i
+
+# target to preprocess a source file
+fctp_fused3_fwd_opt.cu.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.i
+.PHONY : fctp_fused3_fwd_opt.cu.i
+
+fctp_fused3_fwd_opt.s: fctp_fused3_fwd_opt.cu.s
+.PHONY : fctp_fused3_fwd_opt.s
+
+# target to generate assembly for a file
+fctp_fused3_fwd_opt.cu.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/fasteq.dir/build.make CMakeFiles/fasteq.dir/fctp_fused3_fwd_opt.cu.s
+.PHONY : fctp_fused3_fwd_opt.cu.s
+
 fctp_spmm_bwd.o: fctp_spmm_bwd.cu.o
 .PHONY : fctp_spmm_bwd.o
 
@@ -315,6 +387,15 @@ help:
 	@echo "... equi_linear.o"
 	@echo "... equi_linear.i"
 	@echo "... equi_linear.s"
+	@echo "... fctp_fused2_fwd.o"
+	@echo "... fctp_fused2_fwd.i"
+	@echo "... fctp_fused2_fwd.s"
+	@echo "... fctp_fused3_fwd.o"
+	@echo "... fctp_fused3_fwd.i"
+	@echo "... fctp_fused3_fwd.s"
+	@echo "... fctp_fused3_fwd_opt.o"
+	@echo "... fctp_fused3_fwd_opt.i"
+	@echo "... fctp_fused3_fwd_opt.s"
 	@echo "... fctp_spmm_bwd.o"
 	@echo "... fctp_spmm_bwd.i"
 	@echo "... fctp_spmm_bwd.s"
