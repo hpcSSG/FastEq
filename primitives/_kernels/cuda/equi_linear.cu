@@ -26,6 +26,7 @@ __device__ __forceinline__ void WarpATileG2SSwizzleAsync(
     const uint32_t &prefix_i_sum, // 当前path之前的所有path的i总数之和
     const uint32_t &path_size,    // 当前的path的大小
     const uint32_t &total_i,      // I的总数
+    const uint32_t &B,            // B
     const uint32_t &U,            // U
     const uint32_t &tid,          // thread id
     const uint32_t &wid           // warp id
@@ -56,7 +57,10 @@ __device__ __forceinline__ void WarpATileG2SSwizzleAsync(
         static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<void *>(smem_ptr0 + smem_offset)));
 
     // fetch req
-    asm_cp_async_ca_l2_prefetch_128B(real_smem_ptr, A_ptr, 16);
+    if (t_batch < B)
+    { // Batch 维度没越界
+        asm_cp_async_ca_l2_prefetch_128B(real_smem_ptr, A_ptr, 16);
+    }
 }
 
 template <uint32_t WARP_PER_BLOCK>
@@ -190,7 +194,7 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
     uint32_t b_ntile_id = blockIdx.x;
     uint32_t b_bi_id = blockIdx.y;
 
-    uint32_t block_nums_per_bi = B / TILE_M; // !! 需保证 B 能被 TILE_M 整除
+    uint32_t block_nums_per_bi = CEIL_DIV(B, TILE_M);
     uint32_t b_i_id = b_bi_id / block_nums_per_bi;
     uint32_t b_path_id = 3;
 #pragma unroll
@@ -201,13 +205,6 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
     uint32_t b_path_size = i_dims._i[b_path_id];
     uint32_t b_prefix_i_sum = prefex_i_sum._i[b_path_id];
     uint32_t b_mtile_id = (b_i_id - b_prefix_i_sum) * block_nums_per_bi + (b_bi_id % block_nums_per_bi);
-
-#ifdef __FCTP_DEBUG__
-    if (tid == 0 && wid == 0)
-    {
-        printf("[Kernel Debug]: B:[%u, %u], b_path_id=%u, b_mtile_id=%u\n", b_ntile_id, b_bi_id, b_path_id, b_mtile_id);
-    }
-#endif
 
     // 越界Block
     if (b_mtile_id * TILE_M >= b_path_size * B)
@@ -259,7 +256,7 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
         {
             WarpATileG2SSwizzleAsync<WARP_PER_BLOCK>((A_smem + ld_tag * A_SMEM_SIZE_PER_STAGE), x, t_ld_m0, t_ld_ak0,
                                                      loop_k, (W_LD16B_M_ROWS * WARP_PER_BLOCK), m_count, b_prefix_i_sum,
-                                                     b_path_size, total_i, U, tid, wid);
+                                                     b_path_size, total_i, B, U, tid, wid);
         }
 #pragma unroll
         for (uint32_t k_count = 0; k_count < W_LD16B_N_COUNTS; ++k_count)
@@ -307,7 +304,7 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
         {
             WarpATileG2SSwizzleAsync<WARP_PER_BLOCK>((A_smem + ld_tag * A_SMEM_SIZE_PER_STAGE), x, t_ld_m0, t_ld_ak0,
                                                      loop_k, (W_LD16B_M_ROWS * WARP_PER_BLOCK), m_count, b_prefix_i_sum,
-                                                     b_path_size, total_i, U, tid, wid);
+                                                     b_path_size, total_i, B, U, tid, wid);
         }
 #pragma unroll
         for (uint32_t k_count = 0; k_count < W_LD16B_N_COUNTS; ++k_count)
@@ -428,260 +425,10 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
             accu[accu_m][accu_n][accu_l0] *= cg_val;
             accu[accu_m][accu_n][accu_l0 + 1] *= cg_val;
             // store re (sync)
-            FETCH_16B(out[out_offset]) = FETCH_16B(accu[accu_m][accu_n][accu_l0]);
-        }
-    }
-}
-
-template <uint32_t M_WARPS = 2,                                         // m方向warp数量
-          uint32_t N_WARPS = 2,                                         // n方向warp数量
-          uint32_t W_TILE_M = 16,                                       // 每个warp的tile m大小
-          uint32_t W_TILE_N = 16,                                       // 每个warp的tile n大小
-          uint32_t TILE_K = 16>                                         // tile k大小
-__global__ void fused_gmm_path1_kernel_v2(const double *__restrict__ x, // [B, total_i, U]
-                                    const double *__restrict__ w, // [num_paths, U, V]
-                                    double *__restrict__ out,     // [B, total_i, V]
-                                    idim_T i_dims,                // [num_paths]
-                                    idim_T prefex_i_sum,          // [num_paths]
-                                    uint32_t num_paths,           // path数量
-                                    uint32_t total_i,             // i的总数
-                                    uint32_t B,                   // batch size
-                                    uint32_t U,                   // U
-                                    uint32_t V,                   // V
-                                    double cg_val                 // val
-)
-{
-    constexpr uint32_t TILE_M = M_WARPS * W_TILE_M;
-    constexpr uint32_t TILE_N = N_WARPS * W_TILE_N;
-    constexpr uint32_t WARP_PER_BLOCK = M_WARPS * N_WARPS;
-
-    // basic info
-    uint32_t tid = threadIdx.x;
-    uint32_t wid = threadIdx.y;
-    uint32_t w_mid = wid / N_WARPS;
-    uint32_t w_nid = wid % N_WARPS;
-    uint32_t b_ntile_id = blockIdx.x;
-    uint32_t b_mtile_id = blockIdx.y;
-
-    // 越界Block
-    if (b_mtile_id * TILE_M >= total_i * B)
-    {
-        return;
-    }
-    // 计算分块内各个warp的参数
-    uint32_t b_m0 = b_mtile_id * TILE_M;
-    uint32_t b_n0 = b_ntile_id * TILE_N;
-    // 对于M和N矩阵，一个warp以最大带宽加载数据一次能加载几行(ROWS)、每行需要加载几次(PER_ROW)
-    // M矩阵：K方向主序；N矩阵：N方向主序
-    constexpr uint32_t W_LD16B_M_ROWS = CEIL_DIV(WARP_SIZE * 2, TILE_K); // 4
-    // constexpr uint32_t W_LD16B_M_PER_ROW = CEIL_DIV(TILE_K, WARP_SIZE * 2); // 1
-    constexpr uint32_t W_LD16B_N_ROWS = CEIL_DIV(WARP_SIZE * 2, TILE_N); // 2
-    // constexpr uint32_t W_LD16B_N_PER_ROW = CEIL_DIV(TILE_N, WARP_SIZE * 2); // 1
-    // MN矩阵需要的总加载次数
-    constexpr uint32_t W_LD16B_M_COUNTS = CEIL_DIV(TILE_M * TILE_K, WARP_PER_BLOCK * WARP_SIZE * 2); // 2
-    constexpr uint32_t W_LD16B_N_COUNTS = CEIL_DIV(TILE_N * TILE_K, WARP_PER_BLOCK * WARP_SIZE * 2); // 2
-    // MN矩阵加载每行需要几个thread
-    constexpr uint32_t THREADS_PER_M_ROW_LD = TILE_K / 2; // 8
-    constexpr uint32_t THREADS_PER_N_ROW_LD = TILE_N / 2; // 16
-
-    // thread m/n/k
-    uint32_t t_ld_m0 = b_m0 + wid * W_LD16B_M_ROWS + (tid / THREADS_PER_M_ROW_LD);
-    uint32_t t_ld_ak0 = (tid % THREADS_PER_M_ROW_LD) * 2;
-    uint32_t t_ld_n0 = b_n0 + (tid % THREADS_PER_N_ROW_LD) * 2;
-    uint32_t t_ld_bk0 = wid * W_LD16B_N_ROWS + (tid / THREADS_PER_N_ROW_LD);
-
-    // SMEM
-    extern __shared__ double smem[];
-    constexpr uint32_t stage = 2; // 流水级
-    constexpr uint32_t A_SMEM_SIZE_PER_STAGE = TILE_M * TILE_K;
-    constexpr uint32_t B_SMEM_SIZE_PER_STAGE = TILE_N * TILE_K;
-    constexpr uint32_t A_SMEM_SIZE = A_SMEM_SIZE_PER_STAGE * stage;
-    constexpr uint32_t B_SMEM_SIZE = B_SMEM_SIZE_PER_STAGE * stage;
-    double *A_smem = smem;
-    double *B_smem = A_smem + A_SMEM_SIZE;
-
-    // stage计数
-    uint32_t ld_tag = 0;
-    uint32_t use_tag = 1 - ld_tag;
-
-    // 预取 SMEM(ld)
-    {
-        uint32_t loop_k = 0;
-        // G2S
-#pragma unroll
-        for (uint32_t m_count = 0; m_count < W_LD16B_M_COUNTS; ++m_count)
-        {
-            WarpATileG2SSwizzleAsync<WARP_PER_BLOCK>((A_smem + ld_tag * A_SMEM_SIZE_PER_STAGE), x, t_ld_m0, t_ld_ak0,
-                                                     loop_k, (W_LD16B_M_ROWS * WARP_PER_BLOCK), m_count, 0, total_i,
-                                                     total_i, U, tid, wid);
-        }
-#pragma unroll
-        for (uint32_t k_count = 0; k_count < W_LD16B_N_COUNTS; ++k_count)
-        {
-            WarpBTileG2SSwizzleAsync<WARP_PER_BLOCK>((B_smem + ld_tag * B_SMEM_SIZE_PER_STAGE), w, t_ld_n0, t_ld_bk0,
-                                                     loop_k, (W_LD16B_N_ROWS * WARP_PER_BLOCK), k_count, 0, U, V, tid,
-                                                     wid);
-        }
-        asm_cp_async_commit_group();
-    }
-
-    // MMA指令参数
-    constexpr uint32_t MMA_M = 16;
-    constexpr uint32_t MMA_N = 8;
-    constexpr uint32_t MMA_K = 4;
-
-    // Accumulator定义并置为0
-    double accu[W_TILE_M / MMA_M][W_TILE_N / MMA_N][4];
-#pragma unroll
-    for (uint32_t _m = 0; _m < W_TILE_M / MMA_M; ++_m)
-    {
-#pragma unroll
-        for (uint32_t _n = 0; _n < W_TILE_N / MMA_N; ++_n)
-        {
-#pragma unroll
-            for (uint32_t _l = 0; _l < 4; ++_l)
+            if (out_batch < B)
             {
-                accu[_m][_n][_l] = 0.0;
+                FETCH_16B(out[out_offset]) = FETCH_16B(accu[accu_m][accu_n][accu_l0]);
             }
-        }
-    }
-
-    // 更新标志位，等待预取的数据结束读取
-    use_tag = ld_tag;
-    ld_tag = 1 - ld_tag;
-    asm_cp_async_waitgroup(0);
-    __syncthreads();
-
-    // 主循环
-    for (uint32_t loop_k = TILE_K; loop_k < U; loop_k += TILE_K)
-    {
-        // G2S（本轮）
-#pragma unroll
-        for (uint32_t m_count = 0; m_count < W_LD16B_M_COUNTS; ++m_count)
-        {
-            WarpATileG2SSwizzleAsync<WARP_PER_BLOCK>((A_smem + ld_tag * A_SMEM_SIZE_PER_STAGE), x, t_ld_m0, t_ld_ak0,
-                                                     loop_k, (W_LD16B_M_ROWS * WARP_PER_BLOCK), m_count, 0, total_i,
-                                                     total_i, U, tid, wid);
-        }
-#pragma unroll
-        for (uint32_t k_count = 0; k_count < W_LD16B_N_COUNTS; ++k_count)
-        {
-            WarpBTileG2SSwizzleAsync<WARP_PER_BLOCK>((B_smem + ld_tag * B_SMEM_SIZE_PER_STAGE), w, t_ld_n0, t_ld_bk0,
-                                                     loop_k, (W_LD16B_N_ROWS * WARP_PER_BLOCK), k_count, 0, U, V, tid,
-                                                     wid);
-        }
-        asm_cp_async_commit_group();
-
-        // 计算上一轮load的数据
-        // S2R (m16n8k4)
-        double B_reg[W_TILE_N / MMA_N][TILE_K / MMA_K];
-        // 加载整个B矩阵Tile到寄存器中
-#pragma unroll
-        for (uint32_t _n = 0; _n < (W_TILE_N / MMA_N); ++_n)
-        {
-#pragma unroll
-            for (uint32_t _k = 0; _k < (TILE_K / MMA_K); ++_k)
-            {
-                WarpBSubtileN8K4S2RSwizzleSync<W_TILE_N / 8, N_WARPS>(
-                    B_reg[_n][_k], (B_smem + use_tag * B_SMEM_SIZE_PER_STAGE), _n, _k, tid, w_nid);
-            }
-        }
-        // 加载A的同时做MMA
-        for (uint32_t _m = 0; _m < (W_TILE_M / MMA_M); ++_m)
-        {
-            for (uint32_t _k = 0; _k < (TILE_K / MMA_K); ++_k)
-            {
-                // 用M8K4 load一个M16K4要load 2次
-                double A_reg[2];
-                WarpASubtileM8K4S2RSwizzleSync<W_TILE_M / 8>(A_reg[0], (A_smem + use_tag * A_SMEM_SIZE_PER_STAGE),
-                                                             (2 * _m), _k, tid, w_mid);
-                WarpASubtileM8K4S2RSwizzleSync<W_TILE_M / 8>(A_reg[1], (A_smem + use_tag * A_SMEM_SIZE_PER_STAGE),
-                                                             (2 * _m + 1), _k, tid, w_mid);
-                // Do MMA
-#pragma unroll
-                for (uint32_t _n = 0; _n < (W_TILE_N / MMA_N); ++_n)
-                {
-                    asm_mma_m16n8k4_f64_f64_f64_f64(
-                        accu[_m][_n][0], accu[_m][_n][1], accu[_m][_n][2], accu[_m][_n][3], // D
-                        A_reg[0], A_reg[1],                                                 // A
-                        B_reg[_n][_k],                                                      // B
-                        accu[_m][_n][0], accu[_m][_n][1], accu[_m][_n][2], accu[_m][_n][3]  // C
-                    );
-                }
-            }
-        }
-
-        // 更新标志位，等待load返回
-        use_tag = ld_tag;
-        ld_tag = 1 - ld_tag;
-        asm_cp_async_waitgroup(0);
-        __syncthreads();
-    }
-
-    // 尾声处理
-    {
-        // S2R (m16n8k4)
-        double B_reg[W_TILE_N / MMA_N][TILE_K / MMA_K];
-        // 加载整个B矩阵Tile到寄存器中
-#pragma unroll
-        for (uint32_t _n = 0; _n < (W_TILE_N / MMA_N); ++_n)
-        {
-#pragma unroll
-            for (uint32_t _k = 0; _k < (TILE_K / MMA_K); ++_k)
-            {
-                WarpBSubtileN8K4S2RSwizzleSync<W_TILE_N / 8, N_WARPS>(
-                    B_reg[_n][_k], (B_smem + use_tag * B_SMEM_SIZE_PER_STAGE), _n, _k, tid, w_nid);
-            }
-        }
-        // 加载A的同时做MMA
-        for (uint32_t _m = 0; _m < (W_TILE_M / MMA_M); ++_m)
-        {
-            for (uint32_t _k = 0; _k < (TILE_K / MMA_K); ++_k)
-            {
-                // 用M8K4 load一个M16K4要load 2次
-                double A_reg[2];
-                WarpASubtileM8K4S2RSwizzleSync<W_TILE_M / 8>(A_reg[0], (A_smem + use_tag * A_SMEM_SIZE_PER_STAGE),
-                                                             (2 * _m), _k, tid, w_mid);
-                WarpASubtileM8K4S2RSwizzleSync<W_TILE_M / 8>(A_reg[1], (A_smem + use_tag * A_SMEM_SIZE_PER_STAGE),
-                                                             (2 * _m + 1), _k, tid, w_mid);
-                // Do MMA
-#pragma unroll
-                for (uint32_t _n = 0; _n < (W_TILE_N / MMA_N); ++_n)
-                {
-                    asm_mma_m16n8k4_f64_f64_f64_f64(
-                        accu[_m][_n][0], accu[_m][_n][1], accu[_m][_n][2], accu[_m][_n][3], // D
-                        A_reg[0], A_reg[1],                                                 // A
-                        B_reg[_n][_k],                                                      // B
-                        accu[_m][_n][0], accu[_m][_n][1], accu[_m][_n][2], accu[_m][_n][3]  // C
-                    );
-                }
-            }
-        }
-    }
-
-    // ST to Global
-    for (uint32_t out_m0 = 0; out_m0 < (W_TILE_M / 8); ++out_m0)
-    {
-        for (uint32_t out_n0 = 0; out_n0 < (W_TILE_N / 8); ++out_n0)
-        {
-            // 计算accu坐标
-            // 每组accu四个double，前两个是m=0~7的，后两个是m=8~15的
-            uint32_t accu_l0 = (out_m0 & 0x1) << 1; // (out_m % 2) * 2
-            uint32_t accu_m = out_m0 >> 1;          // out_m / 2
-            uint32_t accu_n = out_n0;
-
-            // 计算 global offset
-            uint32_t out_m = b_m0 + w_mid * W_TILE_M + out_m0 * 8 + (tid >> 2);
-            uint32_t out_n = b_n0 + w_nid * W_TILE_N + out_n0 * 8 + ((tid & 0x3) << 1);
-            // 已知 path, m, n -> [B, i, V]
-            uint32_t out_bi = out_m;
-            uint32_t out_v = out_n;
-            uint32_t out_offset = out_bi * V + out_v;
-            // 乘 val
-            accu[accu_m][accu_n][accu_l0] *= cg_val;
-            accu[accu_m][accu_n][accu_l0 + 1] *= cg_val;
-            // store re (sync)
-            FETCH_16B(out[out_offset]) = FETCH_16B(accu[accu_m][accu_n][accu_l0]);
         }
     }
 }
@@ -702,6 +449,8 @@ torch::Tensor fused_gmm(const torch::Tensor &x,                 // [B, total_i, 
     uint32_t V = w.size(2);
 
     uint32_t num_paths = i_dims_vec.size();
+    TORCH_CHECK(num_paths == 4, "num_paths must be 4");
+
     torch::Tensor out = torch::empty({B, total_i, V}, x.options());
 
     idim_T i_dims = {
@@ -722,32 +471,24 @@ torch::Tensor fused_gmm(const torch::Tensor &x,                 // [B, total_i, 
     constexpr uint32_t TILE_N = N_WARPS * W_TILE_N;
     constexpr uint32_t WARP_PER_BLOCK = M_WARPS * N_WARPS;
 
-    //TORCH_CHECK(V % TILE_N == 0, "Dim V must be divisible by %u", TILE_N);
-    //TORCH_CHECK(B % TILE_M == 0, "Dim B must be divisible by %u", TILE_M);
-    dim3 grid(CEIL_DIV(V, TILE_N), CEIL_DIV(total_i * B, TILE_M));
+    TORCH_CHECK(V % TILE_N == 0, "Dim V must be divisible by %u", TILE_N);
+    // TORCH_CHECK(B % TILE_M == 0, "Dim B must be divisible by %u", TILE_M);
+    dim3 grid(CEIL_DIV(V, TILE_N), total_i * CEIL_DIV(B, TILE_M));
     dim3 block(WARP_SIZE, WARP_PER_BLOCK);
 
     constexpr uint32_t SMEM_SIZE = (TILE_M * TILE_K + TILE_N * TILE_K) * 2 * 8; // 2 stage, 8 B/Double
     cudaStream_t cur_stream = c10::cuda::getCurrentCUDAStream(x.device().index()).stream();
 
-    if (num_paths == 1) {
-        auto cuda_kernel = fused_gmm_path1_kernel_v2<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K>;
-        cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 57); // 128 KB （128/228）
-        cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x.data_ptr<double>(), w.data_ptr<double>(),
+    auto cuda_kernel = fused_gmm_kernel_v2<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K>;
+    cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 57); // 128 KB （128/228）
+
+    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x.data_ptr<double>(), w.data_ptr<double>(),
                                                         out.data_ptr<double>(), i_dims, prefix_i_sum, num_paths,
                                                         total_i, B, U, V, val);
-    } else {
-        auto cuda_kernel = fused_gmm_kernel_v2<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K>;
-        cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 57); // 128 KB （128/228）
-        cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x.data_ptr<double>(), w.data_ptr<double>(),
-                                                        out.data_ptr<double>(), i_dims, prefix_i_sum, num_paths,
-                                                        total_i, B, U, V, val);
-    }
-    
+
     return out;
 }
 
-// forward and backward are shared
 TORCH_LIBRARY(equi_linear, m)
 {
     m.def("fused_gemm", &fused_gmm);

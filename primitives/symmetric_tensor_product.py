@@ -362,21 +362,12 @@ class CUDAKernel(torch.nn.Module):
                 f"Calling SymmetricTensorContraction: {self.descriptors}, input shapes: {x0.shape}, {i0.shape}, {x1.shape}"
             )
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
         if self.use_fasteq:
-            print("== call my symmetric tensor contraction ==")
+            logger.info("== call fasteq symmetric tensor contraction ==")
             out = self.FastSTCFunc.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
         else:
             out: torch.Tensor = self.f(x1, x0, i0)
             out = out.reshape(out.shape[0], out.shape[1] * self.u)
-        
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        BATCH = x1.shape[0]
-        print(f"<< is_use_fastequ={self.use_fasteq}, batch={BATCH}, symmetric_tensor_contraction cost: {execution_time_ms:.3f} ms ========")
         return out
 
 

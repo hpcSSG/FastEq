@@ -327,16 +327,14 @@ class TensorProduct(torch.nn.Module):
                     input.shape[1] == self.operands_dims[oid],
                     f"input {oid} should have shape (batch, {self.operands_dims[oid]}), got {input.shape}",
                 )
-        
-        for inp in inputs:
-            print(f"input shape={inp.shape}")
-
+        '''
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
+        '''
         
         if self.use_fasteq:
             if self.op_name == "tp_fully_connected":
-                print("== call my fully connect tensor product ==")
+                logger.info("== call fasteq fully connect tensor product ==")
                 out = self.FastFCTPFunc.apply(
                     inputs[0], inputs[1], inputs[2],
                     self.descriptor,
@@ -345,17 +343,18 @@ class TensorProduct(torch.nn.Module):
                     torch.float64,
                 )
             elif self.op_name == "tp_channel_wise":
-                print("== call my channel-wise tensor product ==")
+                logger.info("== call fasteq channel-wise tensor product ==")
                 out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
             # TODO fix 
-            elif self.op_name == "fix_equi_linear" and (tuple(inputs[0].shape) == (1, 36864)  or tuple(inputs[0].shape) == (1, 9216)):
-                print("== call my equi-linear tensor product ==")
+            elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 36864)):
+                logger.info("== call fasteq equi-linear tensor product ==")
                 out = self.FastEquiLinearFunction.apply(inputs[0], inputs[1], self.descriptor)
             else:
                 out = self.f(inputs)
         else:
             out = self.f(inputs)
 
+        '''
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
@@ -365,8 +364,9 @@ class TensorProduct(torch.nn.Module):
         if len(inputs) > 1:
             BATCH = inputs[1].shape[0]
             UV = inputs[1].shape[1]
-        print(f"<< is_use_fastequ={self.use_fasteq}, batch={BATCH}, UV={UV}, {self.op_name} cost: {execution_time_ms:.3f} ms ========")
-
+        print(f"<< is_use_fastequ={self.use_fasteq}, batch={BATCH}, UV={UV}, {self.op_name} cost: {execution_time_ms:.3f} ms >>")
+        '''
+        
         return out
 
 

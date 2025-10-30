@@ -36,7 +36,7 @@ def load_kernel(name: str):
     return _loaded_kernels[name]
 
 def make_FastFullyConnectedTensorProductFunction():
-    class FullyConnectedTensorProductFunction(torch.autograd.Function):
+    class FastFullyConnectedTensorProductFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w, a, b, descriptor, cg_indices, cg_values, math_dtype):
             
@@ -163,6 +163,9 @@ def make_FastFullyConnectedTensorProductFunction():
             """
             Backward: 将 grad_out 拆分到 segment，再回传到每条路径的中间张量
             """
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             w, a, b, *outputs = ctx.saved_tensors
             descriptor = ctx.descriptor
             #c_tensor_list = ctx.c_tensors
@@ -215,8 +218,13 @@ def make_FastFullyConnectedTensorProductFunction():
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
 
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms ========")
+
             return None, grad_a, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
-    return FullyConnectedTensorProductFunction
+    return FastFullyConnectedTensorProductFunction
 
 
 def make_FastEquiLinearFunction():
@@ -280,8 +288,16 @@ def make_FastChannelWiseTensorProductFunction():
         
         @staticmethod
         def backward(ctx, grad_out):
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
             w, x, y = ctx.saved_tensors
             grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(x.contiguous(), y.contiguous(), w.contiguous(), grad_out.contiguous())
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms ========")
 
             return grad_w, grad_x, grad_y  #  descriptor 不需要梯度
     return FastChannelWiseTensorProductFunction
