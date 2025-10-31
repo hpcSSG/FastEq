@@ -6,147 +6,141 @@
 #include <torch/torch.h>
 #include <iostream>
 
-__constant__ int kOff[4]  = {0, 1, 4, 9};   // 前缀和：0,1,4,9；sum=16
 
-// 线性化 b：b = blockIdx.y + blockIdx.z * gridDim.y
-__global__ void cwtp_kernel_bu_loopk(
-    const double* __restrict__ x,   // [B, U]
-    const double* __restrict__ y,   // [B, dim_sum]
-    const double* __restrict__ w,   // [B, 4*U]  (P==4, V==1)
-    double* __restrict__ out,       // [B, dim_sum, U]
-    int B, int U, int dim_sum)
+constexpr int P  = 4;    // paths
+constexpr int KS = 16;   // dim_sum = 16
+constexpr int U_FIXED = 96; // U=96, 可被4整除
+
+// 2D grid helpers
+__device__ __forceinline__ int grid_b0() {
+    return blockIdx.x + blockIdx.y * gridDim.x;
+}
+__device__ __forceinline__ int grid_bstride() {
+    return gridDim.x * gridDim.y;
+}
+
+// 前向：warp32（blockDim.x=32），沿 U 维 double4 向量化，按 path 分段写出
+// x:[B,U], y:[B,16], w:[B,4,U] -> out:[B,16,U], b_buf:[B,4,U]
+__global__ void fwd_kernel_vec4_warp32_grouped_bstride(
+    const double* __restrict__ x,     // [B,U]
+    const double* __restrict__ y,     // [B,16]
+    const double* __restrict__ w,     // [B,4,U]
+    double* __restrict__ out,         // [B,16,U]
+    double* __restrict__ b_buf,       // [B,4,U]
+    int B, int U)
 {
-    const int u = blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned int b = blockIdx.y + blockIdx.z * gridDim.y;  // 线性化 batch
-    if (b >= (unsigned)B || u >= U) return;
+    const int lane  = threadIdx.x & 31;    // 单 warp
+    const int slots = U / 4;               // 96/4=24
+    if (lane >= slots) return;             // 其余 8 lane 直接退出
 
-    // 读一次 x[b,u]
-    const size_t off_x  = (size_t)b * U + u;
-    const double xv     = x[off_x];
+    for (int b = grid_b0(); b < B; b += grid_bstride()) {
 
-    // 便捷指针
-    const double* __restrict__ y_b   = y   + (size_t)b * dim_sum;           // y[b,0]
-    double*       __restrict__ out_b = out + (size_t)b * dim_sum * U + u;   // out[b,0,u]
+        // y[b,:] 放 shared（128B）
+        __shared__ double y_sh[KS];
+        if (lane < KS) y_sh[lane] = y[size_t(b)*KS + lane];
+        __syncwarp();
 
-    // 阈值（根据 kOff）
-    const int o1 = kOff[1];  // 1
-    const int o2 = kOff[2];  // 4
-    const int o3 = kOff[3];  // 9
+        const int u = lane * 4;
+        const size_t off_u   = size_t(u);
+        const size_t off_bu  = size_t(b) * U + off_u;
+        const size_t off_bk0 = size_t(b) * KS * U;
 
-    // 按 k 循环写出；与 dim_sum 解耦
-    // 如果你的 dim_sum 常为 16，编译器仍会很好地展开这个小循环
-    for (int k = 0; k < dim_sum; ++k) {
-        int p;
-        if      (k < o1) p = 0;
-        else if (k < o2) p = 1;
-        else if (k < o3) p = 2;
-        else             p = 3;
+        // 读取 x4，一次即可
+        const double4 x4 = *reinterpret_cast<const double4*>(&x[off_bu]);
 
-        // 读 w[b,p,u]；按 u 连续访问，合并读
-        const double wv = w[(size_t)b * (4 * U) + (size_t)p * U + u];
-        const double yv = y_b[k];
+        // 预读四条 w_p4，计算 base_p4 = x4 * w_p4，并写入 b_buf
+        const size_t off_w0 = (size_t(b)*P + 0) * U + off_u;
+        const size_t off_w1 = (size_t(b)*P + 1) * U + off_u;
+        const size_t off_w2 = (size_t(b)*P + 2) * U + off_u;
+        const size_t off_w3 = (size_t(b)*P + 3) * U + off_u;
 
-        // out[b,k,u] = x[b,u] * w[b,p,u] * y[b,k]
-        out_b[(size_t)k * U] = xv * wv * yv;
+        const double4 w0 = *reinterpret_cast<const double4*>(&w[off_w0]);
+        const double4 w1 = *reinterpret_cast<const double4*>(&w[off_w1]);
+        const double4 w2 = *reinterpret_cast<const double4*>(&w[off_w2]);
+        const double4 w3 = *reinterpret_cast<const double4*>(&w[off_w3]);
+
+        double4 b0; b0.x = x4.x*w0.x; b0.y = x4.y*w0.y; b0.z = x4.z*w0.z; b0.w = x4.w*w0.w;
+        double4 b1; b1.x = x4.x*w1.x; b1.y = x4.y*w1.y; b1.z = x4.z*w1.z; b1.w = x4.w*w1.w;
+        double4 b2; b2.x = x4.x*w2.x; b2.y = x4.y*w2.y; b2.z = x4.z*w2.z; b2.w = x4.w*w2.w;
+        double4 b3; b3.x = x4.x*w3.x; b3.y = x4.y*w3.y; b3.z = x4.z*w3.z; b3.w = x4.w*w3.w;
+
+        *reinterpret_cast<double4*>(&b_buf[off_w0]) = b0;
+        *reinterpret_cast<double4*>(&b_buf[off_w1]) = b1;
+        *reinterpret_cast<double4*>(&b_buf[off_w2]) = b2;
+        *reinterpret_cast<double4*>(&b_buf[off_w3]) = b3;
+
+        // 写 out：按 path 的 k 段分组，out[b,k,u:u+3] = base_p4 * y[b,k]
+        // path 0: k={0}
+        {
+            const int k = 0;
+            const double yk = y_sh[k];
+            double4 o; o.x = b0.x*yk; o.y = b0.y*yk; o.z = b0.z*yk; o.w = b0.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 1: k={1,2,3}
+        #pragma unroll
+        for (int k = 1; k <= 3; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b1.x*yk; o.y = b1.y*yk; o.z = b1.z*yk; o.w = b1.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 2: k={4,5,6,7,8}
+        #pragma unroll
+        for (int k = 4; k <= 8; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b2.x*yk; o.y = b2.y*yk; o.z = b2.z*yk; o.w = b2.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 3: k={9..15}
+        #pragma unroll
+        for (int k = 9; k <= 15; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b3.x*yk; o.y = b3.y*yk; o.z = b3.z*yk; o.w = b3.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
     }
 }
 
-template <typename T>
-static inline T ceil_div(T a, T b) { return (a + b - 1) / b; }
+std::tuple<at::Tensor, at::Tensor> cwtp_forward(
+    const at::Tensor& x,     // [B,U]
+    const at::Tensor& y,     // [B,16]
+    const at::Tensor& w      // [B,4,U]
+){
+    TORCH_CHECK(x.is_cuda() && y.is_cuda() && w.is_cuda(), "CUDA tensors required");
+    TORCH_CHECK(x.scalar_type()==at::kDouble && y.scalar_type()==at::kDouble && w.scalar_type()==at::kDouble, "expect double dtype");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && w.is_contiguous(), "expect contiguous");
 
-static inline void launch_cwtp_kernel_once(
-    const double* x, const double* y, const double* w, double* out,
-    int B, int U, int dim_sum, cudaStream_t stream)
-{
-    const int threads = 256;
-    dim3 blockDim(threads, 1, 1);
+    const int64_t B = x.size(0);
+    const int64_t U = x.size(1);
 
-    // grid.x 覆盖 U；grid.y / grid.z 线性化覆盖 B（兼容 B > 65535）
-    const unsigned int maxY = 65535u;
-    const unsigned int gy   = (B <= (int)maxY) ? (unsigned)B : maxY;
-    unsigned int gz         = ceil_div((unsigned)B, maxY);
+    TORCH_CHECK(U == U_FIXED, "U must be 96");
+    TORCH_CHECK(y.sizes() == at::IntArrayRef({B, KS}), "y must be [B,16]");
+    TORCH_CHECK(w.sizes() == at::IntArrayRef({B, P * U}), "w must be [B,4,96]");
 
-    // 保护：极端超大 B 时（> 65535*65535）避免非法配置（外层会分批处理）
-    if (gz > 65535u) gz = 65535u;
+    auto out   = at::empty({B, KS, U}, x.options());
+    auto b_buf = at::empty({B, P,  U}, x.options());
 
-    dim3 gridDim(ceil_div(U, threads), gy, gz);
+    // 2D grid 自动适配 B>65535
+    const int max_xy = 65535;
+    int gx_dim = (B > max_xy) ? max_xy : static_cast<int>(B);
+    int gy_dim = static_cast<int>((B + gx_dim - 1) / gx_dim);
+    if (gy_dim > max_xy) gy_dim = max_xy;
 
-    cwtp_kernel_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
-        x, y, w, out, B, U, dim_sum);
-}
+    dim3 grid(gx_dim, gy_dim); // 覆盖任意大 B；剩余用 stride
+    dim3 block(32);            // 单 warp
 
-// 分批 launch：当 B 极端巨大时使用（> 65535*65535）
-static inline void launch_cwtp_kernel_chunked(
-    const double* x, const double* y, const double* w, double* out,
-    int B, int U, int dim_sum, cudaStream_t stream)
-{
-    const int threads = 256;
-    dim3 blockDim(threads, 1, 1);
-    const int maxY = 65535;
-
-    for (int start = 0; start < B; ) {
-        // 本批大小（用 grid.y；grid.z=1）
-        const int chunk = std::min(maxY, B - start);
-
-        // 我们在 kernel 内仍用线性化 b，但这里选择 z=1，y=chunk 更简单
-        dim3 gridDim(ceil_div(U, threads), (unsigned)chunk, 1);
-
-        // 偏移量通过把指针推进来实现（避免在 kernel 增加参数）
-        const double* x_ptr   = x   + (size_t)start * U;
-        const double* y_ptr   = y   + (size_t)start * dim_sum;
-        const double* w_ptr   = w   + (size_t)start * (4 * U);
-        double*       out_ptr = out + (size_t)start * (size_t)dim_sum * U;
-
-        cwtp_kernel_bu_loopk<<<gridDim, blockDim, 0, stream>>>(
-            x_ptr, y_ptr, w_ptr, out_ptr, /*B=*/chunk, U, dim_sum);
-
-        start += chunk;
-    }
-}
-
-at::Tensor cwtp_forward(
-    at::Tensor x,   // [B, U], double, CUDA, contiguous
-    at::Tensor y,   // [B, dim_sum], double, CUDA, contiguous
-    at::Tensor w)   // [B, 4*U], double, CUDA, contiguous
-{
-    TORCH_CHECK(x.is_cuda() && y.is_cuda() && w.is_cuda(), "x/y/w must be CUDA");
-    TORCH_CHECK(x.scalar_type() == at::kDouble &&
-                y.scalar_type() == at::kDouble &&
-                w.scalar_type() == at::kDouble, "x/y/w must be double");
-    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && w.is_contiguous(),
-                "x/y/w must be contiguous");
-
-    const int B       = x.size(0);
-    const int U       = x.size(1);
-    const int dim_sum = y.size(1);
-    const int P       = 4;
-
-    TORCH_CHECK(w.size(0) == B, "w.shape[0] must be B");
-    TORCH_CHECK(w.size(1) == P * U, "w.shape[1] must be 4*U (P==4)");
-
-    // 输出 [B, dim_sum, U]
-    at::Tensor out = at::empty({B, dim_sum, U}, x.options()).contiguous();
-
-    cudaStream_t cur_stream = c10::cuda::getCurrentCUDAStream(x.device().index()).stream();
-
-    // 若 B 不超过 65535*65535：一次 launch 覆盖
-    const uint64_t B64 = static_cast<uint64_t>(B);
-    const uint64_t LIM = 65535ull * 65535ull;
-    if (B64 <= LIM) {
-        launch_cwtp_kernel_once(
-            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
-            out.data_ptr<double>(), B, U, dim_sum, cur_stream);
-    } else {
-        // 极端大 B：分批
-        launch_cwtp_kernel_chunked(
-            x.data_ptr<double>(), y.data_ptr<double>(), w.data_ptr<double>(),
-            out.data_ptr<double>(), B, U, dim_sum, cur_stream);
-    }
-
+    fwd_kernel_vec4_warp32_grouped_bstride<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<double>(),
+        y.data_ptr<double>(),
+        w.data_ptr<double>(),
+        out.data_ptr<double>(),
+        b_buf.data_ptr<double>(),
+        (int)B, (int)U
+    );
+    out = out.reshape({B, KS * U});
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-    // 如需原先的扁平输出
-    return out.reshape({B, dim_sum * U});
+    return {out, b_buf}; // out:[B,16*96], b_buf:[B,4,96]
 }
 
 TORCH_LIBRARY(cwtp_fwd, m)

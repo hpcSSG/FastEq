@@ -19,16 +19,6 @@ def prod(numbers: List[int]):
 so_path = os.path.join(os.path.dirname(__file__), "_kernels/cuda/build/bin/", "libfasteq.so")
 torch.ops.load_library(so_path)
 
-'''
-_loaded_kernels = {}
-_loaded_kernels["stc_fwd"] = torch.ops.stc_fwd
-_loaded_kernels["stc_bwd"] = torch.ops.stc_bwd
-_loaded_kernels["cwtp_fwd"] = torch.ops.cwtp_fwd
-_loaded_kernels["cwtp_bwd"] = torch.ops.cwtp_bwd
-_loaded_kernels["fctp_spmm_fwd"] = torch.ops.fctp_spmm_fwd
-_loaded_kernels["fctp_spmm_bwd"] = torch.ops.fctp_spmm_bwd
-_loaded_kernels["equi_linear"] = torch.ops.equi_linear
-'''
 
 def load_kernel(name: str):
     if name not in _loaded_kernels:
@@ -163,8 +153,6 @@ def make_FastFullyConnectedTensorProductFunction():
             """
             Backward: 将 grad_out 拆分到 segment，再回传到每条路径的中间张量
             """
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
 
             w, a, b, *outputs = ctx.saved_tensors
             descriptor = ctx.descriptor
@@ -217,11 +205,6 @@ def make_FastFullyConnectedTensorProductFunction():
 
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
-
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms ========")
 
             return None, grad_a, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
     return FastFullyConnectedTensorProductFunction
@@ -282,23 +265,15 @@ def make_FastChannelWiseTensorProductFunction():
             cg系数矩阵在 channel_wise 这里为单位矩阵，理论上可省略
             """
             # w:[B, 4 * U], x:[B, U], y:[B, dim_sum=16], outputs:[B, U*dim_sum=96*16]
-            output = torch.ops.cwtp_fwd.forward(x.contiguous(), y.contiguous(), w.contiguous())
+            output, b_buf = torch.ops.cwtp_fwd.forward(x.contiguous(), y.contiguous(), w.contiguous())
             ctx.save_for_backward(w, x, y)
+            ctx.b_buf = b_buf
             return output
         
         @staticmethod
         def backward(ctx, grad_out):
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
-            
             w, x, y = ctx.saved_tensors
-            grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(x.contiguous(), y.contiguous(), w.contiguous(), grad_out.contiguous())
-
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = end_time - start_time
-            print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms ========")
-
+            grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_out.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
             return grad_w, grad_x, grad_y  #  descriptor 不需要梯度
     return FastChannelWiseTensorProductFunction
 
