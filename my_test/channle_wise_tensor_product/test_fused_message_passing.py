@@ -15,6 +15,62 @@ fused_mp = load(
     verbose=False,
 )
 
+fused_mp_bwd = load(
+    name="fused_mp_bwd",
+    sources=["fused_message_passing_bwd.cu"],  # 路径按你的实际放置
+    extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
+    extra_cflags=["-O3"],
+    verbose=False,
+)
+
+
+class FusedMPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, node_feats, edge_attrs, tp_weights,
+                receiver, start_idx, end_idx, dim_list, offs):
+        # 保存反向所需变量
+        ctx.save_for_backward(node_feats, edge_attrs, tp_weights,
+                              receiver, start_idx, end_idx,
+                              dim_list, offs)
+        out = fused_mp.forward(node_feats, edge_attrs, tp_weights,
+                               receiver, start_idx, end_idx,
+                               dim_list, offs, 32, 8)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out_nodes):
+        node_feats, edge_attrs, tp_weights, \
+        receiver, start_idx, end_idx, \
+        dim_list, offs = ctx.saved_tensors
+
+        grad_node_feats, grad_edge_attrs, grad_tp_weights = fused_mp_bwd.backward(
+            grad_out_nodes.contiguous(),
+            node_feats, edge_attrs, tp_weights,
+            receiver, start_idx, end_idx,
+            dim_list, offs,
+        )
+
+        # 对应 forward 的后面几个输入没有梯度的返回 None
+        return (grad_node_feats,
+                grad_edge_attrs,
+                grad_tp_weights,
+                None,  # receiver
+                None,  # start_idx
+                None,  # end_idx
+                None,  # dim_list
+                None)  # offs
+
+
+def fused_mp_cuda(node_feats, edge_attrs, tp_weights,
+                  receiver, start_idx, end_idx,
+                  dim_list, offs):
+    return FusedMPFunction.apply(
+        node_feats, edge_attrs, tp_weights,
+        receiver, start_idx, end_idx,
+        dim_list, offs
+    )
+
+
 # --------------------------
 # 假数据（用你的真实张量替换即可）
 # --------------------------
@@ -27,9 +83,9 @@ offs     = [0, 1, 4, 9]
 DIM_SUM  = sum(dim_list)
 paths    = len(dim_list)
 
-node_feats = torch.randn(nnodes, U, device=device)
-edge_attrs = torch.randn(E, DIM_SUM, device=device)
-tp_weights = torch.randn(E, paths, U, device=device)
+node_feats = torch.randn(nnodes, U, device=device, requires_grad=True)
+edge_attrs = torch.randn(E, DIM_SUM, device=device, requires_grad=True)
+tp_weights = torch.randn(E, paths, U, device=device, requires_grad=True)
 
 # 你给的 sender 是单调递增；这里示例也生成单调递增
 sender = torch.arange(E, device=device) * nnodes // E
@@ -77,64 +133,6 @@ def fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, til
             out_nodes[:, o:o+d, u0:u1].index_add_(0, receiver, msg)
     return out_nodes
 
-# --------------------------
-# fused_streaming_no_x：不构造 x，手动 gather（按 sender 段 + U 分片）
-# 需要 sender 单调递增
-# --------------------------
-def compute_sender_runs(sender: torch.Tensor, nnodes: int):
-    # 返回每个节点 s 的起止边界 [start,end)
-    # sender 单调递增时，可 O(E) 求段界
-    # start_idx[s], end_idx[s]
-    E = sender.numel()
-    # 找变化点
-    diff = torch.ones(E, device=sender.device, dtype=torch.bool)
-    diff[1:] = sender[1:] != sender[:-1]
-    starts = torch.nonzero(diff, as_tuple=False).flatten()       # 段起点列表
-    # 对应的发送者 id
-    senders_unique = sender[starts]
-    # 段终点（起点右移一位 + 末尾 E）
-    ends = torch.empty_like(starts)
-    ends[:-1] = starts[1:]
-    ends[-1]  = E
-
-    # 组装成长度 nnodes 的 start/end，没出边的节点填相同值
-    start_idx = torch.empty(nnodes, device=sender.device, dtype=torch.int32)
-    end_idx   = torch.empty(nnodes, device=sender.device, dtype=torch.int32)
-    start_idx.fill_(0); end_idx.fill_(0)
-
-    start_idx[senders_unique] = starts.to(torch.int32)
-    end_idx[senders_unique]   = ends.to(torch.int32)
-
-    return start_idx, end_idx  # [nnodes], [nnodes]
-
-
-
-def fused_streaming_no_x(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=32):
-    # 先预取 sender 段界（一次性，后续多层可复用）
-    out_nodes = node_feats.new_zeros((nnodes, DIM_SUM, U))
-    start_idx, end_idx = compute_sender_runs(sender, nnodes)
-    # 双层流式：先按 path（小 d），再按 U 分片；内部遍历每个 sender 的 run
-    for p, d in enumerate(dim_list):
-        o = offs[p]
-        for u0 in range(0, U, tile_u):
-            u1 = min(u0 + tile_u, U)
-            # 遍历每个 sender 的连续段
-            # 注：若 nnodes 很大且多数 sender 没出边，可先筛选非空 sender 列表以减少 for 次数
-            non_empty = torch.nonzero((end_idx - start_idx) > 0, as_tuple=False).flatten()
-            for s in non_empty.tolist():
-                st = int(start_idx[s].item())
-                ed = int(end_idx[s].item())
-                # 该 sender 的所有出边范围 [st, ed)
-                # 仅取 U tile，保持小临时张量
-                x_s = node_feats[s, u0:u1].unsqueeze(0)                        # [1,t]
-                # base for this run
-                btu = x_s * tp_weights[st:ed, p, u0:u1]                        # [len,t]
-                # 消息 [len,d,t]
-                msg = edge_attrs[st:ed, o:o+d].unsqueeze(-1) * btu.unsqueeze(1)
-                # 聚合到接收节点
-                out_nodes[:, o:o+d, u0:u1].index_add_(0, receiver[st:ed], msg)
-    return out_nodes
-
 
 start_idx, end_idx = fused_mp.compute_sender_runs_sorted(sender, nnodes)
 
@@ -145,7 +143,6 @@ offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device=device)
 # --------------------------
 # 正确性 & 基准
 # --------------------------
-@torch.inference_mode()
 def check_and_bench():
     def timeit(fn, warmup=3, iters=10):
         for _ in range(warmup):
@@ -160,29 +157,56 @@ def check_and_bench():
             times.append(t0.elapsed_time(t1))
         return sum(times)/len(times)
 
-    ref    = baseline_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver)
-    fused1 = fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=32)
-    fused2 = fused_streaming_no_x(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=32)
 
-    cuda_fused = fused_mp.forward(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8)
+    node_feats_ref = node_feats.clone().detach().requires_grad_(True)
+    edge_attrs_ref = edge_attrs.clone().detach().requires_grad_(True)
+    tp_weights_ref = tp_weights.clone().detach().requires_grad_(True)
+    ref = baseline_conv_scatter(node_feats_ref, edge_attrs_ref, tp_weights_ref, sender, receiver)
+    loss_ref = ref.sum()
+    loss_ref.backward()
+    grad_node_feats_ref = node_feats_ref.grad
+    grad_edge_attrs_ref = edge_attrs_ref.grad
+    grad_tp_weights_ref = tp_weights_ref.grad
 
-    print("max_abs_err (baseline vs fused_basic)   :", (ref - fused1).abs().max().item())
-    print("max_abs_err (baseline vs streaming_no_x):", (ref - fused2).abs().max().item())
-    print("max_abs_err (baseline vs cuda fused):", (ref - cuda_fused).abs().max().item())
+    # fused1 = fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=32)
+    # print("Forward max_abs_err (baseline vs fused_basic)   :", (ref - fused1).abs().max().item())
+
+    node_feats_cu = node_feats.clone().detach().requires_grad_(True)
+    edge_attrs_cu = edge_attrs.clone().detach().requires_grad_(True)
+    tp_weights_cu = tp_weights.clone().detach().requires_grad_(True)
+    
+    # cuda_fused = fused_mp_cuda(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8)
+    
+    out_cu = fused_mp_cuda(node_feats_cu, edge_attrs_cu, tp_weights_cu,
+                           receiver.int(), start_idx, end_idx,
+                           dim_list_tensor, offs_tensor)
+    loss_cu = out_cu.sum()
+    loss_cu.backward()
+    grad_node_feats_cu = node_feats_cu.grad
+    grad_edge_attrs_cu = edge_attrs_cu.grad
+    grad_tp_weights_cu = tp_weights_cu.grad
+
+    print("Forward max_abs_err (baseline vs cuda fused):", (ref - out_cu).abs().max().item())
+    print("Check grad node_feats:")
+    print("  max abs diff:", (grad_node_feats_ref - grad_node_feats_cu).abs().max().item())
+    print("Check grad edge_attrs:")
+    print("  max abs diff:", (grad_edge_attrs_ref - grad_edge_attrs_cu).abs().max().item())
+    print("Check grad tp_weights:")
+    print("  max abs diff:", (grad_tp_weights_ref - grad_tp_weights_cu).abs().max().item())
+
 
     t_base = timeit(lambda: baseline_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver))
     t_fb   = timeit(lambda: fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=U))
-    t_fs   = timeit(lambda: fused_streaming_no_x(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=U))
     t_cuda = timeit(lambda: fused_mp.forward(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8))
+    t_cuda_bwd = timeit(lambda: fused_mp_bwd.backward(out_cu, node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor))
     t_cuda_sender_ready = timeit(lambda: fused_mp.compute_sender_runs_sorted(sender, nnodes))
 
 
     print(f"baseline:             {t_base:.3f} ms")
     print(f"fused_basic (with x): {t_fb:.3f} ms")
-    print(f"fused_streaming_no_x: {t_fs:.3f} ms")
     print(f"fused_cuda: {t_cuda:.3f} ms")
+    print(f"fused_cuda_backward: {t_cuda_bwd:.3f} ms")
     print(f"speedup fused_basic:  {t_base/t_fb:.2f}×")
-    print(f"speedup streaming:    {t_base/t_fs:.2f}×")
     print(f"speedup cuda:    {t_base/t_cuda:.2f}×")
     print(f"t_cuda_sender_ready :    {t_cuda_sender_ready:.3f}ms")
 
