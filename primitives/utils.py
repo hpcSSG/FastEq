@@ -307,3 +307,41 @@ def make_FastSymmetricTensorContractionFunction():
             return grad_x1, None, None, None, None, None
     
     return FastSymmetricTensorContractionFunction
+
+def make_FastFusedMessagePassing():
+    class FusedMPFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, node_feats, edge_attrs, tp_weights, sender,
+                    receiver, dim_list, offs):
+            out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
+                                    sender, receiver, dim_list, offs)
+            ctx.save_for_backward(node_feats, edge_attrs, tp_weights, 
+                                    receiver, start_idx, end_idx, dim_list, offs)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out_nodes):
+            node_feats, edge_attrs, tp_weights, \
+            receiver, start_idx, end_idx, \
+            dim_list, offs = ctx.saved_tensors
+
+            grad_node_feats, grad_edge_attrs, grad_tp_weights = torch.ops.fused_mp_bwd.backward(
+                grad_out_nodes.contiguous(),
+                node_feats, edge_attrs, tp_weights,
+                receiver, start_idx, end_idx,
+                dim_list, offs,
+            )
+
+            # 对应 forward 的后面几个输入没有梯度的返回 None
+            return (grad_node_feats,
+                    grad_edge_attrs,
+                    grad_tp_weights,
+                    None,  # sender
+                    None,  # receiver
+                    None,  # start_idx
+                    None,  # end_idx
+                    None,  # dim_list
+                    None)  # offs
+        
+    return FusedMPFunction
+

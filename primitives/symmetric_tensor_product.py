@@ -346,24 +346,27 @@ class CUDAKernel(torch.nn.Module):
             x_2[j_{n+1}] = val x_0[i_0][j_0] \prod_{k=1}^{n} x_1[j_k]
 
         """
-        torch._assert(x0.ndim == 2, f"Expected shape (num_x0, x0_size), got {x0.shape}")
-        torch._assert(x1.ndim == 2, f"Expected shape (batch, x1_size), got {x1.shape}")
-        torch._assert(i0.ndim == 1, f"Expected shape (batch,), got {i0.shape}")
+
+        torch._assert(x0.ndim == 2, f"Expected shape (num_x0, x0_size)")
+        torch._assert(x1.ndim == 2, f"Expected shape (batch, x1_size)")
+        torch._assert(i0.ndim == 1, f"Expected shape (batch,)")
 
         i0 = i0.to(torch.int32)
         x0 = x0.reshape(x0.shape[0], x0.shape[1] // self.u, self.u)
         x1 = x1.reshape(x1.shape[0], x1.shape[1] // self.u, self.u)
+        
         if (
             not torch.jit.is_scripting()
             and not torch.jit.is_tracing()
             and not torch.compiler.is_compiling()
         ):
             logger.debug(
-                f"Calling SymmetricTensorContraction: {self.descriptors}, input shapes: {x0.shape}, {i0.shape}, {x1.shape}"
+                f"Calling SymmetricTensorContraction"
             )
 
         if self.use_fasteq:
-            logger.info("== call fasteq symmetric tensor contraction ==")
+            #logger.info("== call fasteq symmetric tensor contraction ==")
+            print("== call fasteq symmetric tensor contraction ==")
             out = self.FastSTCFunc.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
         else:
             out: torch.Tensor = self.f(x1, x0, i0)

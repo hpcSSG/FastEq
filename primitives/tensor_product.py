@@ -92,17 +92,17 @@ def _my_tensor_product_fx(
                     inp = inp.reshape(inputs[oid].shape[:-1])
                 segments.append(inp.to(dtype=math_dtype))
             
-            _, U, V, W = segments[0].shape
-            w_seg = segments[0].reshape(U, V, W)
-            a_seg = segments[1]
-            b_seg = segments[2]
-            #print(f"einsum formula={formula}, segments[0].shape={segments[0].shape}, segments[1].shape={segments[1].shape}, segments[2].shape={segments[2].shape}")
 
             c_tensor = disable_type_conv(
                 torch.tensor(path.coefficients, dtype=math_dtype, device=device)
             )
-            
-            out = torch.einsum(formula, c_tensor, *segments)          
+            print(f"c_tensor: {c_tensor}")
+            #out = torch.einsum(formula, c_tensor, *segments)
+            segment0 = segments[0].squeeze(0)
+            segment1 = segments[1].squeeze(1)
+            out = torch.matmul(segment1, segment0) * c_tensor
+            out.unsqueeze_(1)
+            #print(f"out.shape:{out.shape}")   
 
             seg_shape = descriptor.get_segment_shape(-1, path)
             outputs += [
@@ -183,10 +183,10 @@ class TensorProduct(torch.nn.Module):
         self.use_fasteq = use_fasteq
         self.op_name = op_name
         
-        if self.op_name == "tp_fully_connected":
+        if self.op_name == "tp_fully_connected" or self.op_name == "equi_linear":
             self.cg_indices: list[torch.Tensor] = []
             self.cg_values:  list[torch.Tensor] = []
-            #self.c_tensors:  list[torch.Tensor] = []
+            self.c_tensors:  list[torch.Tensor] = []
             device = "cuda"
 
             with torch.no_grad():
@@ -208,15 +208,16 @@ class TensorProduct(torch.nn.Module):
                     # 注册 buffer（会随 .to(device) 与 state_dict 管理）
                     name_idx = f"cg_indices_{i}"
                     name_val = f"cg_values_{i}"
-                    #name_c   = f"c_tensor_{i}"
+                    name_c   = f"c_tensors_{i}"
 
                     self.register_buffer(name_idx, idx, persistent=True)
                     self.register_buffer(name_val, vals, persistent=True)
-                    #self.register_buffer(name_c,  disable_type_conv(coeffs), persistent=True)
+                    self.register_buffer(name_c,  disable_type_conv(coeffs), persistent=True)
 
                     self.cg_indices.append(getattr(self, f"cg_indices_{i}"))
                     self.cg_values.append(getattr(self, f"cg_values_{i}"))
-                    #self.c_tensors.append(getattr(self, f"c_tensor_{i}"))
+                    self.c_tensors.append(getattr(self, f"c_tensors_{i}"))
+
 
         self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
         self.FastEquiLinearFunction = make_FastEquiLinearFunction()
@@ -343,12 +344,19 @@ class TensorProduct(torch.nn.Module):
                     torch.float64,
                 )
             elif self.op_name == "tp_channel_wise":
-                logger.info("== call fasteq channel-wise tensor product ==")
+                print("== call fasteq channel-wise tensor product ==")
+                print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
                 out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
             # TODO fix 
             elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 36864)):
                 logger.info("== call fasteq equi-linear tensor product ==")
+                print("== call fasteq equi-linear tensor product ==")
                 out = self.FastEquiLinearFunction.apply(inputs[0], inputs[1], self.descriptor)
+            elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 9216)) and inputs[1].shape[1] == 96:
+                print(f"==== call my matmul linear, inputs[0].shape={inputs[0].shape}, inputs[1].shape={inputs[1].shape} ====")
+                weight = inputs[0].reshape(96, 96)
+                out = torch.matmul(inputs[1], weight) * 0.10206207261596577
+                #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
             else:
                 out = self.f(inputs)
         else:
