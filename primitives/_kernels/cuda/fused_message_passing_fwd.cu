@@ -14,10 +14,9 @@ __global__ void k_fill_zero_i32(int32_t* arr, int32_t N) {
     if (i < N) arr[i] = 0;
 }
 
-// sender 必须非降序（已按 sender 排序）
-// 对每条边 i 并行：检测 run 起点/终点，无需原子
-__global__ void k_runs_from_sorted_sender(
-    const int32_t* __restrict__ sender, // [E], sorted
+// 将sender、receiver 的排序数组从COO变为CSR格式
+__global__ void k_runs_from_sorted_sender_receiver(
+    const int32_t* __restrict__ sender_receiver, // [E], sorted
     int32_t E,
     int32_t* __restrict__ start_idx,    // [N]
     int32_t* __restrict__ end_idx       // [N]
@@ -25,19 +24,19 @@ __global__ void k_runs_from_sorted_sender(
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= E) return;
 
-    int32_t s = sender[i];
+    int32_t s = sender_receiver[i];
 
     // run start
-    if (i == 0 || sender[i - 1] != s) {
+    if (i == 0 || sender_receiver[i - 1] != s) {
         start_idx[s] = i;
     }
     // run end  (end is exclusive: i+1)
-    if (i == E - 1 || sender[i + 1] != s) {
+    if (i == E - 1 || sender_receiver[i + 1] != s) {
         end_idx[s] = i + 1;
     }
 }
 
-extern "C" void compute_sender_runs_sorted_cuda(
+extern "C" void compute_sender_receiver_csr(
     const int32_t* sender,  // [E], int32, sorted, cuda
     int32_t E,
     int32_t N,
@@ -53,39 +52,39 @@ extern "C" void compute_sender_runs_sorted_cuda(
     k_fill_zero_i32<<<blocksN, threads, 0, stream>>>(end_idx, N);
 
     // 单 pass 根据排序好的 sender 写入每个节点的起止索引
-    k_runs_from_sorted_sender<<<blocksE, threads, 0, stream>>>(
+    k_runs_from_sorted_sender_receiver<<<blocksE, threads, 0, stream>>>(
         sender, E, start_idx, end_idx
     );
 }
 
 
-std::vector<torch::Tensor> compute_sender_runs_sorted_binding(
-    torch::Tensor sender, // [E], int32 或 int64, CUDA, 且已排序
+std::vector<torch::Tensor> compute_sender_receiver_csr_binding(
+    torch::Tensor sender_receiver, // [E], int32 或 int64, CUDA, 且已排序
     int64_t nnodes
 ){
-    TORCH_CHECK(sender.is_cuda(), "sender must be CUDA tensor");
-    TORCH_CHECK(sender.dtype() == at::kInt || sender.dtype() == at::kLong,
+    TORCH_CHECK(sender_receiver.is_cuda(), "sender must be CUDA tensor");
+    TORCH_CHECK(sender_receiver.dtype() == at::kInt || sender_receiver.dtype() == at::kLong,
                 "sender must be int32 or int64");
     TORCH_CHECK(nnodes >= 0, "nnodes must be non-negative");
 
-    auto dev = sender.device();
-    int64_t E64 = sender.numel();
+    auto dev = sender_receiver.device();
+    int64_t E64 = sender_receiver.numel();
     int32_t N = static_cast<int32_t>(nnodes);
     int32_t E = static_cast<int32_t>(E64);
     TORCH_CHECK((int64_t)N == nnodes && (int64_t)E == E64, "size too large for int32");
 
     // 若是 int64 转 int32（假定 sender 值域 < 2^31）
-    torch::Tensor sender_i32 = (sender.dtype() == at::kInt)
-        ? sender.contiguous()
-        : sender.to(at::kInt, /*non_blocking=*/true).contiguous();
+    torch::Tensor sender_receiver_i32 = (sender_receiver.dtype() == at::kInt)
+        ? sender_receiver.contiguous()
+        : sender_receiver.to(at::kInt, /*non_blocking=*/true).contiguous();
 
     auto opts_i32 = torch::TensorOptions().dtype(at::kInt).device(dev);
     auto start_idx = torch::empty({nnodes}, opts_i32);
     auto end_idx   = torch::empty({nnodes}, opts_i32);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    compute_sender_runs_sorted_cuda(
-        sender_i32.data_ptr<int32_t>(),
+    compute_sender_receiver_csr(
+        sender_receiver_i32.data_ptr<int32_t>(),
         E, N,
         start_idx.data_ptr<int32_t>(),
         end_idx.data_ptr<int32_t>(),
@@ -179,22 +178,19 @@ __device__ inline void flush_group_scalar_impl(
 }
 
 // ============================
-//  标量版 fused_mp + group-flush + u 内层循环
-//
+//  sender-major 设计， 适合sender 出度很大的情况。
+//  对于拥有大量出边的 sender，这个 x_val 在 warp 内可以被多次复用
 //  映射：warp -> (sender_idx, u_block)
-//  一个 warp 负责某个 sender 的一个 U-block：
-//     u_block = (warp_u_group * TileU) .. min(u_block+TileU, U)
-//  同一 warp 内通过 u-loop 支持 TileU >= / <= WARP_SIZE，
-//  所以 TileU 可以是 32 / 64 / 96 / 128 / … 任意正数。
+//  一个 warp 负责某个 sender 的一个 U-block
 //  在 sender 段内，若 receiver 已按升序排列，
-//  则相同 receiver 的边是连续的，可以 group-flush，大幅减少 atomic 次数。
 // ============================
 
-template<int TileU, int MAX_D = 8>
-__global__ void fused_mp_warp_streaming_kernel_groupflush_scalar(
+template<int TileU, int MAX_D = 4>
+__global__ void fused_mp_warp_sender_major_allpaths(
     const double* __restrict__ node_feats,     // [N, U]
     const double* __restrict__ edge_attrs,     // [E, DIM_SUM]
     const double* __restrict__ tp_weights,     // [E, P, U]
+    const int32_t* __restrict__ sender,        // [E]
     const int32_t* __restrict__ receiver,      // [E]
     const int32_t* __restrict__ start_idx,     // [N]
     const int32_t* __restrict__ end_idx,       // [N]
@@ -243,7 +239,7 @@ __global__ void fused_mp_warp_streaming_kernel_groupflush_scalar(
             #pragma unroll
             for (int j = 0; j < MAX_D; ++j) acc[j] = 0.0;
 
-            // 扫描 sender 段 e=st..ed-1（如果段内 receiver 升序，group-flush 效果最好）
+            // 扫描 sender 段 e=st..ed-1
             for (int e = st; e < ed; ++e) {
                 double base_u = 0.0;
                 if (u < U) {
@@ -279,63 +275,110 @@ __global__ void fused_mp_warp_streaming_kernel_groupflush_scalar(
 }
 
 
-extern "C" void fused_mp_warp_streaming_launch(
-    const double* node_feats,     // [N, U]
-    const double* edge_attrs,     // [E, DIM_SUM]
-    const double* tp_weights,     // [E, P, U]
-    const int32_t* receiver,      // [E]
-    const int32_t* start_idx,     // [N]
-    const int32_t* end_idx,       // [N]
-    const int32_t* dim_list,      // [P]
-    const int32_t* offs,          // [P]
-    int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
-    double* out_nodes,            // [N, DIM_SUM, U]
-    cudaStream_t stream,
-    int TileU,
-    int warps_per_block
-){
-    
-    const int num_u_groups = (U + TileU - 1) / TileU;
-    const int total_warps  = N * num_u_groups;
-    const int threads_per_block = warps_per_block * 32;   // try 8 or 16
-    const int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
-    
+// ============================
+//  receiver-major 设计， 减少L2 cache的原子开销
+// ============================
 
-    switch (TileU) {
-        case 16:
-            fused_mp_warp_streaming_kernel<16><<<blocks, threads_per_block, 0, stream>>>(
-                node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
-            break;
-        case 32:
-            fused_mp_warp_streaming_kernel<32><<<blocks, threads_per_block, 0, stream>>>(
-                node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
-            break;
-        case 64:
-            fused_mp_warp_streaming_kernel<64><<<blocks, threads_per_block, 0, stream>>>(
-                node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
-            break;
-        default:
-            fused_mp_warp_streaming_kernel<32><<<blocks, threads_per_block, 0, stream>>>(
-                node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
+template<int TileU, int MAX_D = 8>
+__global__ void fused_mp_warp_receiver_major_allpaths(
+    const double* __restrict__ node_feats,      // [N, U]
+    const double* __restrict__ edge_attrs,      // [E, DIM_SUM]  // 已按 receiver 排序
+    const double* __restrict__ tp_weights,      // [E, P, U]     // 已按 receiver 排序
+    const int32_t* __restrict__ sender_sorted,  // [E]           // 对应每条边的 sender
+    const int32_t* __restrict__ receiver_sorted,// [E] (其实 kernel 内只用 CSR 就够)
+    const int32_t* __restrict__ recv_start,     // [N]，按 receiver 的 CSR start
+    const int32_t* __restrict__ recv_end,       // [N]，按 receiver 的 CSR end
+    const int32_t* __restrict__ dim_list,       // [P]
+    const int32_t* __restrict__ offs,           // [P]
+    int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
+    double* __restrict__ out_nodes              // [N, DIM_SUM, U]
+){
+    constexpr int W = WARP_SIZE; // 32
+
+    const int lane            = threadIdx.x & (W - 1);    // 0..31
+    const int warp_in_block   = threadIdx.x / W;          // 0..(blockDim.x/W-1)
+    const int warps_per_block = blockDim.x / W;
+    const int warp_global     = blockIdx.x * warps_per_block + warp_in_block;
+
+    // 2D 映射：warp -> (receiver_idx, u_group)
+    const int num_u_groups = (U + TileU - 1) / TileU;
+    const int receiver_idx = warp_global / num_u_groups;
+    const int u_group      = warp_global % num_u_groups;
+    if (receiver_idx >= N) return;
+
+    const int st = recv_start[receiver_idx];
+    const int ed = recv_end[receiver_idx];
+    if (st >= ed) {
+        // 该 receiver 没有入边
+        return;
     }
-#ifdef DEBUG
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
-    }
-#endif
+
+    const int u_block_start = u_group * TileU;
+    const int u_block_end   = min(u_block_start + TileU, U);
+
+    // 遍历这个 warp 负责的 U-block
+    for (int u = u_block_start + lane; u < u_block_end; u += W) {
+        if (u >= U) continue;
+
+        // 这个 warp 中每个 lane 负责一个 u（stride 32）
+        // 对这个 (receiver_idx, u)，遍历所有 path p
+        for (int p = 0; p < P; ++p) {
+            const int d = dim_list[p];
+            const int o = offs[p];
+
+            // 局部累加缓冲（小 d 方向，最大 MAX_D）
+            double acc[MAX_D];
+            #pragma unroll
+            for (int j = 0; j < MAX_D; ++j) {
+                acc[j] = 0.0;
+            }
+
+            // 扫描该 receiver 的所有入边 e ∈ [st, ed)
+            for (int e = st; e < ed; ++e) {
+                const int s = sender_sorted[e]; // 注意：这里用按 receiver 排序后的 sender
+
+                // 读取 x[sender, u]
+                const double x_val = node_feats[(size_t)s * (size_t)U + (size_t)u];
+
+                // 对应 path p 的权重
+                const double w_val =
+                    tp_weights[((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u];
+
+                const double base_u = x_val * w_val;
+
+                // edge_attrs 段 [o, o+d)
+                const size_t y_base = (size_t)e * (size_t)DIM_SUM + (size_t)o;
+
+                #pragma unroll
+                for (int j = 0; j < MAX_D; ++j) {
+                    if (j >= d) break;
+                    const double yv = edge_attrs[y_base + j];
+                    acc[j] += yv * base_u;
+                }
+            } // e-loop
+
+            // 写回 out_nodes[receiver_idx, o .. o+d-1, u]
+            // 注意：receiver-major 下，每个 (receiver_idx, u) 只由一个 warp 负责，
+            // 不需要 atomicAdd，只要保证 out_nodes 事先清零即可。
+            const size_t out_base =
+                ((size_t)receiver_idx * (size_t)DIM_SUM + (size_t)o) * (size_t)U +
+                (size_t)u;
+
+            #pragma unroll
+            for (int j = 0; j < MAX_D; ++j) {
+                if (j >= d) break;
+                out_nodes[out_base + (size_t)j * (size_t)U] += acc[j];
+            }
+        } // p-loop
+    } // u-loop
 }
 
 
-
-extern "C" void fused_mp_warp_streaming_scalar_launch(
+extern "C" void fused_mp_launch(
     const double* node_feats,     // [N, U]
     const double* edge_attrs,     // [E, DIM_SUM]
     const double* tp_weights,     // [E, P, U]
+    const int32_t* sender,        // [E]
     const int32_t* receiver,      // [E]
     const int32_t* start_idx,     // [N]
     const int32_t* end_idx,       // [N]
@@ -344,32 +387,26 @@ extern "C" void fused_mp_warp_streaming_scalar_launch(
     int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
     double* out_nodes,            // [N, DIM_SUM, U]
     cudaStream_t stream,
-    int TileU,                    // 建议 32
-    int warps_per_block           // 建议 8 或 16
-){
-    if (TileU <= 0) TileU = 32;
+    bool receiver_major = false
+) {
 
+    const int warps_per_block = 4;
+    const int TileU = 32;
     const int num_u_groups = (U + TileU - 1) / TileU;
     const int total_warps  = N * num_u_groups;
     const int threads_per_block = warps_per_block * WARP_SIZE;
     const int blocks = (total_warps + warps_per_block - 1) / warps_per_block;
 
-    switch (TileU) {
-        case 16:  fused_mp_warp_streaming_kernel_groupflush_scalar<16><<<blocks, threads_per_block, 0, stream>>>(
-                    node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                    dim_list, offs, N, E, U, P, DIM_SUM, out_nodes); break;
-        case 32:  fused_mp_warp_streaming_kernel_groupflush_scalar<32><<<blocks, threads_per_block, 0, stream>>>(
-                    node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                    dim_list, offs, N, E, U, P, DIM_SUM, out_nodes); break;
-        case 64:  fused_mp_warp_streaming_kernel_groupflush_scalar<64><<<blocks, threads_per_block, 0, stream>>>(
-                    node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                    dim_list, offs, N, E, U, P, DIM_SUM, out_nodes); break;
-        case 96:  fused_mp_warp_streaming_kernel_groupflush_scalar<96><<<blocks, threads_per_block, 0, stream>>>(
-                    node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                    dim_list, offs, N, E, U, P, DIM_SUM, out_nodes); break;
-        default:  fused_mp_warp_streaming_kernel_groupflush_scalar<32><<<blocks, threads_per_block, 0, stream>>>(
-                    node_feats, edge_attrs, tp_weights, receiver, start_idx, end_idx,
-                    dim_list, offs, N, E, U, P, DIM_SUM, out_nodes); break;
+    if (receiver_major) {
+        // Receiver Major
+        fused_mp_warp_receiver_major_allpaths<32><<<blocks, threads_per_block, 0, stream>>>(
+            node_feats, edge_attrs, tp_weights, sender, receiver, start_idx, end_idx,
+            dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
+    } else {
+        // Sender Major
+        fused_mp_warp_sender_major_allpaths<32><<<blocks, threads_per_block, 0, stream>>>(
+            node_feats, edge_attrs, tp_weights, sender, receiver, start_idx, end_idx,
+            dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
     }
 
 #ifdef DEBUG
@@ -387,11 +424,9 @@ std::vector<torch::Tensor> fused_mp_forward(
     torch::Tensor sender,       // [E], int32, cuda, contiguous
     torch::Tensor receiver,     // [E], int32, cuda, contiguous
     torch::Tensor dim_list,     // [P], int32, cuda/CPU
-    torch::Tensor offs         // [P], int32, cuda/CPU
+    torch::Tensor offs,         // [P], int32, cuda/CPU
+    bool receiver_major = false
 ){
-    
-    int TileU = 32;
-    int warps_per_block = 4;
     
     TORCH_CHECK(node_feats.is_cuda() && edge_attrs.is_cuda() &&
                 tp_weights.is_cuda() && sender.is_cuda() && receiver.is_cuda(),
@@ -435,22 +470,35 @@ std::vector<torch::Tensor> fused_mp_forward(
     auto end_idx   = torch::empty({N}, opts_i32);
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-    compute_sender_runs_sorted_cuda(
-        sender_i32.data_ptr<int32_t>(),
-        E, N,
-        start_idx.data_ptr<int32_t>(),
-        end_idx.data_ptr<int32_t>(),
-        stream
-    );
+    if (receiver_major) {
+        compute_sender_receiver_csr(
+            receiver_i32.data_ptr<int32_t>(),
+            E, N,
+            start_idx.data_ptr<int32_t>(),
+            end_idx.data_ptr<int32_t>(),
+            stream
+        );
+    } else {
+        compute_sender_receiver_csr(
+            sender_i32.data_ptr<int32_t>(),
+            E, N,
+            start_idx.data_ptr<int32_t>(),
+            end_idx.data_ptr<int32_t>(),
+            stream
+        );
+    }
 
+    std::cout<<"start_idx:"<<start_idx<<std::endl;
+    std::cout<<"end_idx:"<<end_idx<<std::endl;
+    
     auto out_nodes = torch::zeros({N, DIM_SUM, U},
                                   node_feats_c.options());
 
-    //fused_mp_warp_streaming_launch(
-    fused_mp_warp_streaming_scalar_launch(
+    fused_mp_launch(
         node_feats_c.data_ptr<double>(),
         edge_attrs_c.data_ptr<double>(),
         tp_weights_c.data_ptr<double>(),
+        sender_i32.data_ptr<int32_t>(),
         receiver_i32.data_ptr<int32_t>(),
         start_idx.data_ptr<int32_t>(),
         end_idx.data_ptr<int32_t>(),
@@ -459,8 +507,7 @@ std::vector<torch::Tensor> fused_mp_forward(
         N, E, U, P, DIM_SUM,
         out_nodes.data_ptr<double>(),
         stream,
-        TileU,
-        warps_per_block
+        receiver_major
     );
     out_nodes = out_nodes.view({N, DIM_SUM * U});
     return {out_nodes, start_idx, end_idx};

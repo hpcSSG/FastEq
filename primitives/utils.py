@@ -314,7 +314,7 @@ def make_FastFusedMessagePassing():
         def forward(ctx, node_feats, edge_attrs, tp_weights, sender,
                     receiver, dim_list, offs):
             out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
-                                    sender, receiver, dim_list, offs)
+                                    sender, receiver, dim_list, offs, False)
             ctx.save_for_backward(node_feats, edge_attrs, tp_weights, 
                                     receiver, start_idx, end_idx, dim_list, offs)
             return out

@@ -250,7 +250,7 @@ std::vector<torch::Tensor> fused_mp_backward(
 {
 
     constexpr int kTileU = 32;
-    constexpr int kMaxD  = 8;
+    constexpr int kMaxD  = 4;
     
     TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
     TORCH_CHECK(grad_out_nodes.scalar_type() == torch::kFloat64,
