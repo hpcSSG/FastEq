@@ -1,3 +1,0 @@
-/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles/fasteq.dir
-/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles/edit_cache.dir
-/home/malixian/repos/cuequivariance_torch/primitives/_kernels/cuda/build/CMakeFiles/rebuild_cache.dir
