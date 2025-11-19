@@ -26,6 +26,7 @@ from cuequivariance.group_theory.irreps_array.misc_ui import (
     default_irreps,
 )
 
+import time
 
 class SymmetricContraction(torch.nn.Module):
     """
@@ -133,6 +134,9 @@ class SymmetricContraction(torch.nn.Module):
         self.etp, p = symmetric_contraction(
             irreps_in, irreps_out, range(1, contraction_degree + 1)
         )
+
+        self.use_fasteq = use_fasteq
+
         if original_mace:
             self.register_buffer(
                 "projection", torch.tensor(p, dtype=dtype, device=device)
@@ -149,6 +153,16 @@ class SymmetricContraction(torch.nn.Module):
             )
         )
 
+        if self.use_fasteq and original_mace:
+            self.register_buffer("project_weight",
+                                torch.empty(0, device=device, dtype=dtype),
+                                persistent=False)
+            
+            # 加载state_dict之后自动重算
+            self._update_project_weight_()
+            self.register_load_state_dict_post_hook(self._on_post_load)
+
+
         self.f = cuet.EquivariantTensorProduct(
             self.etp,
             layout=layout,
@@ -160,6 +174,15 @@ class SymmetricContraction(torch.nn.Module):
             use_fallback=use_fallback,
             use_fasteq=use_fasteq,
         )
+
+    @torch.no_grad()
+    def _update_project_weight_(self):
+        proj = torch.einsum("zau,ab->zbu", self.weight.data, self.projection).flatten(1)
+        self.project_weight.resize_(proj.shape)
+        self.project_weight.copy_(proj)
+
+    def _on_post_load(self, module, incompatible_keys):
+        self._update_project_weight_()
 
     def extra_repr(self) -> str:
         return (
@@ -183,11 +206,16 @@ class SymmetricContraction(torch.nn.Module):
         Returns:
             torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
         """
-
-        if self.projection is not None:
-            weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+        
+        if self.use_fasteq:
+            weight = self.project_weight
         else:
-            weight = self.weight
-        weight = weight.flatten(1)
+            if self.projection is not None:
+                weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+            else:
+                weight = self.weight
+            weight = weight.flatten(1)
 
-        return self.f(weight, x, indices=indices)
+        out = self.f(weight, x, indices=indices)
+
+        return out

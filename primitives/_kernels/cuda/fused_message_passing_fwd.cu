@@ -183,9 +183,10 @@ __device__ inline void flush_group_scalar_impl(
 //  映射：warp -> (sender_idx, u_block)
 //  一个 warp 负责某个 sender 的一个 U-block
 //  在 sender 段内，若 receiver 已按升序排列，
+// MAX_D=8 是因为dim_list = {1, 3, 5, 7}; 
 // ============================
 
-template<int TileU, int MAX_D = 4>
+template<int TileU = 32, int MAX_D = 8>
 __global__ void fused_mp_warp_sender_major_allpaths(
     const double* __restrict__ node_feats,     // [N, U]
     const double* __restrict__ edge_attrs,     // [E, DIM_SUM]
@@ -390,7 +391,7 @@ extern "C" void fused_mp_launch(
     bool receiver_major = false
 ) {
 
-    const int warps_per_block = 4;
+    const int warps_per_block = 8;
     const int TileU = 32;
     const int num_u_groups = (U + TileU - 1) / TileU;
     const int total_warps  = N * num_u_groups;
@@ -487,9 +488,6 @@ std::vector<torch::Tensor> fused_mp_forward(
             stream
         );
     }
-
-    std::cout<<"start_idx:"<<start_idx<<std::endl;
-    std::cout<<"end_idx:"<<end_idx<<std::endl;
     
     auto out_nodes = torch::zeros({N, DIM_SUM, U},
                                   node_feats_c.options());

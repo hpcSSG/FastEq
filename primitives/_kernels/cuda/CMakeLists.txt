@@ -38,6 +38,8 @@ add_library(${PROJECT_NAME} SHARED
     equi_linear.cu
     cwtp_fwd.cu
     cwtp_bwd.cu
+    fused_message_passing_fwd.cu
+    fused_message_passing_bwd.cu
 )
 
 # 为目标设置编译和链接标志
@@ -45,6 +47,8 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>: --expt-relaxed-constexpr> # 允许CUDA constexpr放松限制
     # 其他CUDA特定编译选项...
     -O3
+    -Xptxas --maxrregcount=128
+    --use_fast_math
     --ptxas-options=-v
 )
 

@@ -250,7 +250,6 @@ std::vector<torch::Tensor> fused_mp_backward(
 {
 
     constexpr int kTileU = 32;
-    constexpr int kMaxD  = 4;
     
     TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
     TORCH_CHECK(grad_out_nodes.scalar_type() == torch::kFloat64,
@@ -289,8 +288,7 @@ std::vector<torch::Tensor> fused_mp_backward(
     dim3 grid((total_warps + warps_per_block - 1) / warps_per_block);
     // grad_edge_attrs 用 atomicAdd 累加，初始为 0
     // grad_node_feats / grad_tp_weights 直接覆盖
-    //fused_mp_warp_streaming_kernel_groupflush_scalar_backward<kTileU, kMaxD>
-    fused_mp_warp_streaming_kernel_groupflush_scalar_backward_warp_reduce<kTileU, kMaxD>
+    fused_mp_warp_streaming_kernel_groupflush_scalar_backward_warp_reduce<kTileU>
         <<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
             node_feats.data_ptr<double>(),
             edge_attrs.data_ptr<double>(),
