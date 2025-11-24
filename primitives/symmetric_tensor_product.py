@@ -319,7 +319,7 @@ class CUDAKernel(torch.nn.Module):
         from .utils import make_FastSymmetricTensorContractionFunction
 
         self.register_buffer("coeffs_tensor",
-            torch.as_tensor(path_coefficients, dtype=torch.float64)
+            torch.as_tensor(path_coefficients, dtype=math_dtype)
                  .pin_memory().to(device, non_blocking=True))
 
         self.register_buffer("path_lens_tensor",
@@ -331,9 +331,6 @@ class CUDAKernel(torch.nn.Module):
             batch_first=True, padding_value=0
         )
         self.register_buffer("paths_tensor", paths.pin_memory().to(device, non_blocking=True))
-        
-        #my_stc_fwd = load_kernel_from_lib("stc_fwd").forward
-        #my_stc_bwd = load_kernel_from_lib("stc_bwd").backward
         self.FastSTCFunc = make_FastSymmetricTensorContractionFunction()
         # ================================================
 

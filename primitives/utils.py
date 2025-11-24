@@ -282,6 +282,7 @@ def make_FastSymmetricTensorContractionFunction():
     class FastSymmetricTensorContractionFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
+            print(f"x1.dtype={x1.dtype}, x0.dtype={x0.dtype}, coeffs_tensor.dtype={coeffs_tensor.dtype}")
             x0_g = x0[i0]
             out = torch.ops.stc_fwd.forward(
                 x1.contiguous(),
