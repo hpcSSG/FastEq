@@ -335,13 +335,13 @@ class TensorProduct(torch.nn.Module):
         
         if self.use_fasteq:
             if self.op_name == "tp_fully_connected":
-                logger.info("== call fasteq fully connect tensor product ==")
+                print("== call fasteq fully connect tensor product ==")
                 out = self.FastFCTPFunc.apply(
                     inputs[0], inputs[1], inputs[2],
                     self.descriptor,
                     self.cg_indices,
                     self.cg_values,
-                    torch.float64,
+                    inputs[0].dtype,
                 )
             elif self.op_name == "tp_channel_wise":
                 print("== call fasteq channel-wise tensor product ==")

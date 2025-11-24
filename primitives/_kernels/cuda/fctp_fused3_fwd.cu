@@ -1,71 +1,100 @@
-// fused_argmax_spmm_k7_f64.cu
+#include <torch/extension.h>
+#include <torch/script.h>
+#include <torch/torch.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <torch/extension.h>
-#include <cfloat>
-#include <cstdint>
+#include <c10/cuda/CUDAStream.h>
+#include <limits>
+#include <type_traits>
 
-template <typename T> __host__ __device__ inline T ceil_div(T a, T b){ return (a + b - 1) / b; }
+#define CUDA_CHECK(expr) do { \
+  cudaError_t _err = (expr);  \
+  if (_err != cudaSuccess)    \
+    AT_ERROR("CUDA error: ", cudaGetErrorString(_err), " at ", __FILE__, ":", __LINE__); \
+} while(0)
+
+template <typename T> __host__ __device__ inline T ceil_div(T a, T b){
+    return (a + b - 1) / b;
+}
 
 // a_seg:[B,I,U], b_seg:[B,1,V], w_seg:[U,V,W], out:[B,K,W]
 // 稀疏三元组（nnz<=7）：cg_i:[nnz], cg_k:[nnz], cg_val:[nnz] （J=1 固定，不传 cg_j）
+template<typename scalar_t>
 __global__ void fused_fctp_kernel_fwd(
-    const double* __restrict__ a_seg,    // [B,I,U]
-    const double* __restrict__ b_seg,    // [B,1,V]
-    const double* __restrict__ w_seg,    // [U,V,W]
-    const int*    __restrict__ cg_i,     // [nnz] ∈ [0,I)
-    const int*    __restrict__ cg_k,     // [nnz] ∈ [0,K)
-    const double* __restrict__ cg_val,   // [nnz]
+    const scalar_t* __restrict__ a_seg,    // [B,I,U]
+    const scalar_t* __restrict__ b_seg,    // [B,1,V]
+    const scalar_t* __restrict__ w_seg,    // [U,V,W]
+    const int*     __restrict__ cg_i,      // [nnz] ∈ [0,I)
+    const int*     __restrict__ cg_k,      // [nnz] ∈ [0,K)
+    const scalar_t* __restrict__ cg_val,   // [nnz]
     int nnz, int K,
-    double*       __restrict__ out,      // [B,K,W]
+    scalar_t*      __restrict__ out,       // [B,K,W]
     int B, int I, int U, int V, int W)
 {
     const unsigned b = blockIdx.y;                     // J=1 → grid.y=B
     if (b >= (unsigned)B) return;
 
-    const double* __restrict__ A_b   = a_seg + (size_t)b * I * U;     // [I,U]
-    const double* __restrict__ brow  = b_seg + (size_t)b * V;         // [V]
-    double*       __restrict__ Ob    = out   + (size_t)b * K * W;     // [K,W]
+    const scalar_t* __restrict__ A_b   = a_seg + (size_t)b * I * U;     // [I,U]
+    const scalar_t* __restrict__ brow  = b_seg + (size_t)b * V;         // [V]
+    scalar_t*       __restrict__ Ob    = out   + (size_t)b * K * W;     // [K,W]
 
     // 1) argmax_v b_seg[b,0,v]
     int vstar = 0;
     if (threadIdx.x==0 && threadIdx.y==0){
-        double best=-DBL_MAX; int idx=0;
+        scalar_t best = std::numeric_limits<scalar_t>::lowest();
+        int idx = 0;
         #pragma unroll
-        for (int v=0; v<V; ++v) { double x=brow[v]; if (x>best){best=x; idx=v;} }
+        for (int v=0; v<V; ++v) {
+            scalar_t x = brow[v];
+            if (x > best){ best = x; idx = v; }
+        }
         vstar = idx;
     }
-    __shared__ int sh_v; if (threadIdx.x==0 && threadIdx.y==0) sh_v=vstar; __syncthreads();
+    __shared__ int sh_v;
+    if (threadIdx.x==0 && threadIdx.y==0) sh_v = vstar;
+    __syncthreads();
     const int v = sh_v;
 
     // 2) shared: Wt[W, U+1] + A_sel[nnz, U+1]（只放 nnz 涉及到的 i 行）
     const int U_pad = U + 1;                    // 消 bank 冲突
-    extern __shared__ double shmem[];
-    double* sh_Wt   = shmem;                    // W*U_pad
-    double* sh_Asel = shmem + (size_t)W * U_pad;// nnz*U_pad
 
-    // 2a) load w_seg[:,v,:] → sh_Wt[w,u]  (double4 read, scalar write)
+    extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
+    scalar_t* sh_Wt   = reinterpret_cast<scalar_t*>(shmem_raw);                    // W*U_pad
+    scalar_t* sh_Asel = sh_Wt + (size_t)W * U_pad;                                 // nnz*U_pad
+
+    // 2a) load w_seg[:,v,:] → sh_Wt[w,u]  (vector read, scalar write)
+
+    // 根据 scalar_t 选择 float4 / double4
+    using Vec4 = typename std::conditional<
+        std::is_same<scalar_t, float>::value,
+        float4,
+        double4
+    >::type;
+
     const int Wv = W / 4;
     const int UWv = U * Wv;                     // U=96 → 2304
-    for (int t = threadIdx.y * blockDim.x + threadIdx.x; t < UWv; t += blockDim.x * blockDim.y) {
+    for (int t = threadIdx.y * blockDim.x + threadIdx.x;
+         t < UWv;
+         t += blockDim.x * blockDim.y) {
         int u  = t / Wv;
         int wv = t - u * Wv;
         int w0 = wv << 2;
         const size_t off = ((size_t)u * V + (size_t)v) * W + (size_t)w0;
-        const double4 r = *reinterpret_cast<const double4*>(w_seg + off);
-        sh_Wt[((size_t)w0 + 0) * U_pad + u] = r.x;
-        sh_Wt[((size_t)w0 + 1) * U_pad + u] = r.y;
-        sh_Wt[((size_t)w0 + 2) * U_pad + u] = r.z;
-        sh_Wt[((size_t)w0 + 3) * U_pad + u] = r.w;
+        const Vec4 r = *reinterpret_cast<const Vec4*>(w_seg + off);
+        sh_Wt[((size_t)w0 + 0) * U_pad + u] = (scalar_t)r.x;
+        sh_Wt[((size_t)w0 + 1) * U_pad + u] = (scalar_t)r.y;
+        sh_Wt[((size_t)w0 + 2) * U_pad + u] = (scalar_t)r.z;
+        sh_Wt[((size_t)w0 + 3) * U_pad + u] = (scalar_t)r.w;
     }
 
     // 2b) 只加载 nnz 条 i 行到 sh_Asel[p,:]
-    for (int t = threadIdx.y * blockDim.x + threadIdx.x; t < nnz * U; t += blockDim.x * blockDim.y) {
+    for (int t = threadIdx.y * blockDim.x + threadIdx.x;
+         t < nnz * U;
+         t += blockDim.x * blockDim.y) {
         int p = t / U;
-        int u = t - p * U;
-        int i = cg_i[p];
-        sh_Asel[(size_t)p * U_pad + u] = A_b[(size_t)i * U + u];
+        int uidx = t - p * U;
+        int irow = cg_i[p];
+        sh_Asel[(size_t)p * U_pad + uidx] = A_b[(size_t)irow * U + uidx];
     }
     __syncthreads();
 
@@ -73,18 +102,18 @@ __global__ void fused_fctp_kernel_fwd(
     const int w = threadIdx.x;   // 0..W-1
     const int k = threadIdx.y;   // 0..K-1
     if (w < W && k < K) {
-        const double* __restrict__ Wcol = sh_Wt + (size_t)w * U_pad;
+        const scalar_t* __restrict__ Wcol = sh_Wt + (size_t)w * U_pad;
 
-        double acc = 0.0;
-#pragma unroll
+        scalar_t acc = scalar_t(0);
+    #pragma unroll
         for (int p = 0; p < 7; ++p) {          // nnz≤7：上限展开
             if (p >= nnz) break;
             if (cg_k[p] != k) continue;
 
-            const double* __restrict__ Arow = sh_Asel + (size_t)p * U_pad;
-            double s = 0.0;
+            const scalar_t* __restrict__ Arow = sh_Asel + (size_t)p * U_pad;
+            scalar_t s = scalar_t(0);
             int uu = 0;
-#pragma unroll
+        #pragma unroll
             for (; uu + 3 < U; uu += 4) {
                 s += Arow[uu+0]*Wcol[uu+0]
                    + Arow[uu+1]*Wcol[uu+1]
@@ -99,19 +128,29 @@ __global__ void fused_fctp_kernel_fwd(
     }
 }
 
+
 at::Tensor launch_fused_fctp_forward(
-    at::Tensor a_seg,      // [B,I,U], f64, cuda
-    at::Tensor b_seg,      // [B,1,V], f64, cuda
-    at::Tensor w_seg,      // [U,V,W], f64, cuda
+    at::Tensor a_seg,      // [B,I,U], f32/f64, cuda
+    at::Tensor b_seg,      // [B,1,V], f32/f64, cuda
+    at::Tensor w_seg,      // [U,V,W], f32/f64, cuda
     at::Tensor cg_indices, // [nnz,2] or [nnz,3]，这里用 [i,k] 或 [i,j,k]；J=1 时只需 (i,k)
-    at::Tensor cg_values,  // [nnz], f64, cuda
+    at::Tensor cg_values,  // [nnz], f32/f64, cuda
     int64_t K)
 {
     TORCH_CHECK(a_seg.is_cuda() && b_seg.is_cuda() && w_seg.is_cuda()
              && cg_indices.is_cuda() && cg_values.is_cuda(), "CUDA tensors required");
-    TORCH_CHECK(a_seg.scalar_type()==at::kDouble && b_seg.scalar_type()==at::kDouble
-             && w_seg.scalar_type()==at::kDouble && cg_values.scalar_type()==at::kDouble, "float64 only");
-    a_seg = a_seg.contiguous(); b_seg = b_seg.contiguous(); w_seg = w_seg.contiguous();
+
+    auto dtype = a_seg.scalar_type();
+    TORCH_CHECK(
+        dtype == at::kFloat || dtype == at::kDouble,
+        "a_seg must be float32 or float64");
+    TORCH_CHECK(b_seg.scalar_type()  == dtype, "b_seg must match a_seg dtype");
+    TORCH_CHECK(w_seg.scalar_type()  == dtype, "w_seg must match a_seg dtype");
+    TORCH_CHECK(cg_values.scalar_type() == dtype, "cg_values must match a_seg dtype");
+
+    a_seg = a_seg.contiguous();
+    b_seg = b_seg.contiguous();
+    w_seg = w_seg.contiguous();
 
     const int B = (int)a_seg.size(0);
     const int I = (int)a_seg.size(1);
@@ -135,7 +174,8 @@ at::Tensor launch_fused_fctp_forward(
     auto out = at::empty({B, (int)K, W}, a_seg.options());
 
     // 快路径约束：U=96, W%4==0, B<=65535
-    TORCH_CHECK(U==96 && (W%4==0) && (uint64_t)B <= 65535, "fast path requires U=96, W%4==0, B<=65535, J=1");
+    TORCH_CHECK(U==96 && (W%4==0) && (uint64_t)B <= 65535,
+                "fast path requires U=96, W%4==0, B<=65535, J=1");
 
     // 线程块：x 覆盖 W(96→128)，y 覆盖 K(≤7)
     const int tx = 128;
@@ -143,26 +183,32 @@ at::Tensor launch_fused_fctp_forward(
     dim3 block(tx, ty, 1);
     dim3 grid(1, (unsigned)B, 1);
 
-    // 动态 shared：Wt[W,U+1] + Asel[nnz,U+1]
+    // 动态 shared：Wt[W,U+1] + Asel[nnz,U+1]，按元素大小计算
     const int U_pad = U + 1;
-    size_t shmem_bytes = ((size_t)W * U_pad + (size_t)nnz * U_pad) * sizeof(double);
-
-    cudaFuncSetAttribute(
-        fused_fctp_kernel_fwd,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)shmem_bytes);
+    size_t shmem_elems = (size_t)W * U_pad + (size_t)nnz * U_pad;
+    size_t shmem_bytes = shmem_elems * a_seg.element_size();
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-    fused_fctp_kernel_fwd<<<grid, block, (int)shmem_bytes, stream>>>(
-        a_seg.data_ptr<double>(),
-        b_seg.data_ptr<double>(),
-        w_seg.data_ptr<double>(),
-        cg_i.data_ptr<int>(),
-        cg_k.data_ptr<int>(),
-        cg_v.data_ptr<double>(),
-        nnz, (int)K,
-        out.data_ptr<double>(),
-        B, I, U, V, W);
+
+    AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_forward", [&] {
+        using scalar_t = scalar_t;
+        cudaFuncSetAttribute(
+            fused_fctp_kernel_fwd<scalar_t>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            (int)shmem_bytes);
+
+        fused_fctp_kernel_fwd<scalar_t>
+            <<<grid, block, (int)shmem_bytes, stream>>>(
+                a_seg.data_ptr<scalar_t>(),
+                b_seg.data_ptr<scalar_t>(),
+                w_seg.data_ptr<scalar_t>(),
+                cg_i.data_ptr<int>(),
+                cg_k.data_ptr<int>(),
+                cg_v.data_ptr<scalar_t>(),
+                nnz, (int)K,
+                out.data_ptr<scalar_t>(),
+                B, I, U, V, W);
+    });
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
