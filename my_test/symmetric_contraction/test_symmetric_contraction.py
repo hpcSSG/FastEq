@@ -36,38 +36,43 @@ device = 'cuda'
 x1 = torch.randn(B, num_a, u, dtype=torch.float64, device=device)
 x0_g = torch.randn(B, num_i, u, dtype=torch.float64, device=device)
 
+weight = torch.randn(u, u, dtype=torch.float64, device=device)
+
+
 with open("cg_coeff_paths.txt", "r") as f:
     data = f.read()
 host_paths = ast.literal_eval(data)
 path_lens_tensor = torch.tensor([len(p) for p in host_paths], dtype=torch.int, device=device)
 max_len = max(len(p) for p in host_paths)
 padded_paths = [p + [0] * (max_len - len(p)) for p in host_paths]
-
 paths_tensor = torch.tensor(padded_paths, dtype=torch.int, device=device)
 coeffs = torch.randn(len(path_lens_tensor), dtype=torch.float64, device=device)
+
+print(f"paths_tensor shape: {paths_tensor.shape}, coeffs shape: {coeffs.shape}")
 
 
 # baseline
 def baseline():
     baseline_out = torch.zeros(B, u, dtype=torch.float64, device=device)
     for path_idx in range(0, len(paths_tensor)):
-            path = paths_tensor[path_idx]
-            real_path_len = path_lens_tensor[path_idx]
-            if real_path_len == 3:
-                a = path[0]
-                i = path[1]
-                baseline_out += x1[:, a] * x0_g[:, i] * coeffs[path_idx]
-            if real_path_len == 4:
-                a = path[0]
-                b = path[1]
-                i = path[2]
-                baseline_out += x1[:, a] * x1[:, b] * x0_g[:, i] * coeffs[path_idx]
-            if real_path_len == 5:
-                a = path[0]
-                b = path[1]
-                c = path[2]
-                i = path[3]
-                baseline_out += x1[:, a] * x1[:, b] * x1[:, c] * x0_g[:, i] * coeffs[path_idx]
+        path = paths_tensor[path_idx]
+        real_path_len = path_lens_tensor[path_idx]
+        if real_path_len == 3:
+            a = path[0]
+            i = path[1]
+            baseline_out += x1[:, a] * x0_g[:, i] * coeffs[path_idx]
+        if real_path_len == 4:
+            a = path[0]
+            b = path[1]
+            i = path[2]
+            baseline_out += x1[:, a] * x1[:, b] * x0_g[:, i] * coeffs[path_idx]
+        if real_path_len == 5:
+            a = path[0]
+            b = path[1]
+            c = path[2]
+            i = path[3]
+            baseline_out += x1[:, a] * x1[:, b] * x1[:, c] * x0_g[:, i] * coeffs[path_idx]
+    out = torch.matmul(baseline_out, weight)
     return baseline_out
 
 def stp_cuda():

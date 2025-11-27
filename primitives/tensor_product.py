@@ -96,7 +96,6 @@ def _my_tensor_product_fx(
             c_tensor = disable_type_conv(
                 torch.tensor(path.coefficients, dtype=math_dtype, device=device)
             )
-            print(f"c_tensor: {c_tensor}")
             #out = torch.einsum(formula, c_tensor, *segments)
             segment0 = segments[0].squeeze(0)
             segment1 = segments[1].squeeze(1)
@@ -179,33 +178,32 @@ class TensorProduct(torch.nn.Module):
         self.num_operands = descriptor.num_operands
 
         # ================= FastEq need =================
-        from .utils import make_FastFullyConnectedTensorProductFunction, make_FastEquiLinearFunction, make_FastChannelWiseTensorProductFunction
+        from .utils import make_FastFullyConnectedTensorProductFunction, make_FastEquiLinearFunction, make_FastChannelWiseTensorProductFunction, make_FastFullyConnectedTensorProductPathFused
         self.use_fasteq = use_fasteq
         self.op_name = op_name
         
         if self.op_name == "tp_fully_connected" or self.op_name == "equi_linear":
+                
             self.cg_indices: list[torch.Tensor] = []
             self.cg_values:  list[torch.Tensor] = []
             self.c_tensors:  list[torch.Tensor] = []
+            dim_list = []
             device = "cuda"
 
             with torch.no_grad():
                 for i, path in enumerate(descriptor.paths):
-                    # 跳过无效（或标量）系数
                     if getattr(path, "coefficients", None) is None or path.coefficients.ndim < 3:
                         continue
-
-                    # 系数张量（稠密形式），到目标 device/dtype
                     coeffs = torch.from_numpy(path.coefficients).to(device=device, dtype=math_dtype)
 
-                    # 稀疏提取：非零索引与对应值
                     # idx: [nnz, 3] (i,j,k)；vals: [nnz]
                     idx = coeffs.nonzero(as_tuple=False)     
                     vals = coeffs[idx[:, 0], idx[:, 1], idx[:, 2]]
                     idx = idx.to(device=device, dtype=torch.int)
                     vals = vals.to(device=device, dtype=math_dtype)
 
-                    # 注册 buffer（会随 .to(device) 与 state_dict 管理）
+                    dim_list.append(len(vals))
+
                     name_idx = f"cg_indices_{i}"
                     name_val = f"cg_values_{i}"
                     name_c   = f"c_tensors_{i}"
@@ -217,11 +215,63 @@ class TensorProduct(torch.nn.Module):
                     self.cg_indices.append(getattr(self, f"cg_indices_{i}"))
                     self.cg_values.append(getattr(self, f"cg_values_{i}"))
                     self.c_tensors.append(getattr(self, f"c_tensors_{i}"))
+                
+                if self.op_name == "tp_fully_connected":
 
+                    dimensions_dict = self.descriptor.get_dimensions_dict()
+                    self.U, self.V, self.W = sum(dimensions_dict['u']), sum(dimensions_dict['v']), sum(dimensions_dict['w'])
+                
+                    P = len(self.cg_indices)
+                    assert P == len(dim_list)
 
-        self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
-        self.FastEquiLinearFunction = make_FastEquiLinearFunction()
-        self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
+                    self.K_per_path = torch.tensor(dim_list, device=device, dtype=torch.int32)
+                    self.path_offset = torch.empty(P, device=device, dtype=torch.int32)
+                    self.path_offset[0] = 0
+                    if P > 1:
+                        self.path_offset[1:] = torch.cumsum(self.K_per_path[:-1], dim=0)
+                    self.K_total = int(self.K_per_path.sum().item())
+
+                    self.nnz_list = [ci.shape[0] for ci in self.cg_indices]
+                    self.nnz_max = max(self.nnz_list)
+                    self.nnz_per_path = torch.tensor(self.nnz_list, device=device, dtype=torch.int32)
+
+                    self.cg_i_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
+                    self.cg_j_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
+                    self.cg_k_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
+                    self.cg_val_all = torch.zeros((P, self.nnz_max), device=device, dtype=math_dtype)
+
+                    for p in range(P):
+                        ci_local = self.cg_indices[p]  # [nnz_p, 3], (i_local, j_local, k_local)
+                        cv       = self.cg_values[p]         # [nnz_p]
+                        nnz_p    = self.nnz_list[p]
+                        offset_p = self.path_offset[p].item()
+
+                        i_local = ci_local[:, 0]
+                        j_local = ci_local[:, 1]
+                        k_local = ci_local[:, 2]
+
+                        # --- local -> global ---
+                        i_global = i_local + offset_p
+                        j_global = j_local             # TODO: only support j_local = j_global = 0
+                        k_global = k_local + offset_p
+
+                        self.cg_i_all[p, :nnz_p]   = i_global
+                        self.cg_j_all[p, :nnz_p]   = j_global
+                        self.cg_k_all[p, :nnz_p]   = k_global
+                        self.cg_val_all[p, :nnz_p] = cv
+                        
+                        print(f"op_name:{self.op_name}")
+                        self.FastFCTPOPT = make_FastFullyConnectedTensorProductPathFused(
+                            self.cg_i_all, self.cg_j_all, self.cg_k_all, self.cg_val_all,
+                            self.nnz_per_path, self.K_per_path, self.path_offset, 
+                            self.U, self.V, self.W, self.K_total
+                        )
+                        self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
+        
+        if self.op_name == "equi_linear":
+            self.FastEquiLinearFunction = make_FastEquiLinearFunction()
+        if self.op_name == "tp_channel_wise":
+            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
         # ================================================
 
         if use_fallback is False:
@@ -336,6 +386,11 @@ class TensorProduct(torch.nn.Module):
         if self.use_fasteq:
             if self.op_name == "tp_fully_connected":
                 print("== call fasteq fully connect tensor product ==")
+                
+                '''
+                torch.cuda.synchronize()
+                start_time = time.perf_counter() * 1000
+                
                 out = self.FastFCTPFunc.apply(
                     inputs[0], inputs[1], inputs[2],
                     self.descriptor,
@@ -343,6 +398,29 @@ class TensorProduct(torch.nn.Module):
                     self.cg_values,
                     inputs[0].dtype,
                 )
+
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< fasteq fctp cost: {execution_time_ms:.3f} ms >>")
+                '''
+
+                #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}, self.K_total:{self.K_total}")
+                #print(f"self.U={self.U},  self.V={self.V}, self.W={self.W}, descriptor={self.descriptor.get_dimensions_dict()}")
+                #print(f"inputs[0]:{inputs[0].dtype}, inputs[1]:{inputs[1].dtype}, inputs[2]:{inputs[2].dtype}, cg_val_all.dtype:{self.cg_val_all.dtype}")
+
+                torch.cuda.synchronize()
+                start_time = time.perf_counter() * 1000
+
+                out = self.FastFCTPOPT.apply(
+                     inputs[0], inputs[1], inputs[2], 
+                )
+
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< fasteq fctp-opt cost: {execution_time_ms:.3f} ms >>")
+
             elif self.op_name == "tp_channel_wise":
                 print("== call fasteq channel-wise tensor product ==")
                 print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")

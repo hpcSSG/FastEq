@@ -72,7 +72,7 @@ __global__ void fused_fctp_kernel_fwd(
     >::type;
 
     const int Wv = W / 4;
-    const int UWv = U * Wv;                     // U=96 → 2304
+    const int UWv = U * Wv;
     for (int t = threadIdx.y * blockDim.x + threadIdx.x;
          t < UWv;
          t += blockDim.x * blockDim.y) {
@@ -114,7 +114,7 @@ __global__ void fused_fctp_kernel_fwd(
             scalar_t s = scalar_t(0);
             int uu = 0;
         #pragma unroll
-            for (; uu + 3 < U; uu += 4) {
+            for (; uu + 3 < U; uu += 4) { // ILP
                 s += Arow[uu+0]*Wcol[uu+0]
                    + Arow[uu+1]*Wcol[uu+1]
                    + Arow[uu+2]*Wcol[uu+2]
@@ -124,7 +124,7 @@ __global__ void fused_fctp_kernel_fwd(
 
             acc += s * cg_val[p];
         }
-        Ob[(size_t)k * W + w] = acc;           // 唯一写者，无需原子
+        Ob[(size_t)k * W + w] = acc;
     }
 }
 
@@ -134,8 +134,8 @@ at::Tensor launch_fused_fctp_forward(
     at::Tensor b_seg,      // [B,1,V], f32/f64, cuda
     at::Tensor w_seg,      // [U,V,W], f32/f64, cuda
     at::Tensor cg_indices, // [nnz,2] or [nnz,3]，这里用 [i,k] 或 [i,j,k]；J=1 时只需 (i,k)
-    at::Tensor cg_values,  // [nnz], f32/f64, cuda
-    int64_t K)
+    at::Tensor cg_values   // [nnz], f32/f64, cuda
+    )
 {
     TORCH_CHECK(a_seg.is_cuda() && b_seg.is_cuda() && w_seg.is_cuda()
              && cg_indices.is_cuda() && cg_values.is_cuda(), "CUDA tensors required");
@@ -155,11 +155,16 @@ at::Tensor launch_fused_fctp_forward(
     const int B = (int)a_seg.size(0);
     const int I = (int)a_seg.size(1);
     const int U = (int)a_seg.size(2);
+
+    const int K = I;
+ 
     TORCH_CHECK(b_seg.size(1)==1, "this fast path requires J==1");
     const int V = (int)b_seg.size(2);
-    TORCH_CHECK(w_seg.size(0)==U && w_seg.size(1)==V, "U/V mismatch");
-    const int W = (int)w_seg.size(2);
+    TORCH_CHECK(w_seg.size(1)==U && w_seg.size(2)==V, "U/V mismatch");
+    const int W = (int)w_seg.size(3);
     TORCH_CHECK((int)K <= 7 && K>0, "K<=7 required");
+    w_seg = w_seg.view({U, V, W});                 
+
 
     // 读取 nnz（≤7），提取 (i,k,val)
     TORCH_CHECK(cg_indices.dim()==2 && (cg_indices.size(1)==2 || cg_indices.size(1)==3),
@@ -180,7 +185,7 @@ at::Tensor launch_fused_fctp_forward(
     // 线程块：x 覆盖 W(96→128)，y 覆盖 K(≤7)
     const int tx = 128;
     const int ty = (int)K;     // 1..7
-    dim3 block(tx, ty, 1);
+    dim3 block(tx, ty, 1); // 一个 block 负责一个 batch 样本的整个 [K,W]
     dim3 grid(1, (unsigned)B, 1);
 
     // 动态 shared：Wt[W,U+1] + Asel[nnz,U+1]，按元素大小计算

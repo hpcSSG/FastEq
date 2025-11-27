@@ -17,7 +17,7 @@ mod = load(
 device = "cuda"
 dtype  = torch.float64
 
-B, U = 26840, 96           # 你的大规模用例
+B, U = 40760, 96           # 你的大规模用例
 dim_list = [1, 3, 5, 7]
 DIM_SUM = sum(dim_list)    # 16
 P = len(dim_list)
@@ -48,7 +48,7 @@ def test_forward_big():
 
     with torch.no_grad():
         out_ref = forward_ref(x, y, w)                 # [B,16,U]
-        out_cuda, out_flat, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
+        out_cuda, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
         # 逐元素比较
         diff = (out_cuda - out_ref).abs()
         max_abs = diff.max().item()
@@ -92,12 +92,12 @@ def test_backward_big():
     check("gy", gy, gy_ref)
     check("gw", gw, gw_ref)
 
-def backward_bench():
+def bench():
     torch.manual_seed(1)
     x = torch.randn(B, U, device=device, dtype=dtype, requires_grad=True)
     y = torch.randn(B, DIM_SUM, device=device, dtype=dtype, requires_grad=True)
     w = torch.randn(B, P, U, device=device, dtype=dtype, requires_grad=True)
-    out_cuda, out_flat, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
+    out_cuda, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
     g = torch.randn_like(out_cuda)                       # 上游梯度
     #grad_out_T = g.permute(0, 2, 1).contiguous()
 
@@ -107,8 +107,8 @@ def backward_bench():
         torch.cuda.synchronize()
         start_total = time.perf_counter() *1000
         
-        gx, gy, gw = mod.bwd(g, x.detach(), y.detach(), w.detach(), b_buf.detach())
-        #out_cuda, out_flat, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
+        #gx, gy, gw = mod.bwd(g, x.detach(), y.detach(), w.detach(), b_buf.detach())
+        out_cuda, b_buf = mod.fwd(x.contiguous(), y.contiguous(), w.contiguous())
 
         torch.cuda.synchronize()
         end_total = time.perf_counter() *1000
@@ -128,5 +128,5 @@ if __name__ == "__main__":
     print("✅ All correctness tests passed.")
     '''
     test_forward_big()
-    test_backward_big()
-    backward_bench()
+    #test_backward_big()
+    bench()

@@ -2,12 +2,14 @@ import os, time
 import torch
 torch.set_default_dtype(torch.float64)
 
+from cuequivariance_torch.primitives.utils import make_FastFusedMessagePassing
+
 
 from torch.utils.cpp_extension import load
 torch.set_printoptions(precision=4, sci_mode=False)
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 
-fused_mp = load(
+fused_mp_fwd = load(
     name="fused_mp",
     sources=["fused_message_passing_opt.cu"],  # 路径按你的实际放置
     extra_cuda_cflags=["-O3", "--use_fast_math", '-gencode=arch=compute_90,code=sm_90', '--ptxas-options=-v', "-Xptxas --maxrregcount=128"],
@@ -26,15 +28,14 @@ fused_mp_bwd = load(
 
 class FusedMPFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, node_feats, edge_attrs, tp_weights,
+    def forward(ctx, node_feats, edge_attrs, tp_weights, sender,
                 receiver, start_idx, end_idx, dim_list, offs):
         # 保存反向所需变量
         ctx.save_for_backward(node_feats, edge_attrs, tp_weights,
                               receiver, start_idx, end_idx,
                               dim_list, offs)
-        out = fused_mp.forward(node_feats, edge_attrs, tp_weights,
-                               receiver, start_idx, end_idx,
-                               dim_list, offs, 32, 8)
+        out = fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights, sender,
+                               receiver, dim_list, offs, False)
         return out
 
     @staticmethod
@@ -54,6 +55,7 @@ class FusedMPFunction(torch.autograd.Function):
         return (grad_node_feats,
                 grad_edge_attrs,
                 grad_tp_weights,
+                None,  # sender
                 None,  # receiver
                 None,  # start_idx
                 None,  # end_idx
@@ -61,12 +63,12 @@ class FusedMPFunction(torch.autograd.Function):
                 None)  # offs
 
 
-def fused_mp_cuda(node_feats, edge_attrs, tp_weights,
+def fused_mp_cuda(node_feats, edge_attrs, tp_weights, sender,
                   receiver, start_idx, end_idx,
                   dim_list, offs):
     return FusedMPFunction.apply(
         node_feats, edge_attrs, tp_weights,
-        receiver, start_idx, end_idx,
+        sender, receiver, start_idx, end_idx,
         dim_list, offs
     )
 
@@ -134,8 +136,6 @@ def fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, til
     return out_nodes
 
 
-start_idx, end_idx = fused_mp.compute_sender_runs_sorted(sender, nnodes)
-
 dim_list_tensor = torch.tensor([1,3,5,7], dtype=torch.int32, device=device)
 offs_tensor     = torch.tensor([0,1,4,9], dtype=torch.int32, device=device)
 
@@ -157,6 +157,12 @@ def check_and_bench():
             times.append(t0.elapsed_time(t1))
         return sum(times)/len(times)
 
+    dtype = torch.float32
+
+    node_feats = torch.randn(nnodes, U, dtype=dtype, device=device, requires_grad=True)
+    edge_attrs = torch.randn(E, DIM_SUM, dtype=dtype, device=device, requires_grad=True)
+    tp_weights = torch.randn(E, paths, U, dtype=dtype, device=device, requires_grad=True)
+
 
     node_feats_ref = node_feats.clone().detach().requires_grad_(True)
     edge_attrs_ref = edge_attrs.clone().detach().requires_grad_(True)
@@ -176,17 +182,26 @@ def check_and_bench():
     tp_weights_cu = tp_weights.clone().detach().requires_grad_(True)
     
     # cuda_fused = fused_mp_cuda(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8)
+
+    start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, nnodes)
     
-    out_cu = fused_mp_cuda(node_feats_cu, edge_attrs_cu, tp_weights_cu,
+    #node_feats = node_feats_cu.reshape(node_feats_cu.shape[0], -1)
+    out_cu, _, _ = fused_mp_cuda(node_feats_cu, edge_attrs_cu, tp_weights_cu, sender.int(),
                            receiver.int(), start_idx, end_idx,
                            dim_list_tensor, offs_tensor)
+    
+    ref = ref.reshape(ref.shape[0], -1)
+    print("Forward max_abs_err (baseline vs cuda fused):", (ref - out_cu).abs().max().item())
+
+    t_fasteq_fwd = timeit(lambda: fused_mp_cuda(node_feats_cu, edge_attrs_cu, tp_weights_cu, sender.int(), receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor))
+    print(f"fasteq fused_cuda_forward: {t_fasteq_fwd:.3f} ms")
+
+    '''
     loss_cu = out_cu.sum()
     loss_cu.backward()
     grad_node_feats_cu = node_feats_cu.grad
     grad_edge_attrs_cu = edge_attrs_cu.grad
     grad_tp_weights_cu = tp_weights_cu.grad
-
-    print("Forward max_abs_err (baseline vs cuda fused):", (ref - out_cu).abs().max().item())
     print("Check grad node_feats:")
     print("  max abs diff:", (grad_node_feats_ref - grad_node_feats_cu).abs().max().item())
     print("Check grad edge_attrs:")
@@ -194,12 +209,23 @@ def check_and_bench():
     print("Check grad tp_weights:")
     print("  max abs diff:", (grad_tp_weights_ref - grad_tp_weights_cu).abs().max().item())
 
+    fasteq_fused_mp = make_FastFusedMessagePassing()
+    message_diy = fasteq_fused_mp.apply(node_feats_cu, edge_attrs_cu, tp_weights_cu, sender, receiver, dim_list_tensor, offs_tensor)
+    message_diy = message_diy.reshape(nnodes, DIM_SUM, U)
+    print("Forward max_abs_err (baseline vs call fasteq fused_mp):", (ref - message_diy).abs().max().item())
+
+    start_idx, end_idx = fused_mp_fwd.compute_sender_runs_sorted(sender, nnodes)
+    print(start_idx)
+    print(end_idx)
+
 
     t_base = timeit(lambda: baseline_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver))
     t_fb   = timeit(lambda: fused_conv_scatter(node_feats, edge_attrs, tp_weights, sender, receiver, tile_u=U))
-    t_cuda = timeit(lambda: fused_mp.forward(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8))
+    t_cuda = timeit(lambda: fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor, 32, 8))
     t_cuda_bwd = timeit(lambda: fused_mp_bwd.backward(out_cu, node_feats, edge_attrs, tp_weights, receiver.int(), start_idx, end_idx, dim_list_tensor, offs_tensor))
-    t_cuda_sender_ready = timeit(lambda: fused_mp.compute_sender_runs_sorted(sender, nnodes))
+    t_cuda_sender_ready = timeit(lambda: fused_mp_fwd.compute_sender_runs_sorted(sender, nnodes))
+
+    t_fasteq_fwd = timeit(lambda: fasteq_fused_mp.apply(node_feats_cu, edge_attrs_cu, tp_weights_cu, sender, receiver, dim_list_tensor, offs_tensor))
 
 
     print(f"baseline:             {t_base:.3f} ms")
@@ -209,6 +235,9 @@ def check_and_bench():
     print(f"speedup fused_basic:  {t_base/t_fb:.2f}×")
     print(f"speedup cuda:    {t_base/t_cuda:.2f}×")
     print(f"t_cuda_sender_ready :    {t_cuda_sender_ready:.3f}ms")
+
+    print(f"fasteq fused_cuda_forward: {t_fasteq_fwd:.3f} ms")
+    '''
 
 
 # 直接调用检查/性能对比（如不需要可注释）

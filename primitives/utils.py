@@ -30,6 +30,9 @@ def make_FastFullyConnectedTensorProductFunction():
         @staticmethod
         def forward(ctx, w, a, b, descriptor, cg_indices, cg_values, math_dtype):
             
+            #print(f"w.shape:{w.shape}, message.shape:{a.shape}, node_attrs.shape:{b.shape}")
+            #print(f"cg_indices:{cg_indices}, cg_values:{cg_values}")
+
             inputs = [w, a, b]
             num_inputs = len(inputs)
             slices = [ope.segment_slices() for ope in descriptor.operands]
@@ -51,12 +54,18 @@ def make_FastFullyConnectedTensorProductFunction():
                             inp = inp.reshape(inputs[oid].shape[:-1])
                         segments.append(inp.to(dtype=math_dtype))
                     
+                    '''
                     _, U, V, W = segments[0].shape
                     B, I, U = segments[1].shape
                     B, J, V = segments[2].shape
                     w_seg = segments[0].reshape(U, V, W)
                     a_seg = segments[1]
-                    b_seg = segments[2]                    
+                    b_seg = segments[2] 
+                    '''
+
+                    w_seg = segments[0]
+                    a_seg = segments[1]
+                    b_seg = segments[2]              
 
                     '''
                     # replace out = torch.einsum(formula, c_tensor, *segments)
@@ -90,8 +99,8 @@ def make_FastFullyConnectedTensorProductFunction():
                     execution_time_ms = end_time - start_time
                     print(f"einsum1 + einsum2 + einsum3 cuda cost: {execution_time_ms}")
                     '''
-                    K = I
-                    out = torch.ops.fctp_fused3_fwd.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous(), K)
+                    
+                    out = torch.ops.fctp_fused3_fwd.forward(a_seg.contiguous(), b_seg.contiguous(), w_seg.contiguous(), cg_indices[path_idx].contiguous(), cg_values[path_idx].contiguous())
                     #print("max abs diff:", (out_ref - out).abs().max().item())
                     
                     seg_shape = descriptor.get_segment_shape(-1, path)
@@ -154,6 +163,9 @@ def make_FastFullyConnectedTensorProductFunction():
             Backward: 将 grad_out 拆分到 segment，再回传到每条路径的中间张量
             """
 
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             w, a, b, *outputs = ctx.saved_tensors
             descriptor = ctx.descriptor
             #c_tensor_list = ctx.c_tensors
@@ -206,8 +218,37 @@ def make_FastFullyConnectedTensorProductFunction():
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
 
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
+
             return None, grad_a, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
     return FastFullyConnectedTensorProductFunction
+
+
+def make_FastFullyConnectedTensorProductPathFused(
+        cg_i_all, cg_j_all, cg_k_all, cg_val_all, 
+        nnz_per_path, K_per_path, path_offset, U, V, W, K_total
+    ):
+    class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, w, x, y):
+            output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, 
+                    cg_i_all, cg_j_all, cg_k_all, cg_val_all,
+                    nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
+            
+            ctx.save_for_backward(w, x, y)
+            return output
+        
+        @staticmethod
+        def backward(ctx, grad_out):
+            w, x, y = ctx.saved_tensors
+            grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, 
+                    cg_i_all, cg_j_all, cg_k_all, cg_val_all,
+                    nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
+            return None, grad_x, None  #  descriptor 不需要梯度
+    return FastFullyConnectedTensorProductPathFused
 
 
 def make_FastEquiLinearFunction():

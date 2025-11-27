@@ -7,6 +7,7 @@
 
 constexpr int P       = 4;   // paths = 4  (dim_list=[1,3,5,7])
 constexpr int DIM_SUM = 16;  // 1+3+5+7
+constexpr int KS = DIM_SUM;  // KS = DIM_SUM
 constexpr int U_FIXED = 96;  // U=96 (按你的场景固化)
                                // V=1 已在实现中固化
 
@@ -36,7 +37,7 @@ inline __device__ int idx_bku(int b, int k, int u, int B, int KS, int U) {
 // ---------------------------------------------
 // 前向：out[b,k,u] = (x[b,u]*w[b,p,u]) * y[b,k]
 // 额外写出 b_buf[b,p,u] = x[b,u]*w[b,p,u]
-// gridDim.x = B, blockDim.x >= 96（建议128）
+// gridDim.x = B, blockDim.x >= 96
 // ---------------------------------------------
 __global__ void fwd_kernel_v1(
     const double* __restrict__ x,      // [B, U]
@@ -74,6 +75,96 @@ __global__ void fwd_kernel_v1(
                     out[idx_out(b, k, u, B, DIM_SUM, U)] = base * ybk;
                 }
             }
+        }
+    }
+}
+
+// 2D grid helpers
+__device__ __forceinline__ int grid_b0() {
+    return blockIdx.x + blockIdx.y * gridDim.x;
+}
+__device__ __forceinline__ int grid_bstride() {
+    return gridDim.x * gridDim.y;
+}
+
+// 前向：warp32（blockDim.x=32），沿 U 维 double4 向量化，按 path 分段写出
+// x:[B,U], y:[B,16], w:[B,4,U] -> out:[B,16,U], b_buf:[B,4,U]
+__global__ void fwd_kernel_vec4_warp32_grouped_bstride(
+    const double* __restrict__ x,     // [B,U]
+    const double* __restrict__ y,     // [B,16]
+    const double* __restrict__ w,     // [B,4,U]
+    double* __restrict__ out,         // [B,16,U]
+    double* __restrict__ b_buf,       // [B,4,U]
+    int B, int U)
+{
+    const int lane  = threadIdx.x & 31;    // 单 warp
+    const int slots = U / 4;               // 96/4=24
+    if (lane >= slots) return;             // 其余 8 lane 直接退出
+
+    for (int b = grid_b0(); b < B; b += grid_bstride()) {
+
+        // y[b,:] 放 shared（128B）
+        __shared__ double y_sh[KS];
+        if (lane < KS) y_sh[lane] = y[size_t(b)*KS + lane];
+        __syncwarp();
+
+        const int u = lane * 4;
+        const size_t off_u   = size_t(u);
+        const size_t off_bu  = size_t(b) * U + off_u;
+        const size_t off_bk0 = size_t(b) * KS * U;
+
+        // 读取 x4，一次即可
+        const double4 x4 = *reinterpret_cast<const double4*>(&x[off_bu]);
+
+        // 预读四条 w_p4，计算 base_p4 = x4 * w_p4，并写入 b_buf
+        const size_t off_w0 = (size_t(b)*P + 0) * U + off_u;
+        const size_t off_w1 = (size_t(b)*P + 1) * U + off_u;
+        const size_t off_w2 = (size_t(b)*P + 2) * U + off_u;
+        const size_t off_w3 = (size_t(b)*P + 3) * U + off_u;
+
+        const double4 w0 = *reinterpret_cast<const double4*>(&w[off_w0]);
+        const double4 w1 = *reinterpret_cast<const double4*>(&w[off_w1]);
+        const double4 w2 = *reinterpret_cast<const double4*>(&w[off_w2]);
+        const double4 w3 = *reinterpret_cast<const double4*>(&w[off_w3]);
+
+        double4 b0; b0.x = x4.x*w0.x; b0.y = x4.y*w0.y; b0.z = x4.z*w0.z; b0.w = x4.w*w0.w;
+        double4 b1; b1.x = x4.x*w1.x; b1.y = x4.y*w1.y; b1.z = x4.z*w1.z; b1.w = x4.w*w1.w;
+        double4 b2; b2.x = x4.x*w2.x; b2.y = x4.y*w2.y; b2.z = x4.z*w2.z; b2.w = x4.w*w2.w;
+        double4 b3; b3.x = x4.x*w3.x; b3.y = x4.y*w3.y; b3.z = x4.z*w3.z; b3.w = x4.w*w3.w;
+
+        *reinterpret_cast<double4*>(&b_buf[off_w0]) = b0;
+        *reinterpret_cast<double4*>(&b_buf[off_w1]) = b1;
+        *reinterpret_cast<double4*>(&b_buf[off_w2]) = b2;
+        *reinterpret_cast<double4*>(&b_buf[off_w3]) = b3;
+
+        // 写 out：按 path 的 k 段分组，out[b,k,u:u+3] = base_p4 * y[b,k]
+        // path 0: k={0}
+        {
+            const int k = 0;
+            const double yk = y_sh[k];
+            double4 o; o.x = b0.x*yk; o.y = b0.y*yk; o.z = b0.z*yk; o.w = b0.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 1: k={1,2,3}
+        #pragma unroll
+        for (int k = 1; k <= 3; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b1.x*yk; o.y = b1.y*yk; o.z = b1.z*yk; o.w = b1.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 2: k={4,5,6,7,8}
+        #pragma unroll
+        for (int k = 4; k <= 8; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b2.x*yk; o.y = b2.y*yk; o.z = b2.z*yk; o.w = b2.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
+        }
+        // path 3: k={9..15}
+        #pragma unroll
+        for (int k = 9; k <= 15; ++k) {
+            const double yk = y_sh[k];
+            double4 o; o.x = b3.x*yk; o.y = b3.y*yk; o.z = b3.z*yk; o.w = b3.w*yk;
+            *reinterpret_cast<double4*>(&out[off_bk0 + size_t(k)*U + off_u]) = o;
         }
     }
 }
@@ -849,6 +940,181 @@ __global__ void bwd_kernel_vec4_warp32_stream_grouped(
     *reinterpret_cast<double4*>(&gx[b*U + u])          = gx4;
 }
 
+// ---------------- warp32 + vec4 + grouped + double-buffer ----------------
+__global__ void bwd_kernel_vec4_warp32_grouped_db(
+    const double* __restrict__ grad_out, // [B, KS, U]
+    const double* __restrict__ x,        // [B, U]
+    const double* __restrict__ y,        // [B, KS]
+    const double* __restrict__ w,        // [B, P, U]
+    const double* __restrict__ b_buf,    // [B, P, U] (前向缓存的 base = x*w)
+    double* __restrict__ gx,             // [B, U]
+    double* __restrict__ gy,             // [B, KS]
+    double* __restrict__ gw,             // [B, P, U]
+    int B, int U)
+{
+    const int b = blockIdx.x;
+    if (b >= B) return;
+
+    const int lane  = threadIdx.x & 31;   // 0..31
+    const int slots = U / 4;              // 96/4 = 24
+    if (lane >= slots) return;            // 剩余 8 lane 直接退出（单warp）
+
+    // y[b,:] 放 shared（128B）
+    __shared__ double y_sh[KS];
+    if (lane < KS) y_sh[lane] = y[b*KS + lane];
+    __syncwarp();
+
+    const int u = lane * 4;
+    const size_t off_u = size_t(u);
+    const size_t off_bu = size_t(b) * U + off_u;
+    const size_t off_bk_base = size_t(b) * KS * U;
+
+    // 固定只读一次 x4
+    const double4 x4 = *reinterpret_cast<const double4*>(&x[off_bu]);
+
+    // 必要的累加器
+    double4 gx4 = make_double4(0,0,0,0);
+    double4 gw0 = make_double4(0,0,0,0);
+    double4 gw1 = make_double4(0,0,0,0);
+    double4 gw2 = make_double4(0,0,0,0);
+    double4 gw3 = make_double4(0,0,0,0);
+
+    // ---- path 0: k = {0}  （单次，完全展开）----
+    {
+        const size_t off_pw = (size_t(b)*P + 0) * U + off_u;
+        const double4 wp = *reinterpret_cast<const double4*>(&w[off_pw]);
+        const double4 bp = *reinterpret_cast<const double4*>(&b_buf[off_pw]);
+
+        const int k = 0;
+        const double4 g4 = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(k)*U + off_u]);
+        const double   yk = y_sh[k];
+
+        // gy：现场 warp 归约并写回
+        double v = g4.x*bp.x + g4.y*bp.y + g4.z*bp.z + g4.w*bp.w;
+        unsigned mask = 0xffffffffu;
+        v += __shfl_down_sync(mask, v, 16);
+        v += __shfl_down_sync(mask, v, 8);
+        v += __shfl_down_sync(mask, v, 4);
+        v += __shfl_down_sync(mask, v, 2);
+        v += __shfl_down_sync(mask, v, 1);
+        if (lane == 0) gy[b*KS + k] = v;
+
+        // tmp = g4 * yk，累计 gw0/gx
+        const double t0 = g4.x * yk, t1 = g4.y * yk, t2 = g4.z * yk, t3 = g4.w * yk;
+        gw0.x += t0*x4.x; gw0.y += t1*x4.y; gw0.z += t2*x4.z; gw0.w += t3*x4.w;
+        gx4.x += t0*wp.x; gx4.y += t1*wp.y; gx4.z += t2*wp.z; gx4.w += t3*wp.w;
+    }
+
+    // ---- path 1: k = {1,2,3}  （短段：允许完全展开）----
+    {
+        const size_t off_pw = (size_t(b)*P + 1) * U + off_u;
+        const double4 wp = *reinterpret_cast<const double4*>(&w[off_pw]);
+        const double4 bp = *reinterpret_cast<const double4*>(&b_buf[off_pw]);
+
+        #pragma unroll
+        for (int k = 1; k <= 3; ++k) {
+            const double4 g4 = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(k)*U + off_u]);
+            const double   yk = y_sh[k];
+
+            double v = g4.x*bp.x + g4.y*bp.y + g4.z*bp.z + g4.w*bp.w;
+            unsigned mask = 0xffffffffu;
+            v += __shfl_down_sync(mask, v, 16);
+            v += __shfl_down_sync(mask, v, 8);
+            v += __shfl_down_sync(mask, v, 4);
+            v += __shfl_down_sync(mask, v, 2);
+            v += __shfl_down_sync(mask, v, 1);
+            if (lane == 0) gy[b*KS + k] = v;
+
+            const double t0 = g4.x * yk, t1 = g4.y * yk, t2 = g4.z * yk, t3 = g4.w * yk;
+            gw1.x += t0*x4.x; gw1.y += t1*x4.y; gw1.z += t2*x4.z; gw1.w += t3*x4.w;
+            gx4.x += t0*wp.x; gx4.y += t1*wp.y; gx4.z += t2*wp.z; gx4.w += t3*wp.w;
+        }
+    }
+
+    // ---- path 2: k = {4,5,6,7,8}  （长段：双缓冲 + 禁止展开）----
+    {
+        const size_t off_pw = (size_t(b)*P + 2) * U + off_u;
+        const double4 wp = *reinterpret_cast<const double4*>(&w[off_pw]);
+        const double4 bp = *reinterpret_cast<const double4*>(&b_buf[off_pw]);
+
+        // 预取第一条
+        double4 g4_cur = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(4)*U + off_u]);
+        double  yk_cur = y_sh[4];
+
+        #pragma unroll 1
+        for (int k = 4; k <= 8; ++k) {
+            // 预取下一条
+            double4 g4_next; double yk_next = 0.0;
+            if (k < 8) {
+                g4_next = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(k+1)*U + off_u]);
+                yk_next = y_sh[k+1];
+            }
+
+            // 当前条计算
+            double v = g4_cur.x*bp.x + g4_cur.y*bp.y + g4_cur.z*bp.z + g4_cur.w*bp.w;
+            unsigned mask = 0xffffffffu;
+            v += __shfl_down_sync(mask, v, 16);
+            v += __shfl_down_sync(mask, v, 8);
+            v += __shfl_down_sync(mask, v, 4);
+            v += __shfl_down_sync(mask, v, 2);
+            v += __shfl_down_sync(mask, v, 1);
+            if (lane == 0) gy[b*KS + k] = v;
+
+            const double t0 = g4_cur.x * yk_cur, t1 = g4_cur.y * yk_cur;
+            const double t2 = g4_cur.z * yk_cur, t3 = g4_cur.w * yk_cur;
+            gw2.x += t0*x4.x; gw2.y += t1*x4.y; gw2.z += t2*x4.z; gw2.w += t3*x4.w;
+            gx4.x += t0*wp.x; gx4.y += t1*wp.y; gx4.z += t2*wp.z; gx4.w += t3*wp.w;
+
+            // 交换到下一条
+            g4_cur = g4_next; yk_cur = yk_next;
+        }
+    }
+
+    // ---- path 3: k = {9..15}  （长段：双缓冲 + 禁止展开）----
+    {
+        const size_t off_pw = (size_t(b)*P + 3) * U + off_u;
+        const double4 wp = *reinterpret_cast<const double4*>(&w[off_pw]);
+        const double4 bp = *reinterpret_cast<const double4*>(&b_buf[off_pw]);
+
+        double4 g4_cur = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(9)*U + off_u]);
+        double  yk_cur = y_sh[9];
+
+        #pragma unroll 1
+        for (int k = 9; k <= 15; ++k) {
+            double4 g4_next; double yk_next = 0.0;
+            if (k < 15) {
+                g4_next = *reinterpret_cast<const double4*>(&grad_out[off_bk_base + size_t(k+1)*U + off_u]);
+                yk_next = y_sh[k+1];
+            }
+
+            double v = g4_cur.x*bp.x + g4_cur.y*bp.y + g4_cur.z*bp.z + g4_cur.w*bp.w;
+            unsigned mask = 0xffffffffu;
+            v += __shfl_down_sync(mask, v, 16);
+            v += __shfl_down_sync(mask, v, 8);
+            v += __shfl_down_sync(mask, v, 4);
+            v += __shfl_down_sync(mask, v, 2);
+            v += __shfl_down_sync(mask, v, 1);
+            if (lane == 0) gy[b*KS + k] = v;
+
+            const double t0 = g4_cur.x * yk_cur, t1 = g4_cur.y * yk_cur;
+            const double t2 = g4_cur.z * yk_cur, t3 = g4_cur.w * yk_cur;
+            gw3.x += t0*x4.x; gw3.y += t1*x4.y; gw3.z += t2*x4.z; gw3.w += t3*x4.w;
+            gx4.x += t0*wp.x; gx4.y += t1*wp.y; gx4.z += t2*wp.z; gx4.w += t3*wp.w;
+
+            g4_cur = g4_next; yk_cur = yk_next;
+        }
+    }
+
+    // 写回（vec4）
+    *reinterpret_cast<double4*>(&gw[(size_t(b)*P + 0)*U + off_u]) = gw0;
+    *reinterpret_cast<double4*>(&gw[(size_t(b)*P + 1)*U + off_u]) = gw1;
+    *reinterpret_cast<double4*>(&gw[(size_t(b)*P + 2)*U + off_u]) = gw2;
+    *reinterpret_cast<double4*>(&gw[(size_t(b)*P + 3)*U + off_u]) = gw3;
+    *reinterpret_cast<double4*>(&gx[off_bu])                      = gx4;
+}
+
+
+
 // ---------------------------------------------
 // PyTorch 封装
 // ---------------------------------------------
@@ -884,6 +1150,47 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> fwd_launcher(
 
     auto out_flat = out.view({B, DIM_SUM * U});   // 方便兼容旧接口
     return {out, out_flat, b_buf};
+}
+
+
+std::tuple<at::Tensor, at::Tensor> fwd_warp32_grouped_bstride_launcher(
+    const at::Tensor& x,     // [B,U]
+    const at::Tensor& y,     // [B,16]
+    const at::Tensor& w      // [B,4,U]
+){
+    TORCH_CHECK(x.is_cuda() && y.is_cuda() && w.is_cuda(), "CUDA tensors required");
+    TORCH_CHECK(x.scalar_type()==at::kDouble && y.scalar_type()==at::kDouble && w.scalar_type()==at::kDouble, "expect double dtype");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous() && w.is_contiguous(), "expect contiguous");
+
+    const int64_t B = x.size(0);
+    const int64_t U = x.size(1);
+    TORCH_CHECK(U == U_FIXED, "U must be 96");
+    TORCH_CHECK(y.sizes() == at::IntArrayRef({B, KS}), "y must be [B,16]");
+    TORCH_CHECK(w.sizes() == at::IntArrayRef({B, P, U}), "w must be [B,4,96]");
+
+    auto out   = at::empty({B, KS, U}, x.options());
+    auto b_buf = at::empty({B, P,  U}, x.options());
+
+    // 2D grid 自动适配 B>65535
+    const int max_xy = 65535;
+    int gx_dim = (B > max_xy) ? max_xy : static_cast<int>(B);
+    int gy_dim = static_cast<int>((B + gx_dim - 1) / gx_dim);
+    if (gy_dim > max_xy) gy_dim = max_xy;
+
+    dim3 grid(gx_dim, gy_dim); // 覆盖任意大 B；剩余用 stride
+    dim3 block(32);            // 单 warp
+
+    fwd_kernel_vec4_warp32_grouped_bstride<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+        x.data_ptr<double>(),
+        y.data_ptr<double>(),
+        w.data_ptr<double>(),
+        out.data_ptr<double>(),
+        b_buf.data_ptr<double>(),
+        (int)B, (int)U
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {out, b_buf}; // out:[B,16,96], b_buf:[B,4,96]
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_launcher(
@@ -951,7 +1258,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_launcher_v2(
     dim3 grid(B);
     dim3 block(32);
     size_t smem_bytes = (block.x / 32) * DIM_SUM * sizeof(double); // 每 warp 16 doubles
-    bwd_kernel_vec4_warp32_stream_grouped<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
+    bwd_kernel_vec4_warp32_grouped_db<<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
         grad_out_T.data_ptr<double>(),
         x.data_ptr<double>(),
         y.data_ptr<double>(),
@@ -967,6 +1274,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_launcher_v2(
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("fwd", &fwd_launcher, "einsum_simplified_v1 forward (V=1, dim=[1,3,5,7]) with b_buf");
+    m.def("fwd", &fwd_warp32_grouped_bstride_launcher, "einsum_simplified_v1 forward (V=1, dim=[1,3,5,7]) with b_buf");
     m.def("bwd", &bwd_launcher_v2, "einsum_simplified_v1 backward (V=1, dim=[1,3,5,7]) using b_buf");
 }

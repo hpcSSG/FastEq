@@ -31,6 +31,8 @@ add_library(${PROJECT_NAME} SHARED
     #fctp_fused2_fwd.cu
     fctp_fused3_fwd.cu
     fctp_fused3_bwd.cu
+    fctp_fused_path_fwd.cu
+    fctp_fused_path_bwd.cu
     #fctp_spmm_fwd.cu
     #fctp_spmm_bwd.cu
     stc_fwd.cu
