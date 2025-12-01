@@ -170,6 +170,7 @@ class TensorProduct(torch.nn.Module):
     ):
         super().__init__()
         self.descriptor = descriptor
+        print(f"op_name:{op_name}, math_dtype:{math_dtype}")
         if math_dtype is None:
             math_dtype = torch.get_default_dtype()
 
@@ -261,7 +262,7 @@ class TensorProduct(torch.nn.Module):
                         self.cg_val_all[p, :nnz_p] = cv
                         
                         print(f"op_name:{self.op_name}")
-                        self.FastFCTPOPT = make_FastFullyConnectedTensorProductPathFused(
+                        self.FastFCTPFused = make_FastFullyConnectedTensorProductPathFused(
                             self.cg_i_all, self.cg_j_all, self.cg_k_all, self.cg_val_all,
                             self.nnz_per_path, self.K_per_path, self.path_offset, 
                             self.U, self.V, self.W, self.K_total
@@ -378,14 +379,10 @@ class TensorProduct(torch.nn.Module):
                     input.shape[1] == self.operands_dims[oid],
                     f"input {oid} should have shape (batch, {self.operands_dims[oid]}), got {input.shape}",
                 )
-        '''
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-        '''
         
         if self.use_fasteq:
             if self.op_name == "tp_fully_connected":
-                print("== call fasteq fully connect tensor product ==")
+                #print("== call fasteq fully connect tensor product ==")
                 
                 '''
                 torch.cuda.synchronize()
@@ -409,29 +406,27 @@ class TensorProduct(torch.nn.Module):
                 #print(f"self.U={self.U},  self.V={self.V}, self.W={self.W}, descriptor={self.descriptor.get_dimensions_dict()}")
                 #print(f"inputs[0]:{inputs[0].dtype}, inputs[1]:{inputs[1].dtype}, inputs[2]:{inputs[2].dtype}, cg_val_all.dtype:{self.cg_val_all.dtype}")
 
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
-
-                out = self.FastFCTPOPT.apply(
+                out = self.FastFCTPFused.apply(
                      inputs[0], inputs[1], inputs[2], 
                 )
 
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< fasteq fctp-opt cost: {execution_time_ms:.3f} ms >>")
 
             elif self.op_name == "tp_channel_wise":
-                print("== call fasteq channel-wise tensor product ==")
-                print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
+                #print("== call fasteq channel-wise tensor product ==")
+                #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
                 out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
             # TODO fix 
             elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 36864)):
-                logger.info("== call fasteq equi-linear tensor product ==")
-                print("== call fasteq equi-linear tensor product ==")
-                out = self.FastEquiLinearFunction.apply(inputs[0], inputs[1], self.descriptor)
+                #print("== call fasteq equi-linear tensor product ==")
+                dtype = inputs[0].dtype
+                w = inputs[0].to(torch.float64)
+                x = inputs[1].to(torch.float64)
+
+                out = self.FastEquiLinearFunction.apply(w, x, self.descriptor)
+                out = out.to(dtype)
+
             elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 9216)) and inputs[1].shape[1] == 96:
-                print(f"==== call my matmul linear, inputs[0].shape={inputs[0].shape}, inputs[1].shape={inputs[1].shape} ====")
+                #print(f"==== call my matmul linear ====")
                 weight = inputs[0].reshape(96, 96)
                 out = torch.matmul(inputs[1], weight) * 0.10206207261596577
                 #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
@@ -439,19 +434,6 @@ class TensorProduct(torch.nn.Module):
                 out = self.f(inputs)
         else:
             out = self.f(inputs)
-
-        '''
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        BATCH = -1
-        UV = -1
-
-        if len(inputs) > 1:
-            BATCH = inputs[1].shape[0]
-            UV = inputs[1].shape[1]
-        print(f"<< is_use_fastequ={self.use_fasteq}, batch={BATCH}, UV={UV}, {self.op_name} cost: {execution_time_ms:.3f} ms >>")
-        '''
         
         return out
 

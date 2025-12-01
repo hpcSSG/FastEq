@@ -287,7 +287,7 @@ __global__ void fused_mp_warp_sender_major_allpaths(
 
     const int32_t st = start_idx[sender_idx];
     const int32_t ed = end_idx[sender_idx];
-    if (st >= ed) return; // 无出边
+    if (st >= ed) return;
 
     const int u_block_start = u_group * TileU;
     const int u_block_end   = min(u_block_start + TileU, U);
@@ -340,6 +340,293 @@ __global__ void fused_mp_warp_sender_major_allpaths(
     } // u-loop
 }
 
+template<int TileU = 32, int MAX_D = 8, typename scalar_t>
+__global__ void fused_mp_warp_sender_major_allpaths_v2(
+    const scalar_t* __restrict__ node_feats,     // [N, U]
+    const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]
+    const scalar_t* __restrict__ tp_weights,     // [E, P, U]
+    const int32_t* __restrict__ sender,          // [E] （实际上 kernel 里用的是 start_idx/end_idx）
+    const int32_t* __restrict__ receiver,        // [E]
+    const int32_t* __restrict__ start_idx,       // [N]
+    const int32_t* __restrict__ end_idx,         // [N]
+    const int32_t* __restrict__ dim_list,        // [P]
+    const int32_t* __restrict__ offs,            // [P]
+    int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
+    scalar_t* __restrict__ out_nodes             // [N, DIM_SUM, U]
+){
+    constexpr int W = WARP_SIZE;
+
+    const int lane            = threadIdx.x & (W - 1);  // 0..31
+    const int warp_in_block   = threadIdx.x / W;
+    const int warps_per_block = blockDim.x / W;
+    const int warp_global     = blockIdx.x * warps_per_block + warp_in_block;
+
+    const int num_u_groups = (U + TileU - 1) / TileU;
+    const int sender_idx   = warp_global / num_u_groups;
+    const int u_group      = warp_global % num_u_groups;
+    if (sender_idx >= N) return;
+
+    const int32_t st = start_idx[sender_idx];
+    const int32_t ed = end_idx[sender_idx];
+    if (st >= ed) return;
+
+    const int u_block_start = u_group * TileU;
+    const int u_block_end   = min(u_block_start + TileU, U);
+
+    // --------------------------------------
+    // shared memory：每个 warp 私有一小段 [MAX_D]，缓存 edge_attrs[e, o:o+d]
+    // layout: smem_y[warps_per_block][MAX_D]
+    // --------------------------------------
+
+    extern __shared__ char smem_raw[]; // 全 block 共享的动态 shared memory
+    scalar_t* smem_y_all = reinterpret_cast<scalar_t*>(smem_raw);
+    scalar_t* smem_y     = smem_y_all + warp_in_block * MAX_D;
+
+    // u-loop：每个 warp 负责一个 TileU 的 u 范围，lane 负责其中一部分
+    for (int u = u_block_start + lane; u < u_block_end; u += W) {
+        if (u >= U) continue;
+
+        // x_val 放在 register，后面所有 e / p 循环复用
+        const scalar_t x_val = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u];
+
+        // 对每个 path p
+        #pragma unroll
+        for (int p = 0; p < MAX_D; ++p) {
+            if (p >= P) break;
+            const int d = dim_list[p];   // 该 path 的 dim 长度（<= MAX_D, <= DIM_SUM）
+            const int o = offs[p];       // 在 DIM_SUM 上的 offset
+
+            int       cur_rcv = -1;
+            scalar_t  acc[MAX_D];
+            #pragma unroll
+            for (int j = 0; j < MAX_D; ++j) acc[j] = scalar_t(0);
+
+            // 遍历此 sender 的所有 edges
+            for (int e = st; e < ed; ++e) {
+
+                // -------------------------
+                // 1) 预取 edge_attrs[e, o:o+d] 到 shared memory
+                //    仅由 warp 内前 d 个 lane 负责加载，然后所有 lane 使用 smem_y[j]
+                // -------------------------
+                const size_t y_base = (size_t)e * (size_t)DIM_SUM + (size_t)o;
+
+                // 【标量版本】所有类型通用
+                if (lane < d) {
+                    smem_y[lane] = edge_attrs[y_base + lane];
+                }
+                // 若想在 float + d==4/8 情况下使用 vec4，可以改成：
+                // if constexpr (std::is_same<scalar_t,float>::value) {
+                //   if (d == 4 && lane == 0) {
+                //      auto v = *reinterpret_cast<const float4*>(edge_attrs + y_base);
+                //      smem_y[0] = v.x; smem_y[1] = v.y; smem_y[2] = v.z; smem_y[3] = v.w;
+                //   } else if (d == 8 && lane < 2) {
+                //      auto v = reinterpret_cast<const float4*>(edge_attrs + y_base)[lane];
+                //      smem_y[lane*4 + 0] = v.x;
+                //      smem_y[lane*4 + 1] = v.y;
+                //      smem_y[lane*4 + 2] = v.z;
+                //      smem_y[lane*4 + 3] = v.w;
+                //   }
+                // } else {
+                //   if (lane < d) smem_y[lane] = edge_attrs[y_base + lane];
+                // }
+
+                __syncwarp();
+
+                // -------------------------
+                // 2) 计算 base_u（依赖 u），用 register 存储
+                // -------------------------
+                scalar_t base_u = scalar_t(0);
+                if (u < U) {
+                    base_u = x_val *
+                        tp_weights[((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u];
+                }
+
+                const int rcv = receiver[e];
+
+                // -------------------------
+                // 3) run-length by receiver：切换 receiver 时 flush 上一个 acc
+                // -------------------------
+                if (rcv != cur_rcv) {
+                    flush_group_scalar_impl<scalar_t, MAX_D>(
+                        cur_rcv, d, o, u, U, DIM_SUM, acc, out_nodes);
+                    cur_rcv = rcv;
+                }
+
+                // -------------------------
+                // 4) 累加：acc[j] += smem_y[j] * base_u
+                //    注意：此时 y[j] 已经在 smem_y 里，所有 lane 读的是同一缓存
+                // -------------------------
+                if (u < U) {
+                    #pragma unroll
+                    for (int j = 0; j < MAX_D; ++j) {
+                        if (j >= d) break;
+                        const scalar_t yv = smem_y[j];
+                        acc[j] += yv * base_u;
+                    }
+                }
+
+                __syncwarp(); // 确保下一个 e 使用 smem_y 之前已经用完当前的
+            } // e-loop
+
+            // flush 最后一段 run
+            flush_group_scalar_impl<scalar_t, MAX_D>(
+                cur_rcv, d, o, u, U, DIM_SUM, acc, out_nodes);
+        } // p-loop
+    } // u-loop
+}
+
+template<int TileU = 64, int MAX_D = 8, typename scalar_t>
+__global__ void fused_mp_warp_sender_major_allpaths_v3(
+    const scalar_t* __restrict__ node_feats,     // [N, U]
+    const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]
+    const scalar_t* __restrict__ tp_weights,     // [E, P, U]
+    const int32_t* __restrict__ sender,          // [E]  // 未用，但保持接口
+    const int32_t* __restrict__ receiver,        // [E]
+    const int32_t* __restrict__ start_idx,       // [N]
+    const int32_t* __restrict__ end_idx,         // [N]
+    const int32_t* __restrict__ dim_list,        // [P]
+    const int32_t* __restrict__ offs,            // [P]
+    int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
+    scalar_t* __restrict__ out_nodes             // [N, DIM_SUM, U]
+){
+    constexpr int W = WARP_SIZE;
+
+    const int lane            = threadIdx.x & (W - 1);  // 0..31
+    const int warp_in_block   = threadIdx.x / W;
+    const int warps_per_block = blockDim.x / W;
+    const int warp_global     = blockIdx.x * warps_per_block + warp_in_block;
+
+    // -------- warp 映射：sender_idx, u_group (TileU=64) --------
+    const int num_u_groups = (U + TileU - 1) / TileU;   // U=96 -> 2
+    const int sender_idx   = warp_global / num_u_groups;
+    const int u_group      = warp_global % num_u_groups;
+    if (sender_idx >= N) return;
+
+    const int32_t st = start_idx[sender_idx];
+    const int32_t ed = end_idx[sender_idx];
+    if (st >= ed) return;
+
+    const int u_block_start = u_group * TileU;
+    const int u_block_end   = min(u_block_start + TileU, U);
+
+    // 每个 lane 负责两个 u：u0, u1 = u0 + 32
+    const int u0 = u_block_start + lane;
+    const int u1 = u0 + W;  // W=32
+
+    const bool valid_u0 = (u0 < U);
+    const bool valid_u1 = (u1 < U);
+
+    if (!valid_u0 && !valid_u1) {
+        return;
+    }
+
+    // ---- 动态 shared memory: [warps_per_block][MAX_D] ----
+    extern __shared__ char smem_raw[];
+    scalar_t* smem_y_all = reinterpret_cast<scalar_t*>(smem_raw);
+    scalar_t* smem_y     = smem_y_all + warp_in_block * MAX_D;
+
+    // 预先 load x0/x1
+    scalar_t x0 = scalar_t(0);
+    scalar_t x1 = scalar_t(0);
+    if (valid_u0) {
+        x0 = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u0];
+    }
+    if (valid_u1) {
+        x1 = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u1];
+    }
+
+    // -------- 遍历所有 path p --------
+    #pragma unroll
+    for (int p = 0; p < MAX_D; ++p) {
+        if (p >= P) break;
+        const int d = dim_list[p];   // ∈ {1,3,5,7}
+        const int o = offs[p];
+
+        int       cur_rcv = -1;
+        scalar_t  acc0[MAX_D];
+        scalar_t  acc1[MAX_D];
+
+        #pragma unroll
+        for (int j = 0; j < MAX_D; ++j) {
+            acc0[j] = scalar_t(0);
+            acc1[j] = scalar_t(0);
+        }
+
+        // -------- 遍历此 sender 的所有边 --------
+        for (int e = st; e < ed; ++e) {
+            const int rcv = receiver[e];
+
+            // run-length by receiver: receiver 变了就 flush
+            if (rcv != cur_rcv) {
+                if (cur_rcv >= 0) {
+                    if (valid_u0) {
+                        flush_group_scalar_impl<scalar_t, MAX_D>(
+                            cur_rcv, d, o, u0, U, DIM_SUM, acc0, out_nodes);
+                    }
+                    if (valid_u1) {
+                        flush_group_scalar_impl<scalar_t, MAX_D>(
+                            cur_rcv, d, o, u1, U, DIM_SUM, acc1, out_nodes);
+                    }
+                }
+            }
+
+            cur_rcv = rcv;
+
+            // ---- 1) 预取 edge_attrs[e, o:o+d] 到 shared memory ----
+            const size_t y_base = (size_t)e * (size_t)DIM_SUM + (size_t)o;
+
+            if (lane < d) {
+                smem_y[lane] = edge_attrs[y_base + lane];
+            }
+            __syncwarp();
+
+            // ---- 2) base_u0 / base_u1 ----
+            scalar_t base0 = scalar_t(0);
+            scalar_t base1 = scalar_t(0);
+
+            if (valid_u0) {
+                base0 = x0 *
+                    tp_weights[((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u0];
+            }
+            if (valid_u1) {
+                base1 = x1 *
+                    tp_weights[((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u1];
+            }
+
+            // ---- 3) 累加 acc0 / acc1 ----
+            if (valid_u0 || valid_u1) {
+                #pragma unroll
+                for (int j = 0; j < MAX_D; ++j) {
+                    if (j >= d) break;
+                    const scalar_t yv = smem_y[j];
+                    if (valid_u0) {
+                        acc0[j] += yv * base0;
+                    }
+                    if (valid_u1) {
+                        acc1[j] += yv * base1;
+                    }
+                }
+            }
+
+            __syncwarp();
+        } // e-loop
+
+        // flush 最后一段 run
+        if (cur_rcv >= 0) {
+            if (valid_u0) {
+                flush_group_scalar_impl<scalar_t, MAX_D>(
+                    cur_rcv, d, o, u0, U, DIM_SUM, acc0, out_nodes);
+            }
+            if (valid_u1) {
+                flush_group_scalar_impl<scalar_t, MAX_D>(
+                    cur_rcv, d, o, u1, U, DIM_SUM, acc1, out_nodes);
+            }
+        }
+
+    } // p-loop
+}
+
+
 
 template<typename scalar_t>
 void fused_mp_launch_t(
@@ -358,11 +645,13 @@ void fused_mp_launch_t(
     bool receiver_major = false
 ) {
     const int warps_per_block   = 8;
-    const int TileU             = 32;
+    const int TileU             = 64;
     const int num_u_groups      = (U + TileU - 1) / TileU;
     const int total_warps       = N * num_u_groups;
     const int threads_per_block = warps_per_block * WARP_SIZE;
     const int blocks            = (total_warps + warps_per_block - 1) / warps_per_block;
+
+    size_t smem_bytes = warps_per_block * 8 * sizeof(scalar_t);  // MAX_D = 8
 
     if (receiver_major) {
         fused_mp_warp_receiver_major_allpaths<TileU, 8, scalar_t>
@@ -371,8 +660,8 @@ void fused_mp_launch_t(
                 sender, receiver, start_idx, end_idx,
                 dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
     } else {
-        fused_mp_warp_sender_major_allpaths<TileU, 8, scalar_t>
-            <<<blocks, threads_per_block, 0, stream>>>(
+        fused_mp_warp_sender_major_allpaths_v3<TileU, 8, scalar_t>
+            <<<blocks, threads_per_block, smem_bytes, stream>>>(
                 node_feats, edge_attrs, tp_weights,
                 sender, receiver, start_idx, end_idx,
                 dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);

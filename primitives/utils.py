@@ -163,9 +163,6 @@ def make_FastFullyConnectedTensorProductFunction():
             Backward: 将 grad_out 拆分到 segment，再回传到每条路径的中间张量
             """
 
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
-
             w, a, b, *outputs = ctx.saved_tensors
             descriptor = ctx.descriptor
             #c_tensor_list = ctx.c_tensors
@@ -218,11 +215,6 @@ def make_FastFullyConnectedTensorProductFunction():
                 # 累加到总梯度
                 grad_a[..., slices[1][path.indices[1]]] += grad_a_seg.reshape(a[..., slices[1][path.indices[1]]].shape)
 
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
-
             return None, grad_a, None, None, None, None, None  # grad_w, grad_b, descriptor, c_tensor_list, math_dtype 不需要梯度
     return FastFullyConnectedTensorProductFunction
 
@@ -234,19 +226,41 @@ def make_FastFullyConnectedTensorProductPathFused(
     class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w, x, y):
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
             output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, 
                     cg_i_all, cg_j_all, cg_k_all, cg_val_all,
                     nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
             
             ctx.save_for_backward(w, x, y)
+
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+
             return output
         
         @staticmethod
         def backward(ctx, grad_out):
             w, x, y = ctx.saved_tensors
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
             grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, 
                     cg_i_all, cg_j_all, cg_k_all, cg_val_all,
                     nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
+            
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
+
+
             return None, grad_x, None  #  descriptor 不需要梯度
     return FastFullyConnectedTensorProductPathFused
 
@@ -255,6 +269,10 @@ def make_FastEquiLinearFunction():
     class FastEquiLinearFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w, x, descriptor, math_dtype=torch.float64):
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
             num_paths = len(descriptor.paths)
             # descriptor.operands[1] coresponse tensor x ((1, 96), (3, 96), (5, 96), (7, 96))
             I_list = [segment[0] for segment in descriptor.operands[1]]
@@ -285,14 +303,32 @@ def make_FastEquiLinearFunction():
             ctx.num_paths = num_paths
             ctx.I_list = I_list
             ctx.cg_val = cg_val
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+
+
             return my_out
         
         @staticmethod
         def backward(ctx, grad_out):
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             w, x, output = ctx.saved_tensors
             wt = w.transpose(1, 2).contiguous() 
             grad_out = grad_out.view(ctx.B, ctx.I_total, ctx.u).contiguous()
             grad_x = torch.ops.equi_linear.fused_gemm(grad_out, wt, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
+
+
             return None, grad_x, None, None
     
     return FastEquiLinearFunction
@@ -323,7 +359,10 @@ def make_FastSymmetricTensorContractionFunction():
     class FastSymmetricTensorContractionFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor):
-            print(f"x1.dtype={x1.dtype}, x0.dtype={x0.dtype}, coeffs_tensor.dtype={coeffs_tensor.dtype}")
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000            
+            
             x0_g = x0[i0]
             out = torch.ops.stc_fwd.forward(
                 x1.contiguous(),
@@ -333,10 +372,21 @@ def make_FastSymmetricTensorContractionFunction():
                 path_lens_tensor.contiguous(),
             )
             ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
+            
+
             return out
 
         @staticmethod
         def backward(ctx, grad_out):
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor = ctx.saved_tensors
             grad_x1 = torch.ops.stc_bwd.backward(
                 grad_out.contiguous(),
@@ -346,6 +396,12 @@ def make_FastSymmetricTensorContractionFunction():
                 paths_tensor,
                 path_lens_tensor,
             )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq stc backward cost: {execution_time_ms:.3f} ms >>")
+
             return grad_x1, None, None, None, None, None
     
     return FastSymmetricTensorContractionFunction
@@ -355,10 +411,19 @@ def make_FastFusedMessagePassing():
         @staticmethod
         def forward(ctx, node_feats, edge_attrs, tp_weights, sender,
                     receiver, dim_list, offs):
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
             out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
                                     sender, receiver, dim_list, offs, False)
             ctx.save_for_backward(node_feats, edge_attrs, tp_weights, 
                                     receiver, start_idx, end_idx, dim_list, offs)
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq mptp forward cost: {execution_time_ms:.3f} ms >>")
             return out
 
         @staticmethod
@@ -367,12 +432,21 @@ def make_FastFusedMessagePassing():
             receiver, start_idx, end_idx, \
             dim_list, offs = ctx.saved_tensors
 
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             grad_node_feats, grad_edge_attrs, grad_tp_weights = torch.ops.fused_mp_bwd.backward(
                 grad_out_nodes.contiguous(),
                 node_feats, edge_attrs, tp_weights,
                 receiver, start_idx, end_idx,
                 dim_list, offs,
             )
+
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq mptp backward cost: {execution_time_ms:.3f} ms >>")
 
             # 对应 forward 的后面几个输入没有梯度的返回 None
             return (grad_node_feats,
