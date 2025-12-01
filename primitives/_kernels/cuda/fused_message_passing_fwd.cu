@@ -390,9 +390,8 @@ __global__ void fused_mp_warp_sender_major_allpaths_v2(
         const scalar_t x_val = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u];
 
         // 对每个 path p
-        #pragma unroll
-        for (int p = 0; p < MAX_D; ++p) {
-            if (p >= P) break;
+        //#pragma unroll
+        for (int p = 0; p < P; ++p) {
             const int d = dim_list[p];   // 该 path 的 dim 长度（<= MAX_D, <= DIM_SUM）
             const int o = offs[p];       // 在 DIM_SUM 上的 offset
 
@@ -536,9 +535,8 @@ __global__ void fused_mp_warp_sender_major_allpaths_v3(
     }
 
     // -------- 遍历所有 path p --------
-    #pragma unroll
-    for (int p = 0; p < MAX_D; ++p) {
-        if (p >= P) break;
+    //#pragma unroll
+    for (int p = 0; p < P; ++p) {
         const int d = dim_list[p];   // ∈ {1,3,5,7}
         const int o = offs[p];
 
@@ -643,7 +641,7 @@ void fused_mp_launch_t(
     cudaStream_t stream,
     bool receiver_major = false
 ) {
-    const int warps_per_block   = 4; // Tuning parameter
+    const int warps_per_block   = 8; // Tuning parameter
     const int TileU             = 64;
     const int num_u_groups      = (U + TileU - 1) / TileU;
     const int total_warps       = N * num_u_groups;

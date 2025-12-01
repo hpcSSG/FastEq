@@ -187,9 +187,8 @@ __global__ void fused_mp_warp_streaming_kernel_groupflush_scalar_backward_warp_r
 
         scalar_t gx = scalar_t(0);
 
-        #pragma unroll
-        for (int p = 0; p < MAX_D; ++p) {
-            if (p >= P) break;
+        //#pragma unroll
+        for (int p = 0; p < P; ++p) {
 
             const int d = dim_list[p];
             const int o = offs[p];
@@ -310,9 +309,8 @@ __global__ void fused_mp_warp_sender_major_allpaths_two_u_bwd_v2(
     scalar_t grad_x1 = scalar_t(0);
 
     // ===== 遍历 path p =====
-    #pragma unroll
-    for (int p = 0; p < MAX_D; ++p) {
-        if (p >= P) break;
+    // #pragma unroll
+    for (int p = 0; p < P; ++p) {
         const int d = dim_list[p];
         const int o = offs[p];
 
@@ -453,7 +451,7 @@ void fused_mp_backward_launch_t(
     const int total_warps  = (int)(N * num_u_groups);
 
     // smem: 每个 warp MAX_D 个元素
-    const int warps_per_block = 4;
+    const int warps_per_block = 8;
     size_t smem_bytes = warps_per_block * MAX_D * sizeof(scalar_t);
     dim3 block(warps_per_block * WARP_SIZE);
     dim3 grid((total_warps + warps_per_block - 1) / warps_per_block);
@@ -498,6 +496,7 @@ void fused_mp_backward_launch_t(
     }
     */
     
+
     if (node_feats_requires_grad) {
         fused_mp_warp_sender_major_allpaths_two_u_bwd_v2<
             TileU, MAX_D, scalar_t, true, true, true>
