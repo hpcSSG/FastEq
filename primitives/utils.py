@@ -417,7 +417,7 @@ def make_FastFusedMessagePassing():
             
             out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
                                     sender, receiver, dim_list, offs, False)
-            ctx.save_for_backward(node_feats, edge_attrs, tp_weights, 
+            ctx.save_for_backward(node_feats, edge_attrs, tp_weights, sender,
                                     receiver, start_idx, end_idx, dim_list, offs)
 
             torch.cuda.synchronize()
@@ -429,7 +429,7 @@ def make_FastFusedMessagePassing():
         @staticmethod
         def backward(ctx, grad_out_nodes):
             node_feats, edge_attrs, tp_weights, \
-            receiver, start_idx, end_idx, \
+            sender, receiver, start_idx, end_idx, \
             dim_list, offs = ctx.saved_tensors
 
             torch.cuda.synchronize()
@@ -438,7 +438,7 @@ def make_FastFusedMessagePassing():
             grad_node_feats, grad_edge_attrs, grad_tp_weights = torch.ops.fused_mp_bwd.backward(
                 grad_out_nodes.contiguous(),
                 node_feats, edge_attrs, tp_weights,
-                receiver, start_idx, end_idx,
+                sender, receiver, start_idx, end_idx,
                 dim_list, offs,
             )
 

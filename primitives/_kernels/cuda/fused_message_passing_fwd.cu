@@ -627,7 +627,6 @@ __global__ void fused_mp_warp_sender_major_allpaths_v3(
 }
 
 
-
 template<typename scalar_t>
 void fused_mp_launch_t(
     const scalar_t* node_feats,     // [N, U]
@@ -644,23 +643,24 @@ void fused_mp_launch_t(
     cudaStream_t stream,
     bool receiver_major = false
 ) {
-    const int warps_per_block   = 8;
+    const int warps_per_block   = 4; // Tuning parameter
     const int TileU             = 64;
     const int num_u_groups      = (U + TileU - 1) / TileU;
     const int total_warps       = N * num_u_groups;
     const int threads_per_block = warps_per_block * WARP_SIZE;
     const int blocks            = (total_warps + warps_per_block - 1) / warps_per_block;
+    constexpr int MAX_D = 8;
 
-    size_t smem_bytes = warps_per_block * 8 * sizeof(scalar_t);  // MAX_D = 8
+    size_t smem_bytes = warps_per_block * MAX_D * sizeof(scalar_t);
 
     if (receiver_major) {
-        fused_mp_warp_receiver_major_allpaths<TileU, 8, scalar_t>
+        fused_mp_warp_receiver_major_allpaths<TileU, MAX_D, scalar_t>
             <<<blocks, threads_per_block, 0, stream>>>(
                 node_feats, edge_attrs, tp_weights,
                 sender, receiver, start_idx, end_idx,
                 dim_list, offs, N, E, U, P, DIM_SUM, out_nodes);
     } else {
-        fused_mp_warp_sender_major_allpaths_v3<TileU, 8, scalar_t>
+        fused_mp_warp_sender_major_allpaths_v3<TileU, MAX_D, scalar_t>
             <<<blocks, threads_per_block, smem_bytes, stream>>>(
                 node_feats, edge_attrs, tp_weights,
                 sender, receiver, start_idx, end_idx,
