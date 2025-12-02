@@ -424,6 +424,233 @@ __global__ void fused_mp_warp_sender_major_allpaths_two_u_bwd_v2(
     }
 }
 
+
+template<int TileU, int MAX_D, typename scalar_t,
+         bool GRAD_NODE, bool GRAD_EDGE, bool GRAD_TPW>
+__launch_bounds__(128, 2)
+__global__ void fused_mp_warp_sender_major_allpaths_two_u_bwd_v3(
+    const scalar_t* __restrict__ node_feats,     // [N, U]
+    const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]
+    const scalar_t* __restrict__ tp_weights,     // [E, P, U]
+    const int32_t* __restrict__ receiver,        // [E]
+    const int32_t* __restrict__ start_idx,       // [N]
+    const int32_t* __restrict__ end_idx,         // [N]
+    const int32_t* __restrict__ dim_list,        // [P]
+    const int32_t* __restrict__ offs,            // [P]
+    int32_t N, int32_t E, int32_t U, int32_t P, int32_t DIM_SUM,
+
+    const scalar_t* __restrict__ grad_out_nodes, // [N, DIM_SUM, U]
+
+    scalar_t* __restrict__ grad_node_feats,      // [N, U]
+    scalar_t* __restrict__ grad_edge_attrs,      // [E, DIM_SUM]
+    scalar_t* __restrict__ grad_tp_weights       // [E, P, U]
+){
+    constexpr int W = WARP_SIZE;
+    constexpr int ILP = 2;  // 一次流水两条 edge，可调优
+
+    const int lane            = threadIdx.x & (W - 1);  // 0..31
+    const int warp_in_block   = threadIdx.x / W;
+    const int warps_per_block = blockDim.x / W;
+    const int warp_global     = blockIdx.x * warps_per_block + warp_in_block;
+
+    // ---- warp -> (sender_idx, u_group) ----
+    const int num_u_groups = (U + TileU - 1) / TileU;
+    const int sender_idx   = warp_global / num_u_groups;
+    const int u_group      = warp_global % num_u_groups;
+    if (sender_idx >= N) return;
+
+    const int32_t st = start_idx[sender_idx];
+    const int32_t ed = end_idx[sender_idx];
+    if (st >= ed) return;
+
+    const int u_block_start = u_group * TileU;
+    const int u_block_end   = min(u_block_start + TileU, U);
+
+    const int u0 = u_block_start + lane;
+    const int u1 = u0 + W;
+
+    const bool valid_u0 = (u0 < u_block_end);
+    const bool valid_u1 = (u1 < u_block_end);
+    if (!valid_u0 && !valid_u1) return;
+
+    // ---- smem: edge_attrs tile [warps_per_block, ILP*MAX_D] ----
+    extern __shared__ char smem_raw[];
+    scalar_t* smem_all = reinterpret_cast<scalar_t*>(smem_raw);
+    scalar_t* smem_y   = smem_all + warp_in_block * (ILP * MAX_D);
+
+    // ---- 缓存 forward 中的 node_feats 到寄存器 ----
+    scalar_t x0 = scalar_t(0);
+    scalar_t x1 = scalar_t(0);
+    if (valid_u0) {
+        x0 = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u0];
+    }
+    if (valid_u1) {
+        x1 = node_feats[(size_t)sender_idx * (size_t)U + (size_t)u1];
+    }
+
+    // 对 node_feats 的梯度在这个 (sender_idx, u) 上局部累加
+    scalar_t grad_x0 = scalar_t(0);
+    scalar_t grad_x1 = scalar_t(0);
+
+    // ===== 遍历 path p =====
+    for (int p = 0; p < P; ++p) {
+        const int d = dim_list[p];
+        const int o = offs[p];
+        if (d <= 0) continue;
+
+        // ===== e-loop：一次处理 ILP 条边 =====
+        for (int e_base = st; e_base < ed; e_base += ILP) {
+
+            // 为 ILP 条边准备寄存器缓存
+            int   e_arr[ILP];
+            int   rcv_arr[ILP];
+            bool  valid_edge[ILP];
+            size_t y_base_arr[ILP];
+            size_t go_row_base_arr[ILP];
+
+            scalar_t w0_arr[ILP];
+            scalar_t w1_arr[ILP];
+
+            #pragma unroll
+            for (int k = 0; k < ILP; ++k) {
+                const int e = e_base + k;
+                e_arr[k]      = e;
+                valid_edge[k] = (e < ed);
+                if (!valid_edge[k]) {
+                    rcv_arr[k]         = 0;
+                    y_base_arr[k]      = 0;
+                    go_row_base_arr[k] = 0;
+                    w0_arr[k]          = scalar_t(0);
+                    w1_arr[k]          = scalar_t(0);
+                    continue;
+                }
+
+                const int rcv = receiver[e];
+                rcv_arr[k]    = rcv;
+
+                const size_t y_base = (size_t)e * (size_t)DIM_SUM + (size_t)o;
+                y_base_arr[k] = y_base;
+
+                // L2/L1 复用 grad_out 行：((rcv * DIM_SUM + o) * U)
+                const size_t go_row_base =
+                    ((size_t)rcv * (size_t)DIM_SUM + (size_t)o) * (size_t)U;
+                go_row_base_arr[k] = go_row_base;
+
+                // 1) edge_attrs tile -> smem（k-th edge 占用 [k*MAX_D .. k*MAX_D+d)）
+                if (lane < d) {
+                    smem_y[k * MAX_D + lane] = edge_attrs[y_base + lane];
+                }
+
+                // 2) 预取本 edge 本 path 的 weight
+                if (valid_u0) {
+                    w0_arr[k] = tp_weights[
+                        ((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u0
+                    ];
+                }
+                if (valid_u1) {
+                    w1_arr[k] = tp_weights[
+                        ((size_t)e * (size_t)P + (size_t)p) * (size_t)U + (size_t)u1
+                    ];
+                }
+            } // k in [0, ILP)
+
+            __syncwarp();  // 确保 smem_y 填好
+
+            // 3) 对每条 edge 单独做 j-loop（但 k-loop 提供 ILP）
+            //#pragma unroll
+            for (int k = 0; k < ILP; ++k) {
+                if (!valid_edge[k]) continue;
+
+                const int   e         = e_arr[k];
+                //const int   rcv       = rcv_arr[k];
+                const size_t y_base   = y_base_arr[k];
+                const size_t go_base  = go_row_base_arr[k];
+                scalar_t w0 = w0_arr[k];
+                scalar_t w1 = w1_arr[k];
+
+                // 对单个 (e,p,u) 的 grad_w 是沿 j 累加的
+                scalar_t grad_w0 = scalar_t(0);
+                scalar_t grad_w1 = scalar_t(0);
+
+                // 遍历 path 内的 d 个通道
+                #pragma unroll
+                for (int j = 0; j < MAX_D; ++j) {
+                    if (j >= d) break;
+
+                    const scalar_t yv = smem_y[k * MAX_D + j];
+
+                    scalar_t g0 = scalar_t(0);
+                    scalar_t g1 = scalar_t(0);
+
+                    if (valid_u0) {
+                        const size_t go_idx0 = go_base + (size_t)j * (size_t)U + (size_t)u0;
+                        g0 = grad_out_nodes[go_idx0];
+                    }
+                    if (valid_u1) {
+                        const size_t go_idx1 = go_base + (size_t)j * (size_t)U + (size_t)u1;
+                        g1 = grad_out_nodes[go_idx1];
+                    }
+
+                    // === dL/dx ===
+                    if constexpr (GRAD_NODE) {
+                        if (valid_u0) grad_x0 += g0 * (yv * w0);
+                        if (valid_u1) grad_x1 += g1 * (yv * w1);
+                    }
+
+                    // === dL/dw (e,p,u) ===
+                    if constexpr (GRAD_TPW) {
+                        if (valid_u0) grad_w0 += g0 * (yv * x0);
+                        if (valid_u1) grad_w1 += g1 * (yv * x1);
+                    }
+
+                    // === dL/dy(e, o+j) === （warp 内 reduce，再 atomic 一次） ===
+                    if constexpr (GRAD_EDGE) {
+                        scalar_t gy_local = scalar_t(0);
+                        if (valid_u0) gy_local += g0 * (x0 * w0);
+                        if (valid_u1) gy_local += g1 * (x1 * w1);
+
+                        unsigned mask = __activemask();
+                        scalar_t gy_sum = warp_reduce_sum(gy_local, mask);
+                        if (lane == 0) {
+                            atomicAdd(&grad_edge_attrs[y_base + j], gy_sum);
+                        }
+                    }
+                } // j-loop
+
+                // 4) 写回 grad_tp_weights (e,p,u)
+                if constexpr (GRAD_TPW) {
+                    if (valid_u0) {
+                        const size_t w_idx0 =
+                            ((size_t)e * (size_t)P + (size_t)p) * (size_t)U
+                            + (size_t)u0;
+                        grad_tp_weights[w_idx0] += grad_w0;
+                    }
+                    if (valid_u1) {
+                        const size_t w_idx1 =
+                            ((size_t)e * (size_t)P + (size_t)p) * (size_t)U
+                            + (size_t)u1;
+                        grad_tp_weights[w_idx1] += grad_w1;
+                    }
+                }
+            } // k-loop (ILP edges)
+
+            __syncwarp();
+        } // e-loop (ILP over edges)
+    } // p-loop
+
+    // 5) 最后写回 grad_node_feats(sender_idx, u0/u1)
+    if constexpr (GRAD_NODE) {
+        if (valid_u0) {
+            const size_t x_idx0 = (size_t)sender_idx * (size_t)U + (size_t)u0;
+            grad_node_feats[x_idx0] += grad_x0;
+        }
+        if (valid_u1) {
+            const size_t x_idx1 = (size_t)sender_idx * (size_t)U + (size_t)u1;
+            grad_node_feats[x_idx1] += grad_x1;
+        }
+    }
+}
+
 template<typename scalar_t>
 void fused_mp_backward_launch_t(
     const scalar_t* node_feats,    // [N, U]
@@ -451,8 +678,12 @@ void fused_mp_backward_launch_t(
     const int total_warps  = (int)(N * num_u_groups);
 
     // smem: 每个 warp MAX_D 个元素
-    const int warps_per_block = 8;
-    size_t smem_bytes = warps_per_block * MAX_D * sizeof(scalar_t);
+    const int warps_per_block = 4;
+    // size_t smem_bytes = warps_per_block * MAX_D * sizeof(scalar_t); // for v2
+
+    const int ILP = 2;
+    size_t smem_bytes = warps_per_block * ILP * MAX_D * sizeof(scalar_t);
+
     dim3 block(warps_per_block * WARP_SIZE);
     dim3 grid((total_warps + warps_per_block - 1) / warps_per_block);
 
@@ -498,7 +729,7 @@ void fused_mp_backward_launch_t(
     
 
     if (node_feats_requires_grad) {
-        fused_mp_warp_sender_major_allpaths_two_u_bwd_v2<
+        fused_mp_warp_sender_major_allpaths_two_u_bwd_v3<
             TileU, MAX_D, scalar_t, true, true, true>
         <<<grid, block, smem_bytes, stream>>>(
             node_feats,
@@ -516,7 +747,7 @@ void fused_mp_backward_launch_t(
             grad_tp_weights
         );
     } else {
-        fused_mp_warp_sender_major_allpaths_two_u_bwd_v2<
+        fused_mp_warp_sender_major_allpaths_two_u_bwd_v3<
             TileU, MAX_D, scalar_t, false, true, true>
         <<<grid, block, smem_bytes, stream>>>(
             node_feats,
