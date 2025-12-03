@@ -427,7 +427,7 @@ __global__ void fused_mp_warp_sender_major_allpaths_two_u_bwd_v2(
 
 template<int TileU, int MAX_D, typename scalar_t,
          bool GRAD_NODE, bool GRAD_EDGE, bool GRAD_TPW>
-__launch_bounds__(128, 2)
+//__launch_bounds__(128, 2)
 __global__ void fused_mp_warp_sender_major_allpaths_two_u_bwd_v3(
     const scalar_t* __restrict__ node_feats,     // [N, U]
     const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]

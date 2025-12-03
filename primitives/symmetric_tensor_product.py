@@ -331,6 +331,7 @@ class CUDAKernel(torch.nn.Module):
             batch_first=True, padding_value=0
         )
         self.register_buffer("paths_tensor", paths.pin_memory().to(device, non_blocking=True))
+        self.num_out_segments = num_out_segments
         self.FastSTCFunc = make_FastSymmetricTensorContractionFunction()
         # ================================================
 
@@ -361,13 +362,32 @@ class CUDAKernel(torch.nn.Module):
                 f"Calling SymmetricTensorContraction"
             )
 
+        print(f"stc descriptors:{self.descriptors}, self.descriptors[0].stacked_coefficients:{self.descriptors[0].stacked_coefficients}")
+        print(f"x1.shape:{x1.shape}, x0.shape:{x0.shape}, i0.shape:{i0.shape}, coeffs_tensor.shape:{self.coeffs_tensor.shape}, paths_lens_tensor.shape:{self.path_lens_tensor.shape}")
+
         if self.use_fasteq:
             #logger.info("== call fasteq symmetric tensor contraction ==")
             print("== call fasteq symmetric tensor contraction ==")
-            out = self.FastSTCFunc.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor)
+            #print(f"paths_lens_tensor.shape:{self.path_lens_tensor.shape}")
+            out = self.FastSTCFunc.apply(x1, x0, i0, self.coeffs_tensor, self.paths_tensor, self.path_lens_tensor, self.num_out_segments)
+
+            '''
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            out: torch.Tensor = self.f(x1, x0, i0)
+            out = out.reshape(out.shape[0], out.shape[1] * self.u)
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = (end_time - start_time)
+            print(f"========= cueq stc cost: {execution_time_ms:.3f} ms ========")
+            err = (out - ref).abs().max().item()
+            print(f"stc max err:{err}")
+            '''
+
         else:
             out: torch.Tensor = self.f(x1, x0, i0)
             out = out.reshape(out.shape[0], out.shape[1] * self.u)
+        print(f"stc output.shape:{out.shape}")
         return out
 
 

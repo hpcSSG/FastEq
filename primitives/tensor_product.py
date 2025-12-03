@@ -379,6 +379,8 @@ class TensorProduct(torch.nn.Module):
                     input.shape[1] == self.operands_dims[oid],
                     f"input {oid} should have shape (batch, {self.operands_dims[oid]}), got {input.shape}",
                 )
+
+        print(f"op_name:{self.op_name}, descriptor:{self.descriptor}")
         
         if self.use_fasteq:
             if self.op_name == "tp_fully_connected":
