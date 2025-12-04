@@ -430,6 +430,7 @@ void stc_bwd_kernel_v2(
     }
 }
 
+// TILE_U 可调：比如 32 / 64 / 128
 template <typename scalar_t, int TILE_U>
 __global__ void stc_bwd_kernel_tiled(
     const scalar_t* __restrict__ x1,         // [B, num_a, u]
@@ -442,154 +443,134 @@ __global__ void stc_bwd_kernel_tiled(
     int B, int num_paths, int u, int num_a, int num_i, int num_out_segments)
 {
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char smem[];
-    scalar_t* x1_shared      = reinterpret_cast<scalar_t*>(smem);                          // [num_a * TILE_U]
-    scalar_t* grad_x1_shared = x1_shared + static_cast<size_t>(num_a) * TILE_U;           // [num_a * TILE_U]
+    scalar_t* x1_shared      = reinterpret_cast<scalar_t*>(smem);                        // [num_a * TILE_U]
+    scalar_t* grad_x1_shared = x1_shared + static_cast<size_t>(num_a) * TILE_U;          // [num_a * TILE_U]
 
-    const int b        = blockIdx.x;           // batch index
-    const int tile_id  = blockIdx.y;           // tile index along U
-    const int local_j  = threadIdx.x;          // 0 .. TILE_U-1
-
-    const int base_u   = tile_id * TILE_U;
-    const int j        = base_u + local_j;
+    const int b       = blockIdx.x;      // batch index
+    const int tile_id = blockIdx.y;      // tile index along U
+    const int lj      = threadIdx.x;     // local j in [0, TILE_U)
+    const int j       = tile_id * TILE_U + lj;  // global j
 
     if (b >= B || j >= u) return;
-    const int MAX_OUT_SEG = 9;  // small/meidum/large num_out_segments = 1/4/9
+    constexpr int MAX_OUT_SEG = 9;
     if (num_out_segments > MAX_OUT_SEG) return;
 
     const int seg_lim = num_out_segments;
-    const int tile_len = min(TILE_U, u - base_u);
 
     // -----------------------------
-    // 1. preload x1[b, :, j_tile] 到 shared
-    //    x1_shared[a_idx, local_u]
+    // 1. preload x1[b, :, j] 到 shared，初始化 grad_x1_shared=0
+    //    布局：[a, lj] -> x1_shared[a * TILE_U + lj]
     // -----------------------------
-    for (int idx = local_j; idx < num_a * tile_len; idx += blockDim.x) {
-        int a_idx    = idx / tile_len;   // [0, num_a)
-        int du       = idx % tile_len;   // [0, tile_len)
-        int j_global = base_u + du;      // [0, u)
-
-        scalar_t v = scalar_t(0);
-        if (j_global < u) {
-            v = x1[((b * num_a + a_idx) * u) + j_global];
-        }
-        x1_shared[a_idx * TILE_U + du] = v;
-    }
-
-    // 2. 初始化 grad_x1_shared[b, :, j_tile] = 0
-    for (int idx = local_j; idx < num_a * tile_len; idx += blockDim.x) {
-        int a_idx  = idx / tile_len;
-        int du     = idx % tile_len;
-        grad_x1_shared[a_idx * TILE_U + du] = scalar_t(0);
+    for (int a = 0; a < num_a; ++a) {
+        const int idx_global = ((b * num_a + a) * u) + j;
+        const int idx_shared = a * TILE_U + lj;
+        x1_shared[idx_shared]      = x1[idx_global];
+        grad_x1_shared[idx_shared] = scalar_t(0);
     }
 
     __syncthreads();
 
-    // 每个线程负责当前 tile 里的一个 j（local_j < tile_len）
-    if (local_j < tile_len) {
-        // 预取 grad_out[b, seg, j] 到寄存器
-        scalar_t g_out_seg[MAX_OUT_SEG];
-        for (int s = 0; s < seg_lim; ++s) {
-            g_out_seg[s] = grad_out[((b * num_out_segments) + s) * u + j];
+    // 每个线程负责这个 (b, j) 上所有 a 的梯度
+    // 先把 grad_out[b, seg, j] 读到寄存器
+    scalar_t g_out_seg[MAX_OUT_SEG];
+    for (int s = 0; s < seg_lim; ++s) {
+        g_out_seg[s] = grad_out[((b * num_out_segments) + s) * u + j];
+    }
+
+    // -----------------------------
+    // 2. 遍历所有 paths，累加到 grad_x1_shared[a * TILE_U + lj]
+    // -----------------------------
+    for (int p = 0; p < num_paths; ++p) {
+        const scalar_t coeff = coeffs[p];
+        const int len        = path_lens[p];
+        const int* path      = paths + p * 5;
+
+        const int a_idx = path[0];
+        int d_idx, out_seg;
+        int b_idx = -1, c_idx = -1;
+
+        if (len == 3) {
+            d_idx   = path[1];
+            out_seg = path[2];
+        } else if (len == 4) {
+            b_idx   = path[1];
+            d_idx   = path[2];
+            out_seg = path[3];
+        } else {  // len == 5
+            b_idx   = path[1];
+            c_idx   = path[2];
+            d_idx   = path[3];
+            out_seg = path[4];
         }
 
-        // -----------------------------
-        // 3. 遍历所有 paths，累加到 grad_x1_shared[a_idx, local_j]
-        // -----------------------------
-        for (int p = 0; p < num_paths; ++p) {
-            const scalar_t coeff = coeffs[p];
-            const int len        = path_lens[p];
-            const int* path      = paths + p * 5;
+        if (out_seg < 0 || out_seg >= seg_lim)
+            continue;
 
-            const int a_idx = path[0];
-            int d_idx, out_seg;
-            int b_idx = -1, c_idx = -1;
+        const scalar_t g_out_val = g_out_seg[out_seg];
+        if (g_out_val == scalar_t(0)) continue;
 
-            if (len == 3) {
-                d_idx   = path[1];
-                out_seg = path[2];
-            } else if (len == 4) {
-                b_idx   = path[1];
-                d_idx   = path[2];
-                out_seg = path[3];
-            } else {  // len == 5
-                b_idx   = path[1];
-                c_idx   = path[2];
-                d_idx   = path[3];
-                out_seg = path[4];
-            }
+        // x0_g[b, d_idx, j]
+        const scalar_t x0_val =
+            x0_g[((b * num_i + d_idx) * u) + j];
 
-            if (out_seg < 0 || out_seg >= seg_lim)
-                continue;
+        const scalar_t base = g_out_val * coeff * x0_val;
 
-            const scalar_t g_out_val = g_out_seg[out_seg];
-            if (g_out_val == scalar_t(0)) continue;
+        // x1[a], x1[b], x1[c] at this (b, j)
+        const scalar_t x1_a =
+            x1_shared[a_idx * TILE_U + lj];
 
-            const scalar_t x0_val =
-                x0_g[((b * num_i + d_idx) * u) + j];
+        scalar_t* grad_a_ptr =
+            &grad_x1_shared[a_idx * TILE_U + lj];
 
-            const scalar_t base = g_out_val * coeff * x0_val;
+        if (len == 3) {
+            // f = coeff * x1[a] * x0
+            *grad_a_ptr += base;
 
-            const scalar_t x1_a =
-                x1_shared[a_idx * TILE_U + local_j];
+        } else if (len == 4) {
+            // f = coeff * x1[a] * x1[b] * x0
+            const scalar_t x1_b =
+                x1_shared[b_idx * TILE_U + lj];
 
-            scalar_t* grad_a_ptr =
-                &grad_x1_shared[a_idx * TILE_U + local_j];
+            *grad_a_ptr += base * x1_b;
 
-            if (len == 3) {
-                *grad_a_ptr += base;
+            scalar_t* grad_b_ptr =
+                &grad_x1_shared[b_idx * TILE_U + lj];
+            *grad_b_ptr += base * x1_a;
 
-            } else if (len == 4) {
-                const scalar_t x1_b =
-                    x1_shared[b_idx * TILE_U + local_j];
+        } else { // len == 5
+            // f = coeff * x1[a] * x1[b] * x1[c] * x0
+            const scalar_t x1_b =
+                x1_shared[b_idx * TILE_U + lj];
+            const scalar_t x1_c =
+                x1_shared[c_idx * TILE_U + lj];
 
-                *grad_a_ptr += base * x1_b;
+            const scalar_t da = base * x1_b * x1_c;
+            const scalar_t db = base * x1_a * x1_c;
+            const scalar_t dc = base * x1_a * x1_b;
 
-                scalar_t* grad_b_ptr =
-                    &grad_x1_shared[b_idx * TILE_U + local_j];
-                *grad_b_ptr += base * x1_a;
+            *grad_a_ptr += da;
 
-            } else { // len == 5
-                const scalar_t x1_b =
-                    x1_shared[b_idx * TILE_U + local_j];
-                const scalar_t x1_c =
-                    x1_shared[c_idx * TILE_U + local_j];
+            scalar_t* grad_b_ptr =
+                &grad_x1_shared[b_idx * TILE_U + lj];
+            scalar_t* grad_c_ptr =
+                &grad_x1_shared[c_idx * TILE_U + lj];
 
-                const scalar_t da = base * x1_b * x1_c;
-                const scalar_t db = base * x1_a * x1_c;
-                const scalar_t dc = base * x1_a * x1_b;
-
-                *grad_a_ptr += da;
-
-                scalar_t* grad_b_ptr =
-                    &grad_x1_shared[b_idx * TILE_U + local_j];
-                scalar_t* grad_c_ptr =
-                    &grad_x1_shared[c_idx * TILE_U + local_j];
-
-                *grad_b_ptr += db;
-                *grad_c_ptr += dc;
-            }
+            *grad_b_ptr += db;
+            *grad_c_ptr += dc;
         }
     }
 
     __syncthreads();
 
     // -----------------------------
-    // 4. 将 grad_x1_shared 写回 global grad_x1[b, :, j_tile]
+    // 3. 把 grad_x1_shared 写回 global grad_x1[b, :, j]
     // -----------------------------
-    for (int idx = local_j; idx < num_a * tile_len; idx += blockDim.x) {
-        int a_idx    = idx / tile_len;
-        int du       = idx % tile_len;
-        int j_global = base_u + du;
-
-        if (j_global < u) {
-            const scalar_t gval =
-                grad_x1_shared[a_idx * TILE_U + du];
-            grad_x1[((b * num_a + a_idx) * u) + j_global] = gval;
-        }
+    for (int a = 0; a < num_a; ++a) {
+        const int idx_shared = a * TILE_U + lj;
+        const int idx_global = ((b * num_a + a) * u) + j;
+        grad_x1[idx_global] = grad_x1_shared[idx_shared];
     }
 }
-
-
 
 at::Tensor stc_bwd_x1_launcher(
     at::Tensor grad_out,       // [B, num_out_segments * u] (from forward)
@@ -670,20 +651,21 @@ at::Tensor stc_bwd_x1_launcher(
     } else {
         
         // only x1 to shared memory
+        /*
         dim3 blockDim(u);
         dim3 gridDim(B);
         const size_t shared_elems =
         static_cast<size_t>(num_a) * u;
+        */
 
         // for tile
-        /*
-        constexpr int TILE_U = 64;
+        
+        constexpr int TILE_U = 96;
         const int n_tiles = (u + TILE_U - 1) / TILE_U;
         dim3 blockDim(TILE_U);
         dim3 gridDim(B, n_tiles);
         const size_t shared_elems =
             static_cast<size_t>(num_a) * TILE_U * 2; // x1_shared + grad_x1_shared
-        */
         
         const size_t shared_mem_bytes =
             shared_elems * x1.element_size();
@@ -691,10 +673,10 @@ at::Tensor stc_bwd_x1_launcher(
         cudaStream_t cur_stream =
             c10::cuda::getCurrentCUDAStream(x1.device().index()).stream();
 
-        AT_DISPATCH_FLOATING_TYPES(dtype, "stc_bwd_kernel_v2", [&] {
+        AT_DISPATCH_FLOATING_TYPES(dtype, "stc_bwd_kernel_tiled", [&] {
             using scalar_t = scalar_t;
-            stc_bwd_kernel_v2<scalar_t><<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
-            //stc_bwd_kernel_tiled<scalar_t, TILE_U><<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
+            //stc_bwd_kernel_v2<scalar_t><<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
+            stc_bwd_kernel_tiled<scalar_t, TILE_U><<<gridDim, blockDim, shared_mem_bytes, cur_stream>>>(
                 x1.data_ptr<scalar_t>(),
                 x0_g.data_ptr<scalar_t>(),
                 coeffs.data_ptr<scalar_t>(),
