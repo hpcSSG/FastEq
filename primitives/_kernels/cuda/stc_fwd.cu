@@ -484,8 +484,6 @@ __global__  void stc_fwd_kernel_notiled(
 }
 
 
-
-
 // --------------------------------------
 // Launcher：支持 float32 / float64
 // --------------------------------------
@@ -560,11 +558,6 @@ at::Tensor stc_fwd_launcher(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
-
-
-
-
-
 
 
 // --------------------------------------

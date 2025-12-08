@@ -345,7 +345,7 @@ __global__ void fused_mp_warp_sender_major_allpaths_v2(
     const scalar_t* __restrict__ node_feats,     // [N, U]
     const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]
     const scalar_t* __restrict__ tp_weights,     // [E, P, U]
-    const int32_t* __restrict__ sender,          // [E] （实际上 kernel 里用的是 start_idx/end_idx）
+    const int32_t* __restrict__ sender,          // [E]
     const int32_t* __restrict__ receiver,        // [E]
     const int32_t* __restrict__ start_idx,       // [N]
     const int32_t* __restrict__ end_idx,         // [N]
@@ -408,26 +408,9 @@ __global__ void fused_mp_warp_sender_major_allpaths_v2(
                 //    仅由 warp 内前 d 个 lane 负责加载，然后所有 lane 使用 smem_y[j]
                 // -------------------------
                 const size_t y_base = (size_t)e * (size_t)DIM_SUM + (size_t)o;
-
-                // 【标量版本】所有类型通用
                 if (lane < d) {
                     smem_y[lane] = edge_attrs[y_base + lane];
                 }
-                // 若想在 float + d==4/8 情况下使用 vec4，可以改成：
-                // if constexpr (std::is_same<scalar_t,float>::value) {
-                //   if (d == 4 && lane == 0) {
-                //      auto v = *reinterpret_cast<const float4*>(edge_attrs + y_base);
-                //      smem_y[0] = v.x; smem_y[1] = v.y; smem_y[2] = v.z; smem_y[3] = v.w;
-                //   } else if (d == 8 && lane < 2) {
-                //      auto v = reinterpret_cast<const float4*>(edge_attrs + y_base)[lane];
-                //      smem_y[lane*4 + 0] = v.x;
-                //      smem_y[lane*4 + 1] = v.y;
-                //      smem_y[lane*4 + 2] = v.z;
-                //      smem_y[lane*4 + 3] = v.w;
-                //   }
-                // } else {
-                //   if (lane < d) smem_y[lane] = edge_attrs[y_base + lane];
-                // }
 
                 __syncwarp();
 
@@ -474,12 +457,15 @@ __global__ void fused_mp_warp_sender_major_allpaths_v2(
     } // u-loop
 }
 
+// only for cg_indices: [0, i, j], i == j
+// dim_list = [1, 3, 5, 7]
+// offs = [0,1,4,9]
 template<int TileU = 64, int MAX_D = 8, typename scalar_t>
 __global__ void fused_mp_warp_sender_major_allpaths_v3(
     const scalar_t* __restrict__ node_feats,     // [N, U]
     const scalar_t* __restrict__ edge_attrs,     // [E, DIM_SUM]
     const scalar_t* __restrict__ tp_weights,     // [E, P, U]
-    const int32_t* __restrict__ sender,          // [E]  // 未用，但保持接口
+    const int32_t* __restrict__ sender,          // [E]
     const int32_t* __restrict__ receiver,        // [E]
     const int32_t* __restrict__ start_idx,       // [N]
     const int32_t* __restrict__ end_idx,         // [N]
@@ -554,7 +540,6 @@ __global__ void fused_mp_warp_sender_major_allpaths_v3(
         for (int e = st; e < ed; ++e) {
             const int rcv = receiver[e];
 
-            // run-length by receiver: receiver 变了就 flush
             if (rcv != cur_rcv) {
                 if (cur_rcv >= 0) {
                     if (valid_u0) {
