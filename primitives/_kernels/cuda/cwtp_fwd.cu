@@ -428,15 +428,15 @@ __global__ void tp_channel_wise_sparse_kernel(
 // Opt2: 由于回写占了大头，所以通过group k 写局部，减少global回写次数
 /*
     DRAM Frequency                  Ghz         2.62
-    SM Frequency                    Ghz         1.59
-    Elapsed Cycles                cycle    2,715,632
-    Memory Throughput                 %        71.12
-    DRAM Throughput                   %        71.12
-    Duration                         ms         1.71
-    L1/TEX Cache Throughput           %        49.65
-    L2 Cache Throughput               %        67.03
-    SM Active Cycles              cycle 2,706,541.40
-    Compute (SM) Throughput           %        87.36
+    SM Frequency                    Ghz         1.60
+    Elapsed Cycles                cycle    2,874,643
+    Memory Throughput                 %        75.83
+    DRAM Throughput                   %        67.82
+    Duration                         ms         1.79
+    L1/TEX Cache Throughput           %        75.99
+    L2 Cache Throughput               %        64.20
+    SM Active Cycles              cycle 2,863,095.42
+    Compute (SM) Throughput           %        77.48
 */
 template <typename scalar_t, int MAX_K_DIM>
 __global__ void tp_channel_wise_sparse_groupk_kernel(
@@ -638,7 +638,7 @@ torch::Tensor tp_channel_wise_launch(
     size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_constcg_groupk_kernel", [&] {
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
 
         /*
         if (x_uv.scalar_type() == at::kDouble) {
