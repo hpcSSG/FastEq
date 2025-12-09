@@ -117,10 +117,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
 
     // -----------------------------
     // 3) 一次性把 W_p[:, v*, :] -> sh_Wt[w,u]
-    //
-    //    原始布局: W_p[u, v, w]
-    //    我们需要: Wt[w, u]（带 pad）
-    //
     //    使用 Vec4 沿 w 维做 vector load:
     //       Wv = W/4
     //       t ∈ [0, U*Wv)
@@ -223,7 +219,8 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     const int B       = (int)b_all.size(0);
     const int P       = (int)nnz_per_path.size(0);
-    const int I_total = K_total;
+    TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
+    const int I_total = static_cast<int>(a_all.size(1) / U);
 
     a_all = a_all.view({B, I_total, U});
     b_all = b_all.view({B, 1, V});
@@ -312,6 +309,282 @@ at::Tensor launch_fused_multipath_fctp_backward(
     return grad_a;
 }
 
+
+template<typename scalar_t, int W_TILE>
+__global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledW(
+    const scalar_t* __restrict__ b_all,        // [B,1,V]
+    const scalar_t* __restrict__ w_all,        // [P,U,V,W]
+    const int*     __restrict__ cg_i_all,      // [P,nnz_max]
+    const int*     __restrict__ cg_j_all,      // [P,nnz_max]  // 未使用
+    const int*     __restrict__ cg_k_all,      // [P,nnz_max]
+    const scalar_t* __restrict__ cg_val_all,   // [P,nnz_max]
+    const int*     __restrict__ nnz_per_path,  // [P]
+    const int*     __restrict__ K_per_path,    // [P]
+    const int*     __restrict__ path_offset,   // [P]
+    int nnz_max,
+    int P, int B, int I_total, int U, int V, int W,
+    int K_max, int K_total,
+    const scalar_t* __restrict__ grad_out,     // [B,K_total,W]
+    scalar_t*       __restrict__ grad_a        // [B,I_total,U]
+)
+{
+    const int p = blockIdx.x;   // path id
+    const int b = blockIdx.y;   // batch id
+    if (p >= P || b >= B) return;
+
+    const int nnz_p = nnz_per_path[p];
+    const int K_p   = K_per_path[p];
+    if (nnz_p <= 0 || K_p <= 0) return;
+
+    // global index
+    const int*      cg_i = cg_i_all   + (size_t)p * nnz_max;
+    const int*      cg_j = cg_j_all   + (size_t)p * nnz_max;   // 未使用
+    const int*      cg_k = cg_k_all   + (size_t)p * nnz_max;
+    const scalar_t* cg_v = cg_val_all + (size_t)p * nnz_max;
+
+    // b_all[b]: [1,V] -> [V]
+    const scalar_t* __restrict__ brow = b_all + (size_t)b * V;
+
+    // w_all[p]: [U,V,W]
+    const scalar_t* __restrict__ W_p  = w_all + (size_t)p * U * V * W;
+
+    // grad_out[b]: [K_total,W]
+    const scalar_t* __restrict__ dO_b = grad_out + (size_t)b * K_total * W;
+
+    // grad_a[b]: [I_total,U]
+    scalar_t* __restrict__ dA_b = grad_a + (size_t)b * I_total * U;
+
+    // 1) 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
+    int vstar = 0;
+    if (threadIdx.x == 0) {
+        scalar_t best = std::numeric_limits<scalar_t>::lowest();
+        int idx = 0;
+        for (int v = 0; v < V; ++v) {
+            scalar_t x = brow[v];
+            if (x > best) { best = x; idx = v; }
+        }
+        vstar = idx;
+    }
+    __shared__ int sh_v;
+    if (threadIdx.x == 0)
+        sh_v = vstar;
+    __syncthreads();
+    const int v = sh_v;
+
+    // 2) shared memory: 按 tileW 放
+    //    sh_Wt: [W_TILE, U+1]   存当前 tile 的 W_p[:, v, w]
+    //    sh_dO: [W_TILE]        存当前 tile 的 grad_out[b,k_global,w]
+    const int U_pad = U + 1;
+
+    extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
+    scalar_t* sh_Wt = reinterpret_cast<scalar_t*>(shmem_raw);             // [W_TILE * U_pad]
+    scalar_t* sh_dO = sh_Wt + (size_t)W_TILE * U_pad;                      // [W_TILE]
+
+    const int tx = blockDim.x;    // = U
+    const int u  = threadIdx.x;   // 0..U-1
+
+    // 没有 __syncthreads 之后的 return，所以 tx 建议直接设为 U（<=224）
+    // 若 tx > U，可以加一个 alive 标志，这里我们假定 tx == U
+
+    // 3) 遍历当前 path 的所有 triples (i_global, k_global, val)
+    for (int t = 0; t < nnz_p; ++t) {
+        const int i_global = cg_i[t];
+        const int k_global = cg_k[t];
+        const scalar_t val = cg_v[t];
+
+        scalar_t acc_u = scalar_t(0);
+
+        // 3a) 沿 W 方向 tile
+        for (int w_base = 0; w_base < W; w_base += W_TILE) {
+            const int W_this = min(W_TILE, W - w_base);
+
+            // 3a-1) 加载当前 tile 的 W_p[:, v, w]
+            //       sh_Wt[w_local, u_idx]
+            for (int idx = u; idx < U * W_this; idx += tx) {
+                int u_idx   = idx / W_this;         // 0..U-1
+                int w_local = idx - u_idx * W_this; // 0..W_this-1
+                int w_glb   = w_base + w_local;     // 0..W-1
+
+                const size_t off = ((size_t)u_idx * V + (size_t)v) * W + (size_t)w_glb;
+                sh_Wt[(size_t)w_local * U_pad + u_idx] = W_p[off];
+            }
+
+            // 3a-2) 加载当前 tile 的 grad_out[b,k_global,w]
+            //       sh_dO[w_local]
+            for (int w_local = u; w_local < W_this; w_local += tx) {
+                int w_glb = w_base + w_local;
+                const size_t off = (size_t)k_global * W + (size_t)w_glb;
+                sh_dO[w_local] = dO_b[off];
+            }
+
+            __syncthreads();
+
+            // 3a-3) 当前线程负责固定的 u，遍历该 tile 的所有 w_local
+            for (int w_local = 0; w_local < W_this; ++w_local) {
+                const scalar_t gout = sh_dO[w_local];
+                const scalar_t Wuv  = sh_Wt[(size_t)w_local * U_pad + u];
+                acc_u += gout * Wuv;
+            }
+
+            __syncthreads(); // 所有线程用完本 tile 的 sh_Wt / sh_dO 后再处理下一 tile
+        }
+
+        // 3b) 对这个 triple 累加到 grad_a
+        //     dL/dA[b,i_global,u] += val * acc_u
+        atomicAdd(&dA_b[(size_t)i_global * U + u], val * acc_u);
+    }
+}
+
+
+at::Tensor launch_fused_multipath_fctp_tilew_backward(
+    at::Tensor grad_out,     // [B, K_total, W]
+    at::Tensor w_all,        // [P, U, V, W]
+    at::Tensor a_all,        // [B, I_total, U]
+    at::Tensor b_all,        // [B, 1, V]
+    at::Tensor cg_i_all,     // [P, nnz_max]
+    at::Tensor cg_j_all,     // [P, nnz_max]
+    at::Tensor cg_k_all,     // [P, nnz_max]
+    at::Tensor cg_val_all,   // [P, nnz_max]
+    at::Tensor nnz_per_path, // [P]
+    at::Tensor K_per_path,   // [P]
+    at::Tensor path_offset,  // [P]
+    const int64_t U,
+    const int64_t V,
+    const int64_t W,
+    const int64_t K_total
+)
+{
+    TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
+             && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
+             && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
+             && K_per_path.is_cuda() && path_offset.is_cuda()
+             && grad_out.is_cuda(),
+             "all tensors must be CUDA");
+
+    auto dtype = b_all.scalar_type();
+    TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
+                "b_all must be float32 or float64");
+    TORCH_CHECK(w_all.scalar_type() == dtype &&
+                cg_val_all.scalar_type() == dtype &&
+                grad_out.scalar_type()  == dtype,
+                "dtypes must match");
+
+    c10::cuda::CUDAGuard device_guard(b_all.get_device());
+
+    const int B       = (int)b_all.size(0);
+    const int P       = (int)nnz_per_path.size(0);
+    TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
+    const int I_total = static_cast<int>(a_all.size(1) / U);
+
+    a_all = a_all.view({B, I_total, U});
+    b_all = b_all.view({B, 1, V});
+    w_all = w_all.view({P, U, V, W});
+    grad_out = grad_out.view({B, K_total, W});
+
+    TORCH_CHECK(b_all.size(1) == 1 && b_all.size(2) == V,
+                "b_all must be [B,1,V]");
+    TORCH_CHECK(w_all.size(0) == P && w_all.size(1) == U &&
+                w_all.size(2) == V && w_all.size(3) == W,
+                "w_all must be [P,U,V,W]");
+    TORCH_CHECK(grad_out.size(0) == B &&
+                grad_out.size(1) == K_total &&
+                grad_out.size(2) == W,
+                "grad_out must be [B,K_total,W]");
+    
+
+    b_all        = b_all.contiguous();
+    w_all        = w_all.contiguous();
+    cg_i_all     = cg_i_all.contiguous();
+    cg_j_all     = cg_j_all.contiguous();
+    cg_k_all     = cg_k_all.contiguous();
+    cg_val_all   = cg_val_all.contiguous();
+    nnz_per_path = nnz_per_path.contiguous();
+    K_per_path   = K_per_path.contiguous();
+    path_offset  = path_offset.contiguous();
+    grad_out     = grad_out.contiguous();
+
+    const int nnz_max = (int)cg_i_all.size(1);
+    TORCH_CHECK(cg_i_all.size(0)==P && cg_j_all.size(0)==P &&
+                cg_k_all.size(0)==P && cg_val_all.size(0)==P,
+                "cg_* shape mismatch");
+    TORCH_CHECK(nnz_max <= 7, "nnz_max<=7 required");
+    TORCH_CHECK(W % 4 == 0, "W%4==0 required for Vec4 loads");
+
+    auto grad_a = at::empty({B, I_total, U}, b_all.options());
+
+    auto K_per_path_cpu = K_per_path.to(at::kCPU);
+    int K_max = 0;
+    for (int p = 0; p < P; ++p) {
+        int Kp = K_per_path_cpu[p].item<int>();
+        if (Kp > K_max) K_max = Kp;
+    }
+
+    // block: 每个线程负责一个 u（tx=U）
+    //  MACE-OFF Large U <= 224
+    const int tx = (int)U;
+    const int ty = 1;
+    dim3 block(tx, ty, 1);
+    dim3 grid(P, B, 1);
+
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_kernel_bwd_grad_a_multipath_tiledW", [&] {
+        using scalar_t_ = scalar_t;
+
+        if (std::is_same<scalar_t_, double>::value) {
+            constexpr int W_TILE = 24;  // 保证 shared mem < 48KB
+            const int U_pad = (int)U + 1;
+            size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)W_TILE;
+            size_t shmem_bytes = shmem_elems * sizeof(scalar_t_);
+
+            fused_fctp_kernel_bwd_grad_a_multipath_tiledW<scalar_t_, W_TILE>
+                <<<grid, block, (int)shmem_bytes, stream>>>(
+                    b_all.data_ptr<scalar_t_>(),
+                    w_all.data_ptr<scalar_t_>(),
+                    cg_i_all.data_ptr<int>(),
+                    cg_j_all.data_ptr<int>(),
+                    cg_k_all.data_ptr<int>(),
+                    cg_val_all.data_ptr<scalar_t_>(),
+                    nnz_per_path.data_ptr<int>(),
+                    K_per_path.data_ptr<int>(),
+                    path_offset.data_ptr<int>(),
+                    nnz_max,
+                    P, B, I_total, (int)U, (int)V, (int)W,
+                    K_max, (int)K_total,
+                    grad_out.data_ptr<scalar_t_>(),
+                    grad_a.data_ptr<scalar_t_>());
+        } else { // float
+            constexpr int W_TILE = 48; 
+            const int U_pad = (int)U + 1;
+            size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)W_TILE;
+            size_t shmem_bytes = shmem_elems * sizeof(scalar_t_);
+
+            fused_fctp_kernel_bwd_grad_a_multipath_tiledW<scalar_t_, W_TILE>
+                <<<grid, block, (int)shmem_bytes, stream>>>(
+                    b_all.data_ptr<scalar_t_>(),
+                    w_all.data_ptr<scalar_t_>(),
+                    cg_i_all.data_ptr<int>(),
+                    cg_j_all.data_ptr<int>(),
+                    cg_k_all.data_ptr<int>(),
+                    cg_val_all.data_ptr<scalar_t_>(),
+                    nnz_per_path.data_ptr<int>(),
+                    K_per_path.data_ptr<int>(),
+                    path_offset.data_ptr<int>(),
+                    nnz_max,
+                    P, B, I_total, (int)U, (int)V, (int)W,
+                    K_max, (int)K_total,
+                    grad_out.data_ptr<scalar_t_>(),
+                    grad_a.data_ptr<scalar_t_>());
+        }
+    });
+
+    grad_a = grad_a.view({B, I_total * U});
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return grad_a;
+}
+
+
 TORCH_LIBRARY(fctp_fused_multipath_bwd, m) {
-    m.def("backward", &launch_fused_multipath_fctp_backward);
+    m.def("backward", &launch_fused_multipath_fctp_tilew_backward);
 }

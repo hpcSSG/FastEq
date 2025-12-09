@@ -828,6 +828,7 @@ class TensorProduct(torch.nn.Module):
             execution_time_ms = (end_time - start_time)
             print(f"========= cueq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
 
+            '''
             if self.op_name == "tp_fully_connected":
                 
                 print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
@@ -837,7 +838,7 @@ class TensorProduct(torch.nn.Module):
                 torch.cuda.synchronize()
                 start_time = time.perf_counter() * 1000
 
-                ref = self.FastFCTPFused.apply(
+                out = self.FastFCTPFused.apply(
                      inputs[0], inputs[1], inputs[2], 
                 )
 
@@ -848,7 +849,7 @@ class TensorProduct(torch.nn.Module):
                 print("cueq vs cuda allclose:",
                     torch.allclose(ref, out, atol=1e-9, rtol=1e-7),
                     "max diff", (ref - out).abs().max().item())
-
+            '''
             if self.op_name == "tp_channel_wise":
 
                 #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
