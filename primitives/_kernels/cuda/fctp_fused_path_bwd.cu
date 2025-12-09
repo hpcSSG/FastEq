@@ -26,7 +26,7 @@ __host__ __device__ inline T ceil_div(T a, T b) {
 // grad_out:     [B, K_total, W]
 // grad_a:       [B, I_total, U]
 //
-// fast path 约束：U==96, W%4==0, nnz_max<=7, B<=65535
+// fast path 约束：U==96/128/224, W%4==0, nnz_max<=7, B<=65535
 template<typename scalar_t>
 __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     const scalar_t* __restrict__ b_all,        // [B,1,V]

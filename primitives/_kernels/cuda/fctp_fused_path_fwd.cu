@@ -393,7 +393,8 @@ at::Tensor launch_fused_multipath_fctp(
     // c10::cuda::CUDAGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
-    const int I_total = K_total;
+    TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
+    const int I_total = static_cast<int>(a_all.size(1) / U);
     const int P       = (int)nnz_per_path.size(0);
     
     a_all = a_all.view({B, I_total, U});
@@ -503,7 +504,8 @@ at::Tensor launch_fused_multipath_fctp_tile(
     // c10::cuda::CUDAGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
-    const int I_total = K_total;
+    TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
+    const int I_total = static_cast<int>(a_all.size(1) / U);
     const int P       = (int)nnz_per_path.size(0);
     
     a_all = a_all.view({B, I_total, U});
