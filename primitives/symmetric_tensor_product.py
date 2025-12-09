@@ -362,8 +362,8 @@ class CUDAKernel(torch.nn.Module):
                 f"Calling SymmetricTensorContraction"
             )
 
-        print(f"stc descriptors:{self.descriptors}, self.descriptors[0].stacked_coefficients:{self.descriptors[0].stacked_coefficients}")
-        print(f"x1.shape:{x1.shape}, x0.shape:{x0.shape}, i0.shape:{i0.shape}, coeffs_tensor.shape:{self.coeffs_tensor.shape}, paths_lens_tensor.shape:{self.path_lens_tensor.shape}")
+        #print(f"stc descriptors:{self.descriptors}, self.descriptors[0].stacked_coefficients:{self.descriptors[0].stacked_coefficients}")
+        #print(f"x1.shape:{x1.shape}, x0.shape:{x0.shape}, i0.shape:{i0.shape}, coeffs_tensor.shape:{self.coeffs_tensor.shape}, paths_lens_tensor.shape:{self.path_lens_tensor.shape}")
 
         if self.use_fasteq:
             #logger.info("== call fasteq symmetric tensor contraction ==")
@@ -387,7 +387,6 @@ class CUDAKernel(torch.nn.Module):
         else:
             out: torch.Tensor = self.f(x1, x0, i0)
             out = out.reshape(out.shape[0], out.shape[1] * self.u)
-        print(f"stc output.shape:{out.shape}")
         return out
 
 

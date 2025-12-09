@@ -7,10 +7,13 @@
 #include <iostream>
 
 
-#define CUDA_CHECK(err) \
-  if (err != cudaSuccess) { \
-    throw std::runtime_error(std::string("CUDA error: ") + cudaGetErrorString(err)); \
-  }
+#define CUDA_CHECK(expr)                                                   \
+    do {                                                                   \
+        cudaError_t _err = (expr);                                         \
+        TORCH_CHECK(_err == cudaSuccess,                                   \
+                    "CUDA error: ", cudaGetErrorString(_err),              \
+                    " (error code ", static_cast<int>(_err), ")");         \
+    } while (0)
 
 /*
 ===================== For mace small ============================================
@@ -23,6 +26,89 @@ __device__ __forceinline__ int grid_b0() {
 __device__ __forceinline__ int grid_bstride() {
     return gridDim.x * gridDim.y;
 }
+
+
+
+#define MAX_C_SIZE 1024  // 1M elements
+__constant__ float  c_all_const_f[MAX_C_SIZE];
+__constant__ double c_all_const_d[MAX_C_SIZE];
+
+template <typename scalar_t>
+struct CAllConst;
+
+template <>
+struct CAllConst<float> {
+    static __device__ __forceinline__ float load(int idx) {
+        return c_all_const_f[idx];
+    }
+};
+
+template <>
+struct CAllConst<double> {
+    static __device__ __forceinline__ double load(int idx) {
+        return c_all_const_d[idx];
+    }
+};
+
+
+constexpr int MAX_NNZ_TOTAL = 224;  // mace-medium=86，mace-large=215 根据模型调整
+
+__constant__ uint8_t  c_cg_i[MAX_NNZ_TOTAL];
+__constant__ uint8_t  c_cg_j[MAX_NNZ_TOTAL];
+__constant__ uint8_t  c_cg_k[MAX_NNZ_TOTAL];
+__constant__ double   c_cg_val[MAX_NNZ_TOTAL];  
+
+
+template <typename scalar_t>
+void upload_cg_to_constant(
+    torch::Tensor cg_i_all,
+    torch::Tensor cg_j_all,
+    torch::Tensor cg_k_all,
+    torch::Tensor cg_val_all)
+{
+    TORCH_CHECK(cg_i_all.is_cuda(), "cg_i_all must be CUDA");
+    TORCH_CHECK(cg_j_all.is_cuda(), "cg_j_all must be CUDA");
+    TORCH_CHECK(cg_k_all.is_cuda(), "cg_k_all must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
+
+    int64_t nnz_total = cg_val_all.numel();
+    TORCH_CHECK(nnz_total <= MAX_NNZ_TOTAL, "nnz_total exceeds MAX_NNZ_TOTAL");
+
+    auto cg_i = cg_i_all.contiguous();
+    auto cg_j = cg_j_all.contiguous();
+    auto cg_k = cg_k_all.contiguous();
+    auto cg_v = cg_val_all.contiguous();
+
+    // 从 device → constant memory
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        c_cg_i,
+        cg_i.data_ptr<uint8_t>(),
+        nnz_total * sizeof(uint8_t),
+        0,
+        cudaMemcpyDeviceToDevice));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        c_cg_j,
+        cg_j.data_ptr<uint8_t>(),
+        nnz_total * sizeof(uint8_t),
+        0,
+        cudaMemcpyDeviceToDevice));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        c_cg_k,
+        cg_k.data_ptr<uint8_t>(),
+        nnz_total * sizeof(uint8_t),
+        0,
+        cudaMemcpyDeviceToDevice));
+
+    CUDA_CHECK(cudaMemcpyToSymbol(
+        c_cg_val,
+        cg_v.data_ptr<scalar_t>(), 
+        nnz_total * sizeof(scalar_t),
+        0,
+        cudaMemcpyDeviceToDevice));
+}
+
 
 // only for mace small
 __global__ void fwd_mace_small_kernel(
@@ -235,7 +321,6 @@ __global__ void tp_channel_wise_kernel(
         for (int v_idx = 0; v_idx < V; ++v_idx) {
             // x_uv[z, uv_seg][u_idx, v_idx]
             scalar_t xuv_uv = x_uv_z[uv_base + u_idx * V + v_idx];
-
             for (int k = 0; k < k_dim; ++k) {
                 scalar_t acc = static_cast<scalar_t>(0);
 
@@ -248,7 +333,8 @@ __global__ void tp_channel_wise_kernel(
                         scalar_t xjv_jv = s_jv[jv_base + j * V + v_idx];
 
                         int c_idx = (i * j_dim + j) * k_dim + k; // row-major [i,j,k]
-                        scalar_t cij_k = c_path[c_idx];
+                        //scalar_t cij_k = c_path[c_idx];
+                        scalar_t cij_k = CAllConst<scalar_t>::load(c_idx);
 
                         acc += cij_k * xuv_uv * xiu_iu * xjv_jv;
                     }
@@ -263,6 +349,282 @@ __global__ void tp_channel_wise_kernel(
     }
 }
 
+
+// opt1: CG sparse, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
+/*
+Memory Throughput: 85.31%
+DRAM Throughput: 29.35%
+L2 Cache Throughput: 92.80%
+Compute (SM) Throughput: 30.59%
+Achieved Occupancy: 36.81% 
+Duration: 3.5 ms
+
+*/
+template <typename scalar_t, int MAX_K_DIM>
+__global__ void tp_channel_wise_sparse_kernel(
+    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
+    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
+    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
+
+    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
+    const int32_t* __restrict__ i_dims,         // [num_paths]  (兼容性保留)
+    const int32_t* __restrict__ j_dims,         // [num_paths]  (兼容性保留)
+    const int32_t* __restrict__ k_dims,         // [num_paths] 
+    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
+    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
+    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
+
+    // 稀疏 CG 信息
+    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
+    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
+    const uint8_t* __restrict__ cg_i_all,       // [nnz_total]
+    const uint8_t* __restrict__ cg_j_all,       // [nnz_total]
+    const uint8_t* __restrict__ cg_k_all,       // [nnz_total]
+    const scalar_t* __restrict__ cg_val_all,    // [nnz_total]
+
+    scalar_t* __restrict__ out,                 // [Z, K_TOTAL, U, V]
+
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int V,
+    int num_paths
+) {
+    int z = blockIdx.x;   // 一个 block 一个 batch
+    if (z >= Z) return;
+
+    int u = threadIdx.x;  // 线程在 U 维并行
+    if (u >= U) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
+    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+
+    const scalar_t* x_iu_z = x_iu + z * IU_TOTAL;
+    const scalar_t* x_jv_z = x_jv + z * JV_TOTAL;
+
+    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
+    int threads_in_block = blockDim.x;
+    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
+        s_iu[idx] = x_iu_z[idx];
+    }
+    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
+        s_jv[idx] = x_jv_z[idx];
+    }
+    __syncthreads();
+
+    const scalar_t* x_uv_z = x_uv + z * UV_TOTAL;
+    scalar_t* out_z = out + z * (K_TOTAL * U * V);
+
+    // 2. 遍历所有 path
+    for (int p = 0; p < num_paths; ++p) {
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+
+        int k_dim = k_dims[p];
+        int nnz   = nnz_per_path[p];
+        int nnz_off = nnz_offsets[p];
+
+        if (k_dim <= 0 || nnz <= 0) {
+            continue;
+        }
+        if (k_dim > MAX_K_DIM) {
+            return;
+        }
+
+        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
+        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
+        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
+        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+
+        // 对每个 v:
+        for (int v_idx = 0; v_idx < V; ++v_idx) {
+            // x_uv[z, uv_seg][u, v]
+            scalar_t xuv_uv = x_uv_z[uv_base + u * V + v_idx];
+            scalar_t acc_local[MAX_K_DIM];
+            #pragma unroll
+            for (int kk = 0; kk < MAX_K_DIM; ++kk) {
+                acc_local[kk] = static_cast<scalar_t>(0);
+            }
+
+            for (int t = 0; t < nnz; ++t) {
+                int idx = nnz_off + t;
+
+                int i = cg_i_all[idx];
+                int j = cg_j_all[idx];
+                int k = cg_k_all[idx];  // 0..k_dim-1
+
+                if (k >= k_dim) continue;
+
+                scalar_t c = cg_val_all[idx];
+
+                // x_iu[z, iu_seg][i, u]
+                scalar_t xiu_iu = s_iu[iu_base + i * U + u];
+
+                // x_jv[z, jv_seg][j, v]
+                scalar_t xjv_jv = s_jv[jv_base + j * V + v_idx];
+
+                acc_local[k] += c * xuv_uv * xiu_iu * xjv_jv;
+            }
+
+            // 写回
+            for (int k = 0; k < k_dim; ++k) {
+                int global_k = k_base + k;
+                int out_index = (global_k * U + u) * V + v_idx;
+                out_z[out_index] = acc_local[k];
+            }
+        }
+    }
+}
+
+
+
+
+
+
+// Opt2: 由于回写占了大头，所以通过group k 写局部，减少global回写次数
+/*
+    DRAM Frequency                  Ghz         2.62
+    SM Frequency                    Ghz         1.59
+    Elapsed Cycles                cycle    2,715,632
+    Memory Throughput                 %        71.12
+    DRAM Throughput                   %        71.12
+    Duration                         ms         1.71
+    L1/TEX Cache Throughput           %        49.65
+    L2 Cache Throughput               %        67.03
+    SM Active Cycles              cycle 2,706,541.40
+    Compute (SM) Throughput           %        87.36
+*/
+template <typename scalar_t, int MAX_K_DIM>
+__global__ void tp_channel_wise_sparse_groupk_kernel(
+    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
+    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
+    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
+
+    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
+    //const int32_t* __restrict__ i_dims,         // [num_paths]  (兼容性保留)
+    //const int32_t* __restrict__ j_dims,         // [num_paths]  (兼容性保留)
+    const int32_t* __restrict__ k_dims,         // [num_paths] 
+    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
+    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
+    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
+
+    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
+    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
+
+    // off = nnz_k_offsets[p * MAX_K_DIM + k_local]
+    // cnt = nnz_k_counts [p * MAX_K_DIM + k_local]
+    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM]
+    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM]
+
+    scalar_t* __restrict__ out,                 // [Z, K_TOTAL, U, V]
+
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int V,
+    int num_paths
+) {
+    int z = blockIdx.x;   // 一个 block 一个 batch
+    if (z >= Z) return;
+
+    int u = threadIdx.x;  // 每个 thread 一个 u
+    if (u >= U) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
+    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+
+    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+
+    int threads_in_block = blockDim.x;
+
+    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
+    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
+        s_iu[idx] = x_iu_z[idx];
+    }
+    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
+        s_jv[idx] = x_jv_z[idx];
+    }
+    __syncthreads();
+
+    const scalar_t* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+    scalar_t* out_z = out + (size_t)z * (K_TOTAL * U * V);
+
+    // 2. 遍历所有 path
+    for (int p = 0; p < num_paths; ++p) {
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+
+        int k_dim   = k_dims[p];
+        int nnz     = nnz_per_path[p];
+        int nnz_off = nnz_offsets[p];
+
+        if (k_dim <= 0 || nnz <= 0) {
+            continue;
+        }
+        if (k_dim > MAX_K_DIM) {
+            return;
+        }
+
+        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
+        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
+        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
+        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+
+        // In Mace-OFF, V=1
+        for (int v_idx = 0; v_idx < V; ++v_idx) {
+            scalar_t xuv_uv = x_uv_z[uv_base + u * V + v_idx];
+
+            // 按 k 分组
+            for (int k_local = 0; k_local < k_dim; ++k_local) {
+                int meta_idx    = p * MAX_K_DIM + k_local;
+                int local_off   = nnz_k_offsets[meta_idx];
+                int local_count = nnz_k_counts[meta_idx];
+
+                if (local_count <= 0)
+                    continue;
+
+                scalar_t acc = static_cast<scalar_t>(0);
+
+                // 遍历这个 k 的所有 nnz（已保证在该 path 段内部连续）
+                for (int tt = 0; tt < local_count; ++tt) {
+                    int t   = local_off + tt;
+                    int idx = nnz_off + t; // global nnz index
+
+                    // 从 constant memory 读 CG 系数
+                    int i = static_cast<int>(c_cg_i[idx]);
+                    int j = static_cast<int>(c_cg_j[idx]);
+                    scalar_t c = static_cast<scalar_t>(c_cg_val[idx]);
+
+                    scalar_t xiu_iu = s_iu[iu_base + i * U + u];         // x_iu[z, iu_seg][i, u]
+                    scalar_t xjv_jv = s_jv[jv_base + j * V + v_idx];     // x_jv[z, jv_seg][j, v]
+
+                    acc += c * xuv_uv * xiu_iu * xjv_jv;
+                }
+
+                int global_k  = k_base + k_local;
+                int out_index = (global_k * U + u) * V + v_idx;
+                out_z[out_index] = acc;
+            }
+        }
+    }
+}
+
+
+
+
 torch::Tensor tp_channel_wise_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
@@ -276,6 +638,17 @@ torch::Tensor tp_channel_wise_launch(
     torch::Tensor iu_seg_offsets,  // [iu_seg_count], int32
     torch::Tensor jv_seg_offsets,  // [jv_seg_count], int32
     torch::Tensor kv_k_offsets,    // [kv_seg_count], int32
+
+    // 稀疏 CG
+    torch::Tensor nnz_per_path,    // [num_paths], int32
+    torch::Tensor nnz_offsets,     // [num_paths], int32
+    torch::Tensor nnz_k_offsets,
+    torch::Tensor nnz_k_counts,
+    torch::Tensor cg_i_all,        // [nnz_total], int32
+    torch::Tensor cg_j_all,        // [nnz_total], int32
+    torch::Tensor cg_k_all,        // [nnz_total], int32
+    torch::Tensor cg_val_all,      // [nnz_total], same dtype as x_uv
+
     const int64_t U,
     const int64_t V,
     const int64_t K_TOTAL
@@ -283,6 +656,7 @@ torch::Tensor tp_channel_wise_launch(
     TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
     TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
     TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
@@ -297,6 +671,13 @@ torch::Tensor tp_channel_wise_launch(
     jv_seg_offsets = jv_seg_offsets.contiguous();
     kv_k_offsets = kv_k_offsets.contiguous();
 
+    nnz_per_path   = nnz_per_path.contiguous();
+    nnz_offsets    = nnz_offsets.contiguous();
+    cg_i_all       = cg_i_all.contiguous();
+    cg_j_all       = cg_j_all.contiguous();
+    cg_k_all       = cg_k_all.contiguous();
+    cg_val_all     = cg_val_all.contiguous();
+
     auto Z = x_uv.size(0);
     auto UV_TOTAL = x_uv.size(1);
     auto IU_TOTAL = x_iu.size(1);
@@ -308,30 +689,48 @@ torch::Tensor tp_channel_wise_launch(
 
     int num_paths = path_indices.size(0);
 
+    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
+
     auto out = torch::zeros({Z, K_TOTAL, U, V}, x_uv.options());
 
-    int threads = U;
+    int threads = static_cast<int>(U);
     if (threads < 32) threads = 32;
-    int blocks = Z;
+    if (threads > 1024) threads = 1024;
 
+    int blocks = static_cast<int>(Z);
     size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
-
     auto stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_kernel", [&] {
-        tp_channel_wise_kernel<scalar_t><<<blocks, threads, smem_bytes, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_constcg_groupk_kernel", [&] {
+
+        /*
+        if (x_uv.scalar_type() == at::kDouble) {
+            int total_c_bytes = c_all.numel() * c_all.element_size();
+            cudaMemcpyToSymbol(c_all_const_d, c_all.data_ptr<double>(),
+                    total_c_bytes, 0, cudaMemcpyHostToDevice);
+        } else if (x_uv.scalar_type() == at::kFloat) {
+            int total_c_bytes = c_all.numel() * c_all.element_size();
+            cudaMemcpyToSymbol(c_all_const_f, c_all.data_ptr<float>(),
+                    total_c_bytes, 0, cudaMemcpyHostToDevice);
+        }
+
+        tp_channel_wise_sparse_kernel<scalar_t, MAX_K_DIM><<<blocks, threads, smem_bytes, stream>>>(
             x_uv.data_ptr<scalar_t>(),
             x_iu.data_ptr<scalar_t>(),
             x_jv.data_ptr<scalar_t>(),
-            c_all.data_ptr<scalar_t>(),
             path_indices.data_ptr<int>(),
             i_dims.data_ptr<int>(),
             j_dims.data_ptr<int>(),
             k_dims.data_ptr<int>(),
-            c_offsets.data_ptr<int>(),
             iu_seg_offsets.data_ptr<int>(),
             jv_seg_offsets.data_ptr<int>(),
             kv_k_offsets.data_ptr<int>(),
+            nnz_per_path.data_ptr<int>(),
+            nnz_offsets.data_ptr<int>(),
+            cg_i_all.data_ptr<uint8_t>(),
+            cg_j_all.data_ptr<uint8_t>(),
+            cg_k_all.data_ptr<uint8_t>(),
+            cg_val_all.data_ptr<scalar_t>(),
             out.data_ptr<scalar_t>(),
             (int)Z,
             (int)UV_TOTAL,
@@ -342,6 +741,36 @@ torch::Tensor tp_channel_wise_launch(
             V,
             num_paths
         );
+        */
+        upload_cg_to_constant<scalar_t>(cg_i_all, cg_j_all, cg_k_all, cg_val_all);
+
+        tp_channel_wise_sparse_groupk_kernel<scalar_t, MAX_K_DIM>
+            <<<blocks, threads, smem_bytes, stream>>>(
+                x_uv.data_ptr<scalar_t>(),
+                x_iu.data_ptr<scalar_t>(),
+                x_jv.data_ptr<scalar_t>(),
+                path_indices.data_ptr<int>(),
+                //i_dims.data_ptr<int>(),
+                //j_dims.data_ptr<int>(),
+                k_dims.data_ptr<int>(),
+                iu_seg_offsets.data_ptr<int>(),
+                jv_seg_offsets.data_ptr<int>(),
+                kv_k_offsets.data_ptr<int>(),
+                nnz_per_path.data_ptr<int>(),
+                nnz_offsets.data_ptr<int>(),
+                nnz_k_offsets.data_ptr<int>(),
+                nnz_k_counts.data_ptr<int>(),
+                out.data_ptr<scalar_t>(),
+                (int)Z,
+                (int)UV_TOTAL,
+                (int)IU_TOTAL,
+                (int)JV_TOTAL,
+                (int)K_TOTAL,
+                (int)U,
+                (int)V,
+                num_paths
+            );
+
         CUDA_CHECK(cudaGetLastError());
     });
 
@@ -351,5 +780,5 @@ torch::Tensor tp_channel_wise_launch(
 TORCH_LIBRARY(cwtp_fwd, m)
 {
     //m.def("mace_small", &cwtp_mace_small_forward);
-    m.def("mace", &tp_channel_wise_launch);
+    m.def("comm", &tp_channel_wise_launch);
 }
