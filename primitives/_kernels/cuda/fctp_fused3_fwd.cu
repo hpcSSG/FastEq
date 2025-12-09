@@ -179,8 +179,8 @@ at::Tensor launch_fused_fctp_forward(
     auto out = at::empty({B, (int)K, W}, a_seg.options());
 
     // 快路径约束：U=96, W%4==0, B<=65535
-    TORCH_CHECK(U==96 && (W%4==0) && (uint64_t)B <= 65535,
-                "fast path requires U=96, W%4==0, B<=65535, J=1");
+    TORCH_CHECK((U==96 || U==128 || U==224) && (W==96 || W==128 || W==224) && (uint64_t)B <= 65535,
+                "fast path requires U=96/128/224, W=96/128/224, B<=65535, J=1");
 
     // 线程块：x 覆盖 W(96→128)，y 覆盖 K(≤7)
     const int tx = 128;
