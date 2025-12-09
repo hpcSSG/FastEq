@@ -53,63 +53,6 @@ struct CAllConst<double> {
 
 constexpr int MAX_NNZ_TOTAL = 224;  // mace-medium=86，mace-large=215 根据模型调整
 
-__constant__ uint8_t  c_cg_i[MAX_NNZ_TOTAL];
-__constant__ uint8_t  c_cg_j[MAX_NNZ_TOTAL];
-__constant__ uint8_t  c_cg_k[MAX_NNZ_TOTAL];
-__constant__ double   c_cg_val[MAX_NNZ_TOTAL];  
-
-
-template <typename scalar_t>
-void upload_cg_to_constant(
-    torch::Tensor cg_i_all,
-    torch::Tensor cg_j_all,
-    torch::Tensor cg_k_all,
-    torch::Tensor cg_val_all)
-{
-    TORCH_CHECK(cg_i_all.is_cuda(), "cg_i_all must be CUDA");
-    TORCH_CHECK(cg_j_all.is_cuda(), "cg_j_all must be CUDA");
-    TORCH_CHECK(cg_k_all.is_cuda(), "cg_k_all must be CUDA");
-    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
-
-    int64_t nnz_total = cg_val_all.numel();
-    TORCH_CHECK(nnz_total <= MAX_NNZ_TOTAL, "nnz_total exceeds MAX_NNZ_TOTAL");
-
-    auto cg_i = cg_i_all.contiguous();
-    auto cg_j = cg_j_all.contiguous();
-    auto cg_k = cg_k_all.contiguous();
-    auto cg_v = cg_val_all.contiguous();
-
-    // 从 device → constant memory
-    CUDA_CHECK(cudaMemcpyToSymbol(
-        c_cg_i,
-        cg_i.data_ptr<uint8_t>(),
-        nnz_total * sizeof(uint8_t),
-        0,
-        cudaMemcpyDeviceToDevice));
-
-    CUDA_CHECK(cudaMemcpyToSymbol(
-        c_cg_j,
-        cg_j.data_ptr<uint8_t>(),
-        nnz_total * sizeof(uint8_t),
-        0,
-        cudaMemcpyDeviceToDevice));
-
-    CUDA_CHECK(cudaMemcpyToSymbol(
-        c_cg_k,
-        cg_k.data_ptr<uint8_t>(),
-        nnz_total * sizeof(uint8_t),
-        0,
-        cudaMemcpyDeviceToDevice));
-
-    CUDA_CHECK(cudaMemcpyToSymbol(
-        c_cg_val,
-        cg_v.data_ptr<scalar_t>(), 
-        nnz_total * sizeof(scalar_t),
-        0,
-        cudaMemcpyDeviceToDevice));
-}
-
-
 // only for mace small
 __global__ void fwd_mace_small_kernel(
     const double* __restrict__ x,     // [B,U]
@@ -482,11 +425,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     }
 }
 
-
-
-
-
-
 // Opt2: 由于回写占了大头，所以通过group k 写局部，减少global回写次数
 /*
     DRAM Frequency                  Ghz         2.62
@@ -500,130 +438,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     SM Active Cycles              cycle 2,706,541.40
     Compute (SM) Throughput           %        87.36
 */
-/*
-template <typename scalar_t, int MAX_K_DIM>
-__global__ void tp_channel_wise_sparse_groupk_kernel(
-    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
-    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
-    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
-
-    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
-    //const int32_t* __restrict__ i_dims,         // [num_paths]  (兼容性保留)
-    //const int32_t* __restrict__ j_dims,         // [num_paths]  (兼容性保留)
-    const int32_t* __restrict__ k_dims,         // [num_paths] 
-    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
-    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
-    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
-
-    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
-    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
-
-    // off = nnz_k_offsets[p * MAX_K_DIM + k_local]
-    // cnt = nnz_k_counts [p * MAX_K_DIM + k_local]
-    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM]
-    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM]
-
-    scalar_t* __restrict__ out,                 // [Z, K_TOTAL, U, V]
-
-    int Z,
-    int UV_TOTAL,
-    int IU_TOTAL,
-    int JV_TOTAL,
-    int K_TOTAL,
-    int U,
-    int V,
-    int num_paths
-) {
-    int z = blockIdx.x;   // 一个 block 一个 batch
-    if (z >= Z) return;
-
-    int u = threadIdx.x;  // 每个 thread 一个 u
-    if (u >= U) return;
-
-    extern __shared__ unsigned char smem_raw[];
-    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
-    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
-
-    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
-    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
-
-    int threads_in_block = blockDim.x;
-
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
-    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
-        s_iu[idx] = x_iu_z[idx];
-    }
-    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
-        s_jv[idx] = x_jv_z[idx];
-    }
-    __syncthreads();
-
-    const scalar_t* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
-    scalar_t* out_z = out + (size_t)z * (K_TOTAL * U * V);
-
-    // 2. 遍历所有 path
-    for (int p = 0; p < num_paths; ++p) {
-        int uv_idx = path_indices[p * 4 + 0];
-        int iu_idx = path_indices[p * 4 + 1];
-        int jv_idx = path_indices[p * 4 + 2];
-        int kv_idx = path_indices[p * 4 + 3];
-
-        int k_dim   = k_dims[p];
-        int nnz     = nnz_per_path[p];
-        int nnz_off = nnz_offsets[p];
-
-        if (k_dim <= 0 || nnz <= 0) {
-            continue;
-        }
-        if (k_dim > MAX_K_DIM) {
-            return;
-        }
-
-        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
-        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
-        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
-        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
-
-        // In Mace-OFF, V=1
-        for (int v_idx = 0; v_idx < V; ++v_idx) {
-            scalar_t xuv_uv = x_uv_z[uv_base + u * V + v_idx];
-
-            // 按 k 分组
-            for (int k_local = 0; k_local < k_dim; ++k_local) {
-                int meta_idx    = p * MAX_K_DIM + k_local;
-                int local_off   = nnz_k_offsets[meta_idx];
-                int local_count = nnz_k_counts[meta_idx];
-
-                if (local_count <= 0)
-                    continue;
-
-                scalar_t acc = static_cast<scalar_t>(0);
-
-                // 遍历这个 k 的所有 nnz
-                for (int tt = 0; tt < local_count; ++tt) {
-                    int t   = local_off + tt;
-                    int idx = nnz_off + t; // global nnz index
-
-                    // 从 constant memory 读 CG 系数
-                    int i = static_cast<int>(c_cg_i[idx]);
-                    int j = static_cast<int>(c_cg_j[idx]);
-                    scalar_t c = static_cast<scalar_t>(c_cg_val[idx]);
-
-                    scalar_t xiu_iu = s_iu[iu_base + i * U + u];         // x_iu[z, iu_seg][i, u]
-                    scalar_t xjv_jv = s_jv[jv_base + j * V + v_idx];     // x_jv[z, jv_seg][j, v]
-
-                    acc += c * xuv_uv * xiu_iu * xjv_jv;
-                }
-
-                int global_k  = k_base + k_local;
-                int out_index = (global_k * U + u) * V + v_idx;
-                out_z[out_index] = acc;
-            }
-        }
-    }
-}
-*/
-
 template <typename scalar_t, int MAX_K_DIM>
 __global__ void tp_channel_wise_sparse_groupk_kernel(
     const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
@@ -748,9 +562,6 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
     }
 }
 
-
-
-
 torch::Tensor tp_channel_wise_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
@@ -868,7 +679,6 @@ torch::Tensor tp_channel_wise_launch(
             num_paths
         );
         */
-        //upload_cg_to_constant<scalar_t>(cg_i_all, cg_j_all, cg_k_all, cg_val_all);
 
         tp_channel_wise_sparse_groupk_kernel<scalar_t, MAX_K_DIM>
             <<<blocks, threads, smem_bytes, stream>>>(
