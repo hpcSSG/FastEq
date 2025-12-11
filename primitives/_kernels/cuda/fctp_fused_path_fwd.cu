@@ -188,7 +188,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
 }
 
 
-constexpr int W_TILE = 16; // 必须是4的倍数，且满足 shared mem 限制,不超过 48KB
+constexpr int W_TILE = 16; // 必须是4的倍数, 满足 shared mem 限制,不超过 48KB
 
 template<typename scalar_t>
 __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
@@ -219,7 +219,6 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
 
     const int k_base = path_offset[p];   // 该 path 在全局 K 维的起始位置
 
-    // cg 指针（全部是 global 索引）
     const int*      cg_i = cg_i_all   + (size_t)p * nnz_max;
     //const int*      cg_j = cg_j_all   + (size_t)p * nnz_max; 
     const int*      cg_k = cg_k_all   + (size_t)p * nnz_max;
@@ -302,7 +301,6 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
             const size_t off = ((size_t)u * V + (size_t)v) * W + (size_t)w0;
             const Vec4 r = *reinterpret_cast<const Vec4*>(W_p + off);
 
-            // 映射到 tile 内局部 w
             int w_local0 = w0 - w_base;     // 0..W_this-1，步长为 4
 
             sh_Wt[((size_t)w_local0 + 0) * U_pad + u] = (scalar_t)r.x;
@@ -347,11 +345,9 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
                 acc += s * cg_v[pidx];
             }
 
-            // 写当前 tile 的一个 (k_global, w_global)
+            // 写 tile (k_global, w_global)
             Ob_base[(size_t)k_global * W + w_global] = acc;
         }
-
-        // ⚠️ 所有线程（active / inactive）都必须到这个 barrier
         __syncthreads();
     }
 }

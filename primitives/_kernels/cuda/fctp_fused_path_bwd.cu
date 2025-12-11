@@ -309,9 +309,8 @@ at::Tensor launch_fused_multipath_fctp_backward(
     return grad_a;
 }
 
-
-template<typename scalar_t, int W_TILE>
-__global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledW(
+template<typename scalar_t, int U_TILE>
+__global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     const scalar_t* __restrict__ b_all,        // [B,1,V]
     const scalar_t* __restrict__ w_all,        // [P,U,V,W]
     const int*     __restrict__ cg_i_all,      // [P,nnz_max]
@@ -354,7 +353,9 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledW(
     // grad_a[b]: [I_total,U]
     scalar_t* __restrict__ dA_b = grad_a + (size_t)b * I_total * U;
 
+    // -----------------------------
     // 1) 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
+    // -----------------------------
     int vstar = 0;
     if (threadIdx.x == 0) {
         scalar_t best = std::numeric_limits<scalar_t>::lowest();
@@ -371,72 +372,107 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledW(
     __syncthreads();
     const int v = sh_v;
 
-    // 2) shared memory: 按 tileW 放
-    //    sh_Wt: [W_TILE, U+1]   存当前 tile 的 W_p[:, v, w]
-    //    sh_dO: [W_TILE]        存当前 tile 的 grad_out[b,k_global,w]
-    const int U_pad = U + 1;
+    // -----------------------------
+    // 2) shared memory 布局 (tileU)
+    //
+    //    sh_Wt: [W, U_TILE+1] → 存 W_p[u_base : u_base+U_TILE, v*, :]
+    //    sh_dO: [W]           → 存当前 triple 的 grad_out[b,k_global,:]
+    // -----------------------------
+    const int U_pad = U_TILE + 1;
 
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
-    scalar_t* sh_Wt = reinterpret_cast<scalar_t*>(shmem_raw);             // [W_TILE * U_pad]
-    scalar_t* sh_dO = sh_Wt + (size_t)W_TILE * U_pad;                      // [W_TILE]
+    scalar_t* sh_Wt = reinterpret_cast<scalar_t*>(shmem_raw);             // [W * U_pad]
+    scalar_t* sh_dO = sh_Wt + (size_t)W * U_pad;                          // [W]
 
-    const int tx = blockDim.x;    // = U
-    const int u  = threadIdx.x;   // 0..U-1
+    using Vec4 = typename std::conditional<
+        std::is_same<scalar_t, float>::value,
+        float4,
+        double4
+    >::type;
 
-    // 没有 __syncthreads 之后的 return，所以 tx 建议直接设为 U（<=224）
-    // 若 tx > U，可以加一个 alive 标志，这里我们假定 tx == U
+    const int tx      = blockDim.x;    // 通常设为 U_TILE
+    const int u_local = threadIdx.x;   // tile 内局部 u 索引: 0..U_TILE-1
 
-    // 3) 遍历当前 path 的所有 triples (i_global, k_global, val)
-    for (int t = 0; t < nnz_p; ++t) {
-        const int i_global = cg_i[t];
-        const int k_global = cg_k[t];
-        const scalar_t val = cg_v[t];
+    // Vec4 沿 w 维读
+    const int Wv  = W / 4;
+    const int tv_stride = tx;
 
-        scalar_t acc_u = scalar_t(0);
+    // -----------------------------
+    // 3) 沿 U 方向分块：每个 tile 先把 W_p 的这一块 preload 到 shared
+    // -----------------------------
+    for (int u_base = 0; u_base < U; u_base += U_TILE) {
+        const int U_this = min(U_TILE, U - u_base);
 
-        // 3a) 沿 W 方向 tile
-        for (int w_base = 0; w_base < W; w_base += W_TILE) {
-            const int W_this = min(W_TILE, W - w_base);
+        // 3a) 加载当前 U tile 的 W_p[u_base : u_base+U_this, v*, :] -> sh_Wt[w,u_off]
+        //
+        // t ∈ [0, U_this * Wv)
+        // u_off = t / Wv ∈ [0, U_this)
+        // wv    = t - u_off * Wv ∈ [0, Wv)
+        // w0    = wv * 4
+        for (int t = u_local; t < U_this * Wv; t += tv_stride) {
+            int u_off = t / Wv;           // tile 内 u 索引
+            int wv    = t - u_off * Wv;
+            int w0    = wv << 2;          // 4 元素起始 w
 
-            // 3a-1) 加载当前 tile 的 W_p[:, v, w]
-            //       sh_Wt[w_local, u_idx]
-            for (int idx = u; idx < U * W_this; idx += tx) {
-                int u_idx   = idx / W_this;         // 0..U-1
-                int w_local = idx - u_idx * W_this; // 0..W_this-1
-                int w_glb   = w_base + w_local;     // 0..W-1
+            int u_idx = u_base + u_off;   // 全局 u
 
-                const size_t off = ((size_t)u_idx * V + (size_t)v) * W + (size_t)w_glb;
-                sh_Wt[(size_t)w_local * U_pad + u_idx] = W_p[off];
+            const size_t off = ((size_t)u_idx * V + (size_t)v) * W + (size_t)w0;
+            const Vec4 r = *reinterpret_cast<const Vec4*>(W_p + off);
+
+            sh_Wt[((size_t)w0 + 0) * U_pad + u_off] = (scalar_t)r.x;
+            sh_Wt[((size_t)w0 + 1) * U_pad + u_off] = (scalar_t)r.y;
+            sh_Wt[((size_t)w0 + 2) * U_pad + u_off] = (scalar_t)r.z;
+            sh_Wt[((size_t)w0 + 3) * U_pad + u_off] = (scalar_t)r.w;
+        }
+        __syncthreads();
+
+        // -----------------------------
+        // 4) 对每个 triple (i_global, k_global, val)：
+        //
+        //    先把 grad_out[b,k_global,:] 读入 sh_dO[W]
+        //    再对该 tile 内的所有 u_off（每个线程1~多个 u_off）：
+        //      acc_u = Σ_w sh_dO[w] * sh_Wt[w,u_off]
+        //      grad_a[b,i_global,u_glb] += val * acc_u
+        // -----------------------------
+        for (int t = 0; t < nnz_p; ++t) {
+            const int i_global = cg_i[t];
+            const int k_global = cg_k[t];
+            const scalar_t val = cg_v[t];
+
+            // 4a) 用 Vec4 把 dO_b[k_global, :] -> sh_dO[w]
+            for (int tv = u_local; tv < Wv; tv += tv_stride) {
+                int w0 = tv << 2;
+                const size_t off = (size_t)k_global * W + (size_t)w0;
+                const Vec4 r = *reinterpret_cast<const Vec4*>(dO_b + off);
+                sh_dO[w0 + 0] = (scalar_t)r.x;
+                sh_dO[w0 + 1] = (scalar_t)r.y;
+                sh_dO[w0 + 2] = (scalar_t)r.z;
+                sh_dO[w0 + 3] = (scalar_t)r.w;
             }
-
-            // 3a-2) 加载当前 tile 的 grad_out[b,k_global,w]
-            //       sh_dO[w_local]
-            for (int w_local = u; w_local < W_this; w_local += tx) {
-                int w_glb = w_base + w_local;
-                const size_t off = (size_t)k_global * W + (size_t)w_glb;
-                sh_dO[w_local] = dO_b[off];
-            }
-
             __syncthreads();
 
-            // 3a-3) 当前线程负责固定的 u，遍历该 tile 的所有 w_local
-            for (int w_local = 0; w_local < W_this; ++w_local) {
-                const scalar_t gout = sh_dO[w_local];
-                const scalar_t Wuv  = sh_Wt[(size_t)w_local * U_pad + u];
-                acc_u += gout * Wuv;
+            // 4b) 当前线程负责 tile 内若干个 u_off（stride=blockDim.x）
+            for (int u_off = u_local; u_off < U_this; u_off += tx) {
+                int u_glb = u_base + u_off;   // 全局 u index
+
+                scalar_t acc_u = scalar_t(0);
+                for (int w = 0; w < W; ++w) {
+                    const scalar_t gout = sh_dO[w];
+                    const scalar_t Wuv  = sh_Wt[(size_t)w * U_pad + u_off];
+                    acc_u += gout * Wuv;
+                }
+
+                // grad_a[b,i_global,u_glb] += val * acc_u
+                atomicAdd(&dA_b[(size_t)i_global * U + u_glb], val * acc_u);
             }
 
-            __syncthreads(); // 所有线程用完本 tile 的 sh_Wt / sh_dO 后再处理下一 tile
+            __syncthreads();  // 确保所有线程用完当前 sh_dO 后再覆盖
         }
-
-        // 3b) 对这个 triple 累加到 grad_a
-        //     dL/dA[b,i_global,u] += val * acc_u
-        atomicAdd(&dA_b[(size_t)i_global * U + u], val * acc_u);
+        // 下一轮 u_base 会重新填充 sh_Wt；上一轮 triple 已全部用完当前 tile
     }
 }
 
-
-at::Tensor launch_fused_multipath_fctp_tilew_backward(
+at::Tensor launch_fused_multipath_fctp_tiled_backward(
     at::Tensor grad_out,     // [B, K_total, W]
     at::Tensor w_all,        // [P, U, V, W]
     at::Tensor a_all,        // [B, I_total, U]
@@ -510,8 +546,9 @@ at::Tensor launch_fused_multipath_fctp_tilew_backward(
     TORCH_CHECK(nnz_max <= 7, "nnz_max<=7 required");
     TORCH_CHECK(W % 4 == 0, "W%4==0 required for Vec4 loads");
 
-    auto grad_a = at::empty({B, I_total, U}, b_all.options());
+    auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
+    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
     auto K_per_path_cpu = K_per_path.to(at::kCPU);
     int K_max = 0;
     for (int p = 0; p < P; ++p) {
@@ -519,25 +556,22 @@ at::Tensor launch_fused_multipath_fctp_tilew_backward(
         if (Kp > K_max) K_max = Kp;
     }
 
-    // block: 每个线程负责一个 u（tx=U）
-    //  MACE-OFF Large U <= 224
-    const int tx = (int)U;
-    const int ty = 1;
-    dim3 block(tx, ty, 1);
-    dim3 grid(P, B, 1);
-
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_kernel_bwd_grad_a_multipath_tiledW", [&] {
+    AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath_tiledU", [&] {
         using scalar_t_ = scalar_t;
 
         if (std::is_same<scalar_t_, double>::value) {
-            constexpr int W_TILE = 24;  // 保证 shared mem < 48KB
-            const int U_pad = (int)U + 1;
-            size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)W_TILE;
+            constexpr int U_TILE = 16;      
+            const int tx = U_TILE;             // 每个 block 处理一个 tile 的 U
+            dim3 block(tx, 1, 1);
+            dim3 grid(P, B, 1);
+
+            const int U_pad = U_TILE + 1;
+            size_t shmem_elems = (size_t)W * U_pad + (size_t)W; // sh_Wt + sh_dO
             size_t shmem_bytes = shmem_elems * sizeof(scalar_t_);
 
-            fused_fctp_kernel_bwd_grad_a_multipath_tiledW<scalar_t_, W_TILE>
+            fused_fctp_kernel_bwd_grad_a_multipath_tiledU<scalar_t_, U_TILE>
                 <<<grid, block, (int)shmem_bytes, stream>>>(
                     b_all.data_ptr<scalar_t_>(),
                     w_all.data_ptr<scalar_t_>(),
@@ -553,13 +587,17 @@ at::Tensor launch_fused_multipath_fctp_tilew_backward(
                     K_max, (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
-        } else { // float
-            constexpr int W_TILE = 48; 
-            const int U_pad = (int)U + 1;
-            size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)W_TILE;
+        } else {
+            constexpr int U_TILE = 32;
+            const int tx = U_TILE;
+            dim3 block(tx, 1, 1);
+            dim3 grid(P, B, 1);
+
+            const int U_pad = U_TILE + 1;
+            size_t shmem_elems = (size_t)W * U_pad + (size_t)W;
             size_t shmem_bytes = shmem_elems * sizeof(scalar_t_);
 
-            fused_fctp_kernel_bwd_grad_a_multipath_tiledW<scalar_t_, W_TILE>
+            fused_fctp_kernel_bwd_grad_a_multipath_tiledU<scalar_t_, U_TILE>
                 <<<grid, block, (int)shmem_bytes, stream>>>(
                     b_all.data_ptr<scalar_t_>(),
                     w_all.data_ptr<scalar_t_>(),
@@ -575,8 +613,8 @@ at::Tensor launch_fused_multipath_fctp_tilew_backward(
                     K_max, (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
-        }
-    });
+            }
+        });
 
     grad_a = grad_a.view({B, I_total * U});
 
@@ -585,6 +623,7 @@ at::Tensor launch_fused_multipath_fctp_tilew_backward(
 }
 
 
+
 TORCH_LIBRARY(fctp_fused_multipath_bwd, m) {
-    m.def("backward", &launch_fused_multipath_fctp_tilew_backward);
+    m.def("backward", &launch_fused_multipath_fctp_tiled_backward);
 }

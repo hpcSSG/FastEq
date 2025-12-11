@@ -342,9 +342,9 @@ def make_FastChannelWiseTensorProductFunction():
             cg系数矩阵在 channel_wise 这里为单位矩阵，理论上可省略
             """
             # w:[B, 4 * U], x:[B, U], y:[B, dim_sum=16], outputs:[B, U*dim_sum=96*16]
-            output, b_buf = torch.ops.cwtp_fwd.forward(x.contiguous(), y.contiguous(), w.contiguous())
+            output = torch.ops.cwtp_fwd.comm(x.contiguous(), y.contiguous(), w.contiguous())
             ctx.save_for_backward(w, x, y)
-            ctx.b_buf = b_buf
+            #ctx.b_buf = b_buf
             return output
         
         @staticmethod
