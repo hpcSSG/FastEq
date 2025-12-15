@@ -3,6 +3,14 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#define CUDA_CHECK(expr)                                                   \
+    do {                                                                   \
+        cudaError_t _err = (expr);                                         \
+        TORCH_CHECK(_err == cudaSuccess,                                   \
+                    "CUDA error: ", cudaGetErrorString(_err),              \
+                    " (error code ", static_cast<int>(_err), ")");         \
+    } while (0)
+
 constexpr int P  = 4;    // paths
 constexpr int KS = 16;   // dim_sum = 16
 constexpr int U_FIXED = 96; // U=96, 可被4整除
@@ -185,7 +193,7 @@ __global__ void bwd_kernel_vec4_warp32_grouped_db_bstride(
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
-cwtp_backward(
+cwtp_small_backward(
     const at::Tensor& grad_out, // [B, KS, U]
     const at::Tensor& x,        // [B, U]
     const at::Tensor& y,        // [B, KS]
@@ -235,7 +243,460 @@ cwtp_backward(
     return {gx, gy, gw};
 }
 
+// 瓶颈在原子写操作
+template <typename scalar_t, int MAX_K_DIM>
+__global__ void tp_channel_wise_sparse_groupk_bwd_kernel(
+    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
+    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
+    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
+
+    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
+    const int32_t* __restrict__ k_dims,         // [num_paths]
+    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
+    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
+    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
+
+    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
+    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
+
+    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM]
+    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM]
+
+    // 稀疏 CG 系数（global memory）
+    const uint8_t* __restrict__ cg_i_all,       // [nnz_total]
+    const uint8_t* __restrict__ cg_j_all,       // [nnz_total]
+    const scalar_t* __restrict__ cg_val_all,    // [nnz_total]
+
+    // grad_out: dL/d out
+    const scalar_t* __restrict__ grad_out,      // [Z, K_TOTAL, U, V]
+
+    // 输出梯度
+    scalar_t* __restrict__ grad_x_uv,           // [Z, UV_TOTAL]
+    scalar_t* __restrict__ grad_x_iu,           // [Z, IU_TOTAL]
+    scalar_t* __restrict__ grad_x_jv,           // [Z, JV_TOTAL]
+
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int V,
+    int num_paths
+) {
+    int z = blockIdx.x;   // 一个 block 一个 batch
+    if (z >= Z) return;
+
+    int u = threadIdx.x;  // 每个 thread 一个 u
+    if (u >= U) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
+    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+
+    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+
+    int threads_in_block = blockDim.x;
+
+    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
+    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
+        s_iu[idx] = x_iu_z[idx];
+    }
+    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
+        s_jv[idx] = x_jv_z[idx];
+    }
+    __syncthreads();
+
+    const scalar_t* x_uv_z     = x_uv     + (size_t)z * UV_TOTAL;
+    const scalar_t* grad_out_z = grad_out + (size_t)z * (K_TOTAL * U * V);
+
+    scalar_t* grad_x_uv_z = grad_x_uv + (size_t)z * UV_TOTAL;
+    scalar_t* grad_x_iu_z = grad_x_iu + (size_t)z * IU_TOTAL;
+    scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
+
+    // 2. 遍历所有 path
+    for (int p = 0; p < num_paths; ++p) {
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+
+        int k_dim   = k_dims[p];
+        int nnz     = nnz_per_path[p];
+        int nnz_off = nnz_offsets[p];
+
+        if (k_dim <= 0 || nnz <= 0) {
+            continue;
+        }
+        if (k_dim > MAX_K_DIM) {
+            return;
+        }
+
+        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
+        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
+        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
+        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+
+        // 在 MACE-OFF 中通常 V=1，但这里保持通用
+        for (int v_idx = 0; v_idx < V; ++v_idx) {
+            int xuv_index = uv_base + u * V + v_idx;
+            scalar_t xuv_uv = x_uv_z[xuv_index];
+
+            // 按 k 分组
+            for (int k_local = 0; k_local < k_dim; ++k_local) {
+                int meta_idx    = p * MAX_K_DIM + k_local;
+                int local_off   = nnz_k_offsets[meta_idx];
+                int local_count = nnz_k_counts[meta_idx];
+
+                if (local_count <= 0)
+                    continue;
+
+                int global_k  = k_base + k_local;
+                int out_index = (global_k * U + u) * V + v_idx;
+                scalar_t g = grad_out_z[out_index];  // dL/d out(z,global_k,u,v)
+
+                if (g == static_cast<scalar_t>(0)) {
+                    continue;
+                }
+
+                // 用于 d(x_uv) 的 sum_{(i,j) in nnz} c * x_iu * x_jv
+                scalar_t sum_all_ij = static_cast<scalar_t>(0);
+
+                // 遍历这个 k 的所有 nnz（本 path 内连续）
+                for (int tt = 0; tt < local_count; ++tt) {
+                    int t   = local_off + tt;
+                    int idx = nnz_off + t; // global nnz index
+
+                    int i = static_cast<int>(cg_i_all[idx]);
+                    int j = static_cast<int>(cg_j_all[idx]);
+                    scalar_t c = cg_val_all[idx];
+
+                    // x_iu[z, iu_seg][i, u]
+                    int xiu_index = iu_base + i * U + u;
+                    scalar_t xiu_iu = s_iu[xiu_index];
+
+                    // x_jv[z, jv_seg][j, v]
+                    int xjv_index = jv_base + j * V + v_idx;
+                    scalar_t xjv_jv = s_jv[xjv_index];
+
+                    // --- dL/d x_iu[i,u] += g * c * x_jv * x_uv ---
+                    scalar_t d_xiu = g * c * xjv_jv * xuv_uv;
+                    grad_x_iu_z[xiu_index] += d_xiu;
+
+                    // --- dL/d x_jv[j,v] += g * c * x_iu * x_uv ---
+                    scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
+                    atomicAdd(&grad_x_jv_z[xjv_index], d_xjv);
+
+                    // --- 对 x_uv 的贡献项累加 ---
+                    sum_all_ij += c * xiu_iu * xjv_jv;
+                }
+
+                // --- dL/d x_uv[u,v] += g * sum_{(i,j)} c * x_iu * x_jv ---
+                scalar_t d_xuv = g * sum_all_ij;
+                grad_x_uv_z[xuv_index] += d_xuv;
+            }
+        }
+    }
+}
+
+
+
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
+    // 默认 32-lane warp
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(mask, v, offset);
+    }
+    return v;
+}
+
+// 1. 分组规约减少global write back & 2. warp reduce 减少原子写操作
+template <typename scalar_t, int MAX_K_DIM>
+__global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
+    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
+    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
+    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
+
+    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
+    const int32_t* __restrict__ k_dims,         // [num_paths]
+    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
+    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
+    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
+
+    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
+    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
+
+    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM]
+    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM]
+
+    // 稀疏 CG 系数（global memory）
+    const uint8_t* __restrict__ cg_i_all,       // [nnz_total]
+    const uint8_t* __restrict__ cg_j_all,       // [nnz_total]
+    const scalar_t* __restrict__ cg_val_all,    // [nnz_total]
+
+    // grad_out: dL/d out
+    const scalar_t* __restrict__ grad_out,      // [Z, K_TOTAL, U, V]
+
+    // 输出梯度
+    scalar_t* __restrict__ grad_x_uv,           // [Z, UV_TOTAL]
+    scalar_t* __restrict__ grad_x_iu,           // [Z, IU_TOTAL]
+    scalar_t* __restrict__ grad_x_jv,           // [Z, JV_TOTAL]
+
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int V,
+    int num_paths
+) {
+    int z = blockIdx.x;   // 一个 block 一个 batch
+    if (z >= Z) return;
+
+    int u = threadIdx.x;  // 每个 thread 一个 u
+    if (u >= U) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
+    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+
+    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+
+    int threads_in_block = blockDim.x;
+
+    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
+    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
+        s_iu[idx] = x_iu_z[idx];
+    }
+    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
+        s_jv[idx] = x_jv_z[idx];
+    }
+    __syncthreads();
+
+    const scalar_t* x_uv_z     = x_uv     + (size_t)z * UV_TOTAL;
+    const scalar_t* grad_out_z = grad_out + (size_t)z * (K_TOTAL * U * V);
+
+    scalar_t* grad_x_uv_z = grad_x_uv + (size_t)z * UV_TOTAL;
+    scalar_t* grad_x_iu_z = grad_x_iu + (size_t)z * IU_TOTAL;
+    scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
+
+    // 2. 遍历所有 path
+    for (int p = 0; p < num_paths; ++p) {
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+
+        int k_dim   = k_dims[p];
+        int nnz     = nnz_per_path[p];
+        int nnz_off = nnz_offsets[p];
+
+        if (k_dim <= 0 || nnz <= 0) {
+            continue;
+        }
+        if (k_dim > MAX_K_DIM) {
+            return;
+        }
+
+        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
+        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
+        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
+        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+
+        // 在 MACE-OFF 中 V=1，但这里保持通用
+        for (int v_idx = 0; v_idx < V; ++v_idx) {
+            int xuv_index = uv_base + u * V + v_idx;
+            scalar_t xuv_uv = x_uv_z[xuv_index];
+
+            // 按 k 分组
+            for (int k_local = 0; k_local < k_dim; ++k_local) {
+                int meta_idx    = p * MAX_K_DIM + k_local;
+                int local_off   = nnz_k_offsets[meta_idx];
+                int local_count = nnz_k_counts[meta_idx];
+
+                if (local_count <= 0)
+                    continue;
+
+                int global_k  = k_base + k_local;
+                int out_index = (global_k * U + u) * V + v_idx;
+                scalar_t g = grad_out_z[out_index];  // dL/d out(z,global_k,u,v)
+
+                if (g == static_cast<scalar_t>(0)) {
+                    continue;
+                }
+
+                // 用于 d(x_uv) 的 sum_{(i,j) in nnz} c * x_iu * x_jv
+                scalar_t sum_all_ij = static_cast<scalar_t>(0);
+
+                // 遍历这个 k 的所有 nnz
+                for (int tt = 0; tt < local_count; ++tt) {
+                    int t   = local_off + tt;
+                    int idx = nnz_off + t; // global nnz index
+
+                    int i = static_cast<int>(cg_i_all[idx]);
+                    int j = static_cast<int>(cg_j_all[idx]);
+                    scalar_t c = cg_val_all[idx];
+
+                    // x_iu[z, iu_seg][i, u]
+                    int xiu_index = iu_base + i * U + u;
+                    scalar_t xiu_iu = s_iu[xiu_index];
+
+                    // x_jv[z, jv_seg][j, v]
+                    int xjv_index = jv_base + j * V + v_idx;
+                    scalar_t xjv_jv = s_jv[xjv_index];
+
+                    // --- dL/d x_iu[i,u] += g * c * x_jv * x_uv ---
+                    scalar_t d_xiu = g * c * xjv_jv * xuv_uv;
+                    grad_x_iu_z[xiu_index] += d_xiu;
+
+                    // --- dL/d x_jv[j,v] += g * c * x_iu * x_uv ---
+                    //scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
+                    //atomicAdd(&grad_x_jv_z[xjv_index], d_xjv);
+
+                    scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
+                    // warp 内归约：同一个 (p,k_local,v_idx,tt) 的 xjv_index 对所有 u 都相同
+                    unsigned mask = __activemask();                 // 当前 warp 活跃线程掩码
+                    scalar_t warp_sum = warp_reduce_sum(d_xjv, mask);
+
+                    if ((threadIdx.x & 31) == 0) {                  // lane0
+                        atomicAdd(&grad_x_jv_z[xjv_index], warp_sum);
+                    }
+
+                    // --- 对 x_uv 的贡献项累加 ---
+                    sum_all_ij += c * xiu_iu * xjv_jv;
+                }
+
+                // --- dL/d x_uv[u,v] += g * sum_{(i,j)} c * x_iu * x_jv ---
+                scalar_t d_xuv = g * sum_all_ij;
+                grad_x_uv_z[xuv_index] += d_xuv;
+            }
+        }
+    }
+}
+
+std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
+    torch::Tensor x_uv,            // [Z, UV_TOTAL]
+    torch::Tensor x_iu,            // [Z, IU_TOTAL]
+    torch::Tensor x_jv,            // [Z, JV_TOTAL]
+
+    torch::Tensor path_indices,    // [num_paths, 4], int32
+    torch::Tensor k_dims,          // [num_paths], int32
+    torch::Tensor iu_seg_offsets,  // [iu_seg_count], int32
+    torch::Tensor jv_seg_offsets,  // [jv_seg_count], int32
+    torch::Tensor kv_k_offsets,    // [kv_seg_count], int32
+
+    // 稀疏 CG
+    torch::Tensor nnz_per_path,    // [num_paths], int32
+    torch::Tensor nnz_offsets,     // [num_paths], int32
+    torch::Tensor nnz_k_offsets,   // [num_paths * MAX_K_DIM], int32
+    torch::Tensor nnz_k_counts,    // [num_paths * MAX_K_DIM], int32
+    torch::Tensor cg_i_all,        // [nnz_total], uint8
+    torch::Tensor cg_j_all,        // [nnz_total], uint8
+    torch::Tensor cg_val_all,      // [nnz_total], same dtype as x_uv
+
+    torch::Tensor grad_out,        // [Z, K_TOTAL, U, V]
+
+    const int64_t U,
+    const int64_t V,
+    const int64_t K_TOTAL
+) {
+    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
+    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
+
+    x_uv = x_uv.contiguous();
+    x_iu = x_iu.contiguous();
+    x_jv = x_jv.contiguous();
+    path_indices   = path_indices.contiguous();
+    k_dims         = k_dims.contiguous();
+    iu_seg_offsets = iu_seg_offsets.contiguous();
+    jv_seg_offsets = jv_seg_offsets.contiguous();
+    kv_k_offsets   = kv_k_offsets.contiguous();
+    nnz_per_path   = nnz_per_path.contiguous();
+    nnz_offsets    = nnz_offsets.contiguous();
+    nnz_k_offsets  = nnz_k_offsets.contiguous();
+    nnz_k_counts   = nnz_k_counts.contiguous();
+    cg_i_all       = cg_i_all.contiguous();
+    cg_j_all       = cg_j_all.contiguous();
+    cg_val_all     = cg_val_all.contiguous();
+
+    auto Z        = x_uv.size(0);
+    auto UV_TOTAL = x_uv.size(1);
+    auto IU_TOTAL = x_iu.size(1);
+    auto JV_TOTAL = x_jv.size(1);
+
+    grad_out = grad_out.view({Z, K_TOTAL, U, V}).contiguous();
+
+    TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch dim mismatch");
+    TORCH_CHECK(path_indices.dim() == 2 && path_indices.size(1) == 4,
+                "path_indices must be [num_paths,4]");
+    TORCH_CHECK(grad_out.size(0) == Z &&
+                grad_out.size(1) == K_TOTAL &&
+                grad_out.size(2) == U &&
+                grad_out.size(3) == V,
+                "grad_out shape mismatch");
+
+    int num_paths = path_indices.size(0);
+
+    constexpr int MAX_K_DIM = 8;
+    auto grad_x_uv = torch::zeros_like(x_uv);
+    auto grad_x_iu = torch::zeros_like(x_iu);
+    auto grad_x_jv = torch::zeros_like(x_jv);
+
+    int threads = static_cast<int>(U);
+    if (threads < 32) = 32;
+    if (threads > 1024) threads = 1024;
+
+    int blocks = static_cast<int>(Z);
+    size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(),
+                               "tp_channel_wise_sparse_groupk_bwd_kernel",
+                               [&] {
+        tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel<scalar_t, MAX_K_DIM>
+            <<<blocks, threads, smem_bytes, stream>>>(
+                x_uv.data_ptr<scalar_t>(),
+                x_iu.data_ptr<scalar_t>(),
+                x_jv.data_ptr<scalar_t>(),
+                path_indices.data_ptr<int32_t>(),
+                k_dims.data_ptr<int32_t>(),
+                iu_seg_offsets.data_ptr<int32_t>(),
+                jv_seg_offsets.data_ptr<int32_t>(),
+                kv_k_offsets.data_ptr<int32_t>(),
+                nnz_per_path.data_ptr<int32_t>(),
+                nnz_offsets.data_ptr<int32_t>(),
+                nnz_k_offsets.data_ptr<int32_t>(),
+                nnz_k_counts.data_ptr<int32_t>(),
+                cg_i_all.data_ptr<uint8_t>(),
+                cg_j_all.data_ptr<uint8_t>(),
+                cg_val_all.data_ptr<scalar_t>(),
+                grad_out.data_ptr<scalar_t>(),
+                grad_x_uv.data_ptr<scalar_t>(),
+                grad_x_iu.data_ptr<scalar_t>(),
+                grad_x_jv.data_ptr<scalar_t>(),
+                (int)Z,
+                (int)UV_TOTAL,
+                (int)IU_TOTAL,
+                (int)JV_TOTAL,
+                (int)K_TOTAL,
+                (int)U,
+                (int)V,
+                num_paths
+            );
+        CUDA_CHECK(cudaGetLastError());
+    });
+
+    return {grad_x_uv, grad_x_iu, grad_x_jv};
+}
+
+
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &cwtp_backward);
+    m.def("backward", &tp_channel_wise_bwd_launch);
 }

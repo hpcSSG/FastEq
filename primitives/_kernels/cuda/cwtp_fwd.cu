@@ -150,7 +150,7 @@ std::tuple<at::Tensor, at::Tensor> cwtp_mace_small_forward(
     const int64_t B = x.size(0);
     const int64_t U = x.size(1);
 
-    TORCH_CHECK(U == U_FIXED, "U must be 96");
+    //TORCH_CHECK(U == U_FIXED, "U must be 96");
     TORCH_CHECK(y.sizes() == at::IntArrayRef({B, KS}), "y must be [B,16]");
     TORCH_CHECK(w.sizes() == at::IntArrayRef({B, P * U}), "w must be [B,4,96]");
 
@@ -562,7 +562,7 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
     }
 }
 
-torch::Tensor tp_channel_wise_launch(
+torch::Tensor tp_channel_wise_fwd_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
     torch::Tensor x_jv,            // [Z, JV_TOTAL]
@@ -709,7 +709,8 @@ torch::Tensor tp_channel_wise_launch(
                 (int)V,
                 num_paths
             );
-
+        
+        out = out.view({Z, K_TOTAL * U * V});
         CUDA_CHECK(cudaGetLastError());
     });
 
@@ -718,6 +719,6 @@ torch::Tensor tp_channel_wise_launch(
 
 TORCH_LIBRARY(cwtp_fwd, m)
 {
-    //m.def("mace_small", &cwtp_mace_small_forward);
-    m.def("comm", &tp_channel_wise_launch);
+    //m.def("forward", &cwtp_mace_small_forward);
+    m.def("forward", &tp_channel_wise_fwd_launch);
 }
