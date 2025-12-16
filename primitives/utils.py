@@ -333,25 +333,109 @@ def make_FastEquiLinearFunction():
     
     return FastEquiLinearFunction
 
+def make_FastChannelWiseTensorProductFunction(
+                    c_all,
+                    path_indices_tensor,
+                    i_dims, j_dims, k_dims,
+                    c_offsets,
+                    iu_seg_offsets,
+                    jv_seg_offsets,
+                    kv_k_offsets,
+                    nnz_per_path,
+                    nnz_offsets,
+                    nnz_k_offsets,
+                    nnz_k_counts,
+                    cg_i_all,
+                    cg_j_all,
+                    cg_k_all,
+                    cg_val_all,
+                    U, V, K_TOTAL):
 
-def make_FastChannelWiseTensorProductFunction():
+#def make_FastChannelWiseTensorProductFunction():
     class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w, x, y):
-            """
-            cg系数矩阵在 channel_wise 这里为单位矩阵，理论上可省略
-            """
-            # w:[B, 4 * U], x:[B, U], y:[B, dim_sum=16], outputs:[B, U*dim_sum=96*16]
-            output = torch.ops.cwtp_fwd.comm(x.contiguous(), y.contiguous(), w.contiguous())
+
+            print(f"k_dims:{k_dims}")
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
+            output = torch.ops.cwtp_fwd.forward(
+                w, x, y,
+                c_all,
+                path_indices_tensor,
+                i_dims, j_dims, k_dims,
+                c_offsets,
+                iu_seg_offsets,
+                jv_seg_offsets,
+                kv_k_offsets,
+                nnz_per_path,
+                nnz_offsets,
+                nnz_k_offsets,
+                nnz_k_counts,
+                cg_i_all,
+                cg_j_all,
+                cg_k_all,
+                cg_val_all,
+                U, V, K_TOTAL
+            )
+            
+            '''
+            output, b_buf = torch.ops.cwtp_fwd.forward(x.contiguous(), y.contiguous(), w.contiguous())
             ctx.save_for_backward(w, x, y)
-            #ctx.b_buf = b_buf
+            ctx.b_buf = b_buf
+            '''
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
+
+            ctx.save_for_backward(w, x, y)
+
             return output
-        
+
         @staticmethod
-        def backward(ctx, grad_out):
+        def backward(ctx, grad_output):
+
             w, x, y = ctx.saved_tensors
-            grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_out.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
-            return grad_w, grad_x, grad_y  #  descriptor 不需要梯度
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
+                w, x, y,
+                path_indices_tensor,
+                k_dims,
+                iu_seg_offsets,
+                jv_seg_offsets,
+                kv_k_offsets,
+                nnz_per_path,
+                nnz_offsets,
+                nnz_k_offsets,
+                nnz_k_counts,
+                cg_i_all,
+                cg_j_all,
+                cg_val_all,
+                grad_output,
+                U, V, K_TOTAL
+            )
+            
+
+            #grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_output.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
+            
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms >>")
+
+            return (
+                grad_w,   # w
+                grad_x,   # x
+                grad_y,   # y
+            )
+
     return FastChannelWiseTensorProductFunction
 
 def make_FastSymmetricTensorContractionFunction():
@@ -464,3 +548,44 @@ def make_FastFusedMessagePassing():
         
     return FusedMPFunction
 
+
+
+def make_FastSphericalHarmonics():
+    class FastSphericalHarmonics(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, xyz):
+            
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+            
+            result = torch.ops.fast_spherical_harmonics.forward(xyz)
+
+            if xyz.requires_grad:
+                ctx.save_for_backward(result[1])
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq spherical harmonics forward cost: {execution_time_ms:.3f} ms >>")
+            return result[0]
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            sph_harmonics_deriv, = ctx.saved_tensors
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
+            xyz_grad = torch.ops.fast_spherical_harmonics.backward(
+                sph_harmonics_deriv.contiguous(),
+                grad_out.contiguous()
+            )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq spherical harmonics backward cost: {execution_time_ms:.3f} ms >>")
+
+            return xyz_grad
+        
+    return FastSphericalHarmonics

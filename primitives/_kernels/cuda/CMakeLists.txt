@@ -29,8 +29,8 @@ include_directories(${TORCH_INSTALL_PREFIX}/include)
 # 添加文件，指定CUDA源文件
 add_library(${PROJECT_NAME} SHARED
     #fctp_fused2_fwd.cu
-    fctp_fused3_fwd.cu
-    fctp_fused3_bwd.cu
+    #fctp_fused3_fwd.cu
+    #fctp_fused3_bwd.cu
     fctp_fused_path_fwd.cu
     fctp_fused_path_bwd.cu
     #fctp_spmm_fwd.cu
@@ -42,14 +42,16 @@ add_library(${PROJECT_NAME} SHARED
     cwtp_bwd.cu
     fused_message_passing_fwd.cu
     fused_message_passing_bwd.cu
+    spherical_harmonics.cu
 )
 
 # 为目标设置编译和链接标志
 target_compile_options(${PROJECT_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>: --expt-relaxed-constexpr> # 允许CUDA constexpr放松限制
     # 其他CUDA特定编译选项...
+    --std=c++17
     -O3
-    -Xptxas --maxrregcount=128
+    #-Xptxas --maxrregcount=128
     --use_fast_math
     --ptxas-options=-v
 )
