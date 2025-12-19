@@ -102,7 +102,7 @@ def _my_tensor_product_fx(
             #segment1 = segments[1].squeeze(1)
             #out = torch.matmul(segment1, segment0) * c_tensor
             #out.unsqueeze_(1)
-            print(f"formula:{formula}, c_tensor shape:{c_tensor.shape}, segments[0] shape:{segments[0].shape}, segments[1] shape:{segments[1].shape}, segments[2] shape:{segments[2].shape}, out shape:{out.shape}")   
+            #print(f"formula:{formula}, c_tensor shape:{c_tensor.shape}, segments[0] shape:{segments[0].shape}, segments[1] shape:{segments[1].shape}, segments[2] shape:{segments[2].shape}, out shape:{out.shape}")   
 
             seg_shape = descriptor.get_segment_shape(-1, path)
             outputs += [
@@ -172,6 +172,7 @@ def build_sparse_cg_and_k_groups(descriptor, math_dtype, device, max_k_dim_for_k
             torch.tensor(path.coefficients, dtype=math_dtype, device=device)
         )  # [i_dim, j_dim, k_dim]
         c_tensors.append(c_tensor)
+    
 
     global_offset = 0
     for path_id, c in enumerate(c_tensors):
@@ -180,6 +181,8 @@ def build_sparse_cg_and_k_groups(descriptor, math_dtype, device, max_k_dim_for_k
         # 1) 非零位置
         nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz, 3] (i,j,k)
         nnz = nz_idx.size(0)
+
+        #print(f"path_id:{path_id}, cg shape:{c.shape}, cg:{c}, nnz:{nnz}")
 
         nnz_per_path.append(nnz)
         nnz_offsets.append(global_offset)
@@ -247,6 +250,13 @@ def build_sparse_cg_and_k_groups(descriptor, math_dtype, device, max_k_dim_for_k
     nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0)  # contiguous
     nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0)
 
+    print(f"nnz_per_path:{nnz_per_path}")
+
+    for idx in range(0, len(cg_i_all)):
+        print(f"cg_i {idx}: {cg_i_all[idx]}, cg_j {idx}: {cg_j_all[idx]}, cg_k {idx}: {cg_k_all[idx]}")
+    
+    print(f"nnz_k_counts:{nnz_k_counts}")
+
     return {
         "cg_i_all": cg_i_all,
         "cg_j_all": cg_j_all,
@@ -257,6 +267,135 @@ def build_sparse_cg_and_k_groups(descriptor, math_dtype, device, max_k_dim_for_k
         "nnz_k_offsets": nnz_k_offsets,
         "nnz_k_counts": nnz_k_counts,
     }
+
+@torch.no_grad()
+def build_sparse_cg_and_kij_groups_v2(
+    descriptor,
+    math_dtype,
+    device,
+    max_k_dim_for_kernel=8, # {1, 3, 5, 7}
+    max_i_dim_for_kernel=8, # {1, 3, 5, 7}
+    max_j_dim_for_kernel=8, # {1, 3, 5, 7}
+):
+    """
+    构造三套独立的全局 CG 表：
+      - groupk: path 内按 k 升序排序，k 段连续（无需 perm）
+      - groupi: path 内按 i 升序排序，i 段连续（无需 perm）
+      - groupj: path 内按 j 升序排序，j 段连续（无需 perm）
+
+    每套都输出：
+      cg_i_all, cg_j_all, cg_k_all, cg_val_all
+      nnz_per_path, nnz_offsets
+      nnz_{key}_offsets: [P, MAX_{KEY}_DIM]
+      nnz_{key}_counts : [P, MAX_{KEY}_DIM]
+    """
+
+    # 1) 先把每个 path 的稠密系数张量拉出来
+    c_tensors = []
+    for path in descriptor.paths:
+        c_tensors.append(torch.tensor(path.coefficients, dtype=math_dtype, device=device))
+
+    P = len(c_tensors)
+
+    def _build_one_group(sort_axis: int, max_dim: int, dim_axis: int, name: str):
+        """
+        sort_axis: 0/1/2 表示按 i/j/k 排序
+        dim_axis : 0/1/2 表示对应维度 i_dim/j_dim/k_dim
+        name     : 'k'/'i'/'j' 仅用于报错信息
+        """
+        cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
+        nnz_per_path = []
+        nnz_offsets = []
+        nnz_key_offsets_list = []
+        nnz_key_counts_list = []
+
+        global_offset = 0
+
+        for p, c in enumerate(c_tensors):
+            i_dim, j_dim, k_dim = c.shape
+            dims = (i_dim, j_dim, k_dim)
+            key_dim = int(dims[dim_axis])
+
+            nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3]
+            nnz = int(nz_idx.size(0))
+
+            nnz_per_path.append(nnz)
+            nnz_offsets.append(global_offset)
+
+            local_offsets = torch.zeros(max_dim, dtype=torch.int32, device=device)
+            local_counts  = torch.zeros(max_dim, dtype=torch.int32, device=device)
+
+            if nnz > 0:
+                if key_dim > max_dim:
+                    raise ValueError(f"[{name}] key_dim={key_dim} > max_dim={max_dim} at path {p}")
+
+                # 按 key 排序（stable 保留同 key 内原顺序）
+                order = torch.argsort(nz_idx[:, sort_axis], stable=True)
+                nz_sorted = nz_idx[order]
+
+                i_idx = nz_sorted[:, 0].to(torch.uint8)
+                j_idx = nz_sorted[:, 1].to(torch.uint8)
+                k_idx = nz_sorted[:, 2].to(torch.uint8)
+                vals  = c[nz_sorted[:, 0], nz_sorted[:, 1], nz_sorted[:, 2]].to(math_dtype)
+
+                cg_i_list.append(i_idx)
+                cg_j_list.append(j_idx)
+                cg_k_list.append(k_idx)
+                cg_val_list.append(vals)
+
+                # counts/offsets：由于已经按 key 排序，桶内天然连续
+                keys_sorted = nz_sorted[:, sort_axis].to(torch.int64)  # 0..key_dim-1
+                if torch.any(keys_sorted < 0) or torch.any(keys_sorted >= key_dim):
+                    raise ValueError(f"[{name}] key out of range at path {p}")
+
+                bc = torch.bincount(keys_sorted, minlength=max_dim).to(torch.int32)
+                bc[key_dim:] = 0
+                local_counts[:] = bc
+                local_offsets[0] = 0
+                if max_dim > 1:
+                    local_offsets[1:] = torch.cumsum(bc[:-1], dim=0)
+
+            nnz_key_offsets_list.append(local_offsets)
+            nnz_key_counts_list.append(local_counts)
+
+            global_offset += nnz
+
+        # 拼接全局 CG
+        if len(cg_i_list) > 0:
+            cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
+            cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
+            cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
+            cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
+        else:
+            cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
+            cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
+            cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
+            cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
+
+        nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
+        nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
+
+        nnz_key_offsets = torch.stack(nnz_key_offsets_list, dim=0).contiguous()  # [P,max_dim]
+        nnz_key_counts  = torch.stack(nnz_key_counts_list,  dim=0).contiguous()
+
+        return {
+            "cg_i_all": cg_i_all,
+            "cg_j_all": cg_j_all,
+            "cg_k_all": cg_k_all,
+            "cg_val_all": cg_val_all,
+            "nnz_per_path": nnz_per_path_t,
+            "nnz_offsets": nnz_offsets_t,
+            f"nnz_{name}_offsets": nnz_key_offsets,
+            f"nnz_{name}_counts": nnz_key_counts,
+        }
+
+    # 2) 三套分别构造
+    groupk = _build_one_group(sort_axis=2, max_dim=max_k_dim_for_kernel, dim_axis=2, name="k")
+    groupi = _build_one_group(sort_axis=0, max_dim=max_i_dim_for_kernel, dim_axis=0, name="i")
+    groupj = _build_one_group(sort_axis=1, max_dim=max_j_dim_for_kernel, dim_axis=1, name="j")
+
+    return {"groupk": groupk, "groupi": groupi, "groupj": groupj}
+
 
 
 def infer_slices_and_meta(descriptor, math_dtype, device,
@@ -560,22 +699,39 @@ class TensorProduct(torch.nn.Module):
                 path_indices = meta["path_indices"]
                 self.path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device)
 
+                pi = path_indices.detach()
+                print(f"pi:{pi}")
+                P = pi.size(0)
+                uv = pi[:,0].tolist()
+                iu = pi[:,1].tolist()
+                jv = pi[:,2].tolist()
+                kv = pi[:,3].tolist()
+                self.order_uv = torch.tensor(sorted(range(P), key=lambda p:(uv[p], kv[p])), dtype=torch.int32, device=device)
+                self.order_iu = torch.tensor(sorted(range(P), key=lambda p:(iu[p], kv[p])), dtype=torch.int32, device=device)
+                self.order_jv = torch.tensor(sorted(range(P), key=lambda p:(jv[p], kv[p])), dtype=torch.int32, device=device)
+
                 # for sparse cw tensor product
-                sparse_meta = build_sparse_cg_and_k_groups(descriptor, math_dtype, device)
-                self.nnz_per_path = sparse_meta["nnz_per_path"]
-                self.nnz_offsets = sparse_meta["nnz_offsets"]
-                self.cg_i_all = sparse_meta["cg_i_all"]
-                self.cg_j_all = sparse_meta["cg_j_all"]
-                self.cg_k_all = sparse_meta["cg_k_all"]
-                self.cg_val_all = sparse_meta["cg_val_all"]
+                groups_meta = build_sparse_cg_and_kij_groups_v2(descriptor, math_dtype, device)
 
-                self.nnz_k_offsets = sparse_meta["nnz_k_offsets"]
-                self.nnz_k_counts = sparse_meta["nnz_k_counts"]
+                groupk_meta = groups_meta["groupk"]
+                groupi_meta = groups_meta["groupi"]
+                groupj_meta = groups_meta["groupj"]
 
-                print(f"nnz_k_offsets:{self.nnz_k_offsets}, nnz_k_counts:{self.nnz_k_counts}")
-
+                self.groupk_meta = groupk_meta
+                self.groupi_meta = groupi_meta
+                self.groupj_meta = groupj_meta
                 
-                self.fasteq_cwtp = torch.ops.cwtp_fwd.comm
+                self.cg_i_groupk = groupk_meta["cg_i_all"]
+                self.cg_j_groupk  = groupk_meta["cg_j_all"]
+                self.cg_k_groupk  = groupk_meta["cg_k_all"]
+                self.cg_val_groupk  = groupk_meta["cg_val_all"]
+
+                self.nnz_per_path = groupk_meta["nnz_per_path"]
+                self.nnz_offsets_groupk = groupk_meta["nnz_offsets"]
+                self.nnz_k_offsets_groupk = groupk_meta["nnz_k_offsets"]
+                self.nnz_k_counts_groupk = groupk_meta["nnz_k_counts"]
+                
+                self.fasteq_cwtp = torch.ops.cwtp_fwd.forward
 
             # For mace small
             if self.op_name == "tp_fully_connected":
@@ -656,7 +812,45 @@ class TensorProduct(torch.nn.Module):
         if self.op_name == "equi_linear":
             self.FastEquiLinearFunction = make_FastEquiLinearFunction()
         if self.op_name == "tp_channel_wise":
-            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
+            '''
+            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction(
+                self.c_all,
+                self.path_indices_tensor,
+                self.i_dims, self.j_dims, self.k_dims,
+                self.c_offsets,
+                self.iu_seg_offsets,
+                self.jv_seg_offsets,
+                self.kv_k_offsets,
+                self.nnz_per_path,
+                self.nnz_offsets_groupk,
+                self.nnz_k_offsets_groupk,
+                self.nnz_k_counts_groupk,
+                self.cg_i_groupk,
+                self.cg_j_groupk,
+                self.cg_k_groupk,
+                self.cg_val_groupk,
+                self.u, self.v, self.K_TOTAL
+            )
+            '''
+
+            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction(
+                self.c_all,
+                self.path_indices_tensor,
+                self.i_dims, self.j_dims, self.k_dims,
+                self.c_offsets,
+                self.iu_seg_offsets,
+                self.jv_seg_offsets,
+                self.kv_k_offsets,
+                self.groupk_meta,
+                self.groupi_meta,
+                self.groupj_meta,
+                self.order_uv,
+                self.order_iu,
+                self.order_jv,
+                self.u, self.v, self.K_TOTAL
+            )
+        
+        #self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
         # ================================================
 
         if use_fallback is False:
@@ -799,24 +993,29 @@ class TensorProduct(torch.nn.Module):
             elif self.op_name == "tp_channel_wise":
                 #print("== call fasteq channel-wise tensor product ==")
                 #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
+                
+                out = self.FastCWTPFunc.apply(
+                    inputs[0], inputs[1], inputs[2],
+                )
             # TODO fix 
-            elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 36864)):
-                #print("== call fasteq equi-linear tensor product ==")
-                dtype = inputs[0].dtype
-                w = inputs[0].to(torch.float64)
-                x = inputs[1].to(torch.float64)
+            elif self.op_name == "equi_linear":
+                #print(f"equi_linear, inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}")
+                if tuple(inputs[0].shape) == (1, 36864):
+                    #print("== call fasteq equi-linear tensor product ==")
+                    dtype = inputs[0].dtype
+                    w = inputs[0].to(torch.float64)
+                    x = inputs[1].to(torch.float64)
 
-                out = self.FastEquiLinearFunction.apply(w, x, self.descriptor)
-                out = out.to(dtype)
+                    out = self.FastEquiLinearFunction.apply(w, x, self.descriptor)
+                    out = out.to(dtype)
 
-            elif self.op_name == "equi_linear" and (tuple(inputs[0].shape) == (1, 9216)) and inputs[1].shape[1] == 96:
-                #print(f"==== call my matmul linear ====")
-                weight = inputs[0].reshape(96, 96)
-                out = torch.matmul(inputs[1], weight) * 0.10206207261596577
-                #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
-            else:
-                out = self.f(inputs)
+                elif (tuple(inputs[0].shape) == (1, 9216)) and inputs[1].shape[1] == 96:
+                    #print(f"==== call my matmul linear ====")
+                    weight = inputs[0].reshape(96, 96)
+                    out = torch.matmul(inputs[1], weight) * 0.10206207261596577
+                    #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
+                else:
+                    out = self.f(inputs)
         else:
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
@@ -828,8 +1027,8 @@ class TensorProduct(torch.nn.Module):
             execution_time_ms = (end_time - start_time)
             print(f"========= cueq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
 
+            '''
             if self.op_name == "tp_fully_connected":
-                '''
                 print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
                 print(f"cg_val_all:{self.cg_val_all}, nnz_per_path:{self.nnz_per_path}")
                 print(f"descriptor={self.descriptor.get_dimensions_dict()}")
@@ -848,8 +1047,8 @@ class TensorProduct(torch.nn.Module):
                 print("cueq vs cuda allclose:",
                     torch.allclose(ref, out, atol=1e-9, rtol=1e-7),
                     "max diff", (ref - out).abs().max().item())
-                '''
-
+            '''
+            '''
             if self.op_name == "tp_channel_wise":
 
                 #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
@@ -890,7 +1089,7 @@ class TensorProduct(torch.nn.Module):
                 print("cueq vs cuda allclose:",
                     torch.allclose(ref, out, atol=1e-9, rtol=1e-7),
                     "max diff", (ref - out).abs().max().item())
-            
+            '''
         return out
 
 

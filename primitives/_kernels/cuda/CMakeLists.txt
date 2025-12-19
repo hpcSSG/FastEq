@@ -51,7 +51,7 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     # 其他CUDA特定编译选项...
     --std=c++17
     -O3
-    #-Xptxas --maxrregcount=128
+    -Xptxas --maxrregcount=128
     --use_fast_math
     --ptxas-options=-v
 )

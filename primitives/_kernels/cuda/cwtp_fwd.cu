@@ -640,46 +640,6 @@ torch::Tensor tp_channel_wise_fwd_launch(
 
     AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
 
-        /*
-        if (x_uv.scalar_type() == at::kDouble) {
-            int total_c_bytes = c_all.numel() * c_all.element_size();
-            cudaMemcpyToSymbol(c_all_const_d, c_all.data_ptr<double>(),
-                    total_c_bytes, 0, cudaMemcpyHostToDevice);
-        } else if (x_uv.scalar_type() == at::kFloat) {
-            int total_c_bytes = c_all.numel() * c_all.element_size();
-            cudaMemcpyToSymbol(c_all_const_f, c_all.data_ptr<float>(),
-                    total_c_bytes, 0, cudaMemcpyHostToDevice);
-        }
-
-        tp_channel_wise_sparse_kernel<scalar_t, MAX_K_DIM><<<blocks, threads, smem_bytes, stream>>>(
-            x_uv.data_ptr<scalar_t>(),
-            x_iu.data_ptr<scalar_t>(),
-            x_jv.data_ptr<scalar_t>(),
-            path_indices.data_ptr<int>(),
-            i_dims.data_ptr<int>(),
-            j_dims.data_ptr<int>(),
-            k_dims.data_ptr<int>(),
-            iu_seg_offsets.data_ptr<int>(),
-            jv_seg_offsets.data_ptr<int>(),
-            kv_k_offsets.data_ptr<int>(),
-            nnz_per_path.data_ptr<int>(),
-            nnz_offsets.data_ptr<int>(),
-            cg_i_all.data_ptr<uint8_t>(),
-            cg_j_all.data_ptr<uint8_t>(),
-            cg_k_all.data_ptr<uint8_t>(),
-            cg_val_all.data_ptr<scalar_t>(),
-            out.data_ptr<scalar_t>(),
-            (int)Z,
-            (int)UV_TOTAL,
-            (int)IU_TOTAL,
-            (int)JV_TOTAL,
-            K_TOTAL,
-            U,
-            V,
-            num_paths
-        );
-        */
-
         tp_channel_wise_sparse_groupk_kernel<scalar_t, MAX_K_DIM>
             <<<blocks, threads, smem_bytes, stream>>>(
                 x_uv.data_ptr<scalar_t>(),

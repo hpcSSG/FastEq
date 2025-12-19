@@ -430,7 +430,7 @@ at::Tensor launch_fused_multipath_fctp(
     const int U_pad = U + 1;
     size_t shmem_elems = (size_t)W * U_pad + (size_t)nnz_max * U_pad;
     size_t shmem_bytes = shmem_elems * a_all.element_size();
-    std::cout<<"fast fctp launch param, P:"<<P<<" B:"<<B<<" shmem_byte:"<<shmem_bytes<<std::endl;
+    //std::cout<<"fast fctp launch param, P:"<<P<<" B:"<<B<<" shmem_byte:"<<shmem_bytes<<std::endl;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
@@ -541,9 +541,9 @@ at::Tensor launch_fused_multipath_fctp_tile(
 
     size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)nnz_max * U_pad;
     size_t shmem_bytes = shmem_elems * a_all.element_size();
-    std::cout << "fast fctp launch param, P:" << P
-            << " B:" << B
-            << " shmem_byte:" << shmem_bytes << std::endl;
+    //std::cout << "fast fctp launch param, P:" << P
+    //        << " B:" << B
+    //        << " shmem_byte:" << shmem_bytes << std::endl;
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
