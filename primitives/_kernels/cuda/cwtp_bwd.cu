@@ -701,305 +701,270 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
     return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T v) {
+    unsigned mask = 0xffffffffu;
+    v += __shfl_down_sync(mask, v, 16);
+    v += __shfl_down_sync(mask, v,  8);
+    v += __shfl_down_sync(mask, v,  4);
+    v += __shfl_down_sync(mask, v,  2);
+    v += __shfl_down_sync(mask, v,  1);
+    return v;
+}
 
-template<typename T, int MAX_K, int MAX_I, int MAX_J>
-__global__ void tp_cwtp_bwd_one_kernel_groupij(
-    const T* __restrict__ x_uv,
-    const T* __restrict__ x_iu,
-    const T* __restrict__ x_jv,
-    const T* __restrict__ grad_out,          // [Z,K_TOTAL,U,1] contiguous
+template <typename T>
+__device__ __forceinline__ void add_iu_switch(
+    int i, T v,
+    T &a0, T &a1, T &a2, T &a3, T &a4, T &a5, T &a6, T &a7
+){
+    switch (i) {
+        case 0: a0 += v; break;
+        case 1: a1 += v; break;
+        case 2: a2 += v; break;
+        case 3: a3 += v; break;
+        case 4: a4 += v; break;
+        case 5: a5 += v; break;
+        case 6: a6 += v; break;
+        case 7: a7 += v; break;
+        default: break;
+    }
+}
 
-    const int32_t* __restrict__ path_indices,// [P,4]
-    const int32_t* __restrict__ k_dims,      // [P]
+template <typename T>
+__device__ __forceinline__ void process_bucket_jj(
+    int jj, int p,
+    int iu_base, int jv_base,
+    int U,
+    const T* __restrict__ s_iu,
+    const T* __restrict__ s_jv,
+    const uint8_t* __restrict__ cg_i_j,
+    const uint8_t* __restrict__ cg_k_j,
+    const T* __restrict__ cg_val_j,
+    const int32_t* __restrict__ nnz_j_offsets, // [P*8]
+    const int32_t* __restrict__ nnz_j_counts,  // [P*8]
+    int base_j,
+    int u,
+    T xuv,
+
+    // gk scalars
+    T gk0,T gk1,T gk2,T gk3,T gk4,T gk5,T gk6,T gk7,
+    int k_dim,
+
+    // accum outputs
+    T &acc_uv,
+    T &acc_iu0, T &acc_iu1, T &acc_iu2, T &acc_iu3,
+    T &acc_iu4, T &acc_iu5, T &acc_iu6, T &acc_iu7,
+    T &acc_jv
+){
+    int off = nnz_j_offsets[p * 8 + jj];
+    int cnt = nnz_j_counts [p * 8 + jj];
+    if (cnt <= 0) return;
+
+    T xjv = s_jv[jv_base + jj];
+
+    #pragma unroll 1
+    for (int s = 0; s < cnt; ++s) {
+        int idx = base_j + off + s;
+        int i   = (int)cg_i_j[idx];
+        int kk  = (int)cg_k_j[idx];
+        T   c   = cg_val_j[idx];
+
+        if ((unsigned)i >= 8u) continue; // require i<8
+
+        // GK(kk)
+        T gk = T(0);
+        switch (kk) {
+            case 0: gk = gk0; break;
+            case 1: gk = gk1; break;
+            case 2: gk = gk2; break;
+            case 3: gk = gk3; break;
+            case 4: gk = gk4; break;
+            case 5: gk = gk5; break;
+            case 6: gk = gk6; break;
+            case 7: gk = gk7; break;
+            default: gk = T(0); break;
+        }
+        // 如果 kk >= k_dim，gk 应视为 0（避免无效k）
+        if (kk >= k_dim) continue;
+
+        T xiu = s_iu[iu_base + i * U + u];
+
+        // grad_uv += gk*c*xiu*xjv
+        acc_uv += gk * c * xiu * xjv;
+
+        // grad_iu(i,u) += gk*c*xuv*xjv
+        add_iu_switch(i, gk * c * xuv * xjv,
+                      acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7);
+
+        // grad_jv(j) += gk*c*xuv*xiu
+        acc_jv += gk * c * xuv * xiu;
+    }
+}
+
+template<typename T, bool ATOMIC_UV=true, bool ATOMIC_IU=true>
+__global__ void tp_cwtp_bwd_one_kernel_groupj_fused_nostack(
+    const T* __restrict__ x_uv,        // [Z, UV_TOTAL]
+    const T* __restrict__ x_iu,        // [Z, IU_TOTAL]
+    const T* __restrict__ x_jv,        // [Z, JV_TOTAL]
+    const T* __restrict__ grad_out,    // [Z, K_TOTAL, U]  (V==1)
+
+    const int32_t* __restrict__ path_indices, // [P,4]
+    const int32_t* __restrict__ k_dims,       // [P]
     const int32_t* __restrict__ iu_seg_offsets,
     const int32_t* __restrict__ jv_seg_offsets,
     const int32_t* __restrict__ kv_k_offsets,
 
-    // group-i
-    const uint8_t* __restrict__ cg_j_i,
-    const uint8_t* __restrict__ cg_k_i,
-    const T*       __restrict__ cg_val_i,
-    const int32_t* __restrict__ nnz_offsets_i, // [P]
-    const int32_t* __restrict__ nnz_i_offsets, // [P,MAX_I]
-    const int32_t* __restrict__ nnz_i_counts,  // [P,MAX_I]
-
-    // group-j
-    const uint8_t* __restrict__ cg_i_j,
-    const uint8_t* __restrict__ cg_k_j,
-    const T*       __restrict__ cg_val_j,
+    const uint8_t* __restrict__ cg_i_j,        // [nnz_total]
+    const uint8_t* __restrict__ cg_k_j,        // [nnz_total]
+    const T*       __restrict__ cg_val_j,      // [nnz_total]
     const int32_t* __restrict__ nnz_offsets_j, // [P]
-    const int32_t* __restrict__ nnz_j_offsets, // [P,MAX_J]
-    const int32_t* __restrict__ nnz_j_counts,  // [P,MAX_J]
+    const int32_t* __restrict__ nnz_j_offsets, // [P*8]
+    const int32_t* __restrict__ nnz_j_counts,  // [P*8]
 
-    // NEW: orders
-    const int32_t* __restrict__ order_uv,    // [P]
-    const int32_t* __restrict__ order_iu,    // [P]
-    const int32_t* __restrict__ order_jv,    // [P]
-
-    // outputs (assume zero-inited in launch)
-    T* __restrict__ grad_x_uv,
-    T* __restrict__ grad_x_iu,
-    T* __restrict__ grad_x_jv,
+    T* __restrict__ grad_x_uv,  // [Z, UV_TOTAL]
+    T* __restrict__ grad_x_iu,  // [Z, IU_TOTAL]
+    T* __restrict__ grad_x_jv,  // [Z, JV_TOTAL]
 
     int Z, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
     int K_TOTAL, int U, int V, int P
 ){
-    int z = blockIdx.x;
-    int u = threadIdx.x;
-    if (z>=Z || u>=U) return;
-    // V==1 only
+    int z = (int)blockIdx.x;
+    int u = (int)threadIdx.x;
+    if (z >= Z || u >= U) return;
     if (V != 1) return;
 
-    extern __shared__ unsigned char smem[];
-    T* s_iu = (T*)smem;
+    extern __shared__ unsigned char smem_raw[];
+    T* s_iu = reinterpret_cast<T*>(smem_raw);
     T* s_jv = s_iu + IU_TOTAL;
 
-    const T* x_iu_z = x_iu + (size_t)z*IU_TOTAL;
-    const T* x_jv_z = x_jv + (size_t)z*JV_TOTAL;
-    for(int idx=u; idx<IU_TOTAL; idx+=blockDim.x) s_iu[idx]=x_iu_z[idx];
-    for(int idx=u; idx<JV_TOTAL; idx+=blockDim.x) s_jv[idx]=x_jv_z[idx];
+    const T* x_iu_z = x_iu + (size_t)z * (size_t)IU_TOTAL;
+    const T* x_jv_z = x_jv + (size_t)z * (size_t)JV_TOTAL;
+
+    for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) s_iu[idx] = x_iu_z[idx];
+    for (int idx = u; idx < JV_TOTAL; idx += blockDim.x) s_jv[idx] = x_jv_z[idx];
     __syncthreads();
 
-    const T* x_uv_z = x_uv + (size_t)z*UV_TOTAL;
-    const T* go_z   = grad_out + (size_t)z * (size_t)K_TOTAL * (size_t)U; // [K_TOTAL,U]
-    T* guv_z = grad_x_uv + (size_t)z*UV_TOTAL;
-    T* giu_z = grad_x_iu + (size_t)z*IU_TOTAL;
-    T* gjv_z = grad_x_jv + (size_t)z*JV_TOTAL;
+    const T* x_uv_z = x_uv + (size_t)z * (size_t)UV_TOTAL;
+    const T* go_z   = grad_out + (size_t)z * (size_t)K_TOTAL * (size_t)U; // [K_TOTAL, U]
 
-    const int lane = threadIdx.x & 31;
+    T* g_uv_z = grad_x_uv + (size_t)z * (size_t)UV_TOTAL;
+    T* g_iu_z = grad_x_iu + (size_t)z * (size_t)IU_TOTAL;
+    T* g_jv_z = grad_x_jv + (size_t)z * (size_t)JV_TOTAL;
 
-    // =========================
-    // Pass 1: grad_uv (order_uv)  —— 每个 uv_idx 只写一次（=）
-    // =========================
-    {
-        int cur_uv_idx = -1;
-        int cur_uv_base = 0;
+    int lane = threadIdx.x & 31;
+
+    for (int p = 0; p < P; ++p) {
+        int uv_idx = path_indices[p*4 + 0];
+        int iu_idx = path_indices[p*4 + 1];
+        int jv_idx = path_indices[p*4 + 2];
+        int kv_idx = path_indices[p*4 + 3];
+
+        int k_dim = k_dims[p];
+        if (k_dim <= 0 || k_dim > 8) continue;
+
+        int uv_base = uv_idx * (U * V);
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
+
+        T xuv = x_uv_z[uv_base + u];
+
+        // gk scalars
+        T gk0=T(0),gk1=T(0),gk2=T(0),gk3=T(0),gk4=T(0),gk5=T(0),gk6=T(0),gk7=T(0);
+        if (k_dim > 0) gk0 = go_z[(k_base+0)*U + u];
+        if (k_dim > 1) gk1 = go_z[(k_base+1)*U + u];
+        if (k_dim > 2) gk2 = go_z[(k_base+2)*U + u];
+        if (k_dim > 3) gk3 = go_z[(k_base+3)*U + u];
+        if (k_dim > 4) gk4 = go_z[(k_base+4)*U + u];
+        if (k_dim > 5) gk5 = go_z[(k_base+5)*U + u];
+        if (k_dim > 6) gk6 = go_z[(k_base+6)*U + u];
+        if (k_dim > 7) gk7 = go_z[(k_base+7)*U + u];
+
+        // accumulators (REG only)
         T acc_uv = T(0);
-        T xuv_cur = T(0);
 
-        for(int t=0; t<P; ++t){
-            int p = order_uv[t];
-            int uv_idx = path_indices[p*4 + 0];
-            int iu_idx = path_indices[p*4 + 1];
-            int jv_idx = path_indices[p*4 + 2];
-            int kv_idx = path_indices[p*4 + 3];
+        T acc_iu0=T(0), acc_iu1=T(0), acc_iu2=T(0), acc_iu3=T(0);
+        T acc_iu4=T(0), acc_iu5=T(0), acc_iu6=T(0), acc_iu7=T(0);
 
-            int k_dim = k_dims[p];
-            if(k_dim<=0 || k_dim>MAX_K) continue;
+        T acc_jv0=T(0), acc_jv1=T(0), acc_jv2=T(0), acc_jv3=T(0);
+        T acc_jv4=T(0), acc_jv5=T(0), acc_jv6=T(0), acc_jv7=T(0);
 
-            if (uv_idx != cur_uv_idx){
-                if (cur_uv_idx != -1){
-                    // outputs 是 zero-inited，且每 uv_idx 只出现一次 -> 直接赋值，避免 RMW
-                    guv_z[cur_uv_base + u] = acc_uv;
-                }
-                cur_uv_idx = uv_idx;
-                cur_uv_base = uv_idx * (U * V);
-                acc_uv = T(0);
-                xuv_cur = x_uv_z[cur_uv_base + u]; // V==1
-            }
+        int base_j = nnz_offsets_j[p];
 
-            int iu_base = iu_seg_offsets[iu_idx];
-            int jv_base = jv_seg_offsets[jv_idx];
-            int k_base  = kv_k_offsets[kv_idx];
-
-            // preload gk (scope 限制生命周期，降寄存器压力)
-            T gk[MAX_K];
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk) gk[kk]=T(0);
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk){
-                if(kk<k_dim){
-                    gk[kk] = go_z[(k_base + kk)*U + u];
-                }
-            }
-
-            // 用 group-i 表来扫 nnz（也行：这里我们只需要 (j,k,c)，不需要 i）
-            int base_i = nnz_offsets_i[p];
-            #pragma unroll
-            for(int ii=0; ii<MAX_I; ++ii){
-                int off = nnz_i_offsets[p*MAX_I + ii];
-                int cnt = nnz_i_counts [p*MAX_I + ii];
-                if (cnt<=0) continue;
-
-                // xiu 对该 ii 固定，提到外面，减少 shared load
-                T xiu = s_iu[iu_base + ii*U + u];
-
-                for(int s=0; s<cnt; ++s){
-                    int idx = base_i + off + s;
-                    int j   = (int)cg_j_i[idx];
-                    int kk  = (int)cg_k_i[idx];
-                    T   c   = cg_val_i[idx];
-
-                    T xjv = s_jv[jv_base + j]; // V==1
-                    // grad_uv += gk* c * xiu * xjv
-                    acc_uv += gk[kk] * c * xiu * xjv;
-                }
-            }
+        process_bucket_jj<T>(0, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv0);
+        process_bucket_jj<T>(1, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv1);
+        process_bucket_jj<T>(2, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv2);
+        process_bucket_jj<T>(3, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv3);
+        process_bucket_jj<T>(4, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv4);
+        process_bucket_jj<T>(5, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv5);
+        process_bucket_jj<T>(6, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv6);
+        process_bucket_jj<T>(7, p, iu_base, jv_base, U, s_iu, s_jv,
+                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
+                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
+                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv7);
+        
+        // writeback grad_uv
+        if (acc_uv != (T)0) {
+            if constexpr (ATOMIC_UV) atomicAdd(&g_uv_z[uv_base + u], acc_uv);
+            else                     g_uv_z[uv_base + u] += acc_uv;
         }
 
-        if (cur_uv_idx != -1){
-            guv_z[cur_uv_base + u] = acc_uv;
+        // writeback grad_iu (最多 8 次)
+
+        auto wb_iu = [&](int ii, T v) {
+            if (v != (T)0) {
+                if constexpr (ATOMIC_IU) atomicAdd(&g_iu_z[iu_base + ii*U + u], v);
+                else                     g_iu_z[iu_base + ii*U + u] += v;
+            }
+        };
+        wb_iu(0, acc_iu0); wb_iu(1, acc_iu1); wb_iu(2, acc_iu2); wb_iu(3, acc_iu3);
+        wb_iu(4, acc_iu4); wb_iu(5, acc_iu5); wb_iu(6, acc_iu6); wb_iu(7, acc_iu7);
+        
+        // grad_jv: warp reduce -> lane0 atomic
+        T v0 = warp_reduce_sum(acc_jv0);
+        T v1 = warp_reduce_sum(acc_jv1);
+        T v2 = warp_reduce_sum(acc_jv2);
+        T v3 = warp_reduce_sum(acc_jv3);
+        T v4 = warp_reduce_sum(acc_jv4);
+        T v5 = warp_reduce_sum(acc_jv5);
+        T v6 = warp_reduce_sum(acc_jv6);
+        T v7 = warp_reduce_sum(acc_jv7);
+
+        if (lane == 0) {
+            if (v0 != (T)0) atomicAdd(&g_jv_z[jv_base + 0], v0);
+            if (v1 != (T)0) atomicAdd(&g_jv_z[jv_base + 1], v1);
+            if (v2 != (T)0) atomicAdd(&g_jv_z[jv_base + 2], v2);
+            if (v3 != (T)0) atomicAdd(&g_jv_z[jv_base + 3], v3);
+            if (v4 != (T)0) atomicAdd(&g_jv_z[jv_base + 4], v4);
+            if (v5 != (T)0) atomicAdd(&g_jv_z[jv_base + 5], v5);
+            if (v6 != (T)0) atomicAdd(&g_jv_z[jv_base + 6], v6);
+            if (v7 != (T)0) atomicAdd(&g_jv_z[jv_base + 7], v7);
         }
-    }
-
-    // =========================
-    // Pass 2: grad_iu (order_iu) —— 每个 iu_idx 只 flush 一次（每 i 一次，=）
-    // =========================
-    {
-        int cur_iu_idx = -1;
-        int cur_iu_base = 0;
-        T acc_iu[MAX_I];
-        #pragma unroll
-        for(int ii=0; ii<MAX_I; ++ii) acc_iu[ii]=T(0);
-
-        for(int t=0; t<P; ++t){
-            int p = order_iu[t];
-            int uv_idx = path_indices[p*4 + 0];
-            int iu_idx = path_indices[p*4 + 1];
-            int jv_idx = path_indices[p*4 + 2];
-            int kv_idx = path_indices[p*4 + 3];
-
-            int k_dim = k_dims[p];
-            if(k_dim<=0 || k_dim>MAX_K) continue;
-
-            int uv_base = uv_idx*(U*V);
-            T xuv = x_uv_z[uv_base + u];
-
-            int iu_base = iu_seg_offsets[iu_idx];
-            int jv_base = jv_seg_offsets[jv_idx];
-            int k_base  = kv_k_offsets[kv_idx];
-
-            if (iu_idx != cur_iu_idx){
-                if (cur_iu_idx != -1){
-                    // 每个 iu_idx 只 flush 一次 -> 直接赋值避免 RMW
-                    #pragma unroll
-                    for(int ii=0; ii<MAX_I; ++ii){
-                        if(acc_iu[ii]!=T(0)){
-                            giu_z[cur_iu_base + ii*U + u] = acc_iu[ii];
-                        }
-                    }
-                }
-                cur_iu_idx = iu_idx;
-                cur_iu_base = iu_base;
-                #pragma unroll
-                for(int ii=0; ii<MAX_I; ++ii) acc_iu[ii]=T(0);
-            }
-
-            T gk[MAX_K];
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk) gk[kk]=T(0);
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk){
-                if(kk<k_dim) gk[kk] = go_z[(k_base + kk)*U + u];
-            }
-
-            int base_i = nnz_offsets_i[p];
-            #pragma unroll
-            for(int ii=0; ii<MAX_I; ++ii){
-                int off = nnz_i_offsets[p*MAX_I + ii];
-                int cnt = nnz_i_counts [p*MAX_I + ii];
-                if (cnt<=0) continue;
-
-                for(int s=0; s<cnt; ++s){
-                    int idx = base_i + off + s;
-                    int j   = (int)cg_j_i[idx];
-                    int kk  = (int)cg_k_i[idx];
-                    T   c   = cg_val_i[idx];
-                    T xjv = s_jv[jv_base + j];
-                    // grad_iu(ii,u) += gk * c * xuv * xjv
-                    acc_iu[ii] += gk[kk] * c * xuv * xjv;
-                }
-            }
-        }
-
-        if (cur_iu_idx != -1){
-            #pragma unroll
-            for(int ii=0; ii<MAX_I; ++ii){
-                if(acc_iu[ii]!=T(0)){
-                    giu_z[cur_iu_base + ii*U + u] = acc_iu[ii];
-                }
-            }
-        }
-    }
-
-    // =========================
-    // Pass 3: grad_jv (order_jv) —— 每个 jv_idx 只 flush 一次（每 j 每 warp atomic）
-    // =========================
-    {
-        int cur_jv_idx = -1;
-        int cur_jv_base = 0;
-        T acc_jv[MAX_J];
-        #pragma unroll
-        for(int jj=0; jj<MAX_J; ++jj) acc_jv[jj]=T(0);
-
-        for(int t=0; t<P; ++t){
-            int p = order_jv[t];
-            int uv_idx = path_indices[p*4 + 0];
-            int iu_idx = path_indices[p*4 + 1];
-            int jv_idx = path_indices[p*4 + 2];
-            int kv_idx = path_indices[p*4 + 3];
-
-            int k_dim = k_dims[p];
-            if(k_dim<=0 || k_dim>MAX_K) continue;
-
-            int jv_base = jv_seg_offsets[jv_idx];
-            if (jv_idx != cur_jv_idx){
-                if (cur_jv_idx != -1){
-                    // flush: warp reduce then atomic (每 jv_idx 只做一次)
-                    #pragma unroll
-                    for(int jj=0; jj<MAX_J; ++jj){
-                        T v = warp_sum(acc_jv[jj]);
-                        if (lane==0 && v!=T(0)) atomicAdd(&gjv_z[cur_jv_base + jj], v);
-                    }
-                }
-                cur_jv_idx = jv_idx;
-                cur_jv_base = jv_base;
-                #pragma unroll
-                for(int jj=0; jj<MAX_J; ++jj) acc_jv[jj]=T(0);
-            }
-
-            int uv_base = uv_idx*(U*V);
-            T xuv = x_uv_z[uv_base + u];
-
-            int iu_base = iu_seg_offsets[iu_idx];
-            int k_base  = kv_k_offsets[kv_idx];
-
-            T gk[MAX_K];
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk) gk[kk]=T(0);
-            #pragma unroll
-            for(int kk=0; kk<MAX_K; ++kk){
-                if(kk<k_dim) gk[kk] = go_z[(k_base + kk)*U + u];
-            }
-
-            int base_j = nnz_offsets_j[p];
-            #pragma unroll
-            for(int jj=0; jj<MAX_J; ++jj){
-                int off = nnz_j_offsets[p*MAX_J + jj];
-                int cnt = nnz_j_counts [p*MAX_J + jj];
-                if (cnt<=0) continue;
-
-                for(int s=0; s<cnt; ++s){
-                    int idx = base_j + off + s;
-                    int i   = (int)cg_i_j[idx];
-                    int kk  = (int)cg_k_j[idx];
-                    T   c   = cg_val_j[idx];
-                    T xiu = s_iu[iu_base + i*U + u];
-                    // grad_jv(jj) += gk * c * xuv * xiu
-                    acc_jv[jj] += gk[kk] * c * xuv * xiu;
-                }
-            }
-        }
-
-        if (cur_jv_idx != -1){
-            #pragma unroll
-            for(int jj=0; jj<MAX_J; ++jj){
-                T v = warp_sum(acc_jv[jj]);
-                if (lane==0 && v!=T(0)) atomicAdd(&gjv_z[cur_jv_base + jj], v);
-            }
-        }
+        
     }
 }
+
 
 std::vector<torch::Tensor> tp_channel_wise_groupij_bwd_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
@@ -1114,15 +1079,15 @@ std::vector<torch::Tensor> tp_channel_wise_groupij_bwd_launch(
     dim3 gdim(Z, 1, 1);
 
     // shared: s_iu[IU_TOTAL] + s_jv[JV_TOTAL]
-    const size_t smem_bytes = (size_t)(IU_TOTAL + JV_TOTAL) * x_uv.element_size();
+    size_t smem_bytes = (size_t)(IU_TOTAL + JV_TOTAL) * x_uv.element_size();
     auto stream = at::cuda::getCurrentCUDAStream();
 
     constexpr int MAX_K_DIM = 8;
     constexpr int MAX_I_DIM = 8;
     constexpr int MAX_J_DIM = 8;
 
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_groupij_bwd_launch", [&] {
-        tp_cwtp_bwd_one_kernel_groupij<scalar_t, MAX_K_DIM, MAX_I_DIM, MAX_J_DIM>
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_cwtp_bwd_one_kernel_groupij", [&] {
+        tp_cwtp_bwd_one_kernel_groupj_fused_nostack<scalar_t>
             <<<gdim, bdim, smem_bytes, stream>>>(
                 x_uv.data_ptr<scalar_t>(),
                 x_iu.data_ptr<scalar_t>(),
@@ -1135,13 +1100,19 @@ std::vector<torch::Tensor> tp_channel_wise_groupij_bwd_launch(
                 jv_seg_offsets.data_ptr<int32_t>(),
                 kv_k_offsets.data_ptr<int32_t>(),
 
-                //cg_i_i.data_ptr<uint8_t>(),
+                //order_uv.data_ptr<int32_t>(),
+                //order_iu.data_ptr<int32_t>(),
+                //order_jv.data_ptr<int32_t>(),
+
+                /*
+                cg_i_i.data_ptr<uint8_t>(),
                 cg_j_i.data_ptr<uint8_t>(),
                 cg_k_i.data_ptr<uint8_t>(),
                 cg_val_i.data_ptr<scalar_t>(),
                 nnz_offsets_i.data_ptr<int32_t>(),
                 nnz_i_offsets.data_ptr<int32_t>(),
                 nnz_i_counts.data_ptr<int32_t>(),
+                */
 
                 cg_i_j.data_ptr<uint8_t>(),
                 //cg_j_j.data_ptr<uint8_t>(),
@@ -1150,10 +1121,7 @@ std::vector<torch::Tensor> tp_channel_wise_groupij_bwd_launch(
                 nnz_offsets_j.data_ptr<int32_t>(),
                 nnz_j_offsets.data_ptr<int32_t>(),
                 nnz_j_counts.data_ptr<int32_t>(),
-
-                order_uv.data_ptr<int32_t>(),
-                order_iu.data_ptr<int32_t>(),
-                order_jv.data_ptr<int32_t>(),
+                
 
                 grad_x_uv.data_ptr<scalar_t>(),
                 grad_x_iu.data_ptr<scalar_t>(),

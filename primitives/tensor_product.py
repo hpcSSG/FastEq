@@ -699,13 +699,11 @@ class TensorProduct(torch.nn.Module):
                 path_indices = meta["path_indices"]
                 self.path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device)
 
-                pi = path_indices.detach()
-                print(f"pi:{pi}")
-                P = pi.size(0)
-                uv = pi[:,0].tolist()
-                iu = pi[:,1].tolist()
-                jv = pi[:,2].tolist()
-                kv = pi[:,3].tolist()
+                P = len(path_indices)
+                uv = [row[0] for row in path_indices]
+                iu = [row[1] for row in path_indices]
+                jv = [row[2] for row in path_indices]
+                kv = [row[3] for row in path_indices]
                 self.order_uv = torch.tensor(sorted(range(P), key=lambda p:(uv[p], kv[p])), dtype=torch.int32, device=device)
                 self.order_iu = torch.tensor(sorted(range(P), key=lambda p:(iu[p], kv[p])), dtype=torch.int32, device=device)
                 self.order_jv = torch.tensor(sorted(range(P), key=lambda p:(jv[p], kv[p])), dtype=torch.int32, device=device)
