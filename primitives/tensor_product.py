@@ -413,9 +413,6 @@ def infer_slices_and_meta(
       - 按 k 分组的 sparse meta：
         * nnz_k_offsets: [P, MAX_K_DIM]
         * nnz_k_counts:  [P, MAX_K_DIM]
-      - (NEW) dense-kmajor CG：
-        * cg_dense_all:     concat over paths of [K*I*J] with layout (k,i,j)
-        * cg_dense_offsets: [P] offset into cg_dense_all for each path
     """
 
     # -------------------- 1) paths & dense c_tensors --------------------
@@ -594,33 +591,6 @@ def infer_slices_and_meta(
     nnz_k_offsets_flat = nnz_k_offsets.reshape(-1).contiguous()
     nnz_k_counts_flat  = nnz_k_counts.reshape(-1).contiguous()
 
-    # -------------------- 7.5) (NEW) dense-kmajor packing: cg_dense_all/cg_dense_offsets --------------------
-    # Layout requirement: cg[(k*I + i)*J + j]  (k-major)
-    cg_dense_offsets = []
-    cg_dense_blocks = []
-    dense_running = 0
-
-    for p, c in enumerate(c_tensors):
-        I, J, K = map(int, c.shape)
-
-        cg_dense_offsets.append(dense_running)
-
-        # Make k-major contiguous block:
-        # c is [I,J,K]; we want [K,I,J] then flatten.
-        # permute to [K,I,J] then contiguous then view(-1)
-        block = c.permute(2, 0, 1).contiguous().view(-1)
-
-        cg_dense_blocks.append(block)
-        dense_running += block.numel()
-
-    cg_dense_all = (
-        torch.cat(cg_dense_blocks, dim=0).contiguous()
-        if len(cg_dense_blocks) > 0
-        else torch.empty(0, dtype=math_dtype, device=device)
-    )
-
-    cg_dense_offsets_t = torch.tensor(cg_dense_offsets, dtype=torch.int32, device=device).contiguous()
-
     # -------------------- 8) pack tensors for kernels --------------------
     path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device).contiguous()
     i_dims_t = torch.tensor(i_dims, dtype=torch.int32, device=device).contiguous()
@@ -637,10 +607,6 @@ def infer_slices_and_meta(
         "path_indices_tensor": path_indices_tensor,  # [P,4] int32
         "c_all": c_all,                              # [sum(i*j*k)] layout ((i*J+j)*K+k)
         "c_offsets": c_offsets_t,                    # [P+1]
-
-        # dense packed (k-major): matches cg[(k*I+i)*J+j]
-        "cg_dense_all": cg_dense_all,
-        "cg_dense_offsets": cg_dense_offsets_t,      # [P]
 
         # slices (reference)
         "uv_slices": uv_slices,
@@ -757,9 +723,6 @@ class TensorProduct(torch.nn.Module):
                 self.kv_k_offsets = meta["kv_k_offsets"].to(device)
                 path_indices = meta["path_indices"]
                 self.path_indices_tensor = meta["path_indices_tensor"]
-
-                self.cg_dense_all = meta["cg_dense_all"]
-                self.cg_dense_offsets = meta["cg_dense_offsets"]
 
                 P = len(path_indices)
                 uv = [row[0] for row in path_indices]

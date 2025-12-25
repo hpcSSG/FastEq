@@ -411,7 +411,7 @@ def make_FastChannelWiseTensorProductFunction(
         def backward(ctx, grad_output):
 
             w, x, y = ctx.saved_tensors
-            
+
             cg_i_groupk = groupk_meta["cg_i_all"]
             cg_j_groupk  = groupk_meta["cg_j_all"]
             cg_k_groupk  = groupk_meta["cg_k_all"]
@@ -431,13 +431,11 @@ def make_FastChannelWiseTensorProductFunction(
             jv_seg_offsets = meta["jv_seg_offsets"]
             kv_k_offsets = meta["kv_k_offsets"]
             path_indices = meta["path_indices_tensor"]
-            cg_dense_all = meta["cg_dense_all"]
-            cg_dense_offsets = meta["cg_dense_offsets"]
             
             #cueq cwtp large 7.8ms, medium 4ms
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
-   
+            '''
             # for groupk
             # mace large 18ms, medium 4.3ms
             grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
@@ -457,6 +455,7 @@ def make_FastChannelWiseTensorProductFunction(
                 grad_output,
                 U, V, K_TOTAL
             )
+            '''
 
             '''
             # for matmul
@@ -474,7 +473,18 @@ def make_FastChannelWiseTensorProductFunction(
             )
             '''
 
-
+            grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
+                grad_output, w, x, y, 
+                c_all,
+                path_indices,
+                uv_seg_offsets,
+                iu_seg_offsets,
+                jv_seg_offsets,
+                kv_k_offsets,
+                c_offsets,
+                i_dims, j_dims, k_dims, 
+                K_TOTAL, U, V, 
+            )
 
             #grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_output.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
             
