@@ -16,7 +16,7 @@ import logging
 import math, time
 import warnings
 from functools import partial
-from typing import List, Optional, OrderedDict, Tuple
+from typing import List, Optional, OrderedDict, Tuple, Any, Dict
 
 import torch
 import torch.fx
@@ -83,7 +83,7 @@ def _my_tensor_product_fx(
 
         for path_idx, path in enumerate(descriptor.paths):
             segments = []
-            print(f"path {path_idx} indices: {path.indices}")
+            #print(f"path {path_idx} indices: {path.indices}")
             for oid in range(num_inputs):
                 seg_shape = descriptor.get_segment_shape(oid, path)
                 inp = inputs[oid][..., slices[oid][path.indices[oid]]]
@@ -102,7 +102,7 @@ def _my_tensor_product_fx(
             #segment1 = segments[1].squeeze(1)
             #out = torch.matmul(segment1, segment0) * c_tensor
             #out.unsqueeze_(1)
-            #print(f"formula:{formula}, c_tensor shape:{c_tensor.shape}, segments[0] shape:{segments[0].shape}, segments[1] shape:{segments[1].shape}, segments[2] shape:{segments[2].shape}, out shape:{out.shape}")   
+            print(f"formula:{formula}, segments[0] shape:{segments[0].shape}, segments[1] shape:{segments[1].shape}, out shape:{out.shape}")   
 
             seg_shape = descriptor.get_segment_shape(-1, path)
             outputs += [
@@ -397,71 +397,96 @@ def build_sparse_cg_and_kij_groups_v2(
     return {"groupk": groupk, "groupi": groupi, "groupj": groupj}
 
 
-
-def infer_slices_and_meta(descriptor, math_dtype, device,
-                          max_k_dim_for_kernel: int = 8):
+def infer_slices_and_meta(
+    descriptor,
+    math_dtype,
+    device,
+    max_k_dim_for_kernel: int = 8,
+) -> Dict[str, Any]:
     """
     生成 ChannelWise TP 的所有 meta 信息：
-      - 分段信息：uv / iu / jv / kv offsets
-      - 稠密 c_tensors & i/j/k_dims
-      - 稀疏 CG 信息：
+      - 分段信息：uv / iu / jv / kv offsets + slices
+      - dense c_tensors + (i/j/k_dims, c_offsets, c_all)
+      - sparse CG 信息：
         * cg_i_all, cg_j_all, cg_k_all, cg_val_all
         * nnz_per_path, nnz_offsets
-      - 【新增】按 k 分组的稀疏 meta：
-        * nnz_k_offsets: [num_paths, MAX_K_DIM]
-        * nnz_k_counts:  [num_paths, MAX_K_DIM]
+      - 按 k 分组的 sparse meta：
+        * nnz_k_offsets: [P, MAX_K_DIM]
+        * nnz_k_counts:  [P, MAX_K_DIM]
+      - (NEW) dense-kmajor CG：
+        * cg_dense_all:     concat over paths of [K*I*J] with layout (k,i,j)
+        * cg_dense_offsets: [P] offset into cg_dense_all for each path
     """
-    path_indices = []
-    c_tensors = []
+
+    # -------------------- 1) paths & dense c_tensors --------------------
+    path_indices: List[Tuple[int, int, int, int]] = []
+    c_tensors: List[torch.Tensor] = []
+
     for path_idx, path in enumerate(descriptor.paths):
         print(f"path {path_idx} indices: {path.indices}")
-        path_indices.append(path.indices)
+        path_indices.append(tuple(path.indices))
 
-        c_tensor = disable_type_conv(
-            torch.tensor(path.coefficients, dtype=math_dtype, device=device)
-        )  # [i_dim, j_dim, k_dim]
+        c_tensor = torch.tensor(path.coefficients, dtype=math_dtype, device=device).contiguous()
         c_tensors.append(c_tensor)
-    
-    u, v = list(descriptor.get_dims('u'))[0], list(descriptor.get_dims('v'))[0]
-    UV_TOTAL = descriptor.operands[0].size
-    IU_TOTAL = descriptor.operands[1].size
-    JV_TOTAL = descriptor.operands[2].size
+
+    # U/V
+    u = list(descriptor.get_dims("u"))[0]
+    v = list(descriptor.get_dims("v"))[0]
+
+    UV_TOTAL = int(descriptor.operands[0].size)
+    IU_TOTAL = int(descriptor.operands[1].size)
+    JV_TOTAL = int(descriptor.operands[2].size)
 
     print(f"UV_TOTAL:{UV_TOTAL}, IU_TOTAL:{IU_TOTAL}, JV_TOTAL:{JV_TOTAL}")
-        
-    # path_indices: list[(uv_idx, iu_idx, jv_idx, kv_idx)]
+    P = len(path_indices)
+
+    # segment counts
     uv_seg_count = max(p[0] for p in path_indices) + 1
     iu_seg_count = max(p[1] for p in path_indices) + 1
     jv_seg_count = max(p[2] for p in path_indices) + 1
     kv_seg_count = max(p[3] for p in path_indices) + 1
 
-    # --- i_dim/j_dim/k_dim/c_offset（dense 版仍然保留，方便 debug） ---
+    # -------------------- 2) i/j/k dims + c_offsets + c_all --------------------
     i_dims, j_dims, k_dims = [], [], []
-    c_offsets = []
-    offset = 0
+    c_offsets = [0]
+    c_flat_list = []
+    running = 0
+
     for c in c_tensors:
-        i, j, k = c.shape
-        i_dims.append(i)
-        j_dims.append(j)
-        k_dims.append(k)
-        c_offsets.append(offset)
-        offset += i * j * k
+        i_dim, j_dim, k_dim = map(int, c.shape)
+        i_dims.append(i_dim)
+        j_dims.append(j_dim)
+        k_dims.append(k_dim)
+
+        c_flat = c.reshape(-1).contiguous()          # original layout (i,j,k) flatten => ((i*J + j)*K + k)
+        c_flat_list.append(c_flat)
+
+        running += i_dim * j_dim * k_dim
+        c_offsets.append(running)
+
+    c_all = (
+        torch.cat(c_flat_list, dim=0)
+        if len(c_flat_list) > 0
+        else torch.empty(0, dtype=math_dtype, device=device)
+    )
 
     max_k_dim = max(k_dims) if len(k_dims) > 0 else 0
     assert max_k_dim <= max_k_dim_for_kernel, \
         f"max k_dim {max_k_dim} > kernel MAX_K_DIM {max_k_dim_for_kernel}"
 
-    # --- uv_slices：每个 uv segment 固定长度 u * v ---
+    # -------------------- 3) uv slices + uv_seg_offsets --------------------
     uv_slices = []
+    uv_seg_offsets = []
     start = 0
-    uv_stride = u * v
+    uv_stride = int(u * v)
     for _ in range(uv_seg_count):
+        uv_seg_offsets.append(start)
         end = start + uv_stride
         uv_slices.append(slice(start, end))
         start = end
     assert start == UV_TOTAL, f"UV total {start} != {UV_TOTAL}"
 
-    # --- iu_slices + offsets  ---
+    # -------------------- 4) iu slices + iu_seg_offsets --------------------
     iu_slices = []
     iu_seg_offsets = []
     start = 0
@@ -469,13 +494,13 @@ def infer_slices_and_meta(descriptor, math_dtype, device,
         iu_seg_offsets.append(start)
         idx = next(idx for idx, p in enumerate(path_indices) if p[1] == s)
         i_dim = i_dims[idx]
-        length = i_dim * u
+        length = int(i_dim * u)
         end = start + length
         iu_slices.append(slice(start, end))
         start = end
     assert start == IU_TOTAL, f"IU total {start} != {IU_TOTAL}"
 
-    # --- jv_slices + offsets  ---
+    # -------------------- 5) jv slices + jv_seg_offsets --------------------
     jv_slices = []
     jv_seg_offsets = []
     start = 0
@@ -483,69 +508,53 @@ def infer_slices_and_meta(descriptor, math_dtype, device,
         jv_seg_offsets.append(start)
         idx = next(idx for idx, p in enumerate(path_indices) if p[2] == s)
         j_dim = j_dims[idx]
-        length = j_dim * v
+        length = int(j_dim * v)
         end = start + length
         jv_slices.append(slice(start, end))
         start = end
     assert start == JV_TOTAL, f"JV total {start} != {JV_TOTAL}"
 
-    # --- K 维上的 offsets：kv_k_offsets ---
+    # -------------------- 6) K offsets: kv_k_offsets --------------------
     kv_k_offsets = []
     start = 0
     for s in range(kv_seg_count):
         kv_k_offsets.append(start)
         idx = next(idx for idx, p in enumerate(path_indices) if p[3] == s)
         k_dim = k_dims[idx]
-        start += k_dim
-    K_TOTAL = start
+        start += int(k_dim)
+    K_TOTAL = int(start)
 
-    # ============ 稀疏 CG 信息 + 按 k 分组的 meta ============
-
-    cg_i_list = []
-    cg_j_list = []
-    cg_k_list = []
-    cg_val_list = []
-
+    # -------------------- 7) sparse CG meta + per-k grouping --------------------
+    cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
     nnz_per_path = []
-    nnz_offsets = []
+    nnz_offsets = []  # NOTE: this is "start offset per path", length P (kept as your original)
 
-    # 新增：每个 path、每个 k 的局部 offset & count
-    nnz_k_offsets_list = []  # list of [MAX_K_DIM]
-    nnz_k_counts_list  = []  # list of [MAX_K_DIM]
+    nnz_k_offsets_list = []  # [P, MAX_K_DIM]
+    nnz_k_counts_list  = []  # [P, MAX_K_DIM]
 
-    offset = 0
+    nnz_running = 0
     for path_id, c in enumerate(c_tensors):
-        # c shape: [i_dim, j_dim, k_dim]
-        i_dim, j_dim, k_dim = c.shape
+        i_dim, j_dim, k_dim = map(int, c.shape)
 
-        # 找非零项
-        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz, 3] (i,j,k)
-        nnz = nz_idx.size(0)
+        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
+        nnz = int(nz_idx.size(0))
 
         nnz_per_path.append(nnz)
-        nnz_offsets.append(offset)
-        offset += nnz
+        nnz_offsets.append(nnz_running)
+        nnz_running += nnz
 
-        # 初始化本 path 的 k 分组 meta
-        # 注意：这里用全局 MAX_K_DIM，kernel 也是按这个编译的
-        local_k_offsets = torch.zeros(max_k_dim_for_kernel,
-                                      dtype=torch.int32, device=device)
-        local_k_counts  = torch.zeros(max_k_dim_for_kernel,
-                                      dtype=torch.int32, device=device)
+        local_k_offsets = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
+        local_k_counts  = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
 
         if nnz > 0:
-            # ---- 按 k 排序，保证同一个 k 的 nnz 在本 path 段内部连续 ----
-            # nz_idx: [nnz, 3], 第三列是 k
-            sort_idx = torch.argsort(nz_idx[:, 2])  # 按 k 升序
-            nz_idx_sorted = nz_idx[sort_idx]        # [nnz, 3]
-            i_idx = nz_idx_sorted[:, 0]
-            j_idx = nz_idx_sorted[:, 1]
-            k_idx = nz_idx_sorted[:, 2]
+            sort_idx = torch.argsort(nz_idx[:, 2])  # sort by k
+            nz_sorted = nz_idx[sort_idx]
+            i_idx = nz_sorted[:, 0]
+            j_idx = nz_sorted[:, 1]
+            k_idx = nz_sorted[:, 2]
 
-            # 按新顺序取值
             vals = c[i_idx, j_idx, k_idx]
 
-            # 追加到全局 cg list（按 path 拼接）
             cg_i_list.append(i_idx.to(torch.uint8))
             cg_j_list.append(j_idx.to(torch.uint8))
             cg_k_list.append(k_idx.to(torch.uint8))
@@ -554,75 +563,124 @@ def infer_slices_and_meta(descriptor, math_dtype, device,
             prev_k = int(k_idx[0].item())
             local_k_offsets[prev_k] = 0
 
-            for t in range(1, 
-            ):
+            for t in range(1, nnz):
                 curr_k = int(k_idx[t].item())
                 if curr_k != prev_k:
-                    local_k_counts[prev_k] = t - local_k_offsets[prev_k]
+                    local_k_counts[prev_k] = t - int(local_k_offsets[prev_k].item())
                     local_k_offsets[curr_k] = t
                     prev_k = curr_k
 
-            # 最后一个 k 的计数
-            local_k_counts[prev_k] = nnz - local_k_offsets[prev_k]
+            local_k_counts[prev_k] = nnz - int(local_k_offsets[prev_k].item())
 
         nnz_k_offsets_list.append(local_k_offsets)
         nnz_k_counts_list.append(local_k_counts)
 
-    # concat cg_*_all
     if len(cg_i_list) > 0:
-        cg_i_all = torch.cat(cg_i_list, dim=0)
-        cg_j_all = torch.cat(cg_j_list, dim=0)
-        cg_k_all = torch.cat(cg_k_list, dim=0)
-        cg_val_all = torch.cat(cg_val_list, dim=0)
+        cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
+        cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
+        cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
+        cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
     else:
-        # 所有 c 都是 0
         cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
         cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
         cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
         cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
 
-    nnz_per_path = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
-    nnz_offsets  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
+    nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
+    nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
 
-    # [num_paths, MAX_K_DIM]
-    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0)  # [P, MAX_K_DIM]
-    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0)  # [P, MAX_K_DIM]
+    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0).contiguous()  # [P, MAX_K_DIM]
+    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0).contiguous()  # [P, MAX_K_DIM]
+    nnz_k_offsets_flat = nnz_k_offsets.reshape(-1).contiguous()
+    nnz_k_counts_flat  = nnz_k_counts.reshape(-1).contiguous()
 
-    nnz_k_offsets = nnz_k_offsets.reshape(-1).contiguous()
-    nnz_k_counts = nnz_k_counts.reshape(-1).contiguous()
+    # -------------------- 7.5) (NEW) dense-kmajor packing: cg_dense_all/cg_dense_offsets --------------------
+    # Layout requirement: cg[(k*I + i)*J + j]  (k-major)
+    cg_dense_offsets = []
+    cg_dense_blocks = []
+    dense_running = 0
+
+    for p, c in enumerate(c_tensors):
+        I, J, K = map(int, c.shape)
+
+        cg_dense_offsets.append(dense_running)
+
+        # Make k-major contiguous block:
+        # c is [I,J,K]; we want [K,I,J] then flatten.
+        # permute to [K,I,J] then contiguous then view(-1)
+        block = c.permute(2, 0, 1).contiguous().view(-1)
+
+        cg_dense_blocks.append(block)
+        dense_running += block.numel()
+
+    cg_dense_all = (
+        torch.cat(cg_dense_blocks, dim=0).contiguous()
+        if len(cg_dense_blocks) > 0
+        else torch.empty(0, dtype=math_dtype, device=device)
+    )
+
+    cg_dense_offsets_t = torch.tensor(cg_dense_offsets, dtype=torch.int32, device=device).contiguous()
+
+    # -------------------- 8) pack tensors for kernels --------------------
+    path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device).contiguous()
+    i_dims_t = torch.tensor(i_dims, dtype=torch.int32, device=device).contiguous()
+    j_dims_t = torch.tensor(j_dims, dtype=torch.int32, device=device).contiguous()
+    k_dims_t = torch.tensor(k_dims, dtype=torch.int32, device=device).contiguous()
+    c_offsets_t = torch.tensor(c_offsets, dtype=torch.int32, device=device).contiguous()  # [P+1]
 
     meta = {
+        # dense
         "c_tensors": c_tensors,
         "path_indices": path_indices,
+
+        # dense packed (original i-j-k flatten)
+        "path_indices_tensor": path_indices_tensor,  # [P,4] int32
+        "c_all": c_all,                              # [sum(i*j*k)] layout ((i*J+j)*K+k)
+        "c_offsets": c_offsets_t,                    # [P+1]
+
+        # dense packed (k-major): matches cg[(k*I+i)*J+j]
+        "cg_dense_all": cg_dense_all,
+        "cg_dense_offsets": cg_dense_offsets_t,      # [P]
+
+        # slices (reference)
         "uv_slices": uv_slices,
         "iu_slices": iu_slices,
         "jv_slices": jv_slices,
-        "iu_seg_offsets": torch.tensor(iu_seg_offsets, dtype=torch.int32, device=device),
-        "jv_seg_offsets": torch.tensor(jv_seg_offsets, dtype=torch.int32, device=device),
-        "kv_k_offsets": torch.tensor(kv_k_offsets, dtype=torch.int32, device=device),
-        "i_dims": torch.tensor(i_dims, dtype=torch.int32, device=device),
-        "j_dims": torch.tensor(j_dims, dtype=torch.int32, device=device),
-        "k_dims": torch.tensor(k_dims, dtype=torch.int32, device=device),
-        "c_offsets": torch.tensor(c_offsets, dtype=torch.int32, device=device),
-        "U": u,
-        "V": v,
+
+        # offsets
+        "uv_seg_offsets": torch.tensor(uv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "iu_seg_offsets": torch.tensor(iu_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "jv_seg_offsets": torch.tensor(jv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "kv_k_offsets": torch.tensor(kv_k_offsets, dtype=torch.int32, device=device).contiguous(),
+
+        # dims
+        "i_dims": i_dims_t,
+        "j_dims": j_dims_t,
+        "k_dims": k_dims_t,
+
+        # sizes
+        "U": int(u),
+        "V": int(v),
+        "UV_TOTAL": UV_TOTAL,
+        "IU_TOTAL": IU_TOTAL,
+        "JV_TOTAL": JV_TOTAL,
         "K_TOTAL": K_TOTAL,
 
-        # 稀疏 CG 信息
-        "cg_i_all": cg_i_all,          # [nnz_total], 已按 k 排好序
-        "cg_j_all": cg_j_all,          # [nnz_total]
-        "cg_k_all": cg_k_all,          # [nnz_total]
-        "cg_val_all": cg_val_all,      # [nnz_total]
-        "nnz_per_path": nnz_per_path,  # [num_paths]
-        "nnz_offsets": nnz_offsets,    # [num_paths]
+        # sparse CG info
+        "cg_i_all": cg_i_all,
+        "cg_j_all": cg_j_all,
+        "cg_k_all": cg_k_all,
+        "cg_val_all": cg_val_all,
+        "nnz_per_path": nnz_per_path_t,
+        "nnz_offsets": nnz_offsets_t,  # length P (start offset per path)
 
-        # 按 k 分组的 meta
-        # 传给 kernel 时可以 flatten 成 [P*MAX_K_DIM]
-        "nnz_k_offsets": nnz_k_offsets,  # [P, MAX_K_DIM],  path 内部局部 offset
-        "nnz_k_counts":  nnz_k_counts,   # [P, MAX_K_DIM],
-        "MAX_K_DIM": max_k_dim_for_kernel,
+        # sparse per-k grouping
+        "nnz_k_offsets": nnz_k_offsets_flat,  # [P*MAX_K_DIM]
+        "nnz_k_counts": nnz_k_counts_flat,    # [P*MAX_K_DIM]
+        "MAX_K_DIM": int(max_k_dim_for_kernel),
     }
     return meta
+
 
 
 
@@ -688,16 +746,20 @@ class TensorProduct(torch.nn.Module):
                 c_tensors = meta["c_tensors"]
                 self.c_all = torch.cat([c.reshape(-1) for c in c_tensors], dim=0).contiguous()
                 
-                
+                self.meta = meta
                 self.i_dims = meta["i_dims"].to(device)
                 self.j_dims = meta["j_dims"].to(device)
                 self.k_dims = meta["k_dims"].to(device)
                 self.c_offsets = meta["c_offsets"].to(device)
+                self.uv_seg_offsets = meta["uv_seg_offsets"].to(device)
                 self.iu_seg_offsets = meta["iu_seg_offsets"].to(device)
                 self.jv_seg_offsets = meta["jv_seg_offsets"].to(device)
                 self.kv_k_offsets = meta["kv_k_offsets"].to(device)
                 path_indices = meta["path_indices"]
-                self.path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device)
+                self.path_indices_tensor = meta["path_indices_tensor"]
+
+                self.cg_dense_all = meta["cg_dense_all"]
+                self.cg_dense_offsets = meta["cg_dense_offsets"]
 
                 P = len(path_indices)
                 uv = [row[0] for row in path_indices]
@@ -728,7 +790,20 @@ class TensorProduct(torch.nn.Module):
                 self.nnz_offsets_groupk = groupk_meta["nnz_offsets"]
                 self.nnz_k_offsets_groupk = groupk_meta["nnz_k_offsets"]
                 self.nnz_k_counts_groupk = groupk_meta["nnz_k_counts"]
-                
+
+                self.cg_i_groupi = groupi_meta["cg_i_all"]
+                self.cg_j_groupi  = groupi_meta["cg_j_all"]
+                self.cg_k_groupi  = groupi_meta["cg_k_all"]
+                self.cg_val_groupi  = groupi_meta["cg_val_all"]
+
+                nnz_offset = 0
+                for i in range(0, len(self.nnz_per_path)):
+                    print(f"path {i}, nnz {self.nnz_per_path[i]}, cg.shape:{c_tensors[i].shape}")
+                    for j in range(0, self.nnz_per_path[i]):
+                        idx = nnz_offset + j
+                        print(f"i:{self.cg_i_groupi[idx]}, j:{self.cg_j_groupi[idx]}, k:{self.cg_k_groupi[idx]}")
+                    nnz_offset += self.nnz_per_path[i]
+    
                 self.fasteq_cwtp = torch.ops.cwtp_fwd.forward
 
             # For mace small
@@ -810,41 +885,12 @@ class TensorProduct(torch.nn.Module):
         if self.op_name == "equi_linear":
             self.FastEquiLinearFunction = make_FastEquiLinearFunction()
         if self.op_name == "tp_channel_wise":
-            '''
-            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction(
-                self.c_all,
-                self.path_indices_tensor,
-                self.i_dims, self.j_dims, self.k_dims,
-                self.c_offsets,
-                self.iu_seg_offsets,
-                self.jv_seg_offsets,
-                self.kv_k_offsets,
-                self.nnz_per_path,
-                self.nnz_offsets_groupk,
-                self.nnz_k_offsets_groupk,
-                self.nnz_k_counts_groupk,
-                self.cg_i_groupk,
-                self.cg_j_groupk,
-                self.cg_k_groupk,
-                self.cg_val_groupk,
-                self.u, self.v, self.K_TOTAL
-            )
-            '''
 
             self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction(
-                self.c_all,
-                self.path_indices_tensor,
-                self.i_dims, self.j_dims, self.k_dims,
-                self.c_offsets,
-                self.iu_seg_offsets,
-                self.jv_seg_offsets,
-                self.kv_k_offsets,
+                self.meta,
                 self.groupk_meta,
                 self.groupi_meta,
                 self.groupj_meta,
-                self.order_uv,
-                self.order_iu,
-                self.order_jv,
                 self.u, self.v, self.K_TOTAL
             )
         
@@ -991,13 +1037,12 @@ class TensorProduct(torch.nn.Module):
             elif self.op_name == "tp_channel_wise":
                 #print("== call fasteq channel-wise tensor product ==")
                 #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                
-                out = self.FastCWTPFunc.apply(
-                    inputs[0], inputs[1], inputs[2],
-                )
+                #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
+                out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
             # TODO fix 
             elif self.op_name == "equi_linear":
                 #print(f"equi_linear, inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}")
+                '''
                 if tuple(inputs[0].shape) == (1, 36864):
                     #print("== call fasteq equi-linear tensor product ==")
                     dtype = inputs[0].dtype
@@ -1013,7 +1058,12 @@ class TensorProduct(torch.nn.Module):
                     out = torch.matmul(inputs[1], weight) * 0.10206207261596577
                     #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
                 else:
-                    out = self.f(inputs)
+                    #out = self.f(inputs)
+                    out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
+                    print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, out.shape:{out.shape}")
+                '''
+                out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
+                print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, out.shape:{out.shape}")
         else:
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000

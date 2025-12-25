@@ -54,6 +54,8 @@ target_compile_options(${PROJECT_NAME} PRIVATE
     -Xptxas --maxrregcount=128
     --use_fast_math
     --ptxas-options=-v
+    -Xptxas=-warn-spills
+    -lineinfo
 )
 
 # 添加LibTorch的包含目录（通常find_package(Torch)已设置，但确保其传播）

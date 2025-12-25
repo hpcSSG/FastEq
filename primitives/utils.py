@@ -332,41 +332,15 @@ def make_FastEquiLinearFunction():
             return None, grad_x, None, None
     
     return FastEquiLinearFunction
-'''
-def make_FastChannelWiseTensorProductFunction(
-                    c_all,
-                    path_indices_tensor,
-                    i_dims, j_dims, k_dims,
-                    c_offsets,
-                    iu_seg_offsets,
-                    jv_seg_offsets,
-                    kv_k_offsets,
-                    nnz_per_path,
-                    nnz_offsets,
-                    nnz_k_offsets,
-                    nnz_k_counts,
-                    cg_i_all,
-                    cg_j_all,
-                    cg_k_all,
-                    cg_val_all,
-                    U, V, K_TOTAL):
-'''
+
 
 def make_FastChannelWiseTensorProductFunction(
-                    c_all,
-                    path_indices_tensor,
-                    i_dims, j_dims, k_dims,
-                    c_offsets,
-                    iu_seg_offsets,
-                    jv_seg_offsets,
-                    kv_k_offsets,
+                    meta,
                     groupk_meta,
                     groupi_meta,
                     groupj_meta,
-                    order_uv,
-                    order_iu,
-                    order_jv,
                     U, V, K_TOTAL):
+
     class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         @staticmethod
         def forward(ctx, w, x, y):
@@ -386,11 +360,22 @@ def make_FastChannelWiseTensorProductFunction(
             nnz_k_offsets_groupk = groupk_meta["nnz_k_offsets"]
             nnz_k_counts_groupk = groupk_meta["nnz_k_counts"]
 
+            c_all = meta["c_all"]
+            i_dims = meta["i_dims"]
+            j_dims = meta["j_dims"]
+            k_dims = meta["k_dims"]
+            c_offsets = meta["c_offsets"]
+            uv_seg_offsets = meta["uv_seg_offsets"]
+            iu_seg_offsets = meta["iu_seg_offsets"]
+            jv_seg_offsets = meta["jv_seg_offsets"]
+            kv_k_offsets = meta["kv_k_offsets"]
+            path_indices = meta["path_indices_tensor"]
+
             
             output = torch.ops.cwtp_fwd.forward(
                 w, x, y,
                 c_all,
-                path_indices_tensor,
+                path_indices,
                 i_dims, j_dims, k_dims,
                 c_offsets,
                 iu_seg_offsets,
@@ -426,72 +411,69 @@ def make_FastChannelWiseTensorProductFunction(
         def backward(ctx, grad_output):
 
             w, x, y = ctx.saved_tensors
+            
+            cg_i_groupk = groupk_meta["cg_i_all"]
+            cg_j_groupk  = groupk_meta["cg_j_all"]
+            cg_k_groupk  = groupk_meta["cg_k_all"]
+            cg_val_groupk  = groupk_meta["cg_val_all"]
+            nnz_per_path = groupk_meta["nnz_per_path"]
+            nnz_offsets = groupk_meta["nnz_offsets"]
+            nnz_k_offsets_groupk = groupk_meta["nnz_k_offsets"]
+            nnz_k_counts_groupk = groupk_meta["nnz_k_counts"]
 
-            cg_i_i    = groupi_meta["cg_i_all"]
-            cg_j_i    = groupi_meta["cg_j_all"]
-            cg_k_i    = groupi_meta["cg_k_all"]
-            cg_val_i  = groupi_meta["cg_val_all"]
-            nnz_offsets_i = groupi_meta["nnz_offsets"]
-            nnz_i_offsets = groupi_meta["nnz_i_offsets"]
-            nnz_i_counts  = groupi_meta["nnz_i_counts"]
-
-            cg_i_j    = groupj_meta["cg_i_all"]
-            cg_j_j    = groupj_meta["cg_j_all"]
-            cg_k_j    = groupj_meta["cg_k_all"]
-            cg_val_j  = groupj_meta["cg_val_all"]
-            nnz_offsets_j = groupj_meta["nnz_offsets"]
-            nnz_j_offsets = groupj_meta["nnz_j_offsets"]
-            nnz_j_counts  = groupj_meta["nnz_j_counts"]
-
+            c_all = meta["c_all"]
+            i_dims = meta["i_dims"]
+            j_dims = meta["j_dims"]
+            k_dims = meta["k_dims"]
+            c_offsets = meta["c_offsets"]
+            uv_seg_offsets = meta["uv_seg_offsets"]
+            iu_seg_offsets = meta["iu_seg_offsets"]
+            jv_seg_offsets = meta["jv_seg_offsets"]
+            kv_k_offsets = meta["kv_k_offsets"]
+            path_indices = meta["path_indices_tensor"]
+            cg_dense_all = meta["cg_dense_all"]
+            cg_dense_offsets = meta["cg_dense_offsets"]
+            
+            #cueq cwtp large 7.8ms, medium 4ms
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
-
-            '''
+   
+            # for groupk
+            # mace large 18ms, medium 4.3ms
             grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
                 w, x, y,
-                path_indices_tensor,
+                path_indices,
                 k_dims,
                 iu_seg_offsets,
                 jv_seg_offsets,
                 kv_k_offsets,
                 nnz_per_path,
                 nnz_offsets,
-                nnz_k_offsets,
-                nnz_k_counts,
-                cg_i_all,
-                cg_j_all,
-                cg_val_all,
+                nnz_k_offsets_groupk,
+                nnz_k_counts_groupk,
+                cg_i_groupk,
+                cg_j_groupk,
+                cg_val_groupk,
                 grad_output,
                 U, V, K_TOTAL
             )
-            '''
 
+            '''
+            # for matmul
             grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
-                w, x, y, grad_output,
-                path_indices_tensor,
-                k_dims,
+                grad_output, w, x, y, 
+                c_all,
+                path_indices,
+                uv_seg_offsets,
                 iu_seg_offsets,
                 jv_seg_offsets,
                 kv_k_offsets,
-                cg_i_i,
-                cg_j_i,
-                cg_k_i,
-                cg_val_i,
-                nnz_offsets_i,
-                nnz_i_offsets,
-                nnz_i_counts, # groupi
-                cg_i_j,
-                cg_j_j,
-                cg_k_j,
-                cg_val_j,
-                nnz_offsets_j,
-                nnz_j_offsets,
-                nnz_j_counts, # groupj
-                order_uv,
-                order_iu,
-                order_jv,
+                c_offsets,
+                i_dims, j_dims, k_dims, 
                 K_TOTAL, U, V, 
             )
+            '''
+
 
 
             #grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_output.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
@@ -500,9 +482,6 @@ def make_FastChannelWiseTensorProductFunction(
             end_time = time.perf_counter() * 1000
             execution_time_ms = end_time - start_time
             print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms >>")
-
-            print(f"U:{U}, V:{V}, K_total:{K_TOTAL}")
-
             return (
                 grad_w,   # w
                 grad_x,   # x

@@ -15,7 +15,7 @@
 
 template <typename T> __host__ __device__ inline T ceil_div(T a, T b){ return (a + b - 1) / b; }
 
-// 后向（仅对 a_seg 求梯度），无原子版：
+// 仅对 a_seg 求梯度
 // 约束：J==1, U==96, W%4==0, K<=7, nnz<=7, B<=65535
 // 输入：
 //   b_seg   : [B,1,V]         （求 v*=argmax_v b[b,0,v]）
@@ -73,7 +73,7 @@ __global__ void fused_fctp_backward_kernel(
     scalar_t* sh_G   = sh_Wt  + (size_t)W * U_pad;                                 // size K*U
     scalar_t* sh_tmp = sh_G   + (size_t)K * U;                                     // size nnz*U
 
-    // （小数组）i 分组：把相同 i 的若干非零合组
+    // i 分组：把相同 i 的若干非零合组
     __shared__ int group_i[7];       // unique i 值，最多 7 组
     __shared__ int group_map[7];     // group_map[p] = 该 p 属于哪一组
     __shared__ int Gcnt;             // 组数 (≤ nnz)

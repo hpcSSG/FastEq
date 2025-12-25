@@ -3,6 +3,12 @@
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 
+#include <cuda_pipeline_primitives.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/memcpy_async.h>
+
+namespace cg = cooperative_groups;
+
 #include <vector>
 #include <algorithm>
 #include <cstdint>
@@ -15,6 +21,48 @@
                     " (error code ", static_cast<int>(_err), ")");         \
     } while (0)
 
+
+// 对齐的 async copy（4/8/16 字节）
+template<typename T>
+__device__ __forceinline__ void async_copy_one(T* dst, const T* src) {
+    if constexpr (sizeof(T) == 4) {
+        asm volatile(
+            "cp.async.ca.shared.global [%0], [%1], 4;\n"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+               "l"(src)
+        );
+    } else if constexpr (sizeof(T) == 8) {
+        asm volatile(
+            "cp.async.ca.shared.global [%0], [%1], 8;\n"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+               "l"(src)
+        );
+    } else if constexpr (sizeof(T) == 2) {
+        // fp16/bf16: 拷贝2字节
+        asm volatile(
+            "cp.async.ca.shared.global [%0], [%1], 2;\n"
+            :: "r"(static_cast<uint32_t>(__cvta_generic_to_shared(dst))),
+               "l"(src)
+        );
+    }
+}
+
+// cp.async commit and wait
+__device__ __forceinline__ void async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+
+template<int N>
+__device__ __forceinline__ void async_wait_prior() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+
+/*
 constexpr int P  = 4;    // paths
 constexpr int KS = 16;   // dim_sum = 16
 constexpr int U_FIXED = 96; // U=96, 可被4整除
@@ -247,164 +295,7 @@ cwtp_small_backward(
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return {gx, gy, gw};
 }
-
-// 瓶颈在原子写操作
-template <typename scalar_t, int MAX_K_DIM>
-__global__ void tp_channel_wise_sparse_groupk_bwd_kernel(
-    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
-    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
-    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
-
-    const int32_t* __restrict__ path_indices,   // [num_paths, 4] : (uv_idx, iu_idx, jv_idx, kv_idx)
-    const int32_t* __restrict__ k_dims,         // [num_paths]
-    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
-    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count]
-    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count]
-
-    const int32_t* __restrict__ nnz_per_path,   // [num_paths]
-    const int32_t* __restrict__ nnz_offsets,    // [num_paths]
-
-    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM]
-    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM]
-
-    // 稀疏 CG 系数（global memory）
-    const uint8_t* __restrict__ cg_i_all,       // [nnz_total]
-    const uint8_t* __restrict__ cg_j_all,       // [nnz_total]
-    const scalar_t* __restrict__ cg_val_all,    // [nnz_total]
-
-    // grad_out: dL/d out
-    const scalar_t* __restrict__ grad_out,      // [Z, K_TOTAL, U, V]
-
-    // 输出梯度
-    scalar_t* __restrict__ grad_x_uv,           // [Z, UV_TOTAL]
-    scalar_t* __restrict__ grad_x_iu,           // [Z, IU_TOTAL]
-    scalar_t* __restrict__ grad_x_jv,           // [Z, JV_TOTAL]
-
-    int Z,
-    int UV_TOTAL,
-    int IU_TOTAL,
-    int JV_TOTAL,
-    int K_TOTAL,
-    int U,
-    int V,
-    int num_paths
-) {
-    int z = blockIdx.x;   // 一个 block 一个 batch
-    if (z >= Z) return;
-
-    int u = threadIdx.x;  // 每个 thread 一个 u
-    if (u >= U) return;
-
-    extern __shared__ unsigned char smem_raw[];
-    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
-    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
-
-    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
-    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
-
-    int threads_in_block = blockDim.x;
-
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
-    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
-        s_iu[idx] = x_iu_z[idx];
-    }
-    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
-        s_jv[idx] = x_jv_z[idx];
-    }
-    __syncthreads();
-
-    const scalar_t* x_uv_z     = x_uv     + (size_t)z * UV_TOTAL;
-    const scalar_t* grad_out_z = grad_out + (size_t)z * (K_TOTAL * U * V);
-
-    scalar_t* grad_x_uv_z = grad_x_uv + (size_t)z * UV_TOTAL;
-    scalar_t* grad_x_iu_z = grad_x_iu + (size_t)z * IU_TOTAL;
-    scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
-
-    // 2. 遍历所有 path
-    for (int p = 0; p < num_paths; ++p) {
-        int uv_idx = path_indices[p * 4 + 0];
-        int iu_idx = path_indices[p * 4 + 1];
-        int jv_idx = path_indices[p * 4 + 2];
-        int kv_idx = path_indices[p * 4 + 3];
-
-        int k_dim   = k_dims[p];
-        int nnz     = nnz_per_path[p];
-        int nnz_off = nnz_offsets[p];
-
-        if (k_dim <= 0 || nnz <= 0) {
-            continue;
-        }
-        if (k_dim > MAX_K_DIM) {
-            return;
-        }
-
-        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
-        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
-        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
-        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
-
-        // 在 MACE-OFF 中通常 V=1，但这里保持通用
-        for (int v_idx = 0; v_idx < V; ++v_idx) {
-            int xuv_index = uv_base + u * V + v_idx;
-            scalar_t xuv_uv = x_uv_z[xuv_index];
-
-            // 按 k 分组
-            for (int k_local = 0; k_local < k_dim; ++k_local) {
-                int meta_idx    = p * MAX_K_DIM + k_local;
-                int local_off   = nnz_k_offsets[meta_idx];
-                int local_count = nnz_k_counts[meta_idx];
-
-                if (local_count <= 0)
-                    continue;
-
-                int global_k  = k_base + k_local;
-                int out_index = (global_k * U + u) * V + v_idx;
-                scalar_t g = grad_out_z[out_index];  // dL/d out(z,global_k,u,v)
-
-                if (g == static_cast<scalar_t>(0)) {
-                    continue;
-                }
-
-                // 用于 d(x_uv) 的 sum_{(i,j) in nnz} c * x_iu * x_jv
-                scalar_t sum_all_ij = static_cast<scalar_t>(0);
-
-                // 遍历这个 k 的所有 nnz（本 path 内连续）
-                for (int tt = 0; tt < local_count; ++tt) {
-                    int t   = local_off + tt;
-                    int idx = nnz_off + t; // global nnz index
-
-                    int i = static_cast<int>(cg_i_all[idx]);
-                    int j = static_cast<int>(cg_j_all[idx]);
-                    scalar_t c = cg_val_all[idx];
-
-                    // x_iu[z, iu_seg][i, u]
-                    int xiu_index = iu_base + i * U + u;
-                    scalar_t xiu_iu = s_iu[xiu_index];
-
-                    // x_jv[z, jv_seg][j, v]
-                    int xjv_index = jv_base + j * V + v_idx;
-                    scalar_t xjv_jv = s_jv[xjv_index];
-
-                    // --- dL/d x_iu[i,u] += g * c * x_jv * x_uv ---
-                    scalar_t d_xiu = g * c * xjv_jv * xuv_uv;
-                    grad_x_iu_z[xiu_index] += d_xiu;
-
-                    // --- dL/d x_jv[j,v] += g * c * x_iu * x_uv ---
-                    scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
-                    atomicAdd(&grad_x_jv_z[xjv_index], d_xjv);
-
-                    // --- 对 x_uv 的贡献项累加 ---
-                    sum_all_ij += c * xiu_iu * xjv_jv;
-                }
-
-                // --- dL/d x_uv[u,v] += g * sum_{(i,j)} c * x_iu * x_jv ---
-                scalar_t d_xuv = g * sum_all_ij;
-                grad_x_uv_z[xuv_index] += d_xuv;
-            }
-        }
-    }
-}
-
+*/
 
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
@@ -583,7 +474,7 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     }
 }
 
-std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
+std::vector<torch::Tensor> tp_channel_wise_groupk_bwd_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
     torch::Tensor x_jv,            // [Z, JV_TOTAL]
@@ -702,443 +593,546 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
 }
 
 template <typename T>
-__device__ __forceinline__ T warp_reduce_sum(T v) {
-    unsigned mask = 0xffffffffu;
-    v += __shfl_down_sync(mask, v, 16);
-    v += __shfl_down_sync(mask, v,  8);
-    v += __shfl_down_sync(mask, v,  4);
-    v += __shfl_down_sync(mask, v,  2);
-    v += __shfl_down_sync(mask, v,  1);
-    return v;
+__device__ __forceinline__ T ld_g(const T* p) {
+#if __CUDA_ARCH__ >= 350
+  return __ldg(p);
+#else
+  return *p;
+#endif
 }
 
-template <typename T>
-__device__ __forceinline__ void add_iu_switch(
-    int i, T v,
-    T &a0, T &a1, T &a2, T &a3, T &a4, T &a5, T &a6, T &a7
-){
-    switch (i) {
-        case 0: a0 += v; break;
-        case 1: a1 += v; break;
-        case 2: a2 += v; break;
-        case 3: a3 += v; break;
-        case 4: a4 += v; break;
-        case 5: a5 += v; break;
-        case 6: a6 += v; break;
-        case 7: a7 += v; break;
-        default: break;
-    }
-}
 
-template <typename T>
-__device__ __forceinline__ void process_bucket_jj(
-    int jj, int p,
-    int iu_base, int jv_base,
-    int U,
-    const T* __restrict__ s_iu,
-    const T* __restrict__ s_jv,
-    const uint8_t* __restrict__ cg_i_j,
-    const uint8_t* __restrict__ cg_k_j,
-    const T* __restrict__ cg_val_j,
-    const int32_t* __restrict__ nnz_j_offsets, // [P*8]
-    const int32_t* __restrict__ nnz_j_counts,  // [P*8]
-    int base_j,
-    int u,
-    T xuv,
+template<int P, int UV, int IU, int JV, int KV, int I, int J, int K, int JB, typename T>
+__device__ __forceinline__ void tp17_path_eval_sharedc(
+    int z, int u, int lane,
+    const T* __restrict__ grad_out,  // [Z, K_TOTAL, U]
+    const T* __restrict__ x_uv,      // [Z, UV_TOTAL]
+    const T* __restrict__ x_iu,      // [Z, IU_TOTAL]
+    const T* __restrict__ x_jv,      // [Z, JV_TOTAL]
+    const T* __restrict__ c_s,       // shared c base (C_TOTAL)
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ smem_j,          // shared j partial [U*17]
+    int STRIDE,                      // 17
 
-    // gk scalars
-    T gk0,T gk1,T gk2,T gk3,T gk4,T gk5,T gk6,T gk7,
-    int k_dim,
-
-    // accum outputs
-    T &acc_uv,
-    T &acc_iu0, T &acc_iu1, T &acc_iu2, T &acc_iu3,
-    T &acc_iu4, T &acc_iu5, T &acc_iu6, T &acc_iu7,
-    T &acc_jv
-){
-    int off = nnz_j_offsets[p * 8 + jj];
-    int cnt = nnz_j_counts [p * 8 + jj];
-    if (cnt <= 0) return;
-
-    T xjv = s_jv[jv_base + jj];
-
-    #pragma unroll 1
-    for (int s = 0; s < cnt; ++s) {
-        int idx = base_j + off + s;
-        int i   = (int)cg_i_j[idx];
-        int kk  = (int)cg_k_j[idx];
-        T   c   = cg_val_j[idx];
-
-        if ((unsigned)i >= 8u) continue; // require i<8
-
-        // GK(kk)
-        T gk = T(0);
-        switch (kk) {
-            case 0: gk = gk0; break;
-            case 1: gk = gk1; break;
-            case 2: gk = gk2; break;
-            case 3: gk = gk3; break;
-            case 4: gk = gk4; break;
-            case 5: gk = gk5; break;
-            case 6: gk = gk6; break;
-            case 7: gk = gk7; break;
-            default: gk = T(0); break;
-        }
-        // 如果 kk >= k_dim，gk 应视为 0（避免无效k）
-        if (kk >= k_dim) continue;
-
-        T xiu = s_iu[iu_base + i * U + u];
-
-        // grad_uv += gk*c*xiu*xjv
-        acc_uv += gk * c * xiu * xjv;
-
-        // grad_iu(i,u) += gk*c*xuv*xjv
-        add_iu_switch(i, gk * c * xuv * xjv,
-                      acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7);
-
-        // grad_jv(j) += gk*c*xuv*xiu
-        acc_jv += gk * c * xuv * xiu;
-    }
-}
-
-template<typename T, bool ATOMIC_UV=true, bool ATOMIC_IU=true>
-__global__ void tp_cwtp_bwd_one_kernel_groupj_fused_nostack(
-    const T* __restrict__ x_uv,        // [Z, UV_TOTAL]
-    const T* __restrict__ x_iu,        // [Z, IU_TOTAL]
-    const T* __restrict__ x_jv,        // [Z, JV_TOTAL]
-    const T* __restrict__ grad_out,    // [Z, K_TOTAL, U]  (V==1)
-
-    const int32_t* __restrict__ path_indices, // [P,4]
-    const int32_t* __restrict__ k_dims,       // [P]
+    const int32_t* __restrict__ uv_seg_offsets,
     const int32_t* __restrict__ iu_seg_offsets,
     const int32_t* __restrict__ jv_seg_offsets,
     const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets, // [18]
 
-    const uint8_t* __restrict__ cg_i_j,        // [nnz_total]
-    const uint8_t* __restrict__ cg_k_j,        // [nnz_total]
-    const T*       __restrict__ cg_val_j,      // [nnz_total]
-    const int32_t* __restrict__ nnz_offsets_j, // [P]
-    const int32_t* __restrict__ nnz_j_offsets, // [P*8]
-    const int32_t* __restrict__ nnz_j_counts,  // [P*8]
+    int32_t U_runtime,
+    int32_t K_TOTAL,
+    int32_t UV_TOTAL, int32_t IU_TOTAL, int32_t JV_TOTAL
+) {
+  int uv_base = (int)uv_seg_offsets[UV];
+  int iu_base = (int)iu_seg_offsets[IU];
+  int jv_base = (int)jv_seg_offsets[JV];
+  int k_base  = (int)kv_k_offsets[KV];
 
-    T* __restrict__ grad_x_uv,  // [Z, UV_TOTAL]
-    T* __restrict__ grad_x_iu,  // [Z, IU_TOTAL]
-    T* __restrict__ grad_x_jv,  // [Z, JV_TOTAL]
+  const T* c_ptr = c_s + (int)c_offsets[P]; // now shared
 
-    int Z, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
-    int K_TOTAL, int U, int V, int P
-){
-    int z = (int)blockIdx.x;
-    int u = (int)threadIdx.x;
-    if (z >= Z || u >= U) return;
-    if (V != 1) return;
+  // xuv
+  T xuv = ld_g(x_uv + (int64_t)z * UV_TOTAL + (uv_base + u));
 
-    extern __shared__ unsigned char smem_raw[];
-    T* s_iu = reinterpret_cast<T*>(smem_raw);
-    T* s_jv = s_iu + IU_TOTAL;
+  // xj[J] : warp broadcast
+  T xj[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) {
+    T v = (lane == 0) ? ld_g(x_jv + (int64_t)z * JV_TOTAL + (jv_base + j)) : (T)0;
+    xj[j] = __shfl_sync(0xffffffff, v, 0);
+  }
 
-    const T* x_iu_z = x_iu + (size_t)z * (size_t)IU_TOTAL;
-    const T* x_jv_z = x_jv + (size_t)z * (size_t)JV_TOTAL;
+  // xiu[I]
+  T xiu[I];
+#pragma unroll
+  for (int i = 0; i < I; ++i) {
+    xiu[i] = ld_g(x_iu + (int64_t)z * IU_TOTAL + (iu_base + i * U_runtime + u));
+  }
 
-    for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) s_iu[idx] = x_iu_z[idx];
-    for (int idx = u; idx < JV_TOTAL; idx += blockDim.x) s_jv[idx] = x_jv_z[idx];
-    __syncthreads();
+  // accum uv/iu
+  T acc_uv = (T)0;
+  T acc_iu[I];
+#pragma unroll
+  for (int i = 0; i < I; ++i) acc_iu[i] = (T)0;
 
-    const T* x_uv_z = x_uv + (size_t)z * (size_t)UV_TOTAL;
-    const T* go_z   = grad_out + (size_t)z * (size_t)K_TOTAL * (size_t)U; // [K_TOTAL, U]
+  // jv partial: register accumulate, then one shared add at end
+  T jtmp[J];
+#pragma unroll
+  for (int j = 0; j < J; ++j) jtmp[j] = (T)0;
 
-    T* g_uv_z = grad_x_uv + (size_t)z * (size_t)UV_TOTAL;
-    T* g_iu_z = grad_x_iu + (size_t)z * (size_t)IU_TOTAL;
-    T* g_jv_z = grad_x_jv + (size_t)z * (size_t)JV_TOTAL;
+#pragma unroll
+  for (int kk = 0; kk < K; ++kk) {
+    T go = ld_g(grad_out + (((int64_t)z * K_TOTAL + (k_base + kk)) * (int64_t)U_runtime + u));;
 
-    int lane = threadIdx.x & 31;
-
-    for (int p = 0; p < P; ++p) {
-        int uv_idx = path_indices[p*4 + 0];
-        int iu_idx = path_indices[p*4 + 1];
-        int jv_idx = path_indices[p*4 + 2];
-        int kv_idx = path_indices[p*4 + 3];
-
-        int k_dim = k_dims[p];
-        if (k_dim <= 0 || k_dim > 8) continue;
-
-        int uv_base = uv_idx * (U * V);
-        int iu_base = iu_seg_offsets[iu_idx];
-        int jv_base = jv_seg_offsets[jv_idx];
-        int k_base  = kv_k_offsets[kv_idx];
-
-        T xuv = x_uv_z[uv_base + u];
-
-        // gk scalars
-        T gk0=T(0),gk1=T(0),gk2=T(0),gk3=T(0),gk4=T(0),gk5=T(0),gk6=T(0),gk7=T(0);
-        if (k_dim > 0) gk0 = go_z[(k_base+0)*U + u];
-        if (k_dim > 1) gk1 = go_z[(k_base+1)*U + u];
-        if (k_dim > 2) gk2 = go_z[(k_base+2)*U + u];
-        if (k_dim > 3) gk3 = go_z[(k_base+3)*U + u];
-        if (k_dim > 4) gk4 = go_z[(k_base+4)*U + u];
-        if (k_dim > 5) gk5 = go_z[(k_base+5)*U + u];
-        if (k_dim > 6) gk6 = go_z[(k_base+6)*U + u];
-        if (k_dim > 7) gk7 = go_z[(k_base+7)*U + u];
-
-        // accumulators (REG only)
-        T acc_uv = T(0);
-
-        T acc_iu0=T(0), acc_iu1=T(0), acc_iu2=T(0), acc_iu3=T(0);
-        T acc_iu4=T(0), acc_iu5=T(0), acc_iu6=T(0), acc_iu7=T(0);
-
-        T acc_jv0=T(0), acc_jv1=T(0), acc_jv2=T(0), acc_jv3=T(0);
-        T acc_jv4=T(0), acc_jv5=T(0), acc_jv6=T(0), acc_jv7=T(0);
-
-        int base_j = nnz_offsets_j[p];
-
-        process_bucket_jj<T>(0, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv0);
-        process_bucket_jj<T>(1, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv1);
-        process_bucket_jj<T>(2, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv2);
-        process_bucket_jj<T>(3, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv3);
-        process_bucket_jj<T>(4, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv4);
-        process_bucket_jj<T>(5, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv5);
-        process_bucket_jj<T>(6, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv6);
-        process_bucket_jj<T>(7, p, iu_base, jv_base, U, s_iu, s_jv,
-                             cg_i_j, cg_k_j, cg_val_j, nnz_j_offsets, nnz_j_counts, base_j,
-                             u, xuv, gk0,gk1,gk2,gk3,gk4,gk5,gk6,gk7, k_dim,
-                             acc_uv, acc_iu0,acc_iu1,acc_iu2,acc_iu3,acc_iu4,acc_iu5,acc_iu6,acc_iu7, acc_jv7);
-        
-        // writeback grad_uv
-        if (acc_uv != (T)0) {
-            if constexpr (ATOMIC_UV) atomicAdd(&g_uv_z[uv_base + u], acc_uv);
-            else                     g_uv_z[uv_base + u] += acc_uv;
-        }
-
-        // writeback grad_iu (最多 8 次)
-
-        auto wb_iu = [&](int ii, T v) {
-            if (v != (T)0) {
-                if constexpr (ATOMIC_IU) atomicAdd(&g_iu_z[iu_base + ii*U + u], v);
-                else                     g_iu_z[iu_base + ii*U + u] += v;
-            }
-        };
-        wb_iu(0, acc_iu0); wb_iu(1, acc_iu1); wb_iu(2, acc_iu2); wb_iu(3, acc_iu3);
-        wb_iu(4, acc_iu4); wb_iu(5, acc_iu5); wb_iu(6, acc_iu6); wb_iu(7, acc_iu7);
-        
-        // grad_jv: warp reduce -> lane0 atomic
-        T v0 = warp_reduce_sum(acc_jv0);
-        T v1 = warp_reduce_sum(acc_jv1);
-        T v2 = warp_reduce_sum(acc_jv2);
-        T v3 = warp_reduce_sum(acc_jv3);
-        T v4 = warp_reduce_sum(acc_jv4);
-        T v5 = warp_reduce_sum(acc_jv5);
-        T v6 = warp_reduce_sum(acc_jv6);
-        T v7 = warp_reduce_sum(acc_jv7);
-
-        if (lane == 0) {
-            if (v0 != (T)0) atomicAdd(&g_jv_z[jv_base + 0], v0);
-            if (v1 != (T)0) atomicAdd(&g_jv_z[jv_base + 1], v1);
-            if (v2 != (T)0) atomicAdd(&g_jv_z[jv_base + 2], v2);
-            if (v3 != (T)0) atomicAdd(&g_jv_z[jv_base + 3], v3);
-            if (v4 != (T)0) atomicAdd(&g_jv_z[jv_base + 4], v4);
-            if (v5 != (T)0) atomicAdd(&g_jv_z[jv_base + 5], v5);
-            if (v6 != (T)0) atomicAdd(&g_jv_z[jv_base + 6], v6);
-            if (v7 != (T)0) atomicAdd(&g_jv_z[jv_base + 7], v7);
-        }
-        
+    // uv/iu
+#pragma unroll
+    for (int i = 0; i < I; ++i) {
+      T s = (T)0;
+#pragma unroll
+      for (int j = 0; j < J; ++j) {
+        T c = c_ptr[((i * J + j) * K + kk)];
+        s = fma(c, xj[j], s);
+      }
+      acc_uv    = fma(go, s * xiu[i], acc_uv);
+      acc_iu[i] = fma(go, xuv * s,    acc_iu[i]);
     }
+
+    // jv partial
+#pragma unroll
+    for (int j = 0; j < J; ++j) {
+      T tj = (T)0;
+#pragma unroll
+      for (int i = 0; i < I; ++i) {
+        T c = c_ptr[((i * J + j) * K + kk)];
+        tj = fma(c, xiu[i], tj);
+      }
+      jtmp[j] = fma(go, xuv * tj, jtmp[j]);
+    }
+  }
+
+  // write back uv/iu
+  grad_x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)] += acc_uv;
+#pragma unroll
+  for (int i = 0; i < I; ++i) {
+    grad_x_iu[(int64_t)z * IU_TOTAL + (iu_base + i * U_runtime + u)] += acc_iu[i];
+  }
+
+  // one-time shared add for jv partial
+#pragma unroll
+  for (int j = 0; j < J; ++j) {
+    int jj = JB + j;
+    smem_j[u * STRIDE + jj] += jtmp[j];
+  }
 }
 
 
-std::vector<torch::Tensor> tp_channel_wise_groupij_bwd_launch(
-    torch::Tensor x_uv,            // [Z, UV_TOTAL]
-    torch::Tensor x_iu,            // [Z, IU_TOTAL]
-    torch::Tensor x_jv,            // [Z, JV_TOTAL]
-    torch::Tensor grad_out,        // [Z, K_TOTAL, U, V] or flatten ok, but最好传 4D contiguous
+template<typename T, int JB>
+__device__ __forceinline__ void tp17_eval_single(
+    int z, int u,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ smem_c,
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ smem_j, int STRIDE,
+    const int32_t* __restrict__ uv_seg_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets,
+    int U, int K_TOTAL, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
+    int UV_IDX, int IU_IDX, int JV_IDX, int KV_IDX, int P
+){
+  const int uv_base = (int)uv_seg_offsets[UV_IDX];
+  const int iu_base = (int)iu_seg_offsets[IU_IDX];
+  const int jv_base = (int)jv_seg_offsets[JV_IDX];
+  const int k_base  = (int)kv_k_offsets[KV_IDX];
+  const int c_base  = (int)c_offsets[P];
 
-    torch::Tensor path_indices,    // [P,4] int32
-    torch::Tensor k_dims,          // [P] int32
-    torch::Tensor iu_seg_offsets,  // int32
-    torch::Tensor jv_seg_offsets,  // int32
-    torch::Tensor kv_k_offsets,    // int32
+  const T xuv = x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)];
+  const T xiu = x_iu[(int64_t)z * IU_TOTAL + (iu_base + 0*U + u)];
+  const T xjv = x_jv[(int64_t)z * JV_TOTAL + (jv_base + 0)];
+  const T c   = smem_c[c_base + 0];
+  const T gk  = grad_out[(int64_t)z * (int64_t)K_TOTAL * U + (int64_t)(k_base + 0) * U + u];
 
-    // group-i CG
-    torch::Tensor cg_i_i,          // [nnz_total_i] uint8
-    torch::Tensor cg_j_i,          // [nnz_total_i] uint8
-    torch::Tensor cg_k_i,          // [nnz_total_i] uint8
-    torch::Tensor cg_val_i,        // [nnz_total_i] float/double
-    torch::Tensor nnz_offsets_i,   // [P] int32
-    torch::Tensor nnz_i_offsets,   // [P, MAX_I_DIM] int32
-    torch::Tensor nnz_i_counts,    // [P, MAX_I_DIM] int32
+  const T gc  = gk * c;
 
-    // group-j CG
-    torch::Tensor cg_i_j,          // [nnz_total_j] uint8
-    torch::Tensor cg_j_j,          // [nnz_total_j] uint8
-    torch::Tensor cg_k_j,          // [nnz_total_j] uint8
-    torch::Tensor cg_val_j,        // [nnz_total_j]
-    torch::Tensor nnz_offsets_j,   // [P] int32
-    torch::Tensor nnz_j_offsets,   // [P, MAX_J_DIM] int32
-    torch::Tensor nnz_j_counts,    // [P, MAX_J_DIM] int32
-    torch::Tensor order_uv,
-    torch::Tensor order_iu,
-    torch::Tensor order_jv,
+  grad_x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)] += gc * xiu * xjv;
+  grad_x_iu[(int64_t)z * IU_TOTAL + (iu_base + 0*U + u)] += gc * xuv * xjv;
+  smem_j[u * STRIDE + JB + 0] += gc * xuv * xiu;
+}
+
+template<typename T, int D, int JB>
+__device__ __forceinline__ void tp17_eval_diag_jk_i0(
+    int z, int u,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ smem_c,
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ smem_j, int STRIDE,
+    const int32_t* __restrict__ uv_seg_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets,
+    int U, int K_TOTAL, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
+    int UV_IDX, int IU_IDX, int JV_IDX, int KV_IDX, int P
+){
+  const int uv_base = (int)uv_seg_offsets[UV_IDX];
+  const int iu_base = (int)iu_seg_offsets[IU_IDX];
+  const int jv_base = (int)jv_seg_offsets[JV_IDX];
+  const int k_base  = (int)kv_k_offsets[KV_IDX];
+  const int c_base  = (int)c_offsets[P];
+
+  const T xuv = x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)];
+  const T xiu = x_iu[(int64_t)z * IU_TOTAL + (iu_base + 0*U + u)];
+
+#pragma unroll
+  for (int t = 0; t < D; ++t) {
+    const T xjv = x_jv[(int64_t)z * JV_TOTAL + (jv_base + t)];
+    const T c   = smem_c[c_base + t * (D + 1)];         // (0,t,t)
+    const T gk  = grad_out[(int64_t)z * (int64_t)K_TOTAL * U + (int64_t)(k_base + t) * U + u];
+
+    const T gc = gk * c;
+    grad_x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)] += gc * xiu * xjv;
+    grad_x_iu[(int64_t)z * IU_TOTAL + (iu_base + 0*U + u)] += gc * xuv * xjv;
+    smem_j[u * STRIDE + (JB + t)] += gc * xuv * xiu;
+  }
+}
+
+template<typename T, int D, int JB>
+__device__ __forceinline__ void tp17_eval_diag_ik_j0(
+    int z, int u,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ smem_c,
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ smem_j, int STRIDE,
+    const int32_t* __restrict__ uv_seg_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets,
+    int U, int K_TOTAL, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
+    int UV_IDX, int IU_IDX, int JV_IDX, int KV_IDX, int P
+){
+  const int uv_base = (int)uv_seg_offsets[UV_IDX];
+  const int iu_base = (int)iu_seg_offsets[IU_IDX];
+  const int jv_base = (int)jv_seg_offsets[JV_IDX];
+  const int k_base  = (int)kv_k_offsets[KV_IDX];
+  const int c_base  = (int)c_offsets[P];
+
+  const T xuv = x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)];
+  const T xjv = x_jv[(int64_t)z * JV_TOTAL + (jv_base + 0)]; // j=0 only
+
+#pragma unroll
+  for (int t = 0; t < D; ++t) {
+    const T xiu = x_iu[(int64_t)z * IU_TOTAL + (iu_base + t*U + u)];
+    const T c   = smem_c[c_base + t * (D + 1)];             // (t,0,t)
+    const T gk  = grad_out[(int64_t)z * (int64_t)K_TOTAL * U + (int64_t)(k_base + t) * U + u];
+
+    const T gc = gk * c;
+    grad_x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)] += gc * xiu * xjv;
+    grad_x_iu[(int64_t)z * IU_TOTAL + (iu_base + t*U + u)] += gc * xuv * xjv;
+    smem_j[u * STRIDE + JB + 0] += gc * xuv * xiu;          // j only 0 -> global jj=JB
+  }
+}
+
+template<typename T, int D, int JB>
+__device__ __forceinline__ void tp17_eval_diag_ij_k0(
+    int z, int u,
+    const T* __restrict__ grad_out,
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ smem_c,
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ smem_j, int STRIDE,
+    const int32_t* __restrict__ uv_seg_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets,
+    int U, int K_TOTAL, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL,
+    int UV_IDX, int IU_IDX, int JV_IDX, int KV_IDX, int P
+){
+  const int uv_base = (int)uv_seg_offsets[UV_IDX];
+  const int iu_base = (int)iu_seg_offsets[IU_IDX];
+  const int jv_base = (int)jv_seg_offsets[JV_IDX];
+  const int k_base  = (int)kv_k_offsets[KV_IDX];
+  const int c_base  = (int)c_offsets[P];
+
+  const T xuv = x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)];
+  const T gk  = grad_out[(int64_t)z * (int64_t)K_TOTAL * U + (int64_t)(k_base + 0) * U + u];
+
+#pragma unroll
+  for (int t = 0; t < D; ++t) {
+    const T xiu = x_iu[(int64_t)z * IU_TOTAL + (iu_base + t*U + u)];
+    const T xjv = x_jv[(int64_t)z * JV_TOTAL + (jv_base + t)];
+    const T c   = smem_c[c_base + t * (D + 1)];             // (t,t,0) in D×D×1 -> idx=t*(D+1)
+    const T gc  = gk * c;
+
+    grad_x_uv[(int64_t)z * UV_TOTAL + (uv_base + u)] += gc * xiu * xjv;
+    grad_x_iu[(int64_t)z * IU_TOTAL + (iu_base + t*U + u)] += gc * xuv * xjv;
+    smem_j[u * STRIDE + (JB + t)] += gc * xuv * xiu;
+  }
+}
+
+
+template <typename T>
+__global__ void tp17_bwd_fused_kernel_sharedc(
+    const T* __restrict__ grad_out,
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ c_all,
+
+    const int32_t* __restrict__ uv_seg_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ c_offsets, // [18]
+
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ grad_x_jv,
+
+    int32_t Z, int32_t U,
+    int32_t K_TOTAL,
+    int32_t UV_TOTAL, int32_t IU_TOTAL, int32_t JV_TOTAL
+) {
+  int z = (int)blockIdx.x;
+  int tid = (int)threadIdx.x;
+  if (z >= Z) return;
+
+  bool active = (tid < U);
+  int u = tid;
+
+  constexpr int JJ = 16;
+  constexpr int PAD = 1;
+  constexpr int STRIDE = JJ + PAD; // 17
+
+  int lane = tid & 31;
+  int warp = tid >> 5;
+
+  // ---- shared layout: [j-partial][c-total] ----
+  extern __shared__ unsigned char smem_raw[];
+  T* smem_j = reinterpret_cast<T*>(smem_raw);          // size: U*17
+  T* smem_c = smem_j + (int)(U * STRIDE);              // size: c_offsets[17] (==C_TOTAL)
+
+  // 1) init smem_j
+  if (active) {
+#pragma unroll
+    for (int jj = 0; jj < JJ; ++jj) smem_j[u * STRIDE + jj] = (T)0;
+  }
+
+  // 2) cooperative load c_all -> smem_c (per block once)
+  // C_TOTAL = c_offsets[17]
+  int C_TOTAL = (int)c_offsets[17];
+  for (int idx = tid; idx < C_TOTAL; idx += blockDim.x) {
+    smem_c[idx] = ld_g(c_all + idx);
+  }
+
+  __syncthreads();
+
+  // 3) 17 specialized paths (only active threads)
+  if (active) {
+    // (P, UV, IU, JV, KV, I, J, K, JB)
+
+    // path0: (1,1,1), JB=0, UV=0 IU=0 JV=0 KV=0 P=0
+    tp17_eval_single<T, 0>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                            uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                            U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 0,0,0,0, 0);
+
+    // path1: (1,3,3) j=k diag, JB=1, UV=3 IU=0 JV=1 KV=3 P=1
+    tp17_eval_diag_jk_i0<T, 3, 1>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 3,0,1,3, 1);
+
+    // path2: (1,5,5) JB=4, UV=8 IU=0 JV=2 KV=8 P=2
+    tp17_eval_diag_jk_i0<T, 5, 4>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 8,0,2,8, 2);
+
+    // path3: (1,7,7) JB=9, UV=13 IU=0 JV=3 KV=13 P=3
+    tp17_eval_diag_jk_i0<T, 7, 9>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 13,0,3,13, 3);
+
+    // path4: (3,1,3) i=k, j=0, JB=0, UV=4 IU=1 JV=0 KV=4 P=4
+    tp17_eval_diag_ik_j0<T, 3, 0>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 4,1,0,4, 4);
+
+    // path5: (3,3,1) i=j, k=0, JB=1, UV=1 IU=1 JV=1 KV=1 P=5
+    tp17_eval_diag_ij_k0<T, 3, 1>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 1,1,1,1, 5);
+
+    tp17_path_eval_sharedc< 6,  9,1,1, 9, 3,3,5, 1>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+    tp17_path_eval_sharedc< 7,  5,1,2, 5, 3,5,3, 4>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+
+    tp17_path_eval_sharedc< 8, 14,1,2,14, 3,5,7, 4>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+
+    tp17_path_eval_sharedc< 9, 10,1,3,10, 3,7,5, 9>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+       
+    // path10: (5,1,5) i=k, JB=0, UV=11 IU=2 JV=0 KV=11 P=10
+    tp17_eval_diag_ik_j0<T, 5, 0>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 11,2,0,11, 10);
+    
+    
+    tp17_path_eval_sharedc<11,  6,2,1, 6, 5,3,3, 1>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+    tp17_path_eval_sharedc<12, 15,2,1,15, 5,3,7, 1>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+
+    tp17_eval_diag_ij_k0<T, 5, 4>(z,u,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL, 2,2,2,2, 13);
+   
+    tp17_path_eval_sharedc<14, 12,2,2,12, 5,5,5, 4>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+    tp17_path_eval_sharedc<15,  7,2,3, 7, 5,7,3, 9>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+    tp17_path_eval_sharedc<16, 16,2,3,16, 5,7,7, 9>(z,u,lane,grad_out,x_uv,x_iu,x_jv,smem_c,grad_x_uv,grad_x_iu,smem_j,STRIDE,
+                                                    uv_seg_offsets,iu_seg_offsets,jv_seg_offsets,kv_k_offsets,c_offsets,
+                                                    U,K_TOTAL,UV_TOTAL,IU_TOTAL,JV_TOTAL);
+    
+    
+  }
+
+  __syncthreads();
+
+  // 4) reduce smem_j over u for each jj
+  __shared__ T warp_sum[8][JJ + PAD];
+
+#pragma unroll
+  for (int jj = 0; jj < JJ; ++jj) {
+    T v = (T)0;
+    if (active) v = smem_j[u * STRIDE + jj];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+    if (lane == 0) warp_sum[warp][jj] = v;
+  }
+  __syncthreads();
+
+  if (warp == 0) {
+#pragma unroll
+    for (int jj = 0; jj < JJ; ++jj) {
+      T v = (lane < 8) ? warp_sum[lane][jj] : (T)0;
+#pragma unroll
+      for (int off = 4; off > 0; off >>= 1) v += __shfl_down_sync(0xffffffff, v, off);
+      if (lane == 0) {
+        int jv_idx, j_local;
+        if (jj == 0) { jv_idx = 0; j_local = 0; }
+        else if (jj < 4) { jv_idx = 1; j_local = jj - 1; }
+        else if (jj < 9) { jv_idx = 2; j_local = jj - 4; }
+        else { jv_idx = 3; j_local = jj - 9; }
+
+        int jv_base = (int)jv_seg_offsets[jv_idx];
+        grad_x_jv[(int64_t)z * JV_TOTAL + (int64_t)(jv_base + j_local)] += v;
+      }
+    }
+  }
+}
+
+std::vector<torch::Tensor> tp17_bwd_fused(
+    torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
+    torch::Tensor x_uv,          // [Z,UV_TOTAL]
+    torch::Tensor x_iu,          // [Z,IU_TOTAL]
+    torch::Tensor x_jv,          // [Z,JV_TOTAL]
+    torch::Tensor c_all,         // [C_TOTAL]
+    torch::Tensor path_indices,  // [17,4] int32
+    torch::Tensor uv_seg_offsets,// int32
+    torch::Tensor iu_seg_offsets,// int32
+    torch::Tensor jv_seg_offsets,// int32
+    torch::Tensor kv_k_offsets,  // int32
+    torch::Tensor c_offsets,     // [18] int32
+    torch::Tensor i_dims,        // [17] int32
+    torch::Tensor j_dims,        // [17] int32
+    torch::Tensor k_dims,        // [17] int32
     const int64_t K_TOTAL,
     const int64_t U,
     const int64_t V
 ) {
-    // -------- checks --------
-    TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "inputs must be CUDA");
-    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
-
-    TORCH_CHECK(path_indices.is_cuda() && k_dims.is_cuda(), "path meta must be CUDA");
-    TORCH_CHECK(iu_seg_offsets.is_cuda() && jv_seg_offsets.is_cuda() && kv_k_offsets.is_cuda(),
-                "seg offsets must be CUDA");
-
-    TORCH_CHECK(cg_i_i.is_cuda() && cg_j_i.is_cuda() && cg_k_i.is_cuda() && cg_val_i.is_cuda(),
-                "group-i cg must be CUDA");
-    TORCH_CHECK(nnz_offsets_i.is_cuda() && nnz_i_offsets.is_cuda() && nnz_i_counts.is_cuda(),
-                "group-i nnz meta must be CUDA");
-
-    TORCH_CHECK(cg_i_j.is_cuda() && cg_j_j.is_cuda() && cg_k_j.is_cuda() && cg_val_j.is_cuda(),
-                "group-j cg must be CUDA");
-    TORCH_CHECK(nnz_offsets_j.is_cuda() && nnz_j_offsets.is_cuda() && nnz_j_counts.is_cuda(),
-                "group-j nnz meta must be CUDA");
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
     x_jv = x_jv.contiguous();
-    grad_out = grad_out.contiguous();
+
+    const int64_t Z = x_uv.size(0);
+    
+    grad_out = grad_out.view({Z, K_TOTAL, U*V}).contiguous();
 
     path_indices = path_indices.contiguous();
-    k_dims = k_dims.contiguous();
+    uv_seg_offsets = uv_seg_offsets.contiguous();
     iu_seg_offsets = iu_seg_offsets.contiguous();
     jv_seg_offsets = jv_seg_offsets.contiguous();
     kv_k_offsets = kv_k_offsets.contiguous();
 
-    cg_i_i = cg_i_i.contiguous();
-    cg_j_i = cg_j_i.contiguous();
-    cg_k_i = cg_k_i.contiguous();
-    cg_val_i = cg_val_i.contiguous();
-    nnz_offsets_i = nnz_offsets_i.contiguous();
-    nnz_i_offsets = nnz_i_offsets.contiguous();
-    nnz_i_counts  = nnz_i_counts.contiguous();
+    i_dims = i_dims.contiguous();
+    j_dims = j_dims.contiguous();
+    k_dims = k_dims.contiguous();
 
-    cg_i_j = cg_i_j.contiguous();
-    cg_j_j = cg_j_j.contiguous();
-    cg_k_j = cg_k_j.contiguous();
-    cg_val_j = cg_val_j.contiguous();
-    nnz_offsets_j = nnz_offsets_j.contiguous();
-    nnz_j_offsets = nnz_j_offsets.contiguous();
-    nnz_j_counts  = nnz_j_counts.contiguous();
+    c_offsets = c_offsets.contiguous();
 
-    // shapes
-    const int Z = (int)x_uv.size(0);
-    const int UV_TOTAL = (int)x_uv.size(1);
-    const int IU_TOTAL = (int)x_iu.size(1);
-    const int JV_TOTAL = (int)x_jv.size(1);
+  TORCH_CHECK(path_indices.scalar_type() == torch::kInt32, "path_indices must be int32");
+  TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [Z,K_TOTAL,U] (V=1)");
+  TORCH_CHECK(path_indices.size(0) == 17 && path_indices.size(1) == 4, "path_indices must be [17,4]");
 
-    grad_out = grad_out.view({Z, K_TOTAL, U, V});
+  TORCH_CHECK(U == 224, "This fused kernel assumes U=224");
+  TORCH_CHECK(x_uv.size(0) == Z && x_iu.size(0) == Z && x_jv.size(0) == Z, "Z mismatch");
 
-    TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch mismatch");
+  int32_t UV_TOTAL = (int32_t)x_uv.size(1);
+  int32_t IU_TOTAL = (int32_t)x_iu.size(1);
+  int32_t JV_TOTAL = (int32_t)x_jv.size(1);
 
-    // grad_out expected [Z, K_TOTAL, U, V]
-    TORCH_CHECK(grad_out.dim() == 4, "grad_out must be [Z, K_TOTAL, U, V] contiguous");
-    TORCH_CHECK(grad_out.size(0) == Z, "grad_out Z mismatch");
+  auto grad_x_uv = torch::zeros_like(x_uv);
+  auto grad_x_iu = torch::zeros_like(x_iu);
+  auto grad_x_jv = torch::zeros_like(x_jv);
 
-    TORCH_CHECK(V == 1, "This v1 kernel/launch assumes V==1 (MACE-OFF).");
+  dim3 grid(Z);
+  dim3 block(256); 
 
-    TORCH_CHECK((int)path_indices.size(1) == 4, "path_indices must be [P,4]");
-    const int P = (int)path_indices.size(0);
+  
+  int C_TOTAL = c_all.size(0); 
+  size_t shmem = (size_t)U * (16+1) * (size_t)x_uv.element_size() + (size_t)C_TOTAL *(size_t)x_uv.element_size();
 
-    // outputs
-    auto grad_x_uv = torch::zeros_like(x_uv);
-    auto grad_x_iu = torch::zeros_like(x_iu);
-    auto grad_x_jv = torch::zeros_like(x_jv);
+  AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp17_bwd_fused", [&](){
+    tp17_bwd_fused_kernel_sharedc<scalar_t><<<grid, block, shmem>>>(
+      (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+      (const scalar_t*)x_uv.data_ptr<scalar_t>(),
+      (const scalar_t*)x_iu.data_ptr<scalar_t>(),
+      (const scalar_t*)x_jv.data_ptr<scalar_t>(),
+      (const scalar_t*)c_all.data_ptr<scalar_t>(),
+      
+      uv_seg_offsets.data_ptr<int32_t>(),
+      iu_seg_offsets.data_ptr<int32_t>(),
+      jv_seg_offsets.data_ptr<int32_t>(),
+      kv_k_offsets.data_ptr<int32_t>(),
+      c_offsets.data_ptr<int32_t>(),
 
-    // launch config
-    int threads = U;
-    if (threads < 32) threads = 32;
-    if (threads > 1024) threads = 1024;
-    dim3 bdim(threads, 1, 1);
-    dim3 gdim(Z, 1, 1);
+      (scalar_t*)grad_x_uv.data_ptr<scalar_t>(),
+      (scalar_t*)grad_x_iu.data_ptr<scalar_t>(),
+      (scalar_t*)grad_x_jv.data_ptr<scalar_t>(),
 
-    // shared: s_iu[IU_TOTAL] + s_jv[JV_TOTAL]
-    size_t smem_bytes = (size_t)(IU_TOTAL + JV_TOTAL) * x_uv.element_size();
-    auto stream = at::cuda::getCurrentCUDAStream();
+      Z, U, K_TOTAL, UV_TOTAL, IU_TOTAL, JV_TOTAL
+    );
+  });
 
-    constexpr int MAX_K_DIM = 8;
-    constexpr int MAX_I_DIM = 8;
-    constexpr int MAX_J_DIM = 8;
-
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_cwtp_bwd_one_kernel_groupij", [&] {
-        tp_cwtp_bwd_one_kernel_groupj_fused_nostack<scalar_t>
-            <<<gdim, bdim, smem_bytes, stream>>>(
-                x_uv.data_ptr<scalar_t>(),
-                x_iu.data_ptr<scalar_t>(),
-                x_jv.data_ptr<scalar_t>(),
-                grad_out.data_ptr<scalar_t>(),
-
-                path_indices.data_ptr<int32_t>(),
-                k_dims.data_ptr<int32_t>(),
-                iu_seg_offsets.data_ptr<int32_t>(),
-                jv_seg_offsets.data_ptr<int32_t>(),
-                kv_k_offsets.data_ptr<int32_t>(),
-
-                //order_uv.data_ptr<int32_t>(),
-                //order_iu.data_ptr<int32_t>(),
-                //order_jv.data_ptr<int32_t>(),
-
-                /*
-                cg_i_i.data_ptr<uint8_t>(),
-                cg_j_i.data_ptr<uint8_t>(),
-                cg_k_i.data_ptr<uint8_t>(),
-                cg_val_i.data_ptr<scalar_t>(),
-                nnz_offsets_i.data_ptr<int32_t>(),
-                nnz_i_offsets.data_ptr<int32_t>(),
-                nnz_i_counts.data_ptr<int32_t>(),
-                */
-
-                cg_i_j.data_ptr<uint8_t>(),
-                //cg_j_j.data_ptr<uint8_t>(),
-                cg_k_j.data_ptr<uint8_t>(),
-                cg_val_j.data_ptr<scalar_t>(),
-                nnz_offsets_j.data_ptr<int32_t>(),
-                nnz_j_offsets.data_ptr<int32_t>(),
-                nnz_j_counts.data_ptr<int32_t>(),
-                
-
-                grad_x_uv.data_ptr<scalar_t>(),
-                grad_x_iu.data_ptr<scalar_t>(),
-                grad_x_jv.data_ptr<scalar_t>(),
-
-                Z, UV_TOTAL, IU_TOTAL, JV_TOTAL,
-                K_TOTAL, U, V, P
-            );
-
-        CUDA_CHECK(cudaGetLastError());
-    });
-
-    return {grad_x_uv, grad_x_iu, grad_x_jv};
+  return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
 
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &tp_channel_wise_groupij_bwd_launch);
+    m.def("backward", &tp_channel_wise_groupk_bwd_launch);
 }

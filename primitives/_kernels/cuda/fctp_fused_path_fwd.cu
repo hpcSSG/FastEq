@@ -188,7 +188,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
 }
 
 
-constexpr int W_TILE = 16; // 必须是4的倍数, 满足 shared mem 限制,不超过 48KB
+constexpr int W_TILE = 16;
 
 template<typename scalar_t>
 __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
