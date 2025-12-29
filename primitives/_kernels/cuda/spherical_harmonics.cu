@@ -7,7 +7,6 @@
 #include "cuda_utils.hpp"
 
 #define FULL_MASK 0xffffffff
-#define WARP_SIZE 32
 #define NWARPS_PER_BLOCK 4
 
 using namespace c10;

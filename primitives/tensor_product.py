@@ -1005,7 +1005,6 @@ class TensorProduct(torch.nn.Module):
             # TODO fix 
             elif self.op_name == "equi_linear":
                 #print(f"equi_linear, inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}")
-                '''
                 if tuple(inputs[0].shape) == (1, 36864):
                     #print("== call fasteq equi-linear tensor product ==")
                     dtype = inputs[0].dtype
@@ -1021,12 +1020,7 @@ class TensorProduct(torch.nn.Module):
                     out = torch.matmul(inputs[1], weight) * 0.10206207261596577
                     #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
                 else:
-                    #out = self.f(inputs)
-                    out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
-                    print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, out.shape:{out.shape}")
-                '''
-                out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
-                print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, out.shape:{out.shape}")
+                    out = self.f(inputs)
         else:
             torch.cuda.synchronize()
             start_time = time.perf_counter() * 1000
@@ -1037,70 +1031,6 @@ class TensorProduct(torch.nn.Module):
             end_time = time.perf_counter() * 1000
             execution_time_ms = (end_time - start_time)
             print(f"========= cueq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
-
-            '''
-            if self.op_name == "tp_fully_connected":
-                print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                print(f"cg_val_all:{self.cg_val_all}, nnz_per_path:{self.nnz_per_path}")
-                print(f"descriptor={self.descriptor.get_dimensions_dict()}")
-
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
-
-                ref = self.FastFCTPFused.apply(
-                     inputs[0], inputs[1], inputs[2], 
-                )
-
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = (end_time - start_time)
-                print(f"========= fasteq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
-                print("cueq vs cuda allclose:",
-                    torch.allclose(ref, out, atol=1e-9, rtol=1e-7),
-                    "max diff", (ref - out).abs().max().item())
-            '''
-            '''
-            if self.op_name == "tp_channel_wise":
-
-                #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                #print(f"c_all.shape:{self.c_all.shape}, c_all:{self.c_all}")
-                #print(f"i_dims :{self.i_dims}, lens:{len(self.i_dims)}; j_dims:{self.j_dims}, lens:{len(self.j_dims)}; k_dims:{self.k_dims}, lens:{len(self.k_dims)}")
-                #print(f"nnz_per_path:{self.nnz_per_path}, nnz_offsets:{self.nnz_offsets}, cg_val_all lens:{len(self.cg_val_all)}")
-
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
-                
-                ref = self.fasteq_cwtp(
-                    inputs[0], inputs[1], inputs[2],
-                    self.c_all,
-                    self.path_indices_tensor,
-                    self.i_dims, self.j_dims, self.k_dims,
-                    self.c_offsets,
-                    self.iu_seg_offsets,
-                    self.jv_seg_offsets,
-                    self.kv_k_offsets,
-                    self.nnz_per_path,
-                    self.nnz_offsets,
-                    self.nnz_k_offsets,
-                    self.nnz_k_counts,
-                    self.cg_i_all,
-                    self.cg_j_all,
-                    self.cg_k_all,
-                    self.cg_val_all,
-                    self.u, self.v, self.K_TOTAL
-                )
-                
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = (end_time - start_time)
-                print(f"========= fasteq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
-
-                ref = ref.view(-1, self.K_TOTAL * self.u * self.v)
-                print(f"ref.shape:{ref.shape}, inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                print("cueq vs cuda allclose:",
-                    torch.allclose(ref, out, atol=1e-9, rtol=1e-7),
-                    "max diff", (ref - out).abs().max().item())
-            '''
         return out
 
 

@@ -40,8 +40,8 @@ add_library(${PROJECT_NAME} SHARED
     equi_linear.cu
     cwtp_fwd.cu
     cwtp_bwd.cu
-    fused_message_passing_fwd.cu
-    fused_message_passing_bwd.cu
+    mptp_fwd.cu
+    mptp_bwd.cu
     spherical_harmonics.cu
 )
 

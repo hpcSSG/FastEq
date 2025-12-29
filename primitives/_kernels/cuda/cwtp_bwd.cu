@@ -1196,8 +1196,6 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {
       T v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (T)0;
-
-      // 这里仍用 8-way 结构也没问题：lane>=num_warps 已经置0
       unsigned mask0 = 0xffffffffu;
   #pragma unroll
       for (int off = 4; off > 0; off >>= 1) {

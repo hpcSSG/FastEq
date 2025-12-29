@@ -7,6 +7,17 @@
 #define DEVICE
 #endif
 
+#ifndef WARP_SIZE
+#define WARP_SIZE 32
+#endif
+
+#define CUDA_CHECK(ans) do { \
+  cudaError_t err = (ans); \
+  if (err != cudaSuccess) { \
+    printf("CUDA Error: %s (%d) at %s:%d\n", cudaGetErrorString(err), (int)err, __FILE__, __LINE__); \
+  } \
+} while(0)
+
 DEVICE inline int find_integer_divisor(int x, int bdim) {
   return (x + bdim - 1) / bdim;
 }
