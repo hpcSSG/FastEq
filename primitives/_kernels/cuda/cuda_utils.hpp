@@ -18,6 +18,30 @@
   } \
 } while(0)
 
+template <typename T>
+__device__ __forceinline__ T ld_g(const T* p) {
+#if __CUDA_ARCH__ >= 350
+  return __ldg(p);
+#else
+  return *p;
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        v += __shfl_down_sync(mask, v, offset);
+    }
+    return v;
+}
+
+template <typename T>
+__device__ __forceinline__ T warp_sum(T v) {
+    unsigned mask = 0xffffffffu;
+    for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(mask, v, d);
+    return v;
+}
+
 DEVICE inline int find_integer_divisor(int x, int bdim) {
   return (x + bdim - 1) / bdim;
 }

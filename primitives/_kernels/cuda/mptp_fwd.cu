@@ -7,15 +7,10 @@
 #include <cub/cub.cuh>
 #include "cuda_utils.hpp"
 
-
-
-
-
 // ----------------------------------------------------------------------------
 // 1) row_ptr_s 构建：sender 已排序（非降序），写 run 边界
 // row_ptr_s: [N+1]，初始化为 -1，且 row_ptr_s[0]=0,row_ptr_s[N]=E
 // ----------------------------------------------------------------------------
-template <typename scalar_t>
 __global__ void build_row_ptr_from_sorted_sender(
     const int32_t* __restrict__ sender, // [E], sorted
     int32_t* __restrict__ row_ptr_s,    // [N+1]
@@ -60,7 +55,7 @@ static void fill_row_ptr_holes_prefix_max_int32(
 
 // ----------------------------------------------------------------------------
 // 2) 融合 kernel：sender-major CSR
-//    一个 block 处理一个 sender s；threadIdx.x 对应 u（沿用你 group-k 思路）
+//    一个 block 处理一个 sender s；threadIdx.x 对应 u
 //    遍历该 sender 的边段 [row_ptr_s[s], row_ptr_s[s+1])
 //    对每条边在线计算 TP(group-k) 的输出并 atomicAdd 到 out_nodes[receiver]
 // ----------------------------------------------------------------------------
@@ -120,7 +115,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
   int e1 = row_ptr_s[s + 1];
   if (e0 >= e1) return;
 
-  // Optional: last receiver cache (cheap win if receiver repeats locally)
   int last_r = -1;
 
   for (int e = e0; e < e1; ++e) {
@@ -175,7 +169,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
             scalar_t xjv = x_jv[jv_base + j * V + v_idx];
 
             // acc += c * xuv * xiu * xjv
-            // slightly better dependency: acc = fma(c*xjv, xuv*xiu, acc)
             acc = fma(c * xjv, xuv_uv * xiu, acc);
           }
 
@@ -192,7 +185,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
   }
 }
 
-torch::Tensor tp_channel_wise_fused_sender_scatter_launch(
+std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
     torch::Tensor x_uv,            // tp_weights [E, UV_TOTAL]  (per-edge)
     torch::Tensor x_iu,            // node_feats [N, IU_TOTAL]  (per-node sender feats)
     torch::Tensor x_jv,            // edge_attrs [E, JV_TOTAL]  (per-edge)
@@ -331,7 +324,7 @@ torch::Tensor tp_channel_wise_fused_sender_scatter_launch(
   });
 
   CUDA_CHECK(cudaGetLastError());
-  return out_nodes; // [N, K_TOTAL*U*V]
+  return {out_nodes, row_ptr_s} ; // out_nodes: [N, K_TOTAL*U*V]
 }
 
 TORCH_LIBRARY(mptp_fwd, m)

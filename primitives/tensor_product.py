@@ -710,6 +710,7 @@ class TensorProduct(torch.nn.Module):
                 self.u, self.v = meta["U"], meta["V"]
                 self.K_TOTAL = meta["K_TOTAL"]
                 c_tensors = meta["c_tensors"]
+                print(f"c_tensors:{c_tensors}")
                 self.c_all = torch.cat([c.reshape(-1) for c in c_tensors], dim=0).contiguous()
                 
                 self.meta = meta

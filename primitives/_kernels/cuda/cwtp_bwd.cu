@@ -7,29 +7,7 @@
 #include <algorithm>
 #include <cstdint>
 
-#define CUDA_CHECK(expr)                                                   \
-    do {                                                                   \
-        cudaError_t _err = (expr);                                         \
-        TORCH_CHECK(_err == cudaSuccess,                                   \
-                    "CUDA error: ", cudaGetErrorString(_err),              \
-                    " (error code ", static_cast<int>(_err), ")");         \
-    } while (0)
-
-
-template <typename T>
-__device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset);
-    }
-    return v;
-}
-
-template <typename T>
-__device__ __forceinline__ T warp_sum(T v) {
-    unsigned mask = 0xffffffffu;
-    for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(mask, v, d);
-    return v;
-}
+#include "cuda_utils.hpp"
 
 // 1. 分组规约减少global write back & 2. warp reduce 减少原子写操作
 template <typename scalar_t, int MAX_K_DIM>
@@ -310,15 +288,6 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
     });
 
     return {grad_x_uv, grad_x_iu, grad_x_jv};
-}
-
-template <typename T>
-__device__ __forceinline__ T ld_g(const T* p) {
-#if __CUDA_ARCH__ >= 350
-  return __ldg(p);
-#else
-  return *p;
-#endif
 }
 
 template<int P, int UV, int IU, int JV, int KV, int I, int J, int K, int JB, typename T>
