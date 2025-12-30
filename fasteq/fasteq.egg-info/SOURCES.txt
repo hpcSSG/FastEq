@@ -1,0 +1,8 @@
+LICENSES
+pyproject.toml
+setup.py
+fasteq/fasteq.egg-info/PKG-INFO
+fasteq/fasteq.egg-info/SOURCES.txt
+fasteq/fasteq.egg-info/dependency_links.txt
+fasteq/fasteq.egg-info/not-zip-safe
+fasteq/fasteq.egg-info/top_level.txt
