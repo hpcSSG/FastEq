@@ -66,7 +66,7 @@ with torch.profiler.profile(
 '''
 
 
-for i in range(0, 10):
+for i in range(0, 1):
     calculator.batch_calculate(atoms_list=atoms_list)
 '''
 with profile(activities=activities, record_shapes=True, with_stack=True) as prof:

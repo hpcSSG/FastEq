@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by ncic in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -139,9 +140,17 @@ class Linear(torch.nn.Module):
             e.polynomial,
             method=self.method,
             math_dtype=math_dtype,
-            use_fasteq=use_fasteq,
-            op_name="equi_linear",
         ).to(device)
+
+        if use_fasteq:
+            self.use_fasteq = use_fasteq
+            self.ff = cuet.FastEqSegmentedPolynomial(
+                e.polynomial,
+                method=self.method,
+                math_dtype=math_dtype,
+                use_fasteq=use_fasteq,
+                op_name="equi_linear",
+            ).to(device)
 
     def extra_repr(self) -> str:
         return f"shared_weights={self.shared_weights}, internal_weights={self.internal_weights}, weight_numel={self.weight_numel}"
@@ -190,6 +199,8 @@ class Linear(torch.nn.Module):
         if weight is None:
             raise ValueError("Weights should not be None")
 
-        
-        output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
+        if self.use_fasteq:
+            output = self.ff([weight, self.transpose_in(x)], input_indices=input_indices)
+        else:
+            output = self.f([weight, self.transpose_in(x)], input_indices=input_indices)
         return self.transpose_out(output[0])

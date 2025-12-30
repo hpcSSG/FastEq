@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by ncic in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -27,6 +28,7 @@ from .primitives.transpose import TransposeSegments, TransposeIrrepsLayout
 
 from .primitives.equivariant_tensor_product import EquivariantTensorProduct
 from .primitives.segmented_polynomial import SegmentedPolynomial
+from .primitives.fasteq_segmented_polynomial import FastEqSegmentedPolynomial
 from .operations.tp_channel_wise import ChannelWiseTensorProduct
 from .operations.tp_fully_connected import FullyConnectedTensorProduct
 from .operations.linear import Linear
@@ -98,4 +100,5 @@ __all__ = [
     "layers",
     "onnx_custom_translation_table",
     "register_tensorrt_plugins",
+    "FastEqSegmentedPolynomial",
 ]

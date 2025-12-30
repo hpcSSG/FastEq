@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Modified by ncic in 2025
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -41,7 +41,9 @@ try:
 except ImportError:
     HAS_CUE_OPS = False
 
-class SegmentedPolynomial(nn.Module):
+from fasteq.ops.equi_linear import fast_equi_linear
+
+class FastEqSegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
 
     Args:
@@ -143,6 +145,8 @@ class SegmentedPolynomial(nn.Module):
         math_dtype: str | torch.dtype = None,
         output_dtype_map: List[int] = None,
         name: str = "segmented_polynomial",
+        op_name: str = "",
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -150,6 +154,8 @@ class SegmentedPolynomial(nn.Module):
         self.num_outputs = polynomial.num_outputs
         self.method = method
         self.repr = polynomial.__repr__()
+        self.op_name = op_name
+        self.descriptor = polynomial.operations[0][1]
         
         if method == "":
             warnings.warn(
@@ -304,4 +310,13 @@ class SegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
-        return self.m(inputs, input_indices, output_shapes, output_indices)
+        
+        out = [torch.empty(0) for _ in range(self.num_outputs)]
+        if self.op_name == "equi_linear" and tuple(inputs[0].shape) == (1, 36864):
+            if self.num_outputs != 1:
+                raise ValueError("equi_linear should have exactly one output")
+            ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
+            out[0] = ref
+        else:
+            out = self.m(inputs, input_indices, output_shapes, output_indices)
+        return out
