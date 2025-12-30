@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,15 +18,11 @@ import torch
 
 import cuequivariance as cue
 import cuequivariance_torch as cuet
-from cuequivariance.group_theory.experimental.mace.symmetric_contractions import (
+from cuequivariance.experimental.mace.symmetric_contractions import (
     symmetric_contraction,
 )
-from cuequivariance.group_theory.irreps_array.misc_ui import (
-    assert_same_group,
-    default_irreps,
-)
+from cuequivariance.irreps_array.misc_ui import assert_same_group, default_irreps
 
-import time
 
 class SymmetricContraction(torch.nn.Module):
     """
@@ -42,15 +38,11 @@ class SymmetricContraction(torch.nn.Module):
         layout (IrrepsLayout, optional): The layout of the input and output irreps. If not provided, a default layout is used.
         math_dtype (torch.dtype, optional): The data type for mathematical operations. If not specified, the default data type
             from the torch environment is used.
-        use_fallback (bool, optional): If `None` (default), a CUDA kernel will be used if available.
-                If `False`, a CUDA kernel will be used, and an exception is raised if it's not available.
-                If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
 
     Examples:
-        >>> device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         >>> irreps_in = cue.Irreps("O3", "32x0e + 32x1o")
         >>> irreps_out = cue.Irreps("O3", "32x0e")
-        >>> layer = SymmetricContraction(irreps_in, irreps_out, contraction_degree=3, num_elements=5, layout=cue.ir_mul, dtype=torch.float32, device=device)
+        >>> layer = SymmetricContraction(irreps_in, irreps_out, contraction_degree=3, num_elements=5, layout=cue.ir_mul, dtype=torch.float32)
 
         Now `layer` can be used as part of a PyTorch model.
 
@@ -75,15 +67,14 @@ class SymmetricContraction(torch.nn.Module):
         ...     layout_out=cue.mul_ir,
         ...     original_mace=True,
         ...     dtype=torch.float64,
-        ...     device=device,
         ... )
 
         Then the execution is as follows:
 
-        >>> node_feats = torch.randn(128, 32, feats_irreps.dim // 32, dtype=torch.float64, device=device)
+        >>> node_feats = torch.randn(128, 32, feats_irreps.dim // 32, dtype=torch.float64)
         >>> # with node_attrs_index being the index version of node_attrs, sth like:
         >>> # node_attrs_index = torch.nonzero(node_attrs)[:, 1].int()
-        >>> node_attrs_index = torch.randint(0, 10, (128,), dtype=torch.int32, device=device)
+        >>> node_attrs_index = torch.randint(0, 10, (128,), dtype=torch.int32)
         >>> # OLD CALL:
         >>> # symmetric_contractions_old(node_feats, node_attrs)
         >>> # NEW CALL:
@@ -111,8 +102,7 @@ class SymmetricContraction(torch.nn.Module):
         dtype: Optional[torch.dtype] = None,
         math_dtype: Optional[torch.dtype] = None,
         original_mace: bool = False,
-        use_fallback: Optional[bool] = None,
-        use_fasteq: bool = False,
+        optimize_fallback: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -134,9 +124,6 @@ class SymmetricContraction(torch.nn.Module):
         self.etp, p = symmetric_contraction(
             irreps_in, irreps_out, range(1, contraction_degree + 1)
         )
-
-        self.use_fasteq = use_fasteq
-
         if original_mace:
             self.register_buffer(
                 "projection", torch.tensor(p, dtype=dtype, device=device)
@@ -144,7 +131,7 @@ class SymmetricContraction(torch.nn.Module):
             self.weight_shape = (p.shape[0], mul)
         else:
             self.projection = None
-            self.weight_shape = (self.etp.inputs[0].dim // mul, mul)
+            self.weight_shape = (self.etp.inputs[0].irreps.dim // mul, mul)
 
         self.num_elements = num_elements
         self.weight = torch.nn.Parameter(
@@ -153,36 +140,15 @@ class SymmetricContraction(torch.nn.Module):
             )
         )
 
-        if self.use_fasteq and original_mace:
-            self.register_buffer("project_weight",
-                                torch.empty(0, device=device, dtype=dtype),
-                                persistent=False)
-            
-            # 加载state_dict之后自动重算
-            self._update_project_weight_()
-            self.register_load_state_dict_post_hook(self._on_post_load)
-
-
         self.f = cuet.EquivariantTensorProduct(
             self.etp,
             layout=layout,
             layout_in=layout_in,
             layout_out=layout_out,
-            op_name = "symmetric_contraction",
             device=device,
             math_dtype=math_dtype or dtype,
-            use_fallback=use_fallback,
-            use_fasteq=use_fasteq,
+            optimize_fallback=optimize_fallback,
         )
-
-    @torch.no_grad()
-    def _update_project_weight_(self):
-        proj = torch.einsum("zau,ab->zbu", self.weight.data, self.projection).flatten(1)
-        self.project_weight.resize_(proj.shape)
-        self.project_weight.copy_(proj)
-
-    def _on_post_load(self, module, incompatible_keys):
-        self._update_project_weight_()
 
     def extra_repr(self) -> str:
         return (
@@ -194,28 +160,32 @@ class SymmetricContraction(torch.nn.Module):
         self,
         x: torch.Tensor,
         indices: torch.Tensor,
+        *,
+        use_fallback: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Perform the forward pass of the symmetric contraction operation.
 
         Args:
-            x (torch.Tensor): The input tensor. It should have shape (batch, irreps_in.dim).
+            x (torch.Tensor): The input tensor. It should have shape (..., irreps_in.dim).
             indices (torch.Tensor): The index of the weight to use for each batch element.
-                It should have shape (batch,).
+                It should have shape (...).
+            use_fallback (bool, optional): If `None` (default), a CUDA kernel will be used if available.
+                If `False`, a CUDA kernel will be used, and an exception is raised if it's not available.
+                If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
 
         Returns:
             torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
         """
-        
-        if self.use_fasteq:
-            weight = self.project_weight
+        torch._assert(
+            x.shape[-1] == self.irreps_in.dim,
+            f"Input tensor must have shape (..., {self.irreps_in.dim}), got {x.shape}",
+        )
+
+        if self.projection is not None:
+            weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
         else:
-            if self.projection is not None:
-                weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
-            else:
-                weight = self.weight
-            weight = weight.flatten(1)
+            weight = self.weight
+        weight = weight.flatten(1)
 
-        out = self.f(weight, x, indices=indices)
-
-        return out
+        return self.f(weight, x, indices=indices, use_fallback=use_fallback)

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,14 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import *
 
 import torch
 
 import cuequivariance as cue
-import cuequivariance_torch as cuet
 from cuequivariance import descriptors
-from cuequivariance.group_theory.irreps_array.misc_ui import default_irreps
+import cuequivariance_torch as cuet
+from cuequivariance.irreps_array.misc_ui import default_irreps
 
 
 class Rotation(torch.nn.Module):
@@ -40,7 +40,7 @@ class Rotation(torch.nn.Module):
         layout_out: Optional[cue.IrrepsLayout] = None,
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
-        use_fallback: Optional[bool] = None,
+        optimize_fallback: Optional[bool] = None,
     ):
         super().__init__()
         (irreps,) = default_irreps(irreps)
@@ -60,7 +60,7 @@ class Rotation(torch.nn.Module):
             layout_out=layout_out,
             device=device,
             math_dtype=math_dtype,
-            use_fallback=use_fallback,
+            optimize_fallback=optimize_fallback,
         )
 
     def forward(
@@ -69,6 +69,8 @@ class Rotation(torch.nn.Module):
         beta: torch.Tensor,
         alpha: torch.Tensor,
         x: torch.Tensor,
+        *,
+        use_fallback: Optional[bool] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the rotation layer.
@@ -78,6 +80,9 @@ class Rotation(torch.nn.Module):
             beta (torch.Tensor): The beta angles. Second rotation around the x-axis.
             alpha (torch.Tensor): The alpha angles. Third rotation around the y-axis.
             x (torch.Tensor): The input tensor.
+            use_fallback (bool, optional): If `None` (default), a CUDA kernel will be used if available.
+                If `False`, a CUDA kernel will be used, and an exception is raised if it's not available.
+                If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
 
         Returns:
             torch.Tensor: The rotated tensor.
@@ -90,10 +95,16 @@ class Rotation(torch.nn.Module):
         encodings_beta = encode_rotation_angle(beta, self.lmax)
         encodings_alpha = encode_rotation_angle(alpha, self.lmax)
 
-        return self.f(encodings_gamma, encodings_beta, encodings_alpha, x)
+        return self.f(
+            encodings_gamma,
+            encodings_beta,
+            encodings_alpha,
+            x,
+            use_fallback=use_fallback,
+        )
 
 
-def encode_rotation_angle(angle: torch.Tensor, ell: int) -> torch.Tensor:
+def encode_rotation_angle(angle: torch.Tensor, l: int) -> torch.Tensor:
     """Encode a angle into a tensor of cosines and sines.
 
     The encoding is::
@@ -105,7 +116,7 @@ def encode_rotation_angle(angle: torch.Tensor, ell: int) -> torch.Tensor:
     angle = torch.as_tensor(angle)
     angle = angle.unsqueeze(-1)
 
-    m = torch.arange(1, ell + 1, device=angle.device, dtype=angle.dtype)
+    m = torch.arange(1, l + 1, device=angle.device, dtype=angle.dtype)
     c = torch.cos(m * angle)
     s = torch.sin(m * angle)
     one = torch.ones_like(angle)
@@ -151,9 +162,6 @@ class Inversion(torch.nn.Module):
     Args:
         irreps (Irreps): The irreducible representations of the tensor to invert.
         layout (IrrepsLayout, optional): The memory layout of the tensor, ``cue.ir_mul`` is preferred.
-        use_fallback (bool, optional): If `None` (default), a CUDA kernel will be used if available.
-                If `False`, a CUDA kernel will be used, and an exception is raised if it's not available.
-                If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
     """
 
     def __init__(
@@ -165,7 +173,6 @@ class Inversion(torch.nn.Module):
         layout_out: Optional[cue.IrrepsLayout] = None,
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
-        use_fallback: Optional[bool] = None,
     ):
         super().__init__()
         (irreps,) = default_irreps(irreps)
@@ -183,7 +190,6 @@ class Inversion(torch.nn.Module):
             layout_out=layout_out,
             device=device,
             math_dtype=math_dtype,
-            use_fallback=use_fallback,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

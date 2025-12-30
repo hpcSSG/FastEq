@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,641 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import logging
-import math, time
+import math
 import warnings
-from functools import partial
-from typing import List, Optional, OrderedDict, Tuple, Any, Dict
+from typing import *
 
 import torch
 import torch.fx
 
-import cuequivariance as cue
+from cuequivariance import segmented_tensor_product as stp
 
 logger = logging.getLogger(__name__)
-
-
-def prod(numbers: List[int]):
-    """
-    This method is a workaround for script() not recognizing math.prod()
-    """
-    if torch.jit.is_scripting():
-        product = 1
-        for num in numbers:
-            product *= num
-        return product
-    else:
-        return math.prod(numbers)
-
-def _my_tensor_product_fx(
-    inputs: List[torch.Tensor],
-    descriptor: cue.SegmentedTensorProduct,
-    device: Optional[torch.device],
-    math_dtype: Optional[torch.dtype],
-) -> torch.nn.Module:
-    """
-    batch support of this function:
-    - at least one input operand should have a batch dimension (ndim=2)
-    - the output operand will have a batch dimension (ndim=2)
-    """
-
-    #descriptor = descriptor.remove_zero_paths()
-    #descriptor = descriptor.remove_empty_segments()
-
-    num_inputs = descriptor.num_operands - 1
-
-    #operand_segment_offsets=[ [s.start for s in ope.segment_slices()] for ope in descriptor.operands]
-    #operand_segment_shapes=[ope.segments for ope in descriptor.operands]
-    coefficients_shape = []
-    for _, path in enumerate(descriptor.paths):
-        coefficients_shape.append(path.coefficients.shape)
-
-    if path.coefficients.shape:
-        dim = path.coefficients.shape[0]
-    else:
-        dim = 1
-
-    if num_inputs > 0 and descriptor.num_paths > 0:
-
-        constants = OrderedDict()
-
-        operand_subscripts = [f"Z{ss}" for ss in descriptor.subscripts.operands]
-
-        formula = (
-            ",".join([descriptor.coefficient_subscripts] + operand_subscripts[:-1])
-            + "->"
-            + operand_subscripts[-1]
-        )
-        slices = [ope.segment_slices() for ope in descriptor.operands]
-
-        outputs = []
-
-        for path_idx, path in enumerate(descriptor.paths):
-            segments = []
-            #print(f"path {path_idx} indices: {path.indices}")
-            for oid in range(num_inputs):
-                seg_shape = descriptor.get_segment_shape(oid, path)
-                inp = inputs[oid][..., slices[oid][path.indices[oid]]]
-                if len(seg_shape) > 0:
-                    inp = inp.reshape(inputs[oid].shape[:-1] + seg_shape)
-                else:
-                    inp = inp.reshape(inputs[oid].shape[:-1])
-                segments.append(inp.to(dtype=math_dtype))
-            
-
-            c_tensor = disable_type_conv(
-                torch.tensor(path.coefficients, dtype=math_dtype, device=device)
-            )
-            out = torch.einsum(formula, c_tensor, *segments)
-            #segment0 = segments[0].squeeze(0)
-            #segment1 = segments[1].squeeze(1)
-            #out = torch.matmul(segment1, segment0) * c_tensor
-            #out.unsqueeze_(1)
-            print(f"formula:{formula}, segments[0] shape:{segments[0].shape}, segments[1] shape:{segments[1].shape}, out shape:{out.shape}")   
-
-            seg_shape = descriptor.get_segment_shape(-1, path)
-            outputs += [
-                out.reshape(out.shape[: out.ndim - len(seg_shape)] + (prod(seg_shape),))
-            ]
-        
-        if len(outputs) == 0:
-            raise NotImplementedError("No FX implementation for empty paths")
-
-        def _sum(tensors, *, shape=None, like=None):
-            if len(tensors) == 0:
-                return like.new_zeros(shape)
-            out = tensors[0]
-            for t in tensors[1:]:
-                out = torch.add(out, t)
-            return out
-
-        batch_shape = outputs[0].shape[:-1]
-        output = torch.cat(
-            [
-                _sum(
-                    [
-                        out
-                        for out, path in zip(outputs, descriptor.paths)
-                        if path.indices[-1] == i
-                    ],
-                    shape=batch_shape + (prod(descriptor.operands[-1][i]),),
-                    like=outputs[0],
-                )
-                for i in range(descriptor.operands[-1].num_segments)
-            ],
-            dim=-1,
-        )
-
-
-    else:
-        raise NotImplementedError(
-            "No FX implementation for empty paths and non-empty inputs"
-        )
-    return output
-
-
-def build_sparse_cg_and_k_groups(descriptor, math_dtype, device, max_k_dim_for_kernel=8):
-    """
-    输入:
-      c_tensors: list[Tensor], 每个 [i_dim, j_dim, k_dim]
-    输出:
-      cg_i_all, cg_j_all, cg_k_all, cg_val_all
-      nnz_per_path, nnz_offsets
-      nnz_k_offsets: [P, MAX_K_DIM]
-      nnz_k_counts:  [P, MAX_K_DIM]
-    """
-    cg_i_list = []
-    cg_j_list = []
-    cg_k_list = []
-    cg_val_list = []
-
-    nnz_per_path = []
-    nnz_offsets = []
-
-    nnz_k_offsets_list = []  # list of [MAX_K_DIM]
-    nnz_k_counts_list  = []
-
-    c_tensors = []
-    for path_idx, path in enumerate(descriptor.paths):
-        c_tensor = disable_type_conv(
-            torch.tensor(path.coefficients, dtype=math_dtype, device=device)
-        )  # [i_dim, j_dim, k_dim]
-        c_tensors.append(c_tensor)
-    
-
-    global_offset = 0
-    for path_id, c in enumerate(c_tensors):
-        i_dim, j_dim, k_dim = c.shape
-
-        # 1) 非零位置
-        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz, 3] (i,j,k)
-        nnz = nz_idx.size(0)
-
-        #print(f"path_id:{path_id}, cg shape:{c.shape}, cg:{c}, nnz:{nnz}")
-
-        nnz_per_path.append(nnz)
-        nnz_offsets.append(global_offset)
-        global_offset += nnz
-
-        # 初始化 k 分组 meta
-        local_k_offsets = torch.zeros(max_k_dim_for_kernel,
-                                      dtype=torch.int32, device=device)
-        local_k_counts  = torch.zeros(max_k_dim_for_kernel,
-                                      dtype=torch.int32, device=device)
-
-        if nnz > 0:
-            # 2) 按 k 升序排序（保证本 path 的 CG 在 k 维上连续）
-            sort_idx = torch.argsort(nz_idx[:, 2])  # 按 k 排序
-            nz_sorted = nz_idx[sort_idx]
-
-            i_idx = nz_sorted[:, 0]
-            j_idx = nz_sorted[:, 1]
-            k_idx = nz_sorted[:, 2]
-
-            vals = c[i_idx, j_idx, k_idx]
-
-            # 3) 追加到全局列表（注意：这里是 path 内局部 0..nnz-1 的顺序）
-            cg_i_list.append(i_idx.to(torch.uint8))
-            cg_j_list.append(j_idx.to(torch.uint8))
-            cg_k_list.append(k_idx.to(torch.uint8))
-            cg_val_list.append(vals.to(math_dtype))
-
-            # 4) 统计每个 k 的局部 offset + count
-            #    k_idx 已是升序，全是本 path 的局部 index t∈[0..nnz-1]
-            prev_k = int(k_idx[0].item())
-            local_k_offsets[prev_k] = 0
-
-            for t in range(1, nnz):
-                curr_k = int(k_idx[t].item())
-                if curr_k != prev_k:
-                    # [local_k_offsets[prev_k], t) 这一段都是 prev_k
-                    local_k_counts[prev_k] = t - local_k_offsets[prev_k]
-                    local_k_offsets[curr_k] = t
-                    prev_k = curr_k
-
-            # 最后一个 k 的count
-            local_k_counts[prev_k] = nnz - local_k_offsets[prev_k]
-
-        # 这个 path 的 k 分组 meta
-        nnz_k_offsets_list.append(local_k_offsets)
-        nnz_k_counts_list.append(local_k_counts)
-
-    # 5) 拼接全局 CG 数组
-    if len(cg_i_list) > 0:
-        cg_i_all = torch.cat(cg_i_list, dim=0)
-        cg_j_all = torch.cat(cg_j_list, dim=0)
-        cg_k_all = torch.cat(cg_k_list, dim=0)
-        cg_val_all = torch.cat(cg_val_list, dim=0)
-    else:
-        cg_i_all = torch.empty(0, dtype=torch.uint8,     device=device)
-        cg_j_all = torch.empty(0, dtype=torch.uint8,     device=device)
-        cg_k_all = torch.empty(0, dtype=torch.uint8,     device=device)
-        cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
-
-    nnz_per_path = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
-    nnz_offsets  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
-
-    # [P, MAX_K_DIM]
-    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0)  # contiguous
-    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0)
-
-    print(f"nnz_per_path:{nnz_per_path}")
-
-    for idx in range(0, len(cg_i_all)):
-        print(f"cg_i {idx}: {cg_i_all[idx]}, cg_j {idx}: {cg_j_all[idx]}, cg_k {idx}: {cg_k_all[idx]}")
-    
-    print(f"nnz_k_counts:{nnz_k_counts}")
-
-    return {
-        "cg_i_all": cg_i_all,
-        "cg_j_all": cg_j_all,
-        "cg_k_all": cg_k_all,
-        "cg_val_all": cg_val_all,
-        "nnz_per_path": nnz_per_path,
-        "nnz_offsets": nnz_offsets,
-        "nnz_k_offsets": nnz_k_offsets,
-        "nnz_k_counts": nnz_k_counts,
-    }
-
-@torch.no_grad()
-def build_sparse_cg_and_kij_groups_v2(
-    descriptor,
-    math_dtype,
-    device,
-    max_k_dim_for_kernel=8, # {1, 3, 5, 7}
-    max_i_dim_for_kernel=8, # {1, 3, 5, 7}
-    max_j_dim_for_kernel=8, # {1, 3, 5, 7}
-):
-    """
-    构造三套独立的全局 CG 表：
-      - groupk: path 内按 k 升序排序，k 段连续（无需 perm）
-      - groupi: path 内按 i 升序排序，i 段连续（无需 perm）
-      - groupj: path 内按 j 升序排序，j 段连续（无需 perm）
-
-    每套都输出：
-      cg_i_all, cg_j_all, cg_k_all, cg_val_all
-      nnz_per_path, nnz_offsets
-      nnz_{key}_offsets: [P, MAX_{KEY}_DIM]
-      nnz_{key}_counts : [P, MAX_{KEY}_DIM]
-    """
-
-    # 1) 先把每个 path 的稠密系数张量拉出来
-    c_tensors = []
-    for path in descriptor.paths:
-        c_tensors.append(torch.tensor(path.coefficients, dtype=math_dtype, device=device))
-
-    P = len(c_tensors)
-
-    def _build_one_group(sort_axis: int, max_dim: int, dim_axis: int, name: str):
-        """
-        sort_axis: 0/1/2 表示按 i/j/k 排序
-        dim_axis : 0/1/2 表示对应维度 i_dim/j_dim/k_dim
-        name     : 'k'/'i'/'j' 仅用于报错信息
-        """
-        cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
-        nnz_per_path = []
-        nnz_offsets = []
-        nnz_key_offsets_list = []
-        nnz_key_counts_list = []
-
-        global_offset = 0
-
-        for p, c in enumerate(c_tensors):
-            i_dim, j_dim, k_dim = c.shape
-            dims = (i_dim, j_dim, k_dim)
-            key_dim = int(dims[dim_axis])
-
-            nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3]
-            nnz = int(nz_idx.size(0))
-
-            nnz_per_path.append(nnz)
-            nnz_offsets.append(global_offset)
-
-            local_offsets = torch.zeros(max_dim, dtype=torch.int32, device=device)
-            local_counts  = torch.zeros(max_dim, dtype=torch.int32, device=device)
-
-            if nnz > 0:
-                if key_dim > max_dim:
-                    raise ValueError(f"[{name}] key_dim={key_dim} > max_dim={max_dim} at path {p}")
-
-                # 按 key 排序（stable 保留同 key 内原顺序）
-                order = torch.argsort(nz_idx[:, sort_axis], stable=True)
-                nz_sorted = nz_idx[order]
-
-                i_idx = nz_sorted[:, 0].to(torch.uint8)
-                j_idx = nz_sorted[:, 1].to(torch.uint8)
-                k_idx = nz_sorted[:, 2].to(torch.uint8)
-                vals  = c[nz_sorted[:, 0], nz_sorted[:, 1], nz_sorted[:, 2]].to(math_dtype)
-
-                cg_i_list.append(i_idx)
-                cg_j_list.append(j_idx)
-                cg_k_list.append(k_idx)
-                cg_val_list.append(vals)
-
-                # counts/offsets：由于已经按 key 排序，桶内天然连续
-                keys_sorted = nz_sorted[:, sort_axis].to(torch.int64)  # 0..key_dim-1
-                if torch.any(keys_sorted < 0) or torch.any(keys_sorted >= key_dim):
-                    raise ValueError(f"[{name}] key out of range at path {p}")
-
-                bc = torch.bincount(keys_sorted, minlength=max_dim).to(torch.int32)
-                bc[key_dim:] = 0
-                local_counts[:] = bc
-                local_offsets[0] = 0
-                if max_dim > 1:
-                    local_offsets[1:] = torch.cumsum(bc[:-1], dim=0)
-
-            nnz_key_offsets_list.append(local_offsets)
-            nnz_key_counts_list.append(local_counts)
-
-            global_offset += nnz
-
-        # 拼接全局 CG
-        if len(cg_i_list) > 0:
-            cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
-            cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
-            cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
-            cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
-        else:
-            cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
-            cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
-            cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
-            cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
-
-        nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
-        nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
-
-        nnz_key_offsets = torch.stack(nnz_key_offsets_list, dim=0).contiguous()  # [P,max_dim]
-        nnz_key_counts  = torch.stack(nnz_key_counts_list,  dim=0).contiguous()
-
-        return {
-            "cg_i_all": cg_i_all,
-            "cg_j_all": cg_j_all,
-            "cg_k_all": cg_k_all,
-            "cg_val_all": cg_val_all,
-            "nnz_per_path": nnz_per_path_t,
-            "nnz_offsets": nnz_offsets_t,
-            f"nnz_{name}_offsets": nnz_key_offsets,
-            f"nnz_{name}_counts": nnz_key_counts,
-        }
-
-    # 2) 三套分别构造
-    groupk = _build_one_group(sort_axis=2, max_dim=max_k_dim_for_kernel, dim_axis=2, name="k")
-    groupi = _build_one_group(sort_axis=0, max_dim=max_i_dim_for_kernel, dim_axis=0, name="i")
-    groupj = _build_one_group(sort_axis=1, max_dim=max_j_dim_for_kernel, dim_axis=1, name="j")
-
-    return {"groupk": groupk, "groupi": groupi, "groupj": groupj}
-
-
-def infer_slices_and_meta(
-    descriptor,
-    math_dtype,
-    device,
-    max_k_dim_for_kernel: int = 8,
-) -> Dict[str, Any]:
-    """
-    生成 ChannelWise TP 的所有 meta 信息：
-      - 分段信息：uv / iu / jv / kv offsets + slices
-      - dense c_tensors + (i/j/k_dims, c_offsets, c_all)
-      - sparse CG 信息：
-        * cg_i_all, cg_j_all, cg_k_all, cg_val_all
-        * nnz_per_path, nnz_offsets
-      - 按 k 分组的 sparse meta：
-        * nnz_k_offsets: [P, MAX_K_DIM]
-        * nnz_k_counts:  [P, MAX_K_DIM]
-    """
-
-    # -------------------- 1) paths & dense c_tensors --------------------
-    path_indices: List[Tuple[int, int, int, int]] = []
-    c_tensors: List[torch.Tensor] = []
-
-    for path_idx, path in enumerate(descriptor.paths):
-        print(f"path {path_idx} indices: {path.indices}")
-        path_indices.append(tuple(path.indices))
-
-        c_tensor = torch.tensor(path.coefficients, dtype=math_dtype, device=device).contiguous()
-        c_tensors.append(c_tensor)
-
-    # U/V
-    u = list(descriptor.get_dims("u"))[0]
-    v = list(descriptor.get_dims("v"))[0]
-
-    UV_TOTAL = int(descriptor.operands[0].size)
-    IU_TOTAL = int(descriptor.operands[1].size)
-    JV_TOTAL = int(descriptor.operands[2].size)
-
-    print(f"UV_TOTAL:{UV_TOTAL}, IU_TOTAL:{IU_TOTAL}, JV_TOTAL:{JV_TOTAL}")
-    P = len(path_indices)
-
-    # segment counts
-    uv_seg_count = max(p[0] for p in path_indices) + 1
-    iu_seg_count = max(p[1] for p in path_indices) + 1
-    jv_seg_count = max(p[2] for p in path_indices) + 1
-    kv_seg_count = max(p[3] for p in path_indices) + 1
-
-    # -------------------- 2) i/j/k dims + c_offsets + c_all --------------------
-    i_dims, j_dims, k_dims = [], [], []
-    c_offsets = [0]
-    c_flat_list = []
-    running = 0
-
-    for c in c_tensors:
-        i_dim, j_dim, k_dim = map(int, c.shape)
-        i_dims.append(i_dim)
-        j_dims.append(j_dim)
-        k_dims.append(k_dim)
-
-        c_flat = c.reshape(-1).contiguous()          # original layout (i,j,k) flatten => ((i*J + j)*K + k)
-        c_flat_list.append(c_flat)
-
-        running += i_dim * j_dim * k_dim
-        c_offsets.append(running)
-
-    c_all = (
-        torch.cat(c_flat_list, dim=0)
-        if len(c_flat_list) > 0
-        else torch.empty(0, dtype=math_dtype, device=device)
-    )
-
-    max_k_dim = max(k_dims) if len(k_dims) > 0 else 0
-    assert max_k_dim <= max_k_dim_for_kernel, \
-        f"max k_dim {max_k_dim} > kernel MAX_K_DIM {max_k_dim_for_kernel}"
-
-    # -------------------- 3) uv slices + uv_seg_offsets --------------------
-    uv_slices = []
-    uv_seg_offsets = []
-    start = 0
-    uv_stride = int(u * v)
-    for _ in range(uv_seg_count):
-        uv_seg_offsets.append(start)
-        end = start + uv_stride
-        uv_slices.append(slice(start, end))
-        start = end
-    assert start == UV_TOTAL, f"UV total {start} != {UV_TOTAL}"
-
-    # -------------------- 4) iu slices + iu_seg_offsets --------------------
-    iu_slices = []
-    iu_seg_offsets = []
-    start = 0
-    for s in range(iu_seg_count):
-        iu_seg_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[1] == s)
-        i_dim = i_dims[idx]
-        length = int(i_dim * u)
-        end = start + length
-        iu_slices.append(slice(start, end))
-        start = end
-    assert start == IU_TOTAL, f"IU total {start} != {IU_TOTAL}"
-
-    # -------------------- 5) jv slices + jv_seg_offsets --------------------
-    jv_slices = []
-    jv_seg_offsets = []
-    start = 0
-    for s in range(jv_seg_count):
-        jv_seg_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[2] == s)
-        j_dim = j_dims[idx]
-        length = int(j_dim * v)
-        end = start + length
-        jv_slices.append(slice(start, end))
-        start = end
-    assert start == JV_TOTAL, f"JV total {start} != {JV_TOTAL}"
-
-    # -------------------- 6) K offsets: kv_k_offsets --------------------
-    kv_k_offsets = []
-    start = 0
-    for s in range(kv_seg_count):
-        kv_k_offsets.append(start)
-        idx = next(idx for idx, p in enumerate(path_indices) if p[3] == s)
-        k_dim = k_dims[idx]
-        start += int(k_dim)
-    K_TOTAL = int(start)
-
-    # -------------------- 7) sparse CG meta + per-k grouping --------------------
-    cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
-    nnz_per_path = []
-    nnz_offsets = []  # NOTE: this is "start offset per path", length P (kept as your original)
-
-    nnz_k_offsets_list = []  # [P, MAX_K_DIM]
-    nnz_k_counts_list  = []  # [P, MAX_K_DIM]
-
-    nnz_running = 0
-    for path_id, c in enumerate(c_tensors):
-        i_dim, j_dim, k_dim = map(int, c.shape)
-
-        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
-        nnz = int(nz_idx.size(0))
-
-        nnz_per_path.append(nnz)
-        nnz_offsets.append(nnz_running)
-        nnz_running += nnz
-
-        local_k_offsets = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
-        local_k_counts  = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
-
-        if nnz > 0:
-            sort_idx = torch.argsort(nz_idx[:, 2])  # sort by k
-            nz_sorted = nz_idx[sort_idx]
-            i_idx = nz_sorted[:, 0]
-            j_idx = nz_sorted[:, 1]
-            k_idx = nz_sorted[:, 2]
-
-            vals = c[i_idx, j_idx, k_idx]
-
-            cg_i_list.append(i_idx.to(torch.uint8))
-            cg_j_list.append(j_idx.to(torch.uint8))
-            cg_k_list.append(k_idx.to(torch.uint8))
-            cg_val_list.append(vals)
-
-            prev_k = int(k_idx[0].item())
-            local_k_offsets[prev_k] = 0
-
-            for t in range(1, nnz):
-                curr_k = int(k_idx[t].item())
-                if curr_k != prev_k:
-                    local_k_counts[prev_k] = t - int(local_k_offsets[prev_k].item())
-                    local_k_offsets[curr_k] = t
-                    prev_k = curr_k
-
-            local_k_counts[prev_k] = nnz - int(local_k_offsets[prev_k].item())
-
-        nnz_k_offsets_list.append(local_k_offsets)
-        nnz_k_counts_list.append(local_k_counts)
-
-    if len(cg_i_list) > 0:
-        cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
-        cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
-        cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
-        cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
-    else:
-        cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
-        cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
-
-    nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
-    nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
-
-    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0).contiguous()  # [P, MAX_K_DIM]
-    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0).contiguous()  # [P, MAX_K_DIM]
-    nnz_k_offsets_flat = nnz_k_offsets.reshape(-1).contiguous()
-    nnz_k_counts_flat  = nnz_k_counts.reshape(-1).contiguous()
-
-    # -------------------- 8) pack tensors for kernels --------------------
-    path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device).contiguous()
-    i_dims_t = torch.tensor(i_dims, dtype=torch.int32, device=device).contiguous()
-    j_dims_t = torch.tensor(j_dims, dtype=torch.int32, device=device).contiguous()
-    k_dims_t = torch.tensor(k_dims, dtype=torch.int32, device=device).contiguous()
-    c_offsets_t = torch.tensor(c_offsets, dtype=torch.int32, device=device).contiguous()  # [P+1]
-
-    meta = {
-        # dense
-        "c_tensors": c_tensors,
-        "path_indices": path_indices,
-
-        # dense packed (original i-j-k flatten)
-        "path_indices_tensor": path_indices_tensor,  # [P,4] int32
-        "c_all": c_all,                              # [sum(i*j*k)] layout ((i*J+j)*K+k)
-        "c_offsets": c_offsets_t,                    # [P+1]
-
-        # slices (reference)
-        "uv_slices": uv_slices,
-        "iu_slices": iu_slices,
-        "jv_slices": jv_slices,
-
-        # offsets
-        "uv_seg_offsets": torch.tensor(uv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "iu_seg_offsets": torch.tensor(iu_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "jv_seg_offsets": torch.tensor(jv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
-        "kv_k_offsets": torch.tensor(kv_k_offsets, dtype=torch.int32, device=device).contiguous(),
-
-        # dims
-        "i_dims": i_dims_t,
-        "j_dims": j_dims_t,
-        "k_dims": k_dims_t,
-
-        # sizes
-        "U": int(u),
-        "V": int(v),
-        "UV_TOTAL": UV_TOTAL,
-        "IU_TOTAL": IU_TOTAL,
-        "JV_TOTAL": JV_TOTAL,
-        "K_TOTAL": K_TOTAL,
-
-        # sparse CG info
-        "cg_i_all": cg_i_all,
-        "cg_j_all": cg_j_all,
-        "cg_k_all": cg_k_all,
-        "cg_val_all": cg_val_all,
-        "nnz_per_path": nnz_per_path_t,
-        "nnz_offsets": nnz_offsets_t,  # length P (start offset per path)
-
-        # sparse per-k grouping
-        "nnz_k_offsets": nnz_k_offsets_flat,  # [P*MAX_K_DIM]
-        "nnz_k_counts": nnz_k_counts_flat,    # [P*MAX_K_DIM]
-        "MAX_K_DIM": int(max_k_dim_for_kernel),
-    }
-    return meta
-
-
 
 
 class TensorProduct(torch.nn.Module):
@@ -658,405 +33,87 @@ class TensorProduct(torch.nn.Module):
         descriptor (SegmentedTensorProduct): The descriptor of the segmented tensor product.
         math_dtype (torch.dtype, optional): The data type of the coefficients and calculations.
         device (torch.device, optional): The device on which the calculations are performed.
-        use_fallback (bool, optional):  Determines the computation method. If `None` (default), a CUDA kernel will be used if available. If `False`, a CUDA kernel will be used, and an exception is raised if it's not available. If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
-
-        Raises:
-            RuntimeError: If `use_fallback` is `False` and no CUDA kernel is available.
-
+        optimize_fallback (bool, optional): If `True`, the fallback method is optimized. If `False`, the fallback method is used without optimization.
     """
 
     def __init__(
         self,
-        descriptor: cue.SegmentedTensorProduct,
+        descriptor: stp.SegmentedTensorProduct,
         *,
         device: Optional[torch.device] = None,
         math_dtype: Optional[torch.dtype] = None,
-        use_fallback: Optional[bool] = None,
-        use_fasteq: bool = False,
-        op_name: Optional[str] = "",
+        optimize_fallback: Optional[bool] = None,
     ):
         super().__init__()
         self.descriptor = descriptor
-        if math_dtype is None:
-            math_dtype = torch.get_default_dtype()
 
-        self.has_cuda = False
-        self.f = None
-        self.num_operands = descriptor.num_operands
+        try:
+            self.f_cuda = _tensor_product_cuda(descriptor, device, math_dtype)
+        except NotImplementedError as e:
+            logger.info(f"CUDA implementation not available: {e}")
+            self.f_cuda = None
+        except ImportError as e:
+            logger.warning(f"CUDA implementation not available: {e}")
+            self.f_cuda = None
 
-        # ================= FastEq need =================
-        from .utils import make_FastFullyConnectedTensorProductFunction, make_FastEquiLinearFunction, make_FastChannelWiseTensorProductFunction, make_FastFullyConnectedTensorProductPathFused
-        self.use_fasteq = use_fasteq
-        self.op_name = op_name
-        
-        #if self.op_name == "tp_fully_connected" or self.op_name == "equi_linear":
-                
-        self.cg_indices: list[torch.Tensor] = []
-        self.cg_values:  list[torch.Tensor] = []
-        self.c_tensors:  list[torch.Tensor] = []
-        dim_list = []
-        device = "cuda"
+        self.f_fx = _tensor_product_fx(
+            descriptor, device, math_dtype, optimize_fallback is True
+        )
+        self._optimize_fallback = optimize_fallback
 
-        '''
-        if op_name == "tp_channel_wise":
-            for operand in self.descriptor.operands:
-                print(f"operand: {operand}, size: {operand.size}, segments:{operand.segments}")
-        '''
-
-        with torch.no_grad():
-            
-            if self.op_name == "tp_channel_wise":
-                meta = infer_slices_and_meta(descriptor, math_dtype, device)
-                self.u, self.v = meta["U"], meta["V"]
-                self.K_TOTAL = meta["K_TOTAL"]
-                c_tensors = meta["c_tensors"]
-                print(f"c_tensors:{c_tensors}")
-                self.c_all = torch.cat([c.reshape(-1) for c in c_tensors], dim=0).contiguous()
-                
-                self.meta = meta
-                self.i_dims = meta["i_dims"].to(device)
-                self.j_dims = meta["j_dims"].to(device)
-                self.k_dims = meta["k_dims"].to(device)
-                self.c_offsets = meta["c_offsets"].to(device)
-                self.uv_seg_offsets = meta["uv_seg_offsets"].to(device)
-                self.iu_seg_offsets = meta["iu_seg_offsets"].to(device)
-                self.jv_seg_offsets = meta["jv_seg_offsets"].to(device)
-                self.kv_k_offsets = meta["kv_k_offsets"].to(device)
-                path_indices = meta["path_indices"]
-                self.path_indices_tensor = meta["path_indices_tensor"]
-
-                P = len(path_indices)
-                uv = [row[0] for row in path_indices]
-                iu = [row[1] for row in path_indices]
-                jv = [row[2] for row in path_indices]
-                kv = [row[3] for row in path_indices]
-                self.order_uv = torch.tensor(sorted(range(P), key=lambda p:(uv[p], kv[p])), dtype=torch.int32, device=device)
-                self.order_iu = torch.tensor(sorted(range(P), key=lambda p:(iu[p], kv[p])), dtype=torch.int32, device=device)
-                self.order_jv = torch.tensor(sorted(range(P), key=lambda p:(jv[p], kv[p])), dtype=torch.int32, device=device)
-
-                # for sparse cw tensor product
-                groups_meta = build_sparse_cg_and_kij_groups_v2(descriptor, math_dtype, device)
-
-                groupk_meta = groups_meta["groupk"]
-                groupi_meta = groups_meta["groupi"]
-                groupj_meta = groups_meta["groupj"]
-
-                self.groupk_meta = groupk_meta
-                self.groupi_meta = groupi_meta
-                self.groupj_meta = groupj_meta
-                
-                self.cg_i_groupk = groupk_meta["cg_i_all"]
-                self.cg_j_groupk  = groupk_meta["cg_j_all"]
-                self.cg_k_groupk  = groupk_meta["cg_k_all"]
-                self.cg_val_groupk  = groupk_meta["cg_val_all"]
-
-                self.nnz_per_path = groupk_meta["nnz_per_path"]
-                self.nnz_offsets_groupk = groupk_meta["nnz_offsets"]
-                self.nnz_k_offsets_groupk = groupk_meta["nnz_k_offsets"]
-                self.nnz_k_counts_groupk = groupk_meta["nnz_k_counts"]
-
-                self.cg_i_groupi = groupi_meta["cg_i_all"]
-                self.cg_j_groupi  = groupi_meta["cg_j_all"]
-                self.cg_k_groupi  = groupi_meta["cg_k_all"]
-                self.cg_val_groupi  = groupi_meta["cg_val_all"]
-
-                nnz_offset = 0
-                for i in range(0, len(self.nnz_per_path)):
-                    print(f"path {i}, nnz {self.nnz_per_path[i]}, cg.shape:{c_tensors[i].shape}")
-                    for j in range(0, self.nnz_per_path[i]):
-                        idx = nnz_offset + j
-                        print(f"i:{self.cg_i_groupi[idx]}, j:{self.cg_j_groupi[idx]}, k:{self.cg_k_groupi[idx]}")
-                    nnz_offset += self.nnz_per_path[i]
-    
-                self.fasteq_cwtp = torch.ops.cwtp_fwd.forward
-
-            # For mace small
-            if self.op_name == "tp_fully_connected":
-
-                for i, path in enumerate(descriptor.paths):
-                    if getattr(path, "coefficients", None) is None or path.coefficients.ndim < 3:
-                        continue
-                    coeffs = torch.from_numpy(path.coefficients).to(device=device, dtype=math_dtype)
-
-                    # idx: [nnz, 3] (i,j,k)；vals: [nnz]
-                    idx = coeffs.nonzero(as_tuple=False)     
-                    vals = coeffs[idx[:, 0], idx[:, 1], idx[:, 2]]
-                    idx = idx.to(device=device, dtype=torch.int)
-                    vals = vals.to(device=device, dtype=math_dtype)
-
-                    dim_list.append(len(vals))
-
-                    name_idx = f"cg_indices_{i}"
-                    name_val = f"cg_values_{i}"
-                    name_c   = f"c_tensors_{i}"
-
-                    self.register_buffer(name_idx, idx, persistent=True)
-                    self.register_buffer(name_val, vals, persistent=True)
-                    self.register_buffer(name_c,  disable_type_conv(coeffs), persistent=True)
-
-                    self.cg_indices.append(getattr(self, f"cg_indices_{i}"))
-                    self.cg_values.append(getattr(self, f"cg_values_{i}"))
-                    self.c_tensors.append(getattr(self, f"c_tensors_{i}"))
-
-                    dimensions_dict = self.descriptor.get_dimensions_dict()
-                    self.U, self.V, self.W = sum(dimensions_dict['u']), sum(dimensions_dict['v']), sum(dimensions_dict['w'])
-                
-                    P = len(self.cg_indices)
-                    assert P == len(dim_list)
-
-                    self.K_per_path = torch.tensor(dim_list, device=device, dtype=torch.int32)
-                    self.path_offset = torch.empty(P, device=device, dtype=torch.int32)
-                    self.path_offset[0] = 0
-                    if P > 1:
-                        self.path_offset[1:] = torch.cumsum(self.K_per_path[:-1], dim=0)
-                    self.K_total = int(self.K_per_path.sum().item())
-
-                    self.nnz_list = [ci.shape[0] for ci in self.cg_indices]
-                    self.nnz_max = max(self.nnz_list)
-                    self.nnz_per_path = torch.tensor(self.nnz_list, device=device, dtype=torch.int32)
-
-                    self.cg_i_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
-                    self.cg_j_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
-                    self.cg_k_all   = torch.zeros((P, self.nnz_max), device=device, dtype=torch.int32)
-                    self.cg_val_all = torch.zeros((P, self.nnz_max), device=device, dtype=math_dtype)
-
-                    for p in range(P):
-                        ci_local = self.cg_indices[p]  # [nnz_p, 3], (i_local, j_local, k_local)
-                        cv       = self.cg_values[p]         # [nnz_p]
-                        nnz_p    = self.nnz_list[p]
-                        offset_p = self.path_offset[p].item()
-
-                        i_local = ci_local[:, 0]
-                        j_local = ci_local[:, 1]
-                        k_local = ci_local[:, 2]
-
-                        # --- local -> global ---
-                        i_global = i_local + offset_p
-                        j_global = j_local             # TODO: only support j_local = j_global = 0
-                        k_global = k_local + offset_p
-
-                        self.cg_i_all[p, :nnz_p]   = i_global
-                        self.cg_j_all[p, :nnz_p]   = j_global
-                        self.cg_k_all[p, :nnz_p]   = k_global
-                        self.cg_val_all[p, :nnz_p] = cv
-                        
-                        self.FastFCTPFused = make_FastFullyConnectedTensorProductPathFused(
-                            self.cg_i_all, self.cg_j_all, self.cg_k_all, self.cg_val_all,
-                            self.nnz_per_path, self.K_per_path, self.path_offset, 
-                            self.U, self.V, self.W, self.K_total
-                        )
-                        self.FastFCTPFunc = make_FastFullyConnectedTensorProductFunction()
-        if self.op_name == "equi_linear":
-            self.FastEquiLinearFunction = make_FastEquiLinearFunction()
-        if self.op_name == "tp_channel_wise":
-
-            self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction(
-                self.meta,
-                self.groupk_meta,
-                self.groupi_meta,
-                self.groupj_meta,
-                self.u, self.v, self.K_TOTAL
-            )
-        
-        #self.FastCWTPFunc = make_FastChannelWiseTensorProductFunction()
-        # ================================================
-
-        if use_fallback is False:
-            self.f = _tensor_product_cuda(descriptor, device, math_dtype)
-            self.has_cuda = True
-        elif use_fallback is None:
-            try:
-                self.f = _tensor_product_cuda(descriptor, device, math_dtype)
-                self.has_cuda = True
-            except NotImplementedError as e:
-                logger.info(f"CUDA implementation not available: {e}")
-            except ImportError as e:
-                logger.warning(f"CUDA implementation not available: {e}")
-                logger.warning(
-                    "Did you forget to install the CUDA version of cuequivariance-ops-torch?\n"
-                    "Install it with one of the following commands:\n"
-                    "pip install cuequivariance-ops-torch-cu11\n"
-                    "pip install cuequivariance-ops-torch-cu12"
-                )
-
-        if self.f is None:
-            self.f = _tensor_product_fx(descriptor, device, math_dtype, True)
-
-        self.f = _Wrapper(self.f, descriptor)
-
-        self.operands_dims = [ope.size for ope in descriptor.operands]
-
-    @torch.jit.ignore
     def __repr__(self):
         has_cuda_kernel = (
-            "(with CUDA kernel)" if self.has_cuda else "(without CUDA kernel)"
+            "(with CUDA kernel)" if self.f_cuda is not None else "(without CUDA kernel)"
         )
         return f"TensorProduct({self.descriptor} {has_cuda_kernel})"
 
-    def forward(
-        self,
-        x0: torch.Tensor,
-        x1: Optional[torch.Tensor] = None,
-        x2: Optional[torch.Tensor] = None,
-        x3: Optional[torch.Tensor] = None,
-        x4: Optional[torch.Tensor] = None,
-        x5: Optional[torch.Tensor] = None,
-        x6: Optional[torch.Tensor] = None,
-    ):
+    def forward(self, *args, use_fallback: Optional[bool] = None):
         r"""
         Perform the tensor product based on the specified descriptor.
 
         Args:
-            x0, x1[, x2, x3, x4, x5, x6]: The input tensors. The number of input tensors should match the number of operands in the descriptor minus one.
-                Each input tensor should have a shape of (batch, operand_size) or (1, operand_size)
-                where `operand_size` corresponds to the size of each operand as defined in
-                the tensor product descriptor.
+            args (list of torch.Tensor): The input tensors. The number of input tensors should match the number of operands in the descriptor minus one.
+                Each input tensor should have a shape of ((batch,) operand_size), where `operand_size` corresponds to the size
+                of each operand as defined in the tensor product descriptor.
+            use_fallback (bool, optional):  Determines the computation method. If `None` (default), a CUDA kernel will be used if available and the input
+                is on CUDA. If `False`, a CUDA kernel will be used, and an exception is raised if it's not available or the
+                input is not on CUDA. If `True`, a PyTorch fallback method is used regardless of CUDA kernel availability.
 
         Returns:
             torch.Tensor:
                 The output tensor resulting from the tensor product.
                 It has a shape of (batch, last_operand_size), where
                 `last_operand_size` is the size of the last operand in the descriptor.
+
+        Raises:
+            RuntimeError: If `use_fallback` is `False` and either no CUDA kernel is available or the input tensor is not on CUDA.
         """
-
         if (
-            x6 is not None
-            and x5 is not None
-            and x4 is not None
-            and x3 is not None
-            and x2 is not None
-            and x1 is not None
+            args
+            and args[0].device.type == "cuda"
+            and self.f_cuda is not None
+            and (use_fallback is not True)
         ):
-            inputs = [x0, x1, x2, x3, x4, x5, x6]
-        elif (
-            x5 is not None
-            and x4 is not None
-            and x3 is not None
-            and x2 is not None
-            and x1 is not None
-        ):
-            inputs = [x0, x1, x2, x3, x4, x5]
-        elif x4 is not None and x3 is not None and x2 is not None and x1 is not None:
-            inputs = [x0, x1, x2, x3, x4]
-        elif x3 is not None and x2 is not None and x1 is not None:
-            inputs = [x0, x1, x2, x3]
-        elif x2 is not None and x1 is not None:
-            inputs = [x0, x1, x2]
-        elif x1 is not None:
-            inputs = [x0, x1]
-        else:
-            inputs = [x0]
+            return self.f_cuda(*args)
 
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            if len(inputs) != self.num_operands - 1:
-                raise ValueError(
-                    f"Expected {self.num_operands - 1} input tensors, got {len(inputs)}"
-                )
-            for oid, input in enumerate(inputs):
-                torch._assert(
-                    input.ndim == 2,
-                    f"input {oid} should have ndim=2",
-                )
-                torch._assert(
-                    input.shape[1] == self.operands_dims[oid],
-                    f"input {oid} should have shape (batch, {self.operands_dims[oid]}), got {input.shape}",
-                )
+        if use_fallback is False:
+            if self.f_cuda is not None:
+                raise RuntimeError("CUDA kernel available but input is not on CUDA")
+            else:
+                raise RuntimeError("No CUDA kernel available")
 
-        
-        if self.use_fasteq:
-            if self.op_name == "tp_fully_connected":
-                #print("== call fasteq fully connect tensor product ==")
-                
-                '''
-                torch.cuda.synchronize()
-                start_time = time.perf_counter() * 1000
-                
-                out = self.FastFCTPFunc.apply(
-                    inputs[0], inputs[1], inputs[2],
-                    self.descriptor,
-                    self.cg_indices,
-                    self.cg_values,
-                    inputs[0].dtype,
-                )
-
-                torch.cuda.synchronize()
-                end_time = time.perf_counter() * 1000
-                execution_time_ms = end_time - start_time
-                print(f"<< fasteq fctp cost: {execution_time_ms:.3f} ms >>")
-                '''
-
-                #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}, self.K_total:{self.K_total}")
-                #print(f"self.U={self.U},  self.V={self.V}, self.W={self.W}, descriptor={self.descriptor.get_dimensions_dict()}")
-                #print(f"inputs[0]:{inputs[0].dtype}, inputs[1]:{inputs[1].dtype}, inputs[2]:{inputs[2].dtype}, cg_val_all.dtype:{self.cg_val_all.dtype}")
-
-                out = self.FastFCTPFused.apply(
-                     inputs[0], inputs[1], inputs[2], 
-                )
-
-
-            elif self.op_name == "tp_channel_wise":
-                #print("== call fasteq channel-wise tensor product ==")
-                #print(f"inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}, inputs[2].shape:{inputs[2].shape}")
-                #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
-                out = self.FastCWTPFunc.apply(inputs[0], inputs[1], inputs[2])
-            # TODO fix 
-            elif self.op_name == "equi_linear":
-                #print(f"equi_linear, inputs[0].shape:{inputs[0].shape}, inputs[1].shape:{inputs[1].shape}")
-                if tuple(inputs[0].shape) == (1, 36864):
-                    #print("== call fasteq equi-linear tensor product ==")
-                    dtype = inputs[0].dtype
-                    w = inputs[0].to(torch.float64)
-                    x = inputs[1].to(torch.float64)
-
-                    out = self.FastEquiLinearFunction.apply(w, x, self.descriptor)
-                    out = out.to(dtype)
-
-                elif (tuple(inputs[0].shape) == (1, 9216)) and inputs[1].shape[1] == 96:
-                    #print(f"==== call my matmul linear ====")
-                    weight = inputs[0].reshape(96, 96)
-                    out = torch.matmul(inputs[1], weight) * 0.10206207261596577
-                    #out = _my_tensor_product_fx(inputs, self.descriptor, "cuda", torch.float64)
-                else:
-                    out = self.f(inputs)
-        else:
-            torch.cuda.synchronize()
-            start_time = time.perf_counter() * 1000
-            
-            out = self.f(inputs)
-            
-            torch.cuda.synchronize()
-            end_time = time.perf_counter() * 1000
-            execution_time_ms = (end_time - start_time)
-            print(f"========= cueq {self.op_name} cost: {execution_time_ms:.3f} ms ========")
-        return out
-
-
-def to_notypeconv(t, *args, **kwargs):
-    new_kwargs = kwargs.copy()
-    new_kwargs.pop("dtype", None)
-    new_args = [None if isinstance(a, torch.dtype) else a for a in args]
-    result = t.__original_to(*new_args, **new_kwargs)
-    return result
-
-
-def disable_type_conv(t):
-    """
-    This modifier can be used on Tensors or whole Modules
-    to prevent them from being modified during to(dtype=x) calls
-    """
-    t.__original_to = t.to
-    t.to = partial(to_notypeconv, t)
-    return t
+        if self._optimize_fallback is None:
+            warnings.warn(
+                "The fallback method is used but it has not been optimized. "
+                "Consider setting optimize_fallback=True when creating the TensorProduct module."
+            )
+        return self.f_fx(*args)
 
 
 def _tensor_product_fx(
-    descriptor: cue.SegmentedTensorProduct,
+    descriptor: stp.SegmentedTensorProduct,
     device: Optional[torch.device],
-    math_dtype: torch.dtype,
+    math_dtype: Optional[torch.dtype],
     optimize_einsums: bool,
 ) -> torch.nn.Module:
     """
@@ -1064,6 +121,10 @@ def _tensor_product_fx(
     - at least one input operand should have a batch dimension (ndim=2)
     - the output operand will have a batch dimension (ndim=2)
     """
+
+    if math_dtype is None:
+        math_dtype = torch.get_default_dtype()
+
     descriptor = descriptor.remove_zero_paths()
     descriptor = descriptor.remove_empty_segments()
 
@@ -1078,8 +139,11 @@ def _tensor_product_fx(
             torch.fx.Proxy(graph.placeholder(f"input_{i}"), tracer)
             for i in range(num_inputs)
         ]
-
-        operand_subscripts = [f"Z{ss}" for ss in descriptor.subscripts.operands]
+        for input in inputs:
+            torch._assert(input.ndim == 2, "input should have ndim=2")
+        operand_subscripts = [
+            f"Z{operand.subscripts}" for operand in descriptor.operands
+        ]
 
         formula = (
             ",".join([descriptor.coefficient_subscripts] + operand_subscripts[:-1])
@@ -1090,41 +154,40 @@ def _tensor_product_fx(
 
         outputs = []
         for path_idx, path in enumerate(descriptor.paths):
-            segments = []
-            for oid in range(num_inputs):
-                seg_shape = descriptor.get_segment_shape(oid, path)
-                inp = inputs[oid][..., slices[oid][path.indices[oid]]]
-                if len(seg_shape) > 0:
-                    inp = inp.reshape(inputs[oid].shape[:-1] + seg_shape)
-                else:
-                    inp = inp.reshape(inputs[oid].shape[:-1])
-
-                segments.append(inp.to(dtype=math_dtype))
-
-            c_tensor = disable_type_conv(
-                torch.tensor(path.coefficients, dtype=math_dtype, device=device)
+            segments = [
+                inputs[oid][..., slices[oid][path.indices[oid]]]
+                .reshape(
+                    inputs[oid].shape[:-1] + descriptor.get_segment_shape(oid, path)
+                )
+                .to(dtype=math_dtype)
+                for oid in range(num_inputs)
+            ]
+            constants[f"c{path_idx}"] = torch.tensor(
+                path.coefficients, dtype=math_dtype, device=device
+            ).view(
+                {
+                    2: torch.int16,
+                    4: torch.int32,
+                    8: torch.int64,
+                }[math_dtype.itemsize]
             )
-            constants[f"c{path_idx}"] = c_tensor
-
-            c = torch.fx.Proxy(graph.get_attr(f"c{path_idx}"), tracer=tracer).clone()
+            c = (
+                torch.fx.Proxy(graph.get_attr(f"c{path_idx}"), tracer=tracer)
+                .view(math_dtype)
+                .clone()
+            )
             out = torch.einsum(formula, c, *segments)
             out = out.to(dtype=inputs[0].dtype)
 
             seg_shape = descriptor.get_segment_shape(-1, path)
             outputs += [
-                out.reshape(out.shape[: out.ndim - len(seg_shape)] + (prod(seg_shape),))
+                out.reshape(
+                    out.shape[: out.ndim - len(seg_shape)] + (math.prod(seg_shape),)
+                )
             ]
 
         if len(outputs) == 0:
             raise NotImplementedError("No FX implementation for empty paths")
-
-        def _sum(tensors, *, shape=None, like=None):
-            if len(tensors) == 0:
-                return like.new_zeros(shape)
-            out = tensors[0]
-            for t in tensors[1:]:
-                out = torch.add(out, t)
-            return out
 
         batch_shape = outputs[0].shape[:-1]
         output = torch.cat(
@@ -1135,7 +198,7 @@ def _tensor_product_fx(
                         for out, path in zip(outputs, descriptor.paths)
                         if path.indices[-1] == i
                     ],
-                    shape=batch_shape + (prod(descriptor.operands[-1][i]),),
+                    shape=batch_shape + (math.prod(descriptor.operands[-1][i]),),
                     like=outputs[0],
                 )
                 for i in range(descriptor.operands[-1].num_segments)
@@ -1166,10 +229,10 @@ def _tensor_product_fx(
                     for operand in descriptor.operands[:num_inputs]
                 ]
                 graphmod = opt_einsum_fx.optimize_einsums_full(graphmod, example_inputs)
-    elif num_inputs == 0:
+    else:
 
-        class _no_input(torch.nn.Module):
-            def __init__(self, descriptor: cue.SegmentedTensorProduct):
+        class _no_input_or_no_paths(torch.nn.Module):
+            def __init__(self, descriptor: stp.SegmentedTensorProduct):
                 super().__init__()
 
                 for pid, path in enumerate(descriptor.paths):
@@ -1180,9 +243,12 @@ def _tensor_product_fx(
                         ),
                     )
 
-            def forward(self):
+            def forward(self, *args):
+                shape = torch.broadcast_shapes(*[arg.shape[:-1] for arg in args])
                 output = torch.zeros(
-                    (descriptor.operands[-1].size,), device=device, dtype=math_dtype
+                    shape + (descriptor.operands[-1].size,),
+                    device=device,
+                    dtype=math_dtype,
                 )
                 for pid in range(descriptor.num_paths):
                     output += torch.einsum(
@@ -1193,90 +259,58 @@ def _tensor_product_fx(
                     )
                 return output
 
-        graphmod = _no_input(descriptor)
+        graphmod = _no_input_or_no_paths(descriptor)
 
-    else:
-        raise NotImplementedError(
-            "No FX implementation for empty paths and non-empty inputs"
-        )
-
-    return graphmod
-
-
-class _Caller(torch.nn.Module):
-    def __init__(self, module: torch.nn.Module):
-        super().__init__()
-        self.module = module
-
-
-class _NoArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module()
-
-
-class _OneArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0])
-
-
-class _TwoArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0], args[1])
-
-
-class _ThreeArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0], args[1], args[2])
-
-
-class _FourArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0], args[1], args[2], args[3])
-
-
-class _FiveArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0], args[1], args[2], args[3], args[4])
-
-
-class _SixArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args[0], args[1], args[2], args[3], args[4], args[5])
-
-
-class _SevenArgCaller(_Caller):
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(
-            args[0], args[1], args[2], args[3], args[4], args[5], args[6]
-        )
-
-
-CALL_DISPATCHERS = [
-    _NoArgCaller,
-    _OneArgCaller,
-    _TwoArgCaller,
-    _ThreeArgCaller,
-    _FourArgCaller,
-    _FiveArgCaller,
-    _SixArgCaller,
-    _SevenArgCaller,
-]
+    return _Wrapper(graphmod, descriptor)
 
 
 class _Wrapper(torch.nn.Module):
-    def __init__(self, module: torch.nn.Module, descriptor: cue.SegmentedTensorProduct):
+    def __init__(self, module: torch.nn.Module, descriptor: stp.SegmentedTensorProduct):
         super().__init__()
-        self.module = CALL_DISPATCHERS[descriptor.num_operands - 1](module)
+        self.module = module
         self.descriptor = descriptor
 
-    def forward(self, args: List[torch.Tensor]):
-        return self.module(args)
+    def forward(self, *args):
+        for oid, arg in enumerate(args):
+            torch._assert(
+                arg.shape[-1] == self.descriptor.operands[oid].size,
+                "input shape[-1] does not match operand size",
+            )
+
+        shape = torch.broadcast_shapes(*[arg.shape[:-1] for arg in args])
+
+        args = [
+            (
+                arg.expand(shape + (arg.shape[-1],)).reshape(
+                    (math.prod(shape), arg.shape[-1])
+                )
+                if math.prod(arg.shape[:-1]) > 1
+                else arg.reshape((1, arg.shape[-1]))
+            )
+            for arg in args
+        ]
+
+        logger.debug(
+            f"Calling torch.fx tensor product: {self.descriptor}, input shapes: {', '.join(str(arg.shape) for arg in args)}"
+        )
+        out = self.module(*args)
+
+        return out.reshape(shape + (out.shape[-1],))
+
+
+def _sum(tensors, *, shape=None, like=None):
+    if len(tensors) == 0:
+        return like.new_zeros(shape)
+    out = tensors[0]
+    for t in tensors[1:]:
+        out += t
+    return out
 
 
 def _tensor_product_cuda(
-    descriptor: cue.SegmentedTensorProduct,
+    descriptor: stp.SegmentedTensorProduct,
     device: Optional[torch.device],
-    math_dtype: torch.dtype,
+    math_dtype: Optional[torch.dtype],
 ) -> torch.nn.Module:
     logger.debug(f"Starting search for a cuda kernel for {descriptor}")
 
@@ -1288,6 +322,9 @@ def _tensor_product_cuda(
             "Only descriptors with 3 or 4 operands are supported."
             f" Got {descriptor.subscripts}."
         )
+
+    if math_dtype is None:
+        math_dtype = torch.get_default_dtype()
 
     if not torch.cuda.is_available():
         raise NotImplementedError("CUDA is not available.")
@@ -1319,7 +356,7 @@ def _tensor_product_cuda(
                     return TensorProductUniform4x1d(d, device, math_dtype)
 
     supported_targets = [
-        cue.segmented_polynomials.Subscripts(subscripts)
+        stp.Subscripts(subscripts)
         for subscripts in [
             "u__uw_w",
             "_v_vw_w",
@@ -1337,9 +374,7 @@ def _tensor_product_cuda(
 
     try:
         descriptor, perm = next(
-            cue.segmented_polynomials.dispatch(
-                descriptor, supported_targets, "permute_all_but_last"
-            )
+            stp.dispatch(descriptor, supported_targets, "permute_all_but_last")
         )
     except StopIteration:
         raise NotImplementedError(
@@ -1353,17 +388,20 @@ def _tensor_product_cuda(
         return FusedTensorProductOp4(descriptor, perm[:3], device, math_dtype)
 
 
-def _permutation_module(permutation: Tuple[int, ...]):
-    graph = torch.fx.Graph()
-    inputs = [graph.placeholder(f"input_{i}") for i in range(len(permutation))]
-    graph.output([inputs[i] for i in permutation])
-    return torch.fx.GraphModule(dict(), graph, class_name="perm")
+def _reshape(x: torch.Tensor, leading_shape: tuple[int, ...]) -> torch.Tensor:
+    # Make x have shape (Z, x.shape[-1]) or (x.shape[-1],)
+    if math.prod(leading_shape) > 1 and math.prod(x.shape[:-1]) == 1:
+        return x.reshape((x.shape[-1],))
+    else:
+        return x.expand(leading_shape + (x.shape[-1],)).reshape(
+            (math.prod(leading_shape), x.shape[-1])
+        )
 
 
 class FusedTensorProductOp3(torch.nn.Module):
     def __init__(
         self,
-        descriptor: cue.SegmentedTensorProduct,
+        descriptor: stp.SegmentedTensorProduct,
         perm: Tuple[int, int],
         device: Optional[torch.device],
         math_dtype: torch.dtype,
@@ -1383,7 +421,7 @@ class FusedTensorProductOp3(torch.nn.Module):
         import cuequivariance_ops_torch as ops
 
         self._f = ops.FusedTensorProductOp3(
-            operand_segment_modes=descriptor.subscripts.operands,
+            operand_segment_modes=[ope.subscripts for ope in descriptor.operands],
             operand_segment_offsets=[
                 [s.start for s in ope.segment_slices()] for ope in descriptor.operands
             ],
@@ -1393,32 +431,37 @@ class FusedTensorProductOp3(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device=device)
 
-    @torch.jit.ignore
     def __repr__(self) -> str:
-        return f"FusedTensorProductOp3({self.descriptor} (output last operand))"
+        return f"TensorProductCUDA({self.descriptor} (output last operand))"
 
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        b2: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         x0, x1 = self._perm(x0, x1)
+        assert x0.ndim >= 1, x0.ndim
+        assert x1.ndim >= 1, x1.ndim
+        assert b2 is None
 
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling FusedTensorProductOp3: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
-            )
+        shape = torch.broadcast_shapes(x0.shape[:-1], x1.shape[:-1])
+        x0 = _reshape(x0, shape)
+        x1 = _reshape(x1, shape)
 
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
+        logger.debug(
+            f"Calling FusedTensorProductOp3: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
+        )
 
-        return self._f(x0, x1)
+        out = self._f(x0, x1)
+
+        return out.reshape(shape + (out.shape[-1],))
 
 
 class FusedTensorProductOp4(torch.nn.Module):
     def __init__(
         self,
-        descriptor: cue.SegmentedTensorProduct,
+        descriptor: stp.SegmentedTensorProduct,
         perm: Tuple[int, int, int],
         device: Optional[torch.device],
         math_dtype: torch.dtype,
@@ -1438,7 +481,7 @@ class FusedTensorProductOp4(torch.nn.Module):
         import cuequivariance_ops_torch as ops
 
         self._f = ops.FusedTensorProductOp4(
-            operand_segment_modes=descriptor.subscripts.operands,
+            operand_segment_modes=[ope.subscripts for ope in descriptor.operands],
             operand_segment_offsets=[
                 [s.start for s in ope.segment_slices()] for ope in descriptor.operands
             ],
@@ -1448,35 +491,40 @@ class FusedTensorProductOp4(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device=device)
 
-    @torch.jit.ignore
     def __repr__(self) -> str:
-        return f"FusedTensorProductOp4({self.descriptor} (output last operand))"
+        return f"TensorProductCUDA({self.descriptor} (output last operand))"
 
     def forward(
-        self, x0: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        x2: torch.Tensor,
+        b3: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x0, x1, x2 = self._perm(x0, x1, x2)
+        assert x0.ndim >= 1, x0.ndim
+        assert x1.ndim >= 1, x1.ndim
+        assert x2.ndim >= 1, x2.ndim
+        assert b3 is None
 
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling FusedTensorProductOp4: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}, {x2.shape}"
-            )
+        shape = torch.broadcast_shapes(x0.shape[:-1], x1.shape[:-1], x2.shape[:-1])
+        x0 = _reshape(x0, shape)
+        x1 = _reshape(x1, shape)
+        x2 = _reshape(x2, shape)
 
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x2.ndim == 2, "input should be (batch, dim) or (1, dim)")
+        logger.debug(
+            f"Calling FusedTensorProductOp4: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}, {x2.shape}"
+        )
 
-        return self._f(x0, x1, x2)
+        out = self._f(x0, x1, x2)
+
+        return out.reshape(shape + (out.shape[-1],))
 
 
-class TensorProductUniform1d(torch.nn.Module):
+class TensorProductUniform3x1d(torch.nn.Module):
     def __init__(
         self,
-        descriptor: cue.SegmentedTensorProduct,
+        descriptor: stp.SegmentedTensorProduct,
         device: Optional[torch.device],
         math_dtype: torch.dtype,
     ):
@@ -1499,58 +547,35 @@ class TensorProductUniform1d(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device=device)
 
-
-class TensorProductUniform3x1d(TensorProductUniform1d):
-    @torch.jit.ignore
     def __repr__(self):
-        return f"TensorProductUniform3x1d({self.descriptor} (output last operand))"
+        return f"TensorProductCUDA({self.descriptor} (output last operand))"
 
-    def forward(self, x0: torch.Tensor, x1: torch.Tensor) -> torch.Tensor:
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling TensorProductUniform3x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
-            )
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
+    def forward(self, x0, x1):
+        assert x0.ndim >= 1, x0.ndim
+        assert x1.ndim >= 1, x1.ndim
 
-        # ops.TensorProductUniform1d expects inputs
-        # of shape (Z, dim) or (1, dim)
-        return self._f(x0, x1)
+        shape = torch.broadcast_shapes(x0.shape[:-1], x1.shape[:-1])
+        x0 = _reshape(x0, shape)
+        x1 = _reshape(x1, shape)
 
+        if x0.ndim == 1:
+            x0 = x0.unsqueeze(0)
+        if x1.ndim == 1:
+            x1 = x1.unsqueeze(0)
 
-class TensorProductUniform4x1d(TensorProductUniform1d):
-    @torch.jit.ignore
-    def __repr__(self):
-        return f"TensorProductUniform4x1d({self.descriptor} (output last operand))"
+        logger.debug(
+            f"Calling TensorProductUniform3x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
+        )
 
-    def forward(
-        self, x0: torch.Tensor, x1: torch.Tensor, x2: torch.Tensor
-    ) -> torch.Tensor:
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling TensorProductUniform4x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}, {x2.shape}"
-            )
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x2.ndim == 2, "input should be (batch, dim) or (1, dim)")
+        out = self._f(x0, x1)
 
-        # ops.TensorProductUniform1d expects inputs
-        # of shape (Z, dim) or (1, dim)
-        return self._f(x0, x1, x2)
+        return out.reshape(shape + (out.shape[-1],))
 
 
-class TensorProductUniform3x1dIndexed(torch.nn.Module):
+class TensorProductUniform4x1d(torch.nn.Module):
     def __init__(
         self,
-        descriptor: cue.SegmentedTensorProduct,
+        descriptor: stp.SegmentedTensorProduct,
         device: Optional[torch.device],
         math_dtype: torch.dtype,
     ):
@@ -1564,7 +589,7 @@ class TensorProductUniform3x1dIndexed(torch.nn.Module):
         assert descriptor.coefficient_subscripts == ""
         u = next(iter(descriptor.get_dims(descriptor.subscripts.modes()[0])))
 
-        self._f = ops.TensorProductUniform3x1dIndexed(
+        self._f = ops.TensorProductUniform1d(
             operand_dim=[ope.ndim for ope in descriptor.operands],
             operand_extent=u,
             operand_num_segments=[ope.num_segments for ope in descriptor.operands],
@@ -1573,93 +598,37 @@ class TensorProductUniform3x1dIndexed(torch.nn.Module):
             math_dtype=math_dtype,
         ).to(device=device)
 
-    @torch.jit.ignore
     def __repr__(self):
-        return (
-            f"TensorProductUniform3x1dIndexed({self.descriptor} (output last operand))"
+        return f"TensorProductCUDA({self.descriptor} (output last operand))"
+
+    def forward(self, x0, x1, x2):
+        assert x0.ndim >= 1, x0.ndim
+        assert x1.ndim >= 1, x1.ndim
+        assert x2.ndim >= 1, x2.ndim
+
+        shape = torch.broadcast_shapes(x0.shape[:-1], x1.shape[:-1], x2.shape[:-1])
+        x0 = _reshape(x0, shape)
+        x1 = _reshape(x1, shape)
+        x2 = _reshape(x2, shape)
+
+        if x0.ndim == 1:
+            x0 = x0.unsqueeze(0)
+        if x1.ndim == 1:
+            x1 = x1.unsqueeze(0)
+        if x2.ndim == 1:
+            x2 = x2.unsqueeze(0)
+
+        logger.debug(
+            f"Calling TensorProductUniform4x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}, {x2.shape}"
         )
 
-    def forward(
-        self,
-        x0: torch.Tensor,
-        x1: torch.Tensor,
-        op_idx0: Optional[torch.Tensor],
-        op_idx1: Optional[torch.Tensor],
-        op_idx_out: Optional[torch.Tensor],
-        num_output_rows: int,
-    ) -> torch.Tensor:
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling TensorProductUniform3x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
-            )
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
+        out = self._f(x0, x1, x2)
 
-        # ops.TensorProductUniform1d expects inputs
-        # of shape (Z, dim) or (1, dim)
-        return self._f(x0, x1, op_idx0, op_idx1, op_idx_out, num_output_rows)
+        return out.reshape(shape + (out.shape[-1],))
 
 
-class TensorProductUniform4x1dIndexed(torch.nn.Module):
-    def __init__(
-        self,
-        descriptor: cue.SegmentedTensorProduct,
-        device: Optional[torch.device],
-        math_dtype: torch.dtype,
-    ):
-        super().__init__()
-        import cuequivariance_ops_torch as ops
-
-        self.descriptor = descriptor
-
-        assert len(descriptor.subscripts.modes()) == 1
-        assert descriptor.all_same_segment_shape()
-        assert descriptor.coefficient_subscripts == ""
-        u = next(iter(descriptor.get_dims(descriptor.subscripts.modes()[0])))
-
-        self._f = ops.TensorProductUniform4x1dIndexed(
-            operand_dim=[ope.ndim for ope in descriptor.operands],
-            operand_extent=u,
-            operand_num_segments=[ope.num_segments for ope in descriptor.operands],
-            path_indices=[path.indices for path in descriptor.paths],
-            path_coefficients=[float(path.coefficients) for path in descriptor.paths],
-            math_dtype=math_dtype,
-        ).to(device=device)
-
-    @torch.jit.ignore
-    def __repr__(self):
-        return (
-            f"TensorProductUniform4x1dIndexed({self.descriptor} (output last operand))"
-        )
-
-    def forward(
-        self,
-        x0: torch.Tensor,
-        x1: torch.Tensor,
-        x2: torch.Tensor,
-        op_idx0: Optional[torch.Tensor],
-        op_idx1: Optional[torch.Tensor],
-        op_idx2: Optional[torch.Tensor],
-        op_idx_out: Optional[torch.Tensor],
-        num_output_rows,
-    ) -> torch.Tensor:
-        if (
-            not torch.jit.is_scripting()
-            and not torch.jit.is_tracing()
-            and not torch.compiler.is_compiling()
-        ):
-            logger.debug(
-                f"Calling TensorProductUniform4x1d: {self.descriptor}, input shapes: {x0.shape}, {x1.shape}"
-            )
-        torch._assert(x0.ndim == 2, "input should be (batch, dim) or (1, dim)")
-        torch._assert(x1.ndim == 2, "input should be (batch, dim) or (1, dim)")
-
-        # ops.TensorProductUniform1d expects inputs
-        # of shape (Z, dim) or (1, dim)
-        return self._f(
-            x0, x1, x2, op_idx0, op_idx1, op_idx2, op_idx_out, num_output_rows
-        )
+def _permutation_module(permutation: Tuple[int, ...]):
+    graph = torch.fx.Graph()
+    inputs = [graph.placeholder(f"input_{i}") for i in range(len(permutation))]
+    graph.output([inputs[i] for i in permutation])
+    return torch.fx.GraphModule(dict(), graph, class_name="perm")
