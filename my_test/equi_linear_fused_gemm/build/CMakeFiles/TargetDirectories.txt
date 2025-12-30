@@ -1,3 +1,0 @@
-/home/malixian/repos/FastcuEq/my_test/equi_linear_fused_gemm/build/CMakeFiles/fused_gmm.dir
-/home/malixian/repos/FastcuEq/my_test/equi_linear_fused_gemm/build/CMakeFiles/edit_cache.dir
-/home/malixian/repos/FastcuEq/my_test/equi_linear_fused_gemm/build/CMakeFiles/rebuild_cache.dir
