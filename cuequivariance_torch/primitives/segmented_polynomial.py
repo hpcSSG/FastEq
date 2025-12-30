@@ -40,6 +40,7 @@ try:
 except ImportError:
     HAS_CUE_OPS = False
 
+from fasteq.ops.equi_linear import fast_equi_linear
 
 class SegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
@@ -143,6 +144,8 @@ class SegmentedPolynomial(nn.Module):
         math_dtype: str | torch.dtype = None,
         output_dtype_map: List[int] = None,
         name: str = "segmented_polynomial",
+        op_name: str = "",
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -150,6 +153,9 @@ class SegmentedPolynomial(nn.Module):
         self.num_outputs = polynomial.num_outputs
         self.method = method
         self.repr = polynomial.__repr__()
+        self.op_name = op_name
+
+        print(f"use_fasteq: {use_fasteq}, op_name: {op_name}")
 
         if method == "":
             warnings.warn(
@@ -304,5 +310,6 @@ class SegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
+        
 
         return self.m(inputs, input_indices, output_shapes, output_indices)
