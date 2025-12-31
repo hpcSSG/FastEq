@@ -15,7 +15,7 @@
 # limitations under the License.
 
 import warnings
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, OrderedDict, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -42,6 +42,260 @@ except ImportError:
     HAS_CUE_OPS = False
 
 from fasteq.ops.equi_linear import fast_equi_linear
+from fasteq.ops.stc import fast_stc
+from fasteq.ops.cwtp import fast_cwtp
+from fasteq.ops.mptp import fast_mptp
+
+@torch.no_grad()
+def infer_slices_and_meta(
+    descriptor,
+    math_dtype,
+    device,
+    max_k_dim_for_kernel: int = 8,
+) -> Dict[str, Any]:
+    """
+    生成 ChannelWise TP 的所有 meta 信息：
+      - 分段信息：uv / iu / jv / kv offsets + slices
+      - dense c_tensors + (i/j/k_dims, c_offsets, c_all)
+      - sparse CG 信息：
+        * cg_i_all, cg_j_all, cg_k_all, cg_val_all
+        * nnz_per_path, nnz_offsets
+      - 按 k 分组的 sparse meta：
+        * nnz_k_offsets: [P, MAX_K_DIM]
+        * nnz_k_counts:  [P, MAX_K_DIM]
+    """
+
+    # -------------------- 1) paths & dense c_tensors --------------------
+    path_indices: List[Tuple[int, int, int, int]] = []
+    c_tensors: List[torch.Tensor] = []
+
+    for path_idx, path in enumerate(descriptor.paths):
+        print(f"path {path_idx} indices: {path.indices}")
+        path_indices.append(tuple(path.indices))
+
+        c_tensor = torch.tensor(path.coefficients, dtype=math_dtype, device=device).contiguous()
+        c_tensors.append(c_tensor)
+
+    # U/V
+    u = list(descriptor.get_dims("u"))[0]
+    v = list(descriptor.get_dims("v"))[0]
+
+    UV_TOTAL = int(descriptor.operands[0].size)
+    IU_TOTAL = int(descriptor.operands[1].size)
+    JV_TOTAL = int(descriptor.operands[2].size)
+
+    print(f"UV_TOTAL:{UV_TOTAL}, IU_TOTAL:{IU_TOTAL}, JV_TOTAL:{JV_TOTAL}")
+    P = len(path_indices)
+
+    # segment counts
+    uv_seg_count = max(p[0] for p in path_indices) + 1
+    iu_seg_count = max(p[1] for p in path_indices) + 1
+    jv_seg_count = max(p[2] for p in path_indices) + 1
+    kv_seg_count = max(p[3] for p in path_indices) + 1
+
+    # -------------------- 2) i/j/k dims + c_offsets + c_all --------------------
+    i_dims, j_dims, k_dims = [], [], []
+    c_offsets = [0]
+    c_flat_list = []
+    running = 0
+
+    for c in c_tensors:
+        i_dim, j_dim, k_dim = map(int, c.shape)
+        i_dims.append(i_dim)
+        j_dims.append(j_dim)
+        k_dims.append(k_dim)
+
+        c_flat = c.reshape(-1).contiguous()          # original layout (i,j,k) flatten => ((i*J + j)*K + k)
+        c_flat_list.append(c_flat)
+
+        running += i_dim * j_dim * k_dim
+        c_offsets.append(running)
+
+    c_all = (
+        torch.cat(c_flat_list, dim=0)
+        if len(c_flat_list) > 0
+        else torch.empty(0, dtype=math_dtype, device=device)
+    )
+
+    max_k_dim = max(k_dims) if len(k_dims) > 0 else 0
+    assert max_k_dim <= max_k_dim_for_kernel, \
+        f"max k_dim {max_k_dim} > kernel MAX_K_DIM {max_k_dim_for_kernel}"
+
+    # -------------------- 3) uv slices + uv_seg_offsets --------------------
+    uv_slices = []
+    uv_seg_offsets = []
+    start = 0
+    uv_stride = int(u * v)
+    for _ in range(uv_seg_count):
+        uv_seg_offsets.append(start)
+        end = start + uv_stride
+        uv_slices.append(slice(start, end))
+        start = end
+    assert start == UV_TOTAL, f"UV total {start} != {UV_TOTAL}"
+
+    # -------------------- 4) iu slices + iu_seg_offsets --------------------
+    iu_slices = []
+    iu_seg_offsets = []
+    start = 0
+    for s in range(iu_seg_count):
+        iu_seg_offsets.append(start)
+        idx = next(idx for idx, p in enumerate(path_indices) if p[1] == s)
+        i_dim = i_dims[idx]
+        length = int(i_dim * u)
+        end = start + length
+        iu_slices.append(slice(start, end))
+        start = end
+    assert start == IU_TOTAL, f"IU total {start} != {IU_TOTAL}"
+
+    # -------------------- 5) jv slices + jv_seg_offsets --------------------
+    jv_slices = []
+    jv_seg_offsets = []
+    start = 0
+    for s in range(jv_seg_count):
+        jv_seg_offsets.append(start)
+        idx = next(idx for idx, p in enumerate(path_indices) if p[2] == s)
+        j_dim = j_dims[idx]
+        length = int(j_dim * v)
+        end = start + length
+        jv_slices.append(slice(start, end))
+        start = end
+    assert start == JV_TOTAL, f"JV total {start} != {JV_TOTAL}"
+
+    # -------------------- 6) K offsets: kv_k_offsets --------------------
+    kv_k_offsets = []
+    start = 0
+    for s in range(kv_seg_count):
+        kv_k_offsets.append(start)
+        idx = next(idx for idx, p in enumerate(path_indices) if p[3] == s)
+        k_dim = k_dims[idx]
+        start += int(k_dim)
+    K_TOTAL = int(start)
+
+    # -------------------- 7) sparse CG meta + per-k grouping --------------------
+    cg_i_list, cg_j_list, cg_k_list, cg_val_list = [], [], [], []
+    nnz_per_path = []
+    nnz_offsets = []  # NOTE: this is "start offset per path", length P (kept as your original)
+
+    nnz_k_offsets_list = []  # [P, MAX_K_DIM]
+    nnz_k_counts_list  = []  # [P, MAX_K_DIM]
+
+    nnz_running = 0
+    for path_id, c in enumerate(c_tensors):
+        i_dim, j_dim, k_dim = map(int, c.shape)
+
+        nz_idx = torch.nonzero(c != 0, as_tuple=False)  # [nnz,3] (i,j,k)
+        nnz = int(nz_idx.size(0))
+
+        nnz_per_path.append(nnz)
+        nnz_offsets.append(nnz_running)
+        nnz_running += nnz
+
+        local_k_offsets = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
+        local_k_counts  = torch.zeros(max_k_dim_for_kernel, dtype=torch.int32, device=device)
+
+        if nnz > 0:
+            sort_idx = torch.argsort(nz_idx[:, 2])  # sort by k
+            nz_sorted = nz_idx[sort_idx]
+            i_idx = nz_sorted[:, 0]
+            j_idx = nz_sorted[:, 1]
+            k_idx = nz_sorted[:, 2]
+
+            vals = c[i_idx, j_idx, k_idx]
+
+            cg_i_list.append(i_idx.to(torch.uint8))
+            cg_j_list.append(j_idx.to(torch.uint8))
+            cg_k_list.append(k_idx.to(torch.uint8))
+            cg_val_list.append(vals)
+
+            prev_k = int(k_idx[0].item())
+            local_k_offsets[prev_k] = 0
+
+            for t in range(1, nnz):
+                curr_k = int(k_idx[t].item())
+                if curr_k != prev_k:
+                    local_k_counts[prev_k] = t - int(local_k_offsets[prev_k].item())
+                    local_k_offsets[curr_k] = t
+                    prev_k = curr_k
+
+            local_k_counts[prev_k] = nnz - int(local_k_offsets[prev_k].item())
+
+        nnz_k_offsets_list.append(local_k_offsets)
+        nnz_k_counts_list.append(local_k_counts)
+
+    if len(cg_i_list) > 0:
+        cg_i_all = torch.cat(cg_i_list, dim=0).contiguous()
+        cg_j_all = torch.cat(cg_j_list, dim=0).contiguous()
+        cg_k_all = torch.cat(cg_k_list, dim=0).contiguous()
+        cg_val_all = torch.cat(cg_val_list, dim=0).contiguous()
+    else:
+        cg_i_all = torch.empty(0, dtype=torch.uint8, device=device)
+        cg_j_all = torch.empty(0, dtype=torch.uint8, device=device)
+        cg_k_all = torch.empty(0, dtype=torch.uint8, device=device)
+        cg_val_all = torch.empty(0, dtype=math_dtype, device=device)
+
+    nnz_per_path_t = torch.tensor(nnz_per_path, dtype=torch.int32, device=device)
+    nnz_offsets_t  = torch.tensor(nnz_offsets,  dtype=torch.int32, device=device)
+
+    nnz_k_offsets = torch.stack(nnz_k_offsets_list, dim=0).contiguous()  # [P, MAX_K_DIM]
+    nnz_k_counts  = torch.stack(nnz_k_counts_list,  dim=0).contiguous()  # [P, MAX_K_DIM]
+    nnz_k_offsets_flat = nnz_k_offsets.reshape(-1).contiguous()
+    nnz_k_counts_flat  = nnz_k_counts.reshape(-1).contiguous()
+
+    # -------------------- 8) pack tensors for kernels --------------------
+    path_indices_tensor = torch.tensor(path_indices, dtype=torch.int32, device=device).contiguous()
+    i_dims_t = torch.tensor(i_dims, dtype=torch.int32, device=device).contiguous()
+    j_dims_t = torch.tensor(j_dims, dtype=torch.int32, device=device).contiguous()
+    k_dims_t = torch.tensor(k_dims, dtype=torch.int32, device=device).contiguous()
+    c_offsets_t = torch.tensor(c_offsets, dtype=torch.int32, device=device).contiguous()  # [P+1]
+
+    meta = {
+        # dense
+        "c_tensors": c_tensors,
+        "path_indices": path_indices,
+
+        # dense packed (original i-j-k flatten)
+        "path_indices_tensor": path_indices_tensor,  # [P,4] int32
+        "c_all": c_all,                              # [sum(i*j*k)] layout ((i*J+j)*K+k)
+        "c_offsets": c_offsets_t,                    # [P+1]
+
+        # slices (reference)
+        "uv_slices": uv_slices,
+        "iu_slices": iu_slices,
+        "jv_slices": jv_slices,
+
+        # offsets
+        "uv_seg_offsets": torch.tensor(uv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "iu_seg_offsets": torch.tensor(iu_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "jv_seg_offsets": torch.tensor(jv_seg_offsets, dtype=torch.int32, device=device).contiguous(),
+        "kv_k_offsets": torch.tensor(kv_k_offsets, dtype=torch.int32, device=device).contiguous(),
+
+        # dims
+        "i_dims": i_dims_t,
+        "j_dims": j_dims_t,
+        "k_dims": k_dims_t,
+
+        # sizes
+        "U": int(u),
+        "V": int(v),
+        "UV_TOTAL": UV_TOTAL,
+        "IU_TOTAL": IU_TOTAL,
+        "JV_TOTAL": JV_TOTAL,
+        "K_TOTAL": K_TOTAL,
+
+        # sparse CG info
+        "cg_i_all": cg_i_all,
+        "cg_j_all": cg_j_all,
+        "cg_k_all": cg_k_all,
+        "cg_val_all": cg_val_all,
+        "nnz_per_path": nnz_per_path_t,
+        "nnz_offsets": nnz_offsets_t,  # length P (start offset per path)
+
+        # sparse per-k grouping
+        "nnz_k_offsets": nnz_k_offsets_flat,  # [P*MAX_K_DIM]
+        "nnz_k_counts": nnz_k_counts_flat,    # [P*MAX_K_DIM]
+        "MAX_K_DIM": int(max_k_dim_for_kernel),
+    }
+    return meta
 
 class FastEqSegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
@@ -156,6 +410,7 @@ class FastEqSegmentedPolynomial(nn.Module):
         self.repr = polynomial.__repr__()
         self.op_name = op_name
         self.descriptor = polynomial.operations[0][1]
+        self.use_fasteq = use_fasteq
         
         if method == "":
             warnings.warn(
@@ -169,7 +424,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                 "• 'fused_tp' - A more general CUDA implementation, supporting many 3 and 4 operands contractions.\n"
                 "• 'indexed_linear' - A CUDA implementation for linear layers with indexed weights.\n"
             )
-            method = "uniform_1d"
+            method = "naive"
 
         if not isinstance(polynomial, cue.SegmentedPolynomial):
             raise ValueError(
@@ -207,6 +462,63 @@ class FastEqSegmentedPolynomial(nn.Module):
             self.fallback = self.m
         else:
             raise ValueError(f"Invalid method: {method}")
+
+        if use_fasteq and op_name == "stc":
+            import math
+            from torch.nn.utils.rnn import pad_sequence
+            def f(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
+                
+
+                d = d.move_operand(0, -2)
+                d = d.flatten_coefficient_modes(force=True)
+                d = d.flatten_modes(
+                    [
+                        m
+                        for m in d.subscripts.modes()
+                        if not all(m in ss for ss in d.subscripts.operands)
+                    ]
+                )
+                d = d.consolidate_modes()
+                if d.subscripts.modes() == []:
+                    d = d.append_modes_to_all_operands("u", dict(u=1))
+                '''
+                for oid in range(0, d.num_operands - 2):
+                    print(f"oid:{oid}, len d.operands[oid].num_segments:{d.operands[oid].num_segments}")
+                '''
+
+                # ops.SymmetricTensorContraction will "symmetrize" for the derivatives so we can sort for the forward pass
+                d = d.sort_indices_for_identical_operands(range(0, d.num_operands - 2))
+
+                if len(d.subscripts.modes()) != 1:
+                    raise NotImplementedError("Different modes are not supported.")
+
+                m = d.subscripts.modes()[0]
+
+                if not all(ss == m for ss in d.subscripts.operands):
+                    raise NotImplementedError("Different subscripts are not supported.")
+
+                d = d.split_mode(m, math.gcd(*d.get_dims(m)))
+
+                return d
+
+            ds_ = [f(d) for _, d in polynomial.operations]
+            d_max = max(ds_, key=lambda d: d.num_operands)
+            self.num_out_segments = d_max.operands[-1].num_segments
+            self.u = d_max.operands[0].size // d_max.operands[0].num_segments
+
+            path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+            path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
+
+            device = "cuda" # TODO: make it general
+            self.coeffs_tensor = torch.as_tensor(path_coefficients, dtype=math_dtype).to(device)
+            self.path_lens_tensor = torch.as_tensor([len(p) for p in path_segment_indices], dtype=torch.int32).to(device)
+            self.paths_tensor = pad_sequence(
+                [torch.as_tensor(p, dtype=torch.int32) for p in path_segment_indices],
+                batch_first=True, padding_value=0
+            ).to(device)
+        
+        if use_fasteq and (op_name == "cwtp"):
+            self.meta = infer_slices_and_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
 
     def __repr__(self):
         return self.repr + f"\n{super().__repr__()}"
@@ -264,6 +576,7 @@ class FastEqSegmentedPolynomial(nn.Module):
             output_indices = dict(empty_dict)
 
         inputs = list(inputs)
+
         if not torch.jit.is_scripting():
             if (
                 not torch.jit.is_tracing()
@@ -310,13 +623,61 @@ class FastEqSegmentedPolynomial(nn.Module):
                     return self.fallback(
                         inputs, input_indices, output_shapes, output_indices
                     )
-        
-        out = [torch.empty(0) for _ in range(self.num_outputs)]
-        if self.op_name == "equi_linear" and tuple(inputs[0].shape) == (1, 36864):
+
+        if self.use_fasteq:
+            out = [torch.empty(0) for _ in range(self.num_outputs)]
             if self.num_outputs != 1:
-                raise ValueError("equi_linear should have exactly one output")
-            ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
-            out[0] = ref
+                    raise ValueError("equi_linear should have exactly one output")
+            
+            if self.op_name == "equi_linear":
+                if tuple(inputs[0].shape) == (1, 36864):
+                    ref = fast_equi_linear(self.descriptor, inputs[0], inputs[1])
+                    out[0] = ref
+                else:
+                    return self.m(inputs, input_indices, output_shapes, output_indices)
+            elif self.op_name == "stc":
+                i0 = input_indices[0].to(torch.int32)
+                x0 = inputs[0]
+                x1 = inputs[1]
+                
+                x0 = x0.reshape(x0.shape[0], x0.shape[1] // self.u, self.u)
+                x1 = x1.reshape(x1.shape[0], x1.shape[1] // self.u, self.u)
+
+                #print(f"x1 shape:{x1.shape}, x0 shape:{x0.shape}, i0 shape:{i0.shape}")
+
+                ref = fast_stc(
+                    x1, x0, i0, 
+                    self.coeffs_tensor, 
+                    self.paths_tensor, 
+                    self.path_lens_tensor, 
+                    self.num_out_segments,
+                )
+                out[0] = ref
+            elif self.op_name == "cwtp":
+                #print(f"inputs[0] shape:{inputs[0].shape}, inputs[1] shape:{inputs[1].shape}, inputs[2] shape:{inputs[2].shape}")
+                if input_indices.get(1) is not None and output_indices.get(0) is not None:
+                    for k, v in input_indices.items():
+                        print(f"input_indices key:{k}, value:{v}")
+                    for k, v in output_indices.items():
+                        print(f"output_indices key:{k}, value:{v}")
+                    for inp in inputs:
+                        print(f"input shape:{inp.shape}")
+                    w, x, y = inputs[0], inputs[1], inputs[2]
+                    sender = input_indices[1].to(torch.int32)
+                    receiver= output_indices[0].to(torch.int32)
+                    ref = fast_mptp(
+                        w, x, y,sender, receiver,
+                        self.meta,
+                    )
+                    out[0] = ref
+                else:
+                    w, x, y = inputs[0], inputs[1], inputs[2]
+                    ref = fast_cwtp(
+                        w, x, y,
+                        self.meta,
+                    )
+                    out[0] = ref
+                
         else:
             out = self.m(inputs, input_indices, output_shapes, output_indices)
         return out

@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by ncic in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -119,12 +120,15 @@ class SymmetricContraction(torch.nn.Module):
         original_mace: bool = False,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
 
         irreps_in, irreps_out = default_irreps(irreps_in, irreps_out)
         assert_same_group(irreps_in, irreps_out)
         self.contraction_degree = contraction_degree
+
+        self.use_fasteq = use_fasteq
 
         if len(set(irreps_in.muls) | set(irreps_out.muls)) != 1:
             raise ValueError("Input/Output irreps must have the same mul")
@@ -202,12 +206,39 @@ class SymmetricContraction(torch.nn.Module):
                     "You can consider making the segments uniform in the descriptor."
                 )
             self.method = method
+        
+        if use_fasteq and original_mace:
+            self.register_buffer("project_weight",
+                                torch.empty(0, device=device, dtype=dtype),
+                                persistent=False)
+            
+            # 加载state_dict之后自动重算
+            self._update_project_weight_()
+            self.register_load_state_dict_post_hook(self._on_post_load)
+
+            self.ff = cuet.FastEqSegmentedPolynomial(
+                self.etp.polynomial,
+                method=self.method,
+                math_dtype=math_dtype,
+                use_fasteq=use_fasteq,
+                op_name="stc", # symmetric contraction
+            ).to(device)
 
         self.f = cuet.SegmentedPolynomial(
             self.etp.polynomial,
             method=self.method,
             math_dtype=math_dtype,
+            op_name="stc", # symmetric contraction
         ).to(device)
+    
+    @torch.no_grad()
+    def _update_project_weight_(self):
+        proj = torch.einsum("zau,ab->zbu", self.weight.data, self.projection).flatten(1)
+        self.project_weight.resize_(proj.shape)
+        self.project_weight.copy_(proj)
+
+    def _on_post_load(self, module, incompatible_keys):
+        self._update_project_weight_()
 
     def extra_repr(self) -> str:
         return (
@@ -231,12 +262,16 @@ class SymmetricContraction(torch.nn.Module):
         Returns:
             torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
         """
+        print(f"weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
 
-        if self.projection is not None:
-            weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+        if self.use_fasteq:
+            weight = self.project_weight
+            output = self.ff([weight, self.transpose_in(x)], input_indices={0: indices})
         else:
-            weight = self.weight
-        weight = weight.flatten(1)
-
-        output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
+            if self.projection is not None:
+                weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
+            else:
+                weight = self.weight
+            weight = weight.flatten(1)
+            output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
         return self.transpose_out(output[0])

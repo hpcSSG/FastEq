@@ -20,7 +20,7 @@ else:
     sys.exit(0)
 
 
-calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_small.model', device=device, compile_mode=None, enable_cueq=True, use_batch_size=8)
+calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_small.model', device=device, compile_mode=None, enable_cueq=True, use_batch_size=16)
 
 file_list = []
 atoms_list = []

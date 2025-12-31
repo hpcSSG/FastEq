@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# Modified by ncic in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -73,6 +74,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
+        use_fasteq: Optional[bool] = None,
     ):
         super().__init__()
         irreps_in1, irreps_in2 = default_irreps(irreps_in1, irreps_in2)
@@ -91,6 +93,8 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             e2.all_same_segment_shape()
             and len(e2.polynomial.operations[0][1].subscripts.modes()) == 1
         )
+
+        self.use_fasteq = use_fasteq
 
         self.irreps_in1 = irreps_in1
         self.irreps_in2 = irreps_in2
@@ -168,6 +172,15 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "You can consider making the segments uniform in the descriptor."
                 )
             self.method = method
+        
+        if use_fasteq:
+            self.ff = cuet.FastEqSegmentedPolynomial(
+                e.polynomial,
+                method=self.method,
+                math_dtype=math_dtype,
+                use_fasteq=use_fasteq,
+                op_name="cwtp", # symmetric contraction
+            ).to(device)
 
         self.f = cuet.SegmentedPolynomial(
             e.polynomial,
@@ -247,11 +260,19 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 raise ValueError(
                     "Internal weights are not used, weight should not be None"
                 )
-
-        output = self.f(
-            [weight, x1, x2],
-            input_indices=indices_in,
-            output_shapes=sizes_out,
-            output_indices=indices_out,
-        )
+        if self.use_fasteq:
+            output = self.ff(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=indices_out,
+            )
+            return self.transpose_out(output[0])
+        else:
+            output = self.f(
+                [weight, x1, x2],
+                input_indices=indices_in,
+                output_shapes=sizes_out,
+                output_indices=indices_out,
+            )
         return self.transpose_out(output[0])

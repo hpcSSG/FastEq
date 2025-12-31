@@ -149,7 +149,7 @@ class Linear(torch.nn.Module):
                 method=self.method,
                 math_dtype=math_dtype,
                 use_fasteq=use_fasteq,
-                op_name="equi_linear",
+                op_name="equi_linear", # equivariant linear
             ).to(device)
 
     def extra_repr(self) -> str:

@@ -93,6 +93,7 @@ class SegmentedPolynomialFromUniform1dJit(nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         output_dtype_map: List[int] = None,
         name: str = "segmented_polynomial",
+        op_name: str = "",
     ):
         super().__init__()
 
@@ -219,6 +220,52 @@ class SegmentedPolynomialFromUniform1dJit(nn.Module):
             float(p.coefficients) for o, stp in polynomial.operations for p in stp.paths
         ]
 
+        def f(d: cue.SegmentedTensorProduct) -> cue.SegmentedTensorProduct:
+            import math
+
+            d = d.move_operand(0, -2)
+            d = d.flatten_coefficient_modes(force=True)
+            d = d.flatten_modes(
+                [
+                    m
+                    for m in d.subscripts.modes()
+                    if not all(m in ss for ss in d.subscripts.operands)
+                ]
+            )
+            d = d.consolidate_modes()
+            if d.subscripts.modes() == []:
+                d = d.append_modes_to_all_operands("u", dict(u=1))
+            '''
+            for oid in range(0, d.num_operands - 2):
+                print(f"oid:{oid}, len d.operands[oid].num_segments:{d.operands[oid].num_segments}")
+            '''
+
+            # ops.SymmetricTensorContraction will "symmetrize" for the derivatives so we can sort for the forward pass
+            d = d.sort_indices_for_identical_operands(range(0, d.num_operands - 2))
+
+            if len(d.subscripts.modes()) != 1:
+                raise NotImplementedError("Different modes are not supported.")
+
+            m = d.subscripts.modes()[0]
+
+            if not all(ss == m for ss in d.subscripts.operands):
+                raise NotImplementedError("Different subscripts are not supported.")
+
+            d = d.split_mode(m, math.gcd(*d.get_dims(m)))
+
+            return d
+
+        
+        if op_name == "stc":
+            ds_ = [f(d) for _, d in polynomial.operations]
+
+            fasteq_path_segment_indices = sum((d.indices.tolist() for  d in ds_), [])
+            fasteq_path_coefficients = sum((d.stacked_coefficients.tolist() for d in ds_), [])
+
+            #print(f"fasteq_path_indices: {fasteq_path_segment_indices}")
+            #print(f"fasteq_path_coefficients: {fasteq_path_coefficients}")
+
+        
         self.BATCH_DIM_AUTO = BATCH_DIM_AUTO
         self.BATCH_DIM_SHARED = BATCH_DIM_SHARED
         self.BATCH_DIM_BATCHED = BATCH_DIM_BATCHED
