@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Modified by ncic in 2025
+# Modified by mlx in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -45,13 +45,14 @@ from fasteq.ops.equi_linear import fast_equi_linear
 from fasteq.ops.stc import fast_stc
 from fasteq.ops.cwtp import fast_cwtp
 from fasteq.ops.mptp import fast_mptp
+from fasteq.ops.fctp import fast_fctp
 
 @torch.no_grad()
-def infer_slices_and_meta(
+def infer_cwtp_meta(
     descriptor,
     math_dtype,
     device,
-    max_k_dim_for_kernel: int = 8,
+    max_k_dim_for_kernel: int = 8, # TODO: make it flexible
 ) -> Dict[str, Any]:
     """
     生成 ChannelWise TP 的所有 meta 信息：
@@ -297,6 +298,101 @@ def infer_slices_and_meta(
     }
     return meta
 
+@torch.no_grad()
+def infer_fctp_meta(descriptor, math_dtype, device):
+    # per-path tensors
+    cg_indices = []
+    cg_values  = []
+    c_tensors  = []
+    dim_list   = []
+
+    # 1) build per-path (idx, val, coeffs)
+    for i, path in enumerate(descriptor.paths):
+        if getattr(path, "coefficients", None) is None or path.coefficients.ndim < 3:
+            raise ValueError("FCTP only supports paths with explicit 3D coefficient tensors.")
+
+        coeffs = torch.from_numpy(path.coefficients).to(device=device, dtype=math_dtype)
+
+        # idx: [nnz, 3] (i,j,k) ; vals: [nnz]
+        idx = coeffs.nonzero(as_tuple=False).to(device=device, dtype=torch.int32)
+        vals = coeffs[idx[:, 0], idx[:, 1], idx[:, 2]].to(device=device, dtype=math_dtype)
+
+        dim_list.append(int(vals.numel()))
+
+        cg_indices.append(idx)
+        cg_values.append(vals)
+        c_tensors.append(coeffs)
+
+    # 2) global dimensions
+    dimensions_dict = descriptor.get_dimensions_dict()
+    U = sum(dimensions_dict["u"])
+    V = sum(dimensions_dict["v"])
+    W = sum(dimensions_dict["w"])
+
+    # 3) K_per_path / offsets / totals
+    P = len(cg_indices)
+    assert P == len(dim_list)
+
+    K_per_path = torch.tensor(dim_list, device=device, dtype=torch.int32)
+    path_offset = torch.empty(P, device=device, dtype=torch.int32)
+    path_offset[0] = 0
+    if P > 1:
+        path_offset[1:] = torch.cumsum(K_per_path[:-1], dim=0)
+    K_total = int(K_per_path.sum().item())
+
+    # 4) pack nnz info
+    nnz_list = [int(ci.shape[0]) for ci in cg_indices]
+    nnz_max = max(nnz_list) if nnz_list else 0
+    nnz_per_path = torch.tensor(nnz_list, device=device, dtype=torch.int32)
+
+    # 5) pack cg_*_all
+    cg_i_all   = torch.zeros((P, nnz_max), device=device, dtype=torch.int32)
+    cg_j_all   = torch.zeros((P, nnz_max), device=device, dtype=torch.int32)
+    cg_k_all   = torch.zeros((P, nnz_max), device=device, dtype=torch.int32)
+    cg_val_all = torch.zeros((P, nnz_max), device=device, dtype=math_dtype)
+
+    for p in range(P):
+        ci_local = cg_indices[p]   # [nnz_p, 3]
+        cv       = cg_values[p]    # [nnz_p]
+        nnz_p    = nnz_list[p]
+        offset_p = int(path_offset[p].item())
+
+        i_local = ci_local[:, 0]
+        j_local = ci_local[:, 1]
+        k_local = ci_local[:, 2]
+
+        # --- local -> global ---
+        i_global = i_local + offset_p
+        j_global = j_local              # TODO: only support j_local = j_global = 0
+        k_global = k_local + offset_p
+
+        cg_i_all[p, :nnz_p]   = i_global
+        cg_j_all[p, :nnz_p]   = j_global
+        cg_k_all[p, :nnz_p]   = k_global
+        cg_val_all[p, :nnz_p] = cv
+
+    return {
+        "cg_indices": cg_indices,
+        "cg_values": cg_values,
+        "c_tensors": c_tensors,
+
+        "U": U, "V": V, "W": W,
+
+        "P": P,
+        "K_per_path": K_per_path,
+        "path_offset": path_offset,
+        "K_total": K_total,
+
+        "nnz_list": nnz_list,
+        "nnz_max": nnz_max,
+        "nnz_per_path": nnz_per_path,
+
+        "cg_i_all": cg_i_all,
+        "cg_j_all": cg_j_all,
+        "cg_k_all": cg_k_all,
+        "cg_val_all": cg_val_all,
+    }
+
 class FastEqSegmentedPolynomial(nn.Module):
     """PyTorch module that computes a segmented polynomial.
 
@@ -518,7 +614,10 @@ class FastEqSegmentedPolynomial(nn.Module):
             ).to(device)
         
         if use_fasteq and (op_name == "cwtp"):
-            self.meta = infer_slices_and_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
+            self.meta = infer_cwtp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
+        
+        if use_fasteq and (op_name == "fctp"):
+            self.meta = infer_fctp_meta(self.descriptor, math_dtype=math_dtype, device="cuda") # device hardcoded for now
 
     def __repr__(self):
         return self.repr + f"\n{super().__repr__()}"
@@ -654,14 +753,16 @@ class FastEqSegmentedPolynomial(nn.Module):
                 )
                 out[0] = ref
             elif self.op_name == "cwtp":
-                #print(f"inputs[0] shape:{inputs[0].shape}, inputs[1] shape:{inputs[1].shape}, inputs[2] shape:{inputs[2].shape}")
+                # mptp case use input and output indices
                 if input_indices.get(1) is not None and output_indices.get(0) is not None:
+                    '''
                     for k, v in input_indices.items():
                         print(f"input_indices key:{k}, value:{v}")
                     for k, v in output_indices.items():
                         print(f"output_indices key:{k}, value:{v}")
                     for inp in inputs:
                         print(f"input shape:{inp.shape}")
+                    '''
                     w, x, y = inputs[0], inputs[1], inputs[2]
                     sender = input_indices[1].to(torch.int32)
                     receiver= output_indices[0].to(torch.int32)
@@ -670,6 +771,7 @@ class FastEqSegmentedPolynomial(nn.Module):
                         self.meta,
                     )
                     out[0] = ref
+                # cwtp case use only inputs
                 else:
                     w, x, y = inputs[0], inputs[1], inputs[2]
                     ref = fast_cwtp(
@@ -677,6 +779,15 @@ class FastEqSegmentedPolynomial(nn.Module):
                         self.meta,
                     )
                     out[0] = ref
+            elif self.op_name == "fctp":
+                w, x, y = inputs[0], inputs[1], inputs[2]
+                ref = fast_fctp(
+                    w, x, y,
+                    self.meta,
+                )
+                out[0] = ref
+            else:
+                out = self.m(inputs, input_indices, output_shapes, output_indices)
                 
         else:
             out = self.m(inputs, input_indices, output_shapes, output_indices)

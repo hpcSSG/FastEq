@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Modified by ncic in 2025
+# Modified by mlx in 2025
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -179,7 +179,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 method=self.method,
                 math_dtype=math_dtype,
                 use_fasteq=use_fasteq,
-                op_name="cwtp", # symmetric contraction
+                op_name="cwtp", # channel-wise tensor product
             ).to(device)
 
         self.f = cuet.SegmentedPolynomial(
