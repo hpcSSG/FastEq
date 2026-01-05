@@ -15,6 +15,7 @@
 # limitations under the License.
 import warnings
 from typing import Optional
+import time
 
 import torch
 from cuequivariance.group_theory.experimental.mace.symmetric_contractions import (
@@ -120,15 +121,13 @@ class SymmetricContraction(torch.nn.Module):
         original_mace: bool = False,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
-        use_fasteq: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
 
         irreps_in, irreps_out = default_irreps(irreps_in, irreps_out)
         assert_same_group(irreps_in, irreps_out)
         self.contraction_degree = contraction_degree
-
-        self.use_fasteq = use_fasteq
 
         if len(set(irreps_in.muls) | set(irreps_out.muls)) != 1:
             raise ValueError("Input/Output irreps must have the same mul")
@@ -207,6 +206,8 @@ class SymmetricContraction(torch.nn.Module):
                 )
             self.method = method
         
+        self.use_fasteq = use_fasteq
+        
         if use_fasteq and original_mace:
             self.register_buffer("project_weight",
                                 torch.empty(0, device=device, dtype=dtype),
@@ -262,16 +263,36 @@ class SymmetricContraction(torch.nn.Module):
         Returns:
             torch.Tensor: The output tensor. It has shape (batch, irreps_out.dim).
         """
-        print(f"weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
+        #print(f"weight shape: {self.weight.shape}, x shape: {x.shape}, indices shape: {indices.shape}")
 
         if self.use_fasteq:
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             weight = self.project_weight
             output = self.ff([weight, self.transpose_in(x)], input_indices={0: indices})
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq stc forward cost: {execution_time_ms:.3f} ms >>")
+
         else:
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             if self.projection is not None:
                 weight = torch.einsum("zau,ab->zbu", self.weight, self.projection)
             else:
                 weight = self.weight
             weight = weight.flatten(1)
             output = self.f([weight, self.transpose_in(x)], input_indices={0: indices})
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq stc forward cost: {execution_time_ms:.3f} ms >>")
+            
         return self.transpose_out(output[0])

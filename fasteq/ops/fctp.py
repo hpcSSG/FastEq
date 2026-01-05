@@ -38,7 +38,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         w, x, y = ctx.saved_tensors
-        
+
         meta = ctx.meta
         cg_i_all = meta["cg_i_all"]
         cg_j_all = meta["cg_j_all"]

@@ -15,6 +15,7 @@
 # limitations under the License.
 import warnings
 from typing import Optional, Sequence
+import time
 
 import torch
 from cuequivariance.group_theory.irreps_array.misc_ui import (
@@ -74,7 +75,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
-        use_fasteq: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
         irreps_in1, irreps_in2 = default_irreps(irreps_in1, irreps_in2)
@@ -93,8 +94,6 @@ class ChannelWiseTensorProduct(torch.nn.Module):
             e2.all_same_segment_shape()
             and len(e2.polynomial.operations[0][1].subscripts.modes()) == 1
         )
-
-        self.use_fasteq = use_fasteq
 
         self.irreps_in1 = irreps_in1
         self.irreps_in2 = irreps_in2
@@ -173,6 +172,7 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                 )
             self.method = method
         
+        self.use_fasteq = use_fasteq
         if use_fasteq:
             self.ff = cuet.FastEqSegmentedPolynomial(
                 e.polynomial,
@@ -261,18 +261,33 @@ class ChannelWiseTensorProduct(torch.nn.Module):
                     "Internal weights are not used, weight should not be None"
                 )
         if self.use_fasteq:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             output = self.ff(
                 [weight, x1, x2],
                 input_indices=indices_in,
                 output_shapes=sizes_out,
                 output_indices=indices_out,
             )
-            return self.transpose_out(output[0])
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         else:
+            torch.cuda.synchronize()
+            start_time = time.perf_counter() * 1000
+
             output = self.f(
                 [weight, x1, x2],
                 input_indices=indices_in,
                 output_shapes=sizes_out,
                 output_indices=indices_out,
             )
+
+            torch.cuda.synchronize()
+            end_time = time.perf_counter() * 1000
+            execution_time_ms = end_time - start_time
+            print(f"<< cueq cwtp forward cost: {execution_time_ms:.3f} ms >>")
         return self.transpose_out(output[0])

@@ -20,7 +20,7 @@ else:
     sys.exit(0)
 
 
-calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_small.model', device=device, compile_mode=None, enable_cueq=True, use_batch_size=16)
+calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_large.model', device=device, default_dtype="float32", compile_mode=None, enable_cueq=True, use_batch_size=16)
 
 file_list = []
 atoms_list = []
@@ -66,7 +66,7 @@ with torch.profiler.profile(
 '''
 
 
-for i in range(0, 1):
+for i in range(0, 5):
     calculator.batch_calculate(atoms_list=atoms_list)
 '''
 with profile(activities=activities, record_shapes=True, with_stack=True) as prof:

@@ -15,6 +15,7 @@
 # limitations under the License.
 import warnings
 from typing import Optional
+import time
 
 import torch
 from cuequivariance.group_theory.irreps_array.misc_ui import (
@@ -73,7 +74,7 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         math_dtype: Optional[str | torch.dtype] = None,
         use_fallback: Optional[bool] = None,
         method: Optional[str] = None,
-        use_fasteq: Optional[bool] = None,
+        use_fasteq: bool = False,
     ):
         super().__init__()
         irreps_in1, irreps_in2, irreps_out = default_irreps(
@@ -88,8 +89,6 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             irreps_in1, irreps_in2, irreps_out
         )
         assert e.polynomial.operations[0][1].subscripts == "uvw,iu,jv,kw+ijk"
-
-        self.use_fasteq = use_fasteq
 
         self.irreps_in1 = irreps_in1
         self.irreps_in2 = irreps_in2
@@ -154,6 +153,7 @@ class FullyConnectedTensorProduct(torch.nn.Module):
         if self.method == "fused_tp" and math_dtype is None:
             math_dtype = dtype
         
+        self.use_fasteq = use_fasteq
         if use_fasteq:
             self.ff = cuet.FastEqSegmentedPolynomial(
                 e.polynomial,
@@ -209,9 +209,25 @@ class FullyConnectedTensorProduct(torch.nn.Module):
             if weight is not None:
                 raise ValueError("Internal weights are used, weight should be None")
             if self.use_fasteq:
+                torch.cuda.synchronize()
+                start_time = time.perf_counter() * 1000
+
                 output = self.ff([self.weight, x1, x2])
+
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
             else:
+                torch.cuda.synchronize()
+                start_time = time.perf_counter() * 1000
+                
                 output = self.f([self.weight, x1, x2])
+
+                torch.cuda.synchronize()
+                end_time = time.perf_counter() * 1000
+                execution_time_ms = end_time - start_time
+                print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>")
         else:
             if weight is None:
                 raise ValueError(
@@ -219,8 +235,24 @@ class FullyConnectedTensorProduct(torch.nn.Module):
                 )
             else:
                 if self.use_fasteq:
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter() * 1000
+
                     output = self.ff([weight, x1, x2])
+
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter() * 1000
+                    execution_time_ms = end_time - start_time
+                    print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
                 else:
+                    torch.cuda.synchronize()
+                    start_time = time.perf_counter() * 1000
+
                     output = self.f([weight, x1, x2])
+
+                    torch.cuda.synchronize()
+                    end_time = time.perf_counter() * 1000
+                    execution_time_ms = end_time - start_time
+                    print(f"<< cueq fctp forward cost: {execution_time_ms:.3f} ms >>")
 
         return self.transpose_out(output[0])

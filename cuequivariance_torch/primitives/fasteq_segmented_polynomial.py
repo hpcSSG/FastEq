@@ -71,7 +71,6 @@ def infer_cwtp_meta(
     c_tensors: List[torch.Tensor] = []
 
     for path_idx, path in enumerate(descriptor.paths):
-        print(f"path {path_idx} indices: {path.indices}")
         path_indices.append(tuple(path.indices))
 
         c_tensor = torch.tensor(path.coefficients, dtype=math_dtype, device=device).contiguous()
