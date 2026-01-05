@@ -29,11 +29,22 @@ The operators implemented in FastEq include:
    pip install . --no-build-isolation 
    ```
    We recommend using Virtualenv or Conda to manage the dependencies.
+4. Install patched cuEquivariance_torch
+   ```bash
+   cd 3rdpatry/cuequivariance_torch
+   pip install . --no-build-isolation 
+   ```
+5. Install patched MACE
+   ```bash
+   cd 3rdpatry/mace
+   pip install . --no-build-isolation 
+   ```
+
    
 
 # How to use FastEq
 ## cwtp
-```
+```python
 import cuequivariance_torch as cuet
 
 # Initalization
@@ -59,7 +70,7 @@ message = scatter_sum(
 ```
 
 ## mptp
-```
+```python
 import cuequivariance_torch as cuet
 
 # use a helper to rewrite forward, referencing `with_cueq_conv_fusion` in MACE 
@@ -108,7 +119,7 @@ message = mptp(node_feats, edge_attrs, tp_weights, edge_index)
 ```
 
 ## fctp
-```
+```python
 import cuequivariance_torch as cuet
 
 # Initalization
@@ -127,7 +138,7 @@ skip_tp = cuet.FullyConnectedTensorProduct(
 message = skip_tp(message, node_attrs)
 ```
 ## stc
-```
+```python
 import cuequivariance_torch as cuet
 
 # Initalization
@@ -153,7 +164,7 @@ node_feats = symmetric_contractions(
 
 
 ## equi-linear
-```
+```python
 import cuequivariance_torch as cuet
 
 # Initalization
