@@ -1,7 +1,7 @@
 # FastEq
 
 # Overview
-**FastEq** FastEq is a high-performance equivariant operator library that implements cuEquivariance’s core operators while fully supporting its API and interfaces.
+FastEq is a high-performance equivariant operator library that implements cuEquivariance’s core operators while fully supporting its API and interfaces.
 
 The operators implemented in FastEq include:
 - **ChannelWiseTensorProduct(cwtp)**
@@ -16,7 +16,7 @@ The operators implemented in FastEq include:
 - PyTorch 2.4.1 or higher  
 - [cuEquivariance](https://github.com/NVIDIA/cuEquivariance)  
 
-# Installation and features
+# Installation
 1. Clone this repository:  
    ```bash
    https://github.com/malixian/FastEq.git
