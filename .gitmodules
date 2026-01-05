@@ -1,0 +1,8 @@
+[submodule "3rdparty/mace"]
+	path = 3rdparty/mace
+	url = https://github.com/malixian/mace.git
+	branch = fasteq-v0.8.0
+[submodule "3rdparty/cuequivariance_torch"]
+	path = 3rdparty/cuequivariance_torch
+	url = https://github.com/malixian/cuEquivariance.git
+	branch = fasteq-v0.8.0
