@@ -9,6 +9,7 @@ from tqdm import tqdm
 
 from mace.calculators import MACECalculator
 
+import sys
 
 if torch.cuda.is_available():
     device = 'cuda'
@@ -16,11 +17,15 @@ elif torch.xpu.is_available():
     device = 'xpu'
 else:
     print('Neither CUDA nor XPU devices are available to demonstrate profiling on acceleration devices')
-    import sys
     sys.exit(0)
 
+mace_scale = "small"
+dtype = "float64"
 
-calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_large.model', device=device, default_dtype="float32", compile_mode=None, enable_cueq=True, use_batch_size=16)
+mace_scale = str(sys.argv[1])
+dtype = str(sys.argv[2])
+
+calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_' + mace_scale + '.model', device=device, default_dtype=dtype, compile_mode=None, enable_cueq=True, use_batch_size=16)
 
 file_list = []
 atoms_list = []
@@ -66,7 +71,7 @@ with torch.profiler.profile(
 '''
 
 
-for i in range(0, 5):
+for i in range(0, 1):
     calculator.batch_calculate(atoms_list=atoms_list)
 '''
 with profile(activities=activities, record_shapes=True, with_stack=True) as prof:

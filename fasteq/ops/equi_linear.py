@@ -28,15 +28,15 @@ class _FastEquiLinearFn(torch.autograd.Function):
         w = w.to(torch.float64)
         x = x.to(torch.float64)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         out = torch.ops.equi_linear.fused_gemm(x, w, I_list, cg_val).view(B, -1)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
 
         out = out.to(dtype)
 
@@ -51,8 +51,8 @@ class _FastEquiLinearFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         w, x, output = ctx.saved_tensors
         wt = w.transpose(1, 2).contiguous()
@@ -64,10 +64,10 @@ class _FastEquiLinearFn(torch.autograd.Function):
         
         grad_x = torch.ops.equi_linear.fused_gemm(grad_out, wt, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
 
         grad_x = grad_x.to(math_dtype)
 

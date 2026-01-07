@@ -8,8 +8,8 @@ class FusedMPFunction(torch.autograd.Function):
     def forward(ctx, tp_weights, node_feats, edge_attrs, sender,
                 receiver, meta):
         
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
         
         '''
         out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
@@ -66,10 +66,10 @@ class FusedMPFunction(torch.autograd.Function):
         ctx.save_for_backward(node_feats, edge_attrs, tp_weights, sender, receiver, row_ptr_s)
         ctx.meta = meta
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq mptp forward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq mptp forward cost: {execution_time_ms:.3f} ms >>")
         return output
 
     @staticmethod

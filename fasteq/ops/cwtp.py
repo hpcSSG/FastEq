@@ -7,8 +7,8 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, x, y, meta):
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         cg_i_groupk = meta["cg_i_all"]
         cg_j_groupk  = meta["cg_j_all"]
@@ -54,10 +54,10 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
             U, V, K_TOTAL
         )
         
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq cwtp forward cost: {execution_time_ms:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.meta = meta
@@ -94,8 +94,8 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         V = meta["V"]
         K_TOTAL = meta["K_TOTAL"]
         
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         grad_w, grad_x, grad_y = torch.ops.cwtp_bwd.backward(
             grad_output, w, x, y, 
@@ -112,10 +112,10 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
 
         #grad_x, grad_y, grad_w = torch.ops.cwtp_bwd.backward(grad_output.contiguous(), x.contiguous(), y.contiguous(), w.contiguous(), ctx.b_buf.detach())
         
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms >>")
         return (
             grad_w,   # w
             grad_x,   # x
