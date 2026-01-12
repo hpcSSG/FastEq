@@ -293,7 +293,7 @@ __global__ void tp_channel_wise_kernel(
 }
 
 
-// opt1: CG sparse, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
+// opt1: CG sparse + path 内groupk, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
 /*
 Memory Throughput: 85.31%
 DRAM Throughput: 29.35%
@@ -425,7 +425,7 @@ __global__ void tp_channel_wise_sparse_kernel(
     }
 }
 
-// Opt2: 由于回写占了大头，所以通过group k 写局部，减少global回写次数
+// Opt2: 全局path减少global回写次数
 /*
     DRAM Frequency                  Ghz         2.62
     SM Frequency                    Ghz         1.60

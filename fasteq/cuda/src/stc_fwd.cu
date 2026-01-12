@@ -379,7 +379,7 @@ __global__ void stc_fwd_kernel_tiled_opt(
     }
 }
 
-
+// 当前Path数量不多<400，基于warp在path维度并行实现的segmented reduce 会导致大量atomic
 template <typename scalar_t>
 __global__  void stc_fwd_kernel_notiled(
     const scalar_t* __restrict__ x1,        // [B, num_a, u] -> flattened

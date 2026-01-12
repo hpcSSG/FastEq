@@ -12,7 +12,7 @@ __host__ __device__ inline T ceil_div(T a, T b) {
     return (a + b - 1) / b;
 }
 
-// 多 path 版 fast kernel（concat 输出）：
+// 多 path 版：
 //
 // a_all:        [B, I_total, U]
 // b_all:        [B, 1, V]          // fast path: J==1
@@ -45,7 +45,7 @@ Compute (SM) Throughput           %        32.64
 template<typename scalar_t>
 __global__ void fused_fctp_kernel_fwd_multipath(
     const scalar_t* __restrict__ a_all,        // [B, I_total, U]
-    const scalar_t* __restrict__ b_all,        // [B, 1, V]
+    const scalar_t* __restrict__ b_all,        // [B, 1, V], J = 1
     const scalar_t* __restrict__ w_all,        // [P, U, V, W]
     const int*     __restrict__ cg_i_all,      // [P, nnz_max]
     const int*     __restrict__ cg_j_all,      // [P, nnz_max]
@@ -352,9 +352,7 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
     }
 }
 
-
-
-// Launcher：Python 侧调用的接口
+// 当前只适配J=1的情况
 at::Tensor launch_fused_multipath_fctp(
     at::Tensor w_all,        // [P, U, V, W]
     at::Tensor a_all,        // [B, I_total, U]
