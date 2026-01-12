@@ -82,9 +82,7 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
 
     // 2. 遍历所有 path
-    int start = 8;
-    int end = 17;
-    for (int p = start; p < end; ++p) {
+    for (int p = 0; p < num_paths; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
         int jv_idx = path_indices[p * 4 + 2];
