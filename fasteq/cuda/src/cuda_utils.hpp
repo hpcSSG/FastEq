@@ -29,6 +29,7 @@ __device__ __forceinline__ T ld_g(const T* p) {
 
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
+    #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         v += __shfl_down_sync(mask, v, offset);
     }
@@ -36,13 +37,122 @@ __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
 }
 
 template <typename T>
+__device__ __forceinline__ T warp_reduce_sum(T v) {
+  unsigned mask = 0xffffffffu;
+  #pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+    v += __shfl_down_sync(mask, v, off);
+  return v;
+}
+
+template <typename T>
 __device__ __forceinline__ T warp_sum(T v) {
     unsigned mask = 0xffffffffu;
+    #pragma unroll
     for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(mask, v, d);
     return v;
 }
 
+__device__ __forceinline__ int shfl_i32(int v, int src_lane=0) {
+    return __shfl_sync(0xffffffff, v, src_lane);
+}
+
+__device__ __forceinline__ int shfl_lane0_i32(int v) {
+  return __shfl_sync(0xffffffffu, v, 0);
+}
+
+// block-reduce scalar across warps using shared buffer (size >= num_warps)
+template <typename AccT>
+__device__ __forceinline__ AccT block_reduce_sum_scalar(AccT v, AccT* __restrict__ sh_warp) {
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + 31) >> 5;
+
+  v = warp_reduce_sum(v);
+  if (lane == 0) sh_warp[warp] = v;
+  __syncthreads();
+
+  AccT sum = (AccT)0;
+  if (warp == 0) {
+    sum = (lane < num_warps) ? sh_warp[lane] : (AccT)0;
+    sum = warp_reduce_sum(sum);
+  }
+  __syncthreads();
+  // broadcast from lane0 of warp0
+  return __shfl_sync(0xffffffffu, sum, 0);
+}
+
+
+// ---------------------------------------------
+// cp.async helpers (SM80+)
+// ---------------------------------------------
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+
+__device__ __forceinline__ void cp_async_ca_16B(void* smem_dst, const void* gmem_src) {
+    // cp.async expects shared address in 32-bit "shared space" address
+    unsigned int smem_u32 = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n" ::  // 16 bytes
+        "r"(smem_u32), "l"(gmem_src)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait_group0() {
+    asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+#endif
+
+template <typename T>
+__device__ __forceinline__ void stage_gmem_to_smem_cpasync_16B(
+    T* __restrict__ smem,
+    const T* __restrict__ gmem,
+    int n_elems
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    // choose a 16B vector type
+    using Vec = std::conditional_t<std::is_same<T, float>::value, float4, double2>;
+    constexpr int VEC_ELEMS = (int)(sizeof(Vec) / sizeof(T)); // float:4, double:2
+
+    // n_elems should be multiple of VEC_ELEMS for fast path
+    int n_vec = n_elems / VEC_ELEMS;
+
+    int tid = threadIdx.x;
+    int threads = blockDim.x;
+
+    Vec* __restrict__ smem_v = reinterpret_cast<Vec*>(smem);
+    const Vec* __restrict__ gmem_v = reinterpret_cast<const Vec*>(gmem);
+
+    // issue cp.async (16B) per thread
+    #pragma unroll 1
+    for (int i = tid; i < n_vec; i += threads) {
+        cp_async_ca_16B((void*)&smem_v[i], (const void*)&gmem_v[i]);
+    }
+
+    // finalize: commit + wait + sync
+    cp_async_commit_group();
+    cp_async_wait_group0();
+#else
+    // fallback (shouldn't hit on H100)
+    int tid = threadIdx.x;
+    int threads = blockDim.x;
+    #pragma unroll 1
+    for (int i = tid; i < n_elems; i += threads) {
+        smem[i] = gmem[i];
+    }
+#endif
+}
+
+
 DEVICE inline int find_integer_divisor(int x, int bdim) {
+  return (x + bdim - 1) / bdim;
+}
+
+DEVICE inline int ceil_div(int x, int bdim) {
   return (x + bdim - 1) / bdim;
 }
 

@@ -1,11 +1,16 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda/pipeline>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 #include <torch/script.h>
 #include <torch/torch.h>
 #include <iostream>
+
 #include "cuda_utils.hpp"
+
+#define CWTP_DEFINE_CONSTANTS
+#include "cwtp_helper.cuh"
 
 // opt1: CG sparse + path 内groupk, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
 /*
@@ -264,6 +269,291 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
     }
 }
 
+// Opt2: 离线将cg系数groupk
+template <typename scalar_t, int MAX_K_DIM>
+__global__ void tp_channel_wise_sparse_groupk_constant_kernel(
+    const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
+    const scalar_t* __restrict__ x_iu,          // [Z, IU_TOTAL]
+    const scalar_t* __restrict__ x_jv,          // [Z, JV_TOTAL]
+
+    const int32_t* __restrict__ path_indices,   // [num_paths, 4], 不使用兼容接口
+    const int32_t* __restrict__ k_dims,         // [num_paths], 不使用兼容接口 
+    const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count], 不使用兼容接口
+    const int32_t* __restrict__ jv_seg_offsets, // [jv_seg_count], 不使用兼容接口
+    const int32_t* __restrict__ kv_k_offsets,   // [kv_seg_count], 不使用兼容接口
+
+    const int32_t* __restrict__ nnz_per_path,   // [num_paths], 不使用兼容接口
+    const int32_t* __restrict__ nnz_offsets,    // [num_paths], 不使用兼容接口
+
+    const int32_t* __restrict__ nnz_k_offsets,  // [num_paths * MAX_K_DIM], 不使用兼容接口
+    const int32_t* __restrict__ nnz_k_counts,   // [num_paths * MAX_K_DIM], 不使用兼容接口
+
+    // 稀疏 CG 系数（global memory）
+    const uint8_t* __restrict__ cg_i_all,       // [nnz_total]
+    const uint8_t* __restrict__ cg_j_all,       // [nnz_total]
+    const scalar_t* __restrict__ cg_val_all,    // [nnz_total]
+
+    scalar_t* __restrict__ out,                 // [Z, K_TOTAL, U, V]
+
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int V,
+    int num_paths
+) {
+    int z = blockIdx.x;   // 一个 block 一个 batch
+    if (z >= Z) return;
+
+    int u = threadIdx.x;  // 每个 thread 一个 u
+    if (u >= U) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
+    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+
+    const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+
+    int threads_in_block = blockDim.x;
+
+    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
+    for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
+        s_iu[idx] = x_iu_z[idx];
+    }
+    for (int idx = u; idx < JV_TOTAL; idx += threads_in_block) {
+        s_jv[idx] = x_jv_z[idx];
+    }
+    __syncthreads();
+
+    const scalar_t* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+    scalar_t* out_z = out + (size_t)z * (K_TOTAL * U * V);
+
+    // 2. 遍历所有 path
+    for (int p = 0; p < num_paths; ++p) {
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+
+        int k_dim   = k_dims[p];
+        int nnz     = nnz_per_path[p];
+        int nnz_off = nnz_offsets[p];
+
+        if (k_dim <= 0 || nnz <= 0) {
+            continue;
+        }
+        if (k_dim > MAX_K_DIM) {
+            return;
+        }
+
+        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
+        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
+        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
+        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+
+        // In Mace-OFF, V=1
+        for (int v_idx = 0; v_idx < V; ++v_idx) {
+            scalar_t xuv_uv = x_uv_z[uv_base + u * V + v_idx];
+
+            // 按 k 分组
+            for (int k_local = 0; k_local < k_dim; ++k_local) {
+                int meta_idx    = p * MAX_K_DIM + k_local;
+                int local_off   = nnz_k_offsets[meta_idx];
+                int local_count = nnz_k_counts[meta_idx];
+
+                if (local_count <= 0)
+                    continue;
+
+                scalar_t acc = static_cast<scalar_t>(0);
+
+                // 遍历这个 k 的所有 nnz
+                for (int tt = 0; tt < local_count; ++tt) {
+                    int t   = local_off + tt;
+                    int idx = nnz_off + t; // global nnz index
+
+                    int i = static_cast<int>(cg_i_all[idx]);
+                    int j = static_cast<int>(cg_j_all[idx]);
+                    scalar_t c = cg_val_all[idx];
+
+                    scalar_t xiu_iu = s_iu[iu_base + i * U + u];         // x_iu[z, iu_seg][i, u]
+                    scalar_t xjv_jv = s_jv[jv_base + j * V + v_idx];     // x_jv[z, jv_seg][j, v]
+
+                    acc += c * xuv_uv * xiu_iu * xjv_jv;
+                }
+
+                int global_k  = k_base + k_local;
+                int out_index = (global_k * U + u) * V + v_idx;
+                out_z[out_index] = acc;
+            }
+        }
+    }
+}
+
+// ELL+packed + per-thread scalar cache (NO dynamic indexing arrays) to avoid local-memory stack traffic.
+// - Works best for V=1 (MACE-OFF). V>1 is supported via fallback path.
+// - MAX_K_DIM=8, MAX_I=5, MAX_J=7
+
+template <typename T, int E>
+__device__ __forceinline__ T eval_row_shared_gather_V1(
+    const uint16_t* __restrict__ ij_row,
+    const T* __restrict__ val_row,
+    const T* __restrict__ s_iu, int iu_base, int U, int u,
+    const T* __restrict__ s_jv, int jv_base
+) {
+    T acc = (T)0;
+    #pragma unroll
+    for (int e = 0; e < E; ++e) {
+        uint16_t ij = ij_row[e];
+        T c = val_row[e];
+        int i = (int)(ij & 0xFF);
+        int j = (int)(ij >> 8);
+        T xiu = s_iu[iu_base + i * U + u];
+        T xjv = s_jv[jv_base + j];
+        acc = fma(c, xiu * xjv, acc);
+    }
+    return acc;
+}
+
+template <typename T>
+__device__ __forceinline__ T eval_row_shared_gather_V1_runtime(
+    int E,
+    const uint16_t* __restrict__ ij_row,
+    const T* __restrict__ v_row,
+    const T* __restrict__ s_iu, int iu_base, int U, int u,
+    const T* __restrict__ s_jv, int jv_base
+) {
+    T acc = (T)0;
+    #pragma unroll 1
+    for (int e = 0; e < E; ++e) {
+        uint16_t ij = ij_row[e];
+        T c = v_row[e];
+        int i = (int)(ij & 0xFF);
+        int j = (int)(ij >> 8);
+        T xiu = s_iu[iu_base + i * U + u];
+        T xjv = s_jv[jv_base + j];
+        acc = fma(c, xiu * xjv, acc);
+    }
+    return acc;
+}
+
+// -----------------------------
+// Kernel: ELL packed bucket, V==1
+// 把 CG 的 (i,j) 非零做成了每行固定 E 项的 ELL-packed（ij_row[e] / val_row[e] 连续），并且 s_iu / s_jv 都在 shared 里, 访存更规则一些
+// -----------------------------
+
+template <typename T, int MAX_K_DIM = 8>
+__global__ void tp_channel_wise_sparse_groupk_ell_kernel(
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const int32_t* __restrict__ k_dims,
+    const int4* __restrict__ meta1_4,
+    const int4* __restrict__ meta2_4,
+    T* __restrict__ out,
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int num_paths
+) {
+    
+    int z = (int)blockIdx.x;
+    if (z >= Z) return;
+    int u = (int)threadIdx.x;
+    if (u >= U) return;
+    extern __shared__ unsigned char smem_raw[];
+    T* s_iu = reinterpret_cast<T*>(smem_raw);
+    T* s_jv = s_iu + (size_t)IU_TOTAL;
+    const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+    int threads = (int)blockDim.x;
+    for (int idx = u; idx < IU_TOTAL; idx += threads) s_iu[idx] = x_iu_z[idx];
+    for (int idx = u; idx < JV_TOTAL; idx += threads) s_jv[idx] = x_jv_z[idx];
+    
+    __syncthreads();
+    const T* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+    T* out_z = out + (size_t)z * (size_t)(K_TOTAL * U);
+    
+    const T* cval = ell_val_const_ptr<T>();
+    for (int p = 0; p < num_paths; ++p) {
+
+        /*
+        int uv_idx = path_indices[p * 4 + 0];
+        int iu_idx = path_indices[p * 4 + 1];
+        int jv_idx = path_indices[p * 4 + 2];
+        int kv_idx = path_indices[p * 4 + 3];
+        int uv_base = uv_idx * U; 
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
+        */
+
+        /*
+        int uv_base = path_bases[p * 4 + 0];
+        int iu_base = path_bases[p * 4 + 1];
+        int jv_base = path_bases[p * 4 + 2];
+        int k_base  = path_bases[p * 4 + 3];
+
+        int k_dim = k_dims[p];
+        //if (k_dim <= 0) continue;
+        //if (k_dim > MAX_K_DIM) return;
+        // ---- use CONSTANT for ell meta ----
+        int E    = c_ell_E[p];
+        int base = c_ell_base[p];
+        if (E <= 0) continue;
+        */
+
+        /*
+        // uv_base, iu_base, jv_base, k_base
+        int uv_base = c_meta1[p * 4 + 0];
+        int iu_base = c_meta1[p * 4 + 1];
+        int jv_base = c_meta1[p * 4 + 2];
+        int k_base  = c_meta1[p * 4 + 3];
+
+        // k_dims, ell_E, ell_base, pad
+        int k_dim   = c_meta2[p * 4 + 0];
+        int E       = c_meta2[p * 4 + 1];
+        int base    = c_meta2[p * 4 + 2];
+        */
+
+        //const int4* meta1_4 = reinterpret_cast<const int4*>(c_meta1);
+        //const int4* meta2_4 = reinterpret_cast<const int4*>(c_meta2);
+        int4 m1 = meta1_4[p];
+        int4 m2 = meta2_4[p];
+        int uv_base, iu_base, jv_base, k_base;
+        int k_dim, E, base;
+        uv_base = m1.x; iu_base = m1.y; jv_base = m1.z; k_base = m1.w;
+        k_dim   = m2.x; E       = m2.y; base    = m2.z;
+
+        T xuv_uv = x_uv_z[uv_base + u];
+        #pragma unroll 1
+        for (int k_local = 0; k_local < k_dim; ++k_local) {
+            int row = base + k_local * E;
+            const uint16_t* ij_row = c_ell_ij + row;  // constant
+            const T*        v_row  = cval     + row;  // constant
+            T acc;
+            switch (E) {
+                case 1: acc = eval_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                case 3: acc = eval_row_shared_gather_V1<T,3>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                case 4: acc = eval_row_shared_gather_V1<T,4>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                case 5: acc = eval_row_shared_gather_V1<T,5>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                case 6: acc = eval_row_shared_gather_V1<T,6>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                case 8: acc = eval_row_shared_gather_V1<T,8>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
+                default:
+                    acc = eval_row_shared_gather_V1_runtime<T>(E, ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base);
+                    break;
+            }
+            out_z[(k_base + k_local) * U + u] = acc * xuv_uv;
+        }
+    }
+}
+
+
 torch::Tensor tp_channel_wise_fwd_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
@@ -287,6 +577,12 @@ torch::Tensor tp_channel_wise_fwd_launch(
     torch::Tensor cg_j_all,        // [nnz_total], int32
     torch::Tensor cg_k_all,        // [nnz_total], int32
     torch::Tensor cg_val_all,      // [nnz_total], same dtype as x_uv
+
+    //ell data and Packed base offsets 
+    torch::Tensor ell_ij,
+    torch::Tensor ell_val,
+    torch::Tensor meta1,            // packed bases_offsets, [num_paths, 4], int32
+    torch::Tensor meta2,            // packed kdims, ell, [num_paths, 4], int32
 
     const int64_t U,
     const int64_t V,
@@ -322,13 +618,19 @@ torch::Tensor tp_channel_wise_fwd_launch(
     auto IU_TOTAL = x_iu.size(1);
     auto JV_TOTAL = x_jv.size(1);
 
+    int num_paths = path_indices.size(0);
+    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
+
     TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch dim mismatch");
     TORCH_CHECK(path_indices.dim() == 2 && path_indices.size(1) == 4,
                 "path_indices must be [num_paths,4]");
+    
+    int ell_total = (int)ell_ij.numel();
+    TORCH_CHECK(ell_total == (int)ell_val.numel(), "ell_ij and ell_val numel mismatch");
+    TORCH_CHECK(num_paths <= MAX_PATHS_CONST, "num_paths exceeds MAX_PATHS_CONST");
+    TORCH_CHECK(ell_total <= ELL_MAX_CONST, "ell_total exceeds ELL_MAX_CONST");
 
-    int num_paths = path_indices.size(0);
-
-    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
+    
 
     auto out = torch::empty({Z, K_TOTAL, U, V}, x_uv.options());
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -339,18 +641,24 @@ torch::Tensor tp_channel_wise_fwd_launch(
 
     int blocks = static_cast<int>(Z);
     size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
-    
+
+    // copy meta to constant (D2D)
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(
+        c_ell_ij,
+        ell_ij.data_ptr<uint16_t>(),
+        sizeof(uint16_t) * ell_total,
+        0,
+        cudaMemcpyDeviceToDevice,
+        stream));
 
     AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
-
-        tp_channel_wise_sparse_groupk_kernel<scalar_t, MAX_K_DIM>
+        /*
+        tp_channel_wise_sparse_groupk_constant_kernel<scalar_t, MAX_K_DIM>
             <<<blocks, threads, smem_bytes, stream>>>(
                 x_uv.data_ptr<scalar_t>(),
                 x_iu.data_ptr<scalar_t>(),
                 x_jv.data_ptr<scalar_t>(),
                 path_indices.data_ptr<int>(),
-                //i_dims.data_ptr<int>(),
-                //j_dims.data_ptr<int>(),
                 k_dims.data_ptr<int>(),
                 iu_seg_offsets.data_ptr<int>(),
                 jv_seg_offsets.data_ptr<int>(),
@@ -372,6 +680,44 @@ torch::Tensor tp_channel_wise_fwd_launch(
                 (int)V,
                 num_paths
             );
+            */
+        
+        if constexpr (std::is_same<scalar_t, float>::value) {
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(
+                c_ell_val_f32,
+                ell_val.data_ptr<float>(),
+                sizeof(float) * ell_total,
+                0,
+                cudaMemcpyDeviceToDevice,
+                stream));
+        } else if constexpr (std::is_same<scalar_t, double>::value) {
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(
+                c_ell_val_f64,
+                ell_val.data_ptr<double>(),
+                sizeof(double) * ell_total,
+                0,
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+
+        tp_channel_wise_sparse_groupk_ell_kernel<scalar_t, MAX_K_DIM>
+        <<<blocks, threads, smem_bytes, stream>>>(
+            x_uv.data_ptr<scalar_t>(),
+            x_iu.data_ptr<scalar_t>(),
+            x_jv.data_ptr<scalar_t>(),
+            k_dims.data_ptr<int32_t>(),
+            reinterpret_cast<const int4*>(meta1.data_ptr<int32_t>()),
+            reinterpret_cast<const int4*>(meta2.data_ptr<int32_t>()),
+            out.data_ptr<scalar_t>(),
+            (int)Z,
+            (int)UV_TOTAL,
+            (int)IU_TOTAL,
+            (int)JV_TOTAL,
+            (int)K_TOTAL,
+            (int)U,
+            num_paths
+        );
+
         
         out = out.view({Z, K_TOTAL * U * V});
         CUDA_CHECK(cudaGetLastError());
@@ -380,116 +726,110 @@ torch::Tensor tp_channel_wise_fwd_launch(
     return out;
 }
 
-// tp_channel_wise_sparse_groupk_kernel_ell_packed_cached_scalar.cu
-// ELL+packed + per-thread scalar cache (NO dynamic indexing arrays) to avoid local-memory stack traffic.
-//
-// Assumptions / Notes:
-// - Works best for V=1 (MACE-OFF). V>1 is supported via fallback path.
-// - MAX_K_DIM=8, MAX_I=5, MAX_J=7 (matches your shapes).
-// - Input ell format:
-//     ell_E[p] = E (max nnz per k for path p)
-//     ell_base[p] = base offset (in elements) for path p inside ell_ij/ell_val
-//     ell_ij[ base + k_local*E + e ] = packed uint16: i | (j<<8)
-//     ell_val[ same ] = scalar value; padded entries have val=0.
 
 
-#ifndef MAX_PATHS_CONST
-#define MAX_PATHS_CONST 64
-#endif
-
-#ifndef ELL_MAX_CONST
-#define ELL_MAX_CONST 2048
-#endif
-
-__constant__ int32_t  c_ell_E    [MAX_PATHS_CONST];
-__constant__ int32_t  c_ell_base [MAX_PATHS_CONST];
-__constant__ uint16_t c_ell_ij   [ELL_MAX_CONST];
-__constant__ float    c_ell_val_f32[ELL_MAX_CONST];
-__constant__ double   c_ell_val_f64[ELL_MAX_CONST];
+// sharedy, path parallel, k-tile to reduce register
+// --------------------- helpers ---------------------
 
 template <typename T>
-__device__ __forceinline__ const T* ell_val_const_ptr();
-template <>
-__device__ __forceinline__ const float* ell_val_const_ptr<float>() {
-  return c_ell_val_f32;
+__device__ __forceinline__ T pick_x5_switch(int i, T x0, T x1, T x2, T x3, T x4) {
+  T xi;
+  switch (i) {
+    default: xi = x0; break;
+    case 1:  xi = x1; break;
+    case 2:  xi = x2; break;
+    case 3:  xi = x3; break;
+    case 4:  xi = x4; break;
+  }
+  return xi;
 }
-template <>
-__device__ __forceinline__ const double* ell_val_const_ptr<double>() {
-  return c_ell_val_f64;
-}
+
+// --------------------- eval: compile-time E, k-tile(4) ---------------------
 
 template <typename T, int E>
-__device__ __forceinline__ T eval_row_shared_gather_V1(
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base
+__device__ __forceinline__ void eval_ell_innerk_sharedy_xscalar_k4(
+    int kdim, int base, int k0,               // compute ks in [k0, k0+3]
+    T x0, T x1, T x2, T x3, T x4,
+    const T* __restrict__ s_y,                // shared y, length >= 8
+    T &b0, T &b1, T &b2, T &b3                // accum for k0..k0+3
 ) {
-    // V==1 : s_jv indexed as [jv_base + j]
-    T acc = (T)0;
-    #pragma unroll
-    for (int e = 0; e < E; ++e) {
-        uint16_t ij = ij_row[e];
-        T c = val_row[e];                 // pad=0 safe
-        int i = (int)(ij & 0xFF);
-        int j = (int)(ij >> 8);
+  const T* cval = ell_val_const_ptr<T>();
 
-        // shared gather (simple addressing)
-        T xiu = s_iu[iu_base + i * U + u];
-        T xjv = s_jv[jv_base + j];
+  #pragma unroll
+  for (int e = 0; e < E; ++e) {
 
-        acc = fma(c, xiu * xjv, acc);
-    }
-    return acc;
+    #define DO_ONE(KK, ACC) do { \
+      int kk = (KK); \
+      if (kk < kdim) { \
+        int slot = base + kk * E + e; \
+        uint16_t ij = c_ell_ij[slot]; \
+        T c = cval[slot];            /* padding c==0 ok */ \
+        int i = (int)(ij & 0xFF); \
+        int j = (int)(ij >> 8); \
+        T xi = pick_x5_switch<T>(i, x0, x1, x2, x3, x4); \
+        T yj = s_y[j]; \
+        ACC = fma(c, xi * yj, ACC); \
+      } \
+    } while (0)
+
+    DO_ONE(k0 + 0, b0);
+    DO_ONE(k0 + 1, b1);
+    DO_ONE(k0 + 2, b2);
+    DO_ONE(k0 + 3, b3);
+
+    #undef DO_ONE
+  }
 }
 
-// Runtime fallback for unexpected E
+// --------------------- eval: runtime E, k-tile(4) ---------------------
+
 template <typename T>
-__device__ __forceinline__ T eval_row_shared_gather_V1_runtime(
-    int E,
-    const uint16_t* __restrict__ ij_row,
-    const T*        __restrict__ v_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base
+__device__ __forceinline__ void eval_ell_innerk_sharedy_xscalar_k4_runtimeE(
+    int E, int kdim, int base, int k0,
+    T x0, T x1, T x2, T x3, T x4,
+    const T* __restrict__ s_y,
+    T &b0, T &b1, T &b2, T &b3
 ) {
-    T acc = (T)0;
-    #pragma unroll 1
-    for (int e = 0; e < E; ++e) {
-        uint16_t ij = ij_row[e];
-        T c = v_row[e];
+  const T* cval = ell_val_const_ptr<T>();
+
+  #pragma unroll 1
+  for (int e = 0; e < E; ++e) {
+
+    auto step = [&](int kk, T &acc) {
+      if (kk < kdim) {
+        int slot = base + kk * E + e;
+        uint16_t ij = c_ell_ij[slot];
+        T c = cval[slot];
         int i = (int)(ij & 0xFF);
         int j = (int)(ij >> 8);
-        T xiu = s_iu[iu_base + i * U + u];
-        T xjv = s_jv[jv_base + j];
-        acc = fma(c, xiu * xjv, acc);
-    }
-    return acc;
+        T xi = pick_x5_switch<T>(i, x0, x1, x2, x3, x4);
+        T yj = s_y[j];
+        acc = fma(c, xi * yj, acc);
+      }
+    };
+
+    step(k0 + 0, b0);
+    step(k0 + 1, b1);
+    step(k0 + 2, b2);
+    step(k0 + 3, b3);
+  }
 }
 
-// -----------------------------
-// Kernel: ELL packed bucket, V==1
-// -----------------------------
+// --------------------- kernel: k-tile(4) ---------------------
+
 template <typename T, int MAX_K_DIM = 8>
-__global__ void tp_channel_wise_sparse_groupk_kernel_ell_packed_bucket(
+__global__ void cwtp_fwd_path_parallel_ell_innerk_template_kernel_k4_sharedy_xscalar(
     const T* __restrict__ x_uv,
     const T* __restrict__ x_iu,
     const T* __restrict__ x_jv,
-
-    const int32_t* __restrict__ path_indices,
-    const int32_t* __restrict__ k_dims,
-
+    const int32_t* __restrict__ path_indices, // [P,4] uv,iu,jv,kv
+    const int32_t* __restrict__ i_dims,       // [P] i<=5
+    const int32_t* __restrict__ j_dims,       // [P] j<=7
+    const int32_t* __restrict__ k_dims,       // [P] k<=MAX_K_DIM
     const int32_t* __restrict__ iu_seg_offsets,
     const int32_t* __restrict__ jv_seg_offsets,
     const int32_t* __restrict__ kv_k_offsets,
-
-    // 仍保留参数以兼容旧接口
-    const int32_t* __restrict__ ell_E,
-    const int32_t* __restrict__ ell_base,
-    const uint16_t* __restrict__ ell_ij,
-    const T* __restrict__ ell_val,
-
-    T* __restrict__ out,
-
+    T* __restrict__ out,                      // [Z, K_TOTAL*U]
     int Z,
     int UV_TOTAL,
     int IU_TOTAL,
@@ -498,96 +838,248 @@ __global__ void tp_channel_wise_sparse_groupk_kernel_ell_packed_bucket(
     int U,
     int num_paths
 ) {
-    (void)ell_E; (void)ell_base; (void)ell_ij; (void)ell_val; // unused
+  int z   = (int)blockIdx.x;
+  int pid = (int)blockIdx.y;
+  if (z >= Z || pid >= num_paths) return;
 
-    int z = (int)blockIdx.x;
-    if (z >= Z) return;
+  int u = (int)threadIdx.x;
+  if (u >= U) return;
 
-    int u = (int)threadIdx.x;
-    if (u >= U) return;
+  const T* x_uv_z = x_uv + (size_t)z * (size_t)UV_TOTAL;
+  const T* x_iu_z = x_iu + (size_t)z * (size_t)IU_TOTAL;
+  const T* x_jv_z = x_jv + (size_t)z * (size_t)JV_TOTAL;
+  T* out_z        = out  + (size_t)z * (size_t)(K_TOTAL * U);
 
-    extern __shared__ unsigned char smem_raw[];
-    T* s_iu = reinterpret_cast<T*>(smem_raw);
-    T* s_jv = s_iu + (size_t)IU_TOTAL;
+  // path meta
+  int uv_idx = path_indices[pid * 4 + 0];
+  int iu_idx = path_indices[pid * 4 + 1];
+  int jv_idx = path_indices[pid * 4 + 2];
+  int kv_idx = path_indices[pid * 4 + 3];
 
-    const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
-    const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+  int idim = i_dims[pid];   // <=5
+  int jdim = j_dims[pid];   // <=7
+  int kdim = k_dims[pid];   // <=MAX_K_DIM
+  if (idim <= 0 || idim > 5) return;
+  if (jdim <= 0 || jdim > 7) return;
+  if (kdim <= 0 || kdim > MAX_K_DIM) return;
 
-    int threads = (int)blockDim.x;
-    for (int idx = u; idx < IU_TOTAL; idx += threads) s_iu[idx] = x_iu_z[idx];
-    for (int idx = u; idx < JV_TOTAL; idx += threads) s_jv[idx] = x_jv_z[idx];
-    
+  int iu_base = iu_seg_offsets[iu_idx];
+  int jv_base = jv_seg_offsets[jv_idx];
+  int k_base  = kv_k_offsets[kv_idx];
+
+  // V==1: w scalar per u
+  T xuv_uv = x_uv_z[uv_idx * U + u];
+
+  // ELL meta from constant
+  int E    = c_ell_E[pid];
+  int base = c_ell_base[pid];
+  if (E <= 0) return;
+
+  // ----- x scalar regs (per thread) -----
+  T x0=0, x1=0, x2=0, x3=0, x4=0;
+  if (idim > 0) x0 = x_iu_z[iu_base + 0 * U + u];
+  if (idim > 1) x1 = x_iu_z[iu_base + 1 * U + u];
+  if (idim > 2) x2 = x_iu_z[iu_base + 2 * U + u];
+  if (idim > 3) x3 = x_iu_z[iu_base + 3 * U + u];
+  if (idim > 4) x4 = x_iu_z[iu_base + 4 * U + u];
+
+  // ----- shared y for this path (jdim<=7), padded to 8 -----
+  __shared__ T s_y[8];
+  if (threadIdx.x < 8) {
+    if (threadIdx.x < jdim) s_y[threadIdx.x] = x_jv_z[jv_base + threadIdx.x];
+    else                    s_y[threadIdx.x] = (T)0;
+  }
+  __syncthreads();
+
+  // ================= k-tile 0..3 =================
+  T b0=0, b1=0, b2=0, b3=0;
+  switch (E) {
+    case 1: eval_ell_innerk_sharedy_xscalar_k4<T,1>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    case 3: eval_ell_innerk_sharedy_xscalar_k4<T,3>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    case 4: eval_ell_innerk_sharedy_xscalar_k4<T,4>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    case 5: eval_ell_innerk_sharedy_xscalar_k4<T,5>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    case 6: eval_ell_innerk_sharedy_xscalar_k4<T,6>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    case 8: eval_ell_innerk_sharedy_xscalar_k4<T,8>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+    default:
+      eval_ell_innerk_sharedy_xscalar_k4_runtimeE<T>(E, kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3);
+      break;
+  }
+  if (kdim > 0) out_z[(k_base + 0) * U + u] = b0 * xuv_uv;
+  if (kdim > 1) out_z[(k_base + 1) * U + u] = b1 * xuv_uv;
+  if (kdim > 2) out_z[(k_base + 2) * U + u] = b2 * xuv_uv;
+  if (kdim > 3) out_z[(k_base + 3) * U + u] = b3 * xuv_uv;
+
+  // ================= k-tile 4..7 =================
+  if (kdim > 4) {
+    T c0=0, c1=0, c2=0, c3=0;
+    switch (E) {
+      case 1: eval_ell_innerk_sharedy_xscalar_k4<T,1>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      case 3: eval_ell_innerk_sharedy_xscalar_k4<T,3>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      case 4: eval_ell_innerk_sharedy_xscalar_k4<T,4>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      case 5: eval_ell_innerk_sharedy_xscalar_k4<T,5>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      case 6: eval_ell_innerk_sharedy_xscalar_k4<T,6>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      case 8: eval_ell_innerk_sharedy_xscalar_k4<T,8>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+      default:
+        eval_ell_innerk_sharedy_xscalar_k4_runtimeE<T>(E, kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3);
+        break;
+    }
+    if (kdim > 4) out_z[(k_base + 4) * U + u] = c0 * xuv_uv;
+    if (kdim > 5) out_z[(k_base + 5) * U + u] = c1 * xuv_uv;
+    if (kdim > 6) out_z[(k_base + 6) * U + u] = c2 * xuv_uv;
+    if (kdim > 7) out_z[(k_base + 7) * U + u] = c3 * xuv_uv;
+  }
+}
+
+// ==================== path 分组 for mace-large paths=17 ===================
+// 3 groups by iu_idx: {0},{1},{2}
+// offsets: [0,4,11,17]
+__device__ __constant__ int32_t c_group_offsets[4] = {0, 4, 10, 17};
+
+__device__ __constant__ int32_t c_group_pids[17] = {
+  // G0 iu=0
+  0, 1, 2, 3,
+  // G1 iu=1
+  4, 5, 6, 7, 8, 9,
+  // G2 iu=2
+  10, 11, 12, 13, 14, 15, 16
+};
+
+__device__ __constant__ int32_t c_group_iu_idx[3] = {0, 1, 2};
+
+
+template <typename T, int MAX_K_DIM = 8>
+__global__ void cwtp_fwd_group3_by_iu_k4_sharedy_xscalar(
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const int32_t* __restrict__ path_indices, // [P,4] uv,iu,jv,kv
+    const int32_t* __restrict__ i_dims,       // [P] (1/3/5)
+    const int32_t* __restrict__ j_dims,       // [P] (<=7)
+    const int32_t* __restrict__ k_dims,       // [P] (<=MAX_K_DIM)
+    const int32_t* __restrict__ iu_seg_offsets,
+    const int32_t* __restrict__ jv_seg_offsets,
+    const int32_t* __restrict__ kv_k_offsets,
+    T* __restrict__ out,                      // [Z, K_TOTAL*U]
+    int Z,
+    int UV_TOTAL,
+    int IU_TOTAL,
+    int JV_TOTAL,
+    int K_TOTAL,
+    int U,
+    int num_paths   // should be 17 here, but keep for safety
+) {
+  int z   = (int)blockIdx.x;
+  int gid = (int)blockIdx.y; // 0..2
+  if (z >= Z) return;
+  if ((unsigned)gid >= 3u) return;
+
+  int u = (int)threadIdx.x;
+  if (u >= U) return;
+
+  const T* x_uv_z = x_uv + (size_t)z * (size_t)UV_TOTAL;
+  const T* x_iu_z = x_iu + (size_t)z * (size_t)IU_TOTAL;
+  const T* x_jv_z = x_jv + (size_t)z * (size_t)JV_TOTAL;
+  T* out_z        = out  + (size_t)z * (size_t)(K_TOTAL * U);
+
+  // ---------------- shared X for this group (iu_idx fixed) ----------------
+  int iu_idx  = c_group_iu_idx[gid];
+  int iu_base = iu_seg_offsets[iu_idx];
+
+  // load maximum 5 rows once; safe because IU_TOTAL includes these segments
+  T x0 = x_iu_z[iu_base + 0 * U + u];
+  T x1 = x_iu_z[iu_base + 1 * U + u];
+  T x2 = x_iu_z[iu_base + 2 * U + u];
+  T x3 = x_iu_z[iu_base + 3 * U + u];
+  T x4 = x_iu_z[iu_base + 4 * U + u];
+
+  __shared__ T s_y[8];
+
+  int beg = c_group_offsets[gid];
+  int end = c_group_offsets[gid + 1];
+
+  // ---------------- loop pids in this group ----------------
+  #pragma unroll 1
+  for (int t = beg; t < end; ++t) {
+    int pid = c_group_pids[t];
+    if (pid >= num_paths) continue;
+
+    // per pid meta
+    int uv_idx = path_indices[pid * 4 + 0];
+    int jv_idx = path_indices[pid * 4 + 2];
+    int kv_idx = path_indices[pid * 4 + 3];
+
+    int idim = i_dims[pid];
+    int jdim = j_dims[pid];
+    int kdim = k_dims[pid];
+
+    if (idim <= 0 || idim > 5) continue;
+    if (jdim <= 0 || jdim > 7) continue;
+    if (kdim <= 0 || kdim > MAX_K_DIM) continue;
+
+    int jv_base = jv_seg_offsets[jv_idx];
+    int k_base  = kv_k_offsets[kv_idx];
+
+    // load y to shared (tid<8)
+    if (threadIdx.x < 8) {
+      if (threadIdx.x < jdim) s_y[threadIdx.x] = x_jv_z[jv_base + threadIdx.x];
+      else                    s_y[threadIdx.x] = (T)0;
+    }
     __syncthreads();
 
-    const T* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+    // per thread xuv scalar (V==1)
+    T xuv_uv = x_uv_z[uv_idx * U + u];
 
-    // V==1: 你这里 out 分配是 [Z,K_TOTAL,U,V] 但 V=1，
-    // 所以 stride 等价于 [Z, K_TOTAL*U]
-    T* out_z = out + (size_t)z * (size_t)(K_TOTAL * U);
+    // ELL meta from constant (you already have these)
+    int E    = c_ell_E[pid];
+    int base = c_ell_base[pid];
+    if (E <= 0) { __syncthreads(); continue; }
 
-    // prefetch p=0 xuv
-    T xuv_next = (T)0;
-    if (num_paths > 0) {
-        int uv_idx0  = path_indices[0 * 4 + 0];
-        int uv_base0 = uv_idx0 * U;
-        xuv_next     = x_uv_z[uv_base0 + u];
+    // -------- k tile 0..3 --------
+    T b0=0,b1=0,b2=0,b3=0;
+    switch (E) {
+      case 1: eval_ell_innerk_sharedy_xscalar_k4<T,1>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      case 3: eval_ell_innerk_sharedy_xscalar_k4<T,3>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      case 4: eval_ell_innerk_sharedy_xscalar_k4<T,4>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      case 5: eval_ell_innerk_sharedy_xscalar_k4<T,5>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      case 6: eval_ell_innerk_sharedy_xscalar_k4<T,6>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      case 8: eval_ell_innerk_sharedy_xscalar_k4<T,8>(kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3); break;
+      default:
+        eval_ell_innerk_sharedy_xscalar_k4_runtimeE<T>(E, kdim, base, 0, x0,x1,x2,x3,x4, s_y, b0,b1,b2,b3);
+        break;
+    }
+    if (kdim > 0) out_z[(k_base + 0) * U + u] = b0 * xuv_uv;
+    if (kdim > 1) out_z[(k_base + 1) * U + u] = b1 * xuv_uv;
+    if (kdim > 2) out_z[(k_base + 2) * U + u] = b2 * xuv_uv;
+    if (kdim > 3) out_z[(k_base + 3) * U + u] = b3 * xuv_uv;
+
+    // -------- k tile 4..7 --------
+    if (kdim > 4) {
+      T c0=0,c1=0,c2=0,c3=0;
+      switch (E) {
+        case 1: eval_ell_innerk_sharedy_xscalar_k4<T,1>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        case 3: eval_ell_innerk_sharedy_xscalar_k4<T,3>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        case 4: eval_ell_innerk_sharedy_xscalar_k4<T,4>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        case 5: eval_ell_innerk_sharedy_xscalar_k4<T,5>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        case 6: eval_ell_innerk_sharedy_xscalar_k4<T,6>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        case 8: eval_ell_innerk_sharedy_xscalar_k4<T,8>(kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3); break;
+        default:
+          eval_ell_innerk_sharedy_xscalar_k4_runtimeE<T>(E, kdim, base, 4, x0,x1,x2,x3,x4, s_y, c0,c1,c2,c3);
+          break;
+      }
+      if (kdim > 4) out_z[(k_base + 4) * U + u] = c0 * xuv_uv;
+      if (kdim > 5) out_z[(k_base + 5) * U + u] = c1 * xuv_uv;
+      if (kdim > 6) out_z[(k_base + 6) * U + u] = c2 * xuv_uv;
+      if (kdim > 7) out_z[(k_base + 7) * U + u] = c3 * xuv_uv;
     }
 
-    const T* cval = ell_val_const_ptr<T>();
-
-    for (int p = 0; p < num_paths; ++p) {
-        T xuv_uv = xuv_next;
-
-        if (p + 1 < num_paths) {
-            int uv_idx1  = path_indices[(p + 1) * 4 + 0];
-            int uv_base1 = uv_idx1 * U;
-            xuv_next     = x_uv_z[uv_base1 + u];
-        }
-
-        int iu_idx = path_indices[p * 4 + 1];
-        int jv_idx = path_indices[p * 4 + 2];
-        int kv_idx = path_indices[p * 4 + 3];
-
-        int k_dim = k_dims[p];
-        if (k_dim <= 0) continue;
-        if (k_dim > MAX_K_DIM) return;
-
-        // ---- use CONSTANT for ell meta ----
-        int E    = c_ell_E[p];
-        int base = c_ell_base[p];
-        if (E <= 0) continue;
-
-        int iu_base = iu_seg_offsets[iu_idx];
-        int jv_base = jv_seg_offsets[jv_idx];
-        int k_base  = kv_k_offsets[kv_idx];
-
-        #pragma unroll 1
-        for (int k_local = 0; k_local < k_dim; ++k_local) {
-            int row = base + k_local * E;
-
-            const uint16_t* ij_row = c_ell_ij + row;  // constant
-            const T*        v_row  = cval     + row;  // constant
-
-            T acc;
-            switch (E) {
-                case 1: acc = eval_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                case 3: acc = eval_row_shared_gather_V1<T,3>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                case 4: acc = eval_row_shared_gather_V1<T,4>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                case 5: acc = eval_row_shared_gather_V1<T,5>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                case 6: acc = eval_row_shared_gather_V1<T,6>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                case 8: acc = eval_row_shared_gather_V1<T,8>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base); break;
-                default:
-                    acc = eval_row_shared_gather_V1_runtime<T>(E, ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base);
-                    break;
-            }
-
-            out_z[(k_base + k_local) * U + u] = acc * xuv_uv;
-        }
-    }
+    // protect next pid's s_y write
+    __syncthreads();
+  }
 }
 
 
-torch::Tensor tp_channel_wise_fwd_template_launch(
+// path parallel for cwtp
+torch::Tensor tp_channel_wise_pp_fwd_launch(
     torch::Tensor x_uv,            // [Z, UV_TOTAL]
     torch::Tensor x_iu,            // [Z, IU_TOTAL]
     torch::Tensor x_jv,            // [Z, JV_TOTAL]
@@ -605,7 +1097,7 @@ torch::Tensor tp_channel_wise_fwd_template_launch(
     torch::Tensor ell_E,
     torch::Tensor ell_base,
     torch::Tensor ell_ij,
-    torch::Tensor ell_val,         
+    torch::Tensor ell_val,
 
     const int64_t U,
     const int64_t V,
@@ -685,15 +1177,9 @@ torch::Tensor tp_channel_wise_fwd_template_launch(
         cudaMemcpyDeviceToDevice,
         stream));
 
-        int threads = static_cast<int>(U);
-        if (threads < 32) threads = 32;
-        if (threads > 1024) threads = 1024;
-
-        int blocks = static_cast<int>(Z);
-        size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
     
 
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "cwtp_fwd_group3_by_iu_k4_sharedy_xscalar", [&] {
 
         // copy ell_val to typed constant
         if constexpr (std::is_same<scalar_t, float>::value) {
@@ -714,34 +1200,30 @@ torch::Tensor tp_channel_wise_fwd_template_launch(
                 stream));
         }
 
-        tp_channel_wise_sparse_groupk_kernel_ell_packed_bucket<scalar_t, MAX_K_DIM>
-            <<<blocks, threads, smem_bytes, stream>>>(
-                x_uv.data_ptr<scalar_t>(),
-                x_iu.data_ptr<scalar_t>(),
-                x_jv.data_ptr<scalar_t>(),
-                path_indices.data_ptr<int>(),
-                k_dims.data_ptr<int>(),
-                //i_dims.data_ptr<int>(),
-                //j_dims.data_ptr<int>(),
-                iu_seg_offsets.data_ptr<int>(),
-                jv_seg_offsets.data_ptr<int>(),
-                kv_k_offsets.data_ptr<int>(),
-                // keep passing (unused)
-                ell_E.data_ptr<int>(),
-                ell_base.data_ptr<int>(),
-                ell_ij.data_ptr<uint16_t>(),
-                ell_val.data_ptr<scalar_t>(),
-                out.data_ptr<scalar_t>(),
-                (int)Z,
-                (int)UV_TOTAL,
-                (int)IU_TOTAL,
-                (int)JV_TOTAL,
-                (int)K_TOTAL,
-                (int)U,
-                //(int)V,
-                num_paths
-            );
         
+        dim3 grid(Z, 3, 1);
+        dim3 block(U, 1, 1);
+       //cwtp_fwd_path_parallel_ell_innerk_template_kernel_k4_sharedy_xscalar<scalar_t> // grid.y = num_paths
+       cwtp_fwd_group3_by_iu_k4_sharedy_xscalar<scalar_t, 8> // grid.y = 3
+        <<<grid, block, 0, stream>>>(
+            x_uv.data_ptr<scalar_t>(),
+            x_iu.data_ptr<scalar_t>(),
+            x_jv.data_ptr<scalar_t>(),
+            (const int32_t*)path_indices.data_ptr<int32_t>(),
+            (const int32_t*)i_dims.data_ptr<int32_t>(),
+            (const int32_t*)j_dims.data_ptr<int32_t>(),
+            (const int32_t*)k_dims.data_ptr<int32_t>(),
+            (const int32_t*)iu_seg_offsets.data_ptr<int32_t>(),
+            (const int32_t*)jv_seg_offsets.data_ptr<int32_t>(),
+            (const int32_t*)kv_k_offsets.data_ptr<int32_t>(),
+            out.data_ptr<scalar_t>(),
+            (int)Z,
+            (int)UV_TOTAL,
+            (int)IU_TOTAL,
+            (int)JV_TOTAL,
+            (int)K_TOTAL,
+            (int)U,
+            num_paths);
         out = out.view({Z, K_TOTAL * U * V});
         CUDA_CHECK(cudaGetLastError());
     });
@@ -752,5 +1234,5 @@ torch::Tensor tp_channel_wise_fwd_template_launch(
 TORCH_LIBRARY(cwtp_fwd, m)
 {
     m.def("forward", &tp_channel_wise_fwd_launch);
-    m.def("forward_test", &tp_channel_wise_fwd_template_launch);
+    m.def("forward_pp", &tp_channel_wise_pp_fwd_launch);
 }
