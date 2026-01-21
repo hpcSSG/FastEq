@@ -851,7 +851,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
 
 }
 
-std::vector<torch::Tensor> cwtp_bwd_fused(
+std::vector<torch::Tensor> tp_channel_wise_bwd_coo_launch(
     torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
     torch::Tensor x_uv,          // [Z,UV_TOTAL]
     torch::Tensor x_iu,          // [Z,IU_TOTAL]
@@ -982,7 +982,7 @@ std::vector<torch::Tensor> cwtp_bwd_fused(
   return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
-/*
+
 // ------------------------------
 // Backward row-eval (E known at compile time)
 //   forward: out = (sum_e c * xiu * xjv) * xuv
@@ -994,68 +994,8 @@ std::vector<torch::Tensor> cwtp_bwd_fused(
 // ------------------------------
 // ---- row backward: update grad_x_iu, compute acc (for grad_x_uv) ----
 
-template <typename T, int E>
-__device__ __forceinline__ void bwd_row_shared_gather_V1(
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base,
-    T gok, T xuv_u,
-    T& acc,
-    T* __restrict__ gxiu_z
-) {
-  T a = (T)0;
-  #pragma unroll
-  for (int e = 0; e < E; ++e) {
-    uint16_t ij = ij_row[e];
-    T c = val_row[e];
-    int i = (int)(ij & 0xFF);
-    int j = (int)(ij >> 8);
-
-    T xiu = s_iu[iu_base + i * U + u];
-    T xjv = s_jv[jv_base + j];
-
-    a = fma(c, xiu * xjv, a);
-
-    // grad_xiu += go * xuv * c * xjv
-    gxiu_z[iu_base + i * U + u] = fma(gok * xuv_u * c, xjv,
-                                      gxiu_z[iu_base + i * U + u]);
-  }
-  acc += a;
-}
-
-template <typename T>
-__device__ __forceinline__ void bwd_row_shared_gather_V1_runtime(
-    int E,
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base,
-    T gok, T xuv_u,
-    T& acc,
-    T* __restrict__ gxiu_z
-) {
-  T a = (T)0;
-  #pragma unroll 1
-  for (int e = 0; e < E; ++e) {
-    uint16_t ij = ij_row[e];
-    T c = val_row[e];
-    int i = (int)(ij & 0xFF);
-    int j = (int)(ij >> 8);
-
-    T xiu = s_iu[iu_base + i * U + u];
-    T xjv = s_jv[jv_base + j];
-
-    a = fma(c, xiu * xjv, a);
-
-    gxiu_z[iu_base + i * U + u] = fma(gok * xuv_u * c, xjv,
-                                      gxiu_z[iu_base + i * U + u]);
-  }
-  acc += a;
-}
-
 template <typename T, int E, int IACC_PAD>
-__device__ __forceinline__ void bwd_row_shared_gather_IUACC_SHMEM(
+__device__ __forceinline__ void bwd_row_shared_gather(
     const uint16_t* __restrict__ ij_row,
     const T* __restrict__ val_row,
     const T* __restrict__ s_iu, int iu_base, int U, int u,
@@ -1089,10 +1029,9 @@ __device__ __forceinline__ void bwd_row_shared_gather_IUACC_SHMEM(
 }
 
 
-
 // -------------------- kernel --------------------
 template <typename T, int MAX_K_DIM = 8>
-__global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
+__global__ void tp_cwtp_bwd_ell_packed(
     const T* __restrict__ x_uv,          // [Z, UV_TOTAL] = [Z, K_TOTAL*U]
     const T* __restrict__ x_iu,          // [Z, IU_TOTAL]
     const T* __restrict__ x_jv,          // [Z, JV_TOTAL]
@@ -1127,7 +1066,7 @@ __global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
   // shared for block-reduce (T)
   T* sh_warp = reinterpret_cast<T*>(s_jv + (size_t)JV_TOTAL);
   T* s_ju    = sh_warp + (size_t)num_warps * 32;   // [JV_TOTAL * U]
-  T* s_iuacc = s_ju    + (size_t)JV_TOTAL * U;         // [U*IACC_PAD]
+  T* s_iuacc = s_ju    + (size_t)JV_TOTAL * U;     // [U*IACC_PAD]
 
   const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
   const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
@@ -1160,26 +1099,11 @@ __global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
     #pragma unroll
     for (int ii = 0; ii < IACC; ++ii) iuacc_row[ii] = (T)0;
 
-    if (lane == 0) {
-      int4 m1 = meta1[p];
-      int4 m2 = meta2[p];
-      uv_base = m1.x; iu_base = m1.y; jv_base = m1.z; k_base = m1.w;
-      k_dim   = m2.x; E       = m2.y; base   = m2.z;
-    } else {
-      uv_base = iu_base = jv_base = k_base = 0;
-      k_dim = E = base = 0;
-    }
-    uv_base = shfl_i32(uv_base);
-    iu_base = shfl_i32(iu_base);
-    jv_base = shfl_i32(jv_base);
-    k_base  = shfl_i32(k_base);
-    k_dim   = shfl_i32(k_dim);
-    E       = shfl_i32(E);
-    base    = shfl_i32(base);
-
-    if (k_dim <= 0) continue;
-    if (k_dim > MAX_K_DIM) continue;
-
+    int4 m1 = meta1[p];
+    int4 m2 = meta2[p];
+    uv_base = m1.x; iu_base = m1.y; jv_base = m1.z; k_base = m1.w;
+    k_dim   = m2.x; E       = m2.y; base   = m2.z;
+    
     T xuv_u = x_uv_z[uv_base + u];
 
     // grad_x_uv accumulator in T
@@ -1193,61 +1117,23 @@ __global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
 
       T gok = go_z[(k_base + k_local) * U + u];
 
-      // 1) compute acc + update grad_x_iu (no atomic)
+      //update grad_x_iu
       T acc = (T)0;
       switch (E) {
-        //case 1: bwd_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 3: bwd_row_shared_gather_V1<T,3>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 4: bwd_row_shared_gather_V1<T,4>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 5: bwd_row_shared_gather_V1<T,5>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 6: bwd_row_shared_gather_V1<T,6>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 8: bwd_row_shared_gather_V1<T,8>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        
-        case 1:
-            bwd_row_shared_gather_IUACC_SHMEM<T,1,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-        case 3:
-            bwd_row_shared_gather_IUACC_SHMEM<T,3,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 4:
-            bwd_row_shared_gather_IUACC_SHMEM<T,4,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 5:
-            bwd_row_shared_gather_IUACC_SHMEM<T,5,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 6:
-            bwd_row_shared_gather_IUACC_SHMEM<T,6,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 8:
-            bwd_row_shared_gather_IUACC_SHMEM<T,8,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        
+        case 1: bwd_row_shared_gather<T,1,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
+        case 3: bwd_row_shared_gather<T,3,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
+        case 4: bwd_row_shared_gather<T,4,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
+        case 5: bwd_row_shared_gather<T,5,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
+        case 6: bwd_row_shared_gather<T,6,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
+        case 8: bwd_row_shared_gather<T,8,IACC_PAD>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, iuacc_row, gxiu_z); break;
         default:
-          bwd_row_shared_gather_V1_runtime<T>(E, ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z);
           break;
       }
 
       // gxuv_acc += gok * acc
       gxuv_acc = fma(gok, acc, gxuv_acc);
 
-      // 2) grad_jv: 只累积到 shared s_ju (T)，不做reduce、不写global
+      // grad_jv:
       #pragma unroll 1
       for (int e = 0; e < E; ++e) {
         uint16_t ij = ij_row[e];
@@ -1278,7 +1164,7 @@ __global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
 
   __syncthreads();
 
-  // 3) paths 全结束后：对每个 j 规约一次，再写回 global
+  // grad_jv
   #pragma unroll 1
   for (int j = 0; j < JV_TOTAL; ++j) {
     T pj_u = s_ju[(size_t)j * U + u];
@@ -1288,7 +1174,7 @@ __global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
   }
 }
 
-std::vector<torch::Tensor> tp_channel_wise_bwd_template_launch(
+std::vector<torch::Tensor> tp_channel_wise_bwd_ell_launch(
     torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
     torch::Tensor x_uv,          // [Z,UV_TOTAL]
     torch::Tensor x_iu,          // [Z,IU_TOTAL]
@@ -1367,12 +1253,7 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_template_launch(
     (size_t)U * IACC_PAD * x_uv.element_size();
     
     AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_cwtp_bwd_ell_packed_meta2x16", [&] {
-      cudaFuncSetAttribute(
-        tp_cwtp_bwd_ell_packed_meta2x16_opt<scalar_t, MAX_K_DIM>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)smem_bytes
-      );
-      tp_cwtp_bwd_ell_packed_meta2x16_opt<scalar_t, MAX_K_DIM>
+      tp_cwtp_bwd_ell_packed<scalar_t, MAX_K_DIM>
       <<<blocks, threads, smem_bytes, stream>>>(
           x_uv.data_ptr<scalar_t>(),
           x_iu.data_ptr<scalar_t>(),
@@ -1398,10 +1279,10 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_template_launch(
 
     return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
-*/
+
 
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &cwtp_bwd_fused);
-   // m.def("backward_opt", &tp_channel_wise_bwd_template_launch);
+    m.def("backward", &tp_channel_wise_bwd_coo_launch);
+    m.def("backward_opt", &tp_channel_wise_bwd_ell_launch);
 }

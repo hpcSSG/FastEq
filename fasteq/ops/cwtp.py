@@ -169,7 +169,6 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         execution_time_ms = end_time - start_time
         print(f"<< fasteq cwtp backward cost: {execution_time_ms:.3f} ms >>")
         
-        '''
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
@@ -189,11 +188,10 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"<< fasteq cwtp opt backward cost: {execution_time_ms:.3f} ms >>")
-        '''
 
-        #print(f"grad_w:{grad_w}, ref_grad_w:{ref_grad_w}")
-        #print(f"grad_x:{grad_x}, ref_grad_x:{ref_grad_x}")
-        #print(f"grad_y:{grad_y}, ref_grad_y:{ref_grad_y}")
+        print(f"grad_w:{grad_w}, ref_grad_w:{ref_grad_w}")
+        print(f"grad_x:{grad_x}, ref_grad_x:{ref_grad_x}")
+        print(f"grad_y:{grad_y}, ref_grad_y:{ref_grad_y}")
 
         return (
             grad_w,   # w
