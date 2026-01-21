@@ -97,8 +97,23 @@ __device__ __forceinline__ void cp_async_ca_16B(void* smem_dst, const void* gmem
     );
 }
 
+
+__device__ __forceinline__ void cp_async_cg_16B(void* smem_dst, const void* gmem_src) {
+    // cp.async expects shared address in 32-bit "shared space" address
+    unsigned int smem_u32 = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
+    asm volatile(
+        "cp.async.cg.shared.global [%0], [%1], 16;\n" ::  // 16 bytes
+        "r"(smem_u32), "l"(gmem_src)
+    );
+}
+
 __device__ __forceinline__ void cp_async_commit_group() {
     asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group() {
+  asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
 __device__ __forceinline__ void cp_async_wait_group0() {
@@ -106,6 +121,8 @@ __device__ __forceinline__ void cp_async_wait_group0() {
 }
 
 #endif
+
+
 
 template <typename T>
 __device__ __forceinline__ void stage_gmem_to_smem_cpasync_16B(

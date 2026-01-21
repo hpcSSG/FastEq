@@ -11,6 +11,8 @@
 
 #define CWTP_DEFINE_CONSTANTS
 #include "cwtp_helper.cuh"
+#include "codegen/eval_pid_generated.cuh"
+#include "codegen/pid_table_generated.cuh"
 
 // opt1: CG sparse + path 内groupk, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
 /*
@@ -443,7 +445,6 @@ __device__ __forceinline__ T eval_row_shared_gather_V1_runtime(
 // Kernel: ELL packed bucket, V==1
 // 把 CG 的 (i,j) 非零做成了每行固定 E 项的 ELL-packed（ij_row[e] / val_row[e] 连续），并且 s_iu / s_jv 都在 shared 里, 访存更规则一些
 // -----------------------------
-
 template <typename T, int MAX_K_DIM = 8>
 __global__ void tp_channel_wise_sparse_groupk_ell_kernel(
     const T* __restrict__ x_uv,
@@ -472,7 +473,7 @@ __global__ void tp_channel_wise_sparse_groupk_ell_kernel(
     const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
     const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
     int threads = (int)blockDim.x;
-    for (int idx = u; idx < IU_TOTAL; idx += threads) s_iu[idx] = x_iu_z[idx];
+    for (int idx = u; idx < IU_TOTAL; idx += threads) s_iu[idx] = x_iu_z[idx]; // TODO, pipeline
     for (int idx = u; idx < JV_TOTAL; idx += threads) s_jv[idx] = x_jv_z[idx];
     
     __syncthreads();
@@ -492,37 +493,8 @@ __global__ void tp_channel_wise_sparse_groupk_ell_kernel(
         int jv_base = jv_seg_offsets[jv_idx];
         int k_base  = kv_k_offsets[kv_idx];
         */
-
-        /*
-        int uv_base = path_bases[p * 4 + 0];
-        int iu_base = path_bases[p * 4 + 1];
-        int jv_base = path_bases[p * 4 + 2];
-        int k_base  = path_bases[p * 4 + 3];
-
-        int k_dim = k_dims[p];
-        //if (k_dim <= 0) continue;
-        //if (k_dim > MAX_K_DIM) return;
-        // ---- use CONSTANT for ell meta ----
-        int E    = c_ell_E[p];
-        int base = c_ell_base[p];
-        if (E <= 0) continue;
-        */
-
-        /*
-        // uv_base, iu_base, jv_base, k_base
-        int uv_base = c_meta1[p * 4 + 0];
-        int iu_base = c_meta1[p * 4 + 1];
-        int jv_base = c_meta1[p * 4 + 2];
-        int k_base  = c_meta1[p * 4 + 3];
-
-        // k_dims, ell_E, ell_base, pad
-        int k_dim   = c_meta2[p * 4 + 0];
-        int E       = c_meta2[p * 4 + 1];
-        int base    = c_meta2[p * 4 + 2];
-        */
-
-        //const int4* meta1_4 = reinterpret_cast<const int4*>(c_meta1);
-        //const int4* meta2_4 = reinterpret_cast<const int4*>(c_meta2);
+        
+        // packed vectorize load
         int4 m1 = meta1_4[p];
         int4 m2 = meta2_4[p];
         int uv_base, iu_base, jv_base, k_base;
@@ -552,6 +524,7 @@ __global__ void tp_channel_wise_sparse_groupk_ell_kernel(
         }
     }
 }
+
 
 
 torch::Tensor tp_channel_wise_fwd_launch(
@@ -652,6 +625,25 @@ torch::Tensor tp_channel_wise_fwd_launch(
         stream));
 
     AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
+        
+        if constexpr (std::is_same<scalar_t, float>::value) {
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(
+                c_ell_val_f32,
+                ell_val.data_ptr<float>(),
+                sizeof(float) * ell_total,
+                0,
+                cudaMemcpyDeviceToDevice,
+                stream));
+        } else if constexpr (std::is_same<scalar_t, double>::value) {
+            CUDA_CHECK(cudaMemcpyToSymbolAsync(
+                c_ell_val_f64,
+                ell_val.data_ptr<double>(),
+                sizeof(double) * ell_total,
+                0,
+                cudaMemcpyDeviceToDevice,
+                stream));
+        }
+
         /*
         tp_channel_wise_sparse_groupk_constant_kernel<scalar_t, MAX_K_DIM>
             <<<blocks, threads, smem_bytes, stream>>>(
@@ -680,7 +672,221 @@ torch::Tensor tp_channel_wise_fwd_launch(
                 (int)V,
                 num_paths
             );
-            */
+        */
+
+        tp_channel_wise_sparse_groupk_ell_kernel<scalar_t, MAX_K_DIM>
+        <<<blocks, threads, smem_bytes, stream>>>(
+            x_uv.data_ptr<scalar_t>(),
+            x_iu.data_ptr<scalar_t>(),
+            x_jv.data_ptr<scalar_t>(),
+            k_dims.data_ptr<int>(),
+            reinterpret_cast<const int4*>(meta1.data_ptr<int32_t>()),
+            reinterpret_cast<const int4*>(meta2.data_ptr<int32_t>()),
+            out.data_ptr<scalar_t>(),
+            (int)Z,
+            (int)UV_TOTAL,
+            (int)IU_TOTAL,
+            (int)JV_TOTAL,
+            (int)K_TOTAL,
+            (int)U,
+            num_paths
+        );
+        
+        out = out.view({Z, K_TOTAL * U * V});
+        CUDA_CHECK(cudaGetLastError());
+    });
+
+    return out;
+}
+
+template<typename T>
+__device__ __forceinline__ T eval_pid_table(
+    int pid, const T* v_row,
+    const T* s_iu, int iu_base, int U, int u,
+    const T* s_jv, int jv_base
+) {
+    T acc = (T)0;
+    uint8_t E = PID_E[pid];
+
+    #pragma unroll
+    for (int e = 0; e < 8; ++e) {
+        T ce = (e < E) ? v_row[e] : (T)0;
+        uint8_t i = PID_I[pid][e];
+        uint8_t j = PID_J[pid][e];
+        T xiu = s_iu[iu_base + (int)i * U + u];
+        T xjv = s_jv[jv_base + (int)j];
+        acc = fma(ce, xiu * xjv, acc);
+    }
+    return acc;
+}
+
+
+template <typename T, int MAX_K_DIM=8, int NUM_PATHS=17>
+__global__ void tp_channel_wise_sparse_groupk_ell_pid_kernel_shared_iujv(
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const int4* __restrict__ meta1_4,
+    const int4* __restrict__ meta2_4,
+    T* __restrict__ out,
+    int Z, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL, int K_TOTAL, int U
+) {
+    int z = (int)blockIdx.x;
+    int u = (int)threadIdx.x;
+    if (z >= Z || u >= U) return;
+
+    
+
+    extern __shared__ unsigned char smem_raw[];
+    T* s_iu = reinterpret_cast<T*>(smem_raw);
+    T* s_jv = s_iu + (size_t)IU_TOTAL;       // [JV_TOTAL]
+
+    const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+    const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+    const T* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+    T* out_z = out + (size_t)z * (size_t)(K_TOTAL * U);
+
+    // IU/JV -> shared
+    for (int idx = u; idx < IU_TOTAL; idx += (int)blockDim.x) s_iu[idx] = x_iu_z[idx];
+    for (int idx = u; idx < JV_TOTAL; idx += (int)blockDim.x) s_jv[idx] = x_jv_z[idx];
+    __syncthreads();
+
+    const T* cval = ell_val_const_ptr<T>();
+
+    #pragma unroll
+    for (int p = 0; p < NUM_PATHS; ++p) {
+        int4 m1 = meta1_4[p];
+        int4 m2 = meta2_4[p];
+
+        int uv_base = m1.x;
+        int iu_base = m1.y;
+        int jv_base = m1.z;
+        int k_base  = m1.w;
+
+        int k_dim = m2.x;
+        int E     = m2.y;
+        int base  = m2.z;
+
+        T xuv_uv = x_uv_z[uv_base + u];
+
+        #pragma unroll
+        for (int k_local = 0; k_local < MAX_K_DIM; ++k_local) {
+            if (k_local >= k_dim) break;
+
+            uint8_t pid = CWTP_PID_TABLE[p][k_local];
+
+            int row = base + k_local * E;  // 布局：每行长度=E
+            const T* v_row = cval + row;
+
+            T acc = eval_pid_dispatch<T>(
+                (int)pid,
+                v_row,
+                s_iu, iu_base, U, u,
+                s_jv, jv_base
+            );
+            
+
+            out_z[(k_base + k_local) * U + u] = acc * xuv_uv;
+        }
+    }
+}
+
+torch::Tensor tp_channel_wise_fwd_codegen_launch(
+    torch::Tensor x_uv,            // [Z, UV_TOTAL]
+    torch::Tensor x_iu,            // [Z, IU_TOTAL]
+    torch::Tensor x_jv,            // [Z, JV_TOTAL]
+    torch::Tensor c_all,           // [sum_p i_p*j_p*k_p]
+    torch::Tensor path_indices,    // [num_paths, 4], int32
+    torch::Tensor i_dims,          // [num_paths], int32
+    torch::Tensor j_dims,          // [num_paths], int32
+    torch::Tensor k_dims,          // [num_paths], int32
+    torch::Tensor c_offsets,       // [num_paths], int32
+    torch::Tensor iu_seg_offsets,  // [iu_seg_count], int32
+    torch::Tensor jv_seg_offsets,  // [jv_seg_count], int32
+    torch::Tensor kv_k_offsets,    // [kv_seg_count], int32
+
+    // 稀疏 CG
+    torch::Tensor nnz_per_path,    // [num_paths], int32
+    torch::Tensor nnz_offsets,     // [num_paths], int32
+    torch::Tensor nnz_k_offsets,
+    torch::Tensor nnz_k_counts,
+    torch::Tensor cg_i_all,        // [nnz_total], int32
+    torch::Tensor cg_j_all,        // [nnz_total], int32
+    torch::Tensor cg_k_all,        // [nnz_total], int32
+    torch::Tensor cg_val_all,      // [nnz_total], same dtype as x_uv
+
+    //ell data and Packed base offsets 
+    torch::Tensor ell_ij,
+    torch::Tensor ell_val,
+    torch::Tensor meta1,            // packed bases_offsets, [num_paths, 4], int32
+    torch::Tensor meta2,            // packed kdims, ell, [num_paths, 4], int32
+
+    const int64_t U,
+    const int64_t V,
+    const int64_t K_TOTAL
+) {
+    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
+    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
+
+    x_uv = x_uv.contiguous();
+    x_iu = x_iu.contiguous();
+    x_jv = x_jv.contiguous();
+    c_all = c_all.contiguous();
+    path_indices = path_indices.contiguous();
+    i_dims = i_dims.contiguous();
+    j_dims = j_dims.contiguous();
+    k_dims = k_dims.contiguous();
+    c_offsets = c_offsets.contiguous();
+    iu_seg_offsets = iu_seg_offsets.contiguous();
+    jv_seg_offsets = jv_seg_offsets.contiguous();
+    kv_k_offsets = kv_k_offsets.contiguous();
+
+    nnz_per_path   = nnz_per_path.contiguous();
+    nnz_offsets    = nnz_offsets.contiguous();
+    cg_i_all       = cg_i_all.contiguous();
+    cg_j_all       = cg_j_all.contiguous();
+    cg_k_all       = cg_k_all.contiguous();
+    cg_val_all     = cg_val_all.contiguous();
+
+    auto Z = x_uv.size(0);
+    auto UV_TOTAL = x_uv.size(1);
+    auto IU_TOTAL = x_iu.size(1);
+    auto JV_TOTAL = x_jv.size(1);
+
+    int num_paths = path_indices.size(0);
+    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
+
+    TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch dim mismatch");
+    TORCH_CHECK(path_indices.dim() == 2 && path_indices.size(1) == 4,
+                "path_indices must be [num_paths,4]");
+    
+    int ell_total = (int)ell_ij.numel();
+    TORCH_CHECK(ell_total == (int)ell_val.numel(), "ell_ij and ell_val numel mismatch");
+    TORCH_CHECK(num_paths <= MAX_PATHS_CONST, "num_paths exceeds MAX_PATHS_CONST");
+    TORCH_CHECK(ell_total <= ELL_MAX_CONST, "ell_total exceeds ELL_MAX_CONST");
+
+    
+
+    auto out = torch::empty({Z, K_TOTAL, U, V}, x_uv.options());
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    int threads = U;
+
+    int blocks = static_cast<int>(Z);
+    size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
+
+    // copy meta to constant (D2D)
+    CUDA_CHECK(cudaMemcpyToSymbolAsync(
+        c_ell_ij,
+        ell_ij.data_ptr<uint16_t>(),
+        sizeof(uint16_t) * ell_total,
+        0,
+        cudaMemcpyDeviceToDevice,
+        stream));
+
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_channel_wise_sparse_groupk_kernel", [&] {
         
         if constexpr (std::is_same<scalar_t, float>::value) {
             CUDA_CHECK(cudaMemcpyToSymbolAsync(
@@ -700,12 +906,11 @@ torch::Tensor tp_channel_wise_fwd_launch(
                 stream));
         }
 
-        tp_channel_wise_sparse_groupk_ell_kernel<scalar_t, MAX_K_DIM>
+        tp_channel_wise_sparse_groupk_ell_pid_kernel_shared_iujv<scalar_t, MAX_K_DIM, 17>
         <<<blocks, threads, smem_bytes, stream>>>(
             x_uv.data_ptr<scalar_t>(),
             x_iu.data_ptr<scalar_t>(),
             x_jv.data_ptr<scalar_t>(),
-            k_dims.data_ptr<int32_t>(),
             reinterpret_cast<const int4*>(meta1.data_ptr<int32_t>()),
             reinterpret_cast<const int4*>(meta2.data_ptr<int32_t>()),
             out.data_ptr<scalar_t>(),
@@ -714,10 +919,9 @@ torch::Tensor tp_channel_wise_fwd_launch(
             (int)IU_TOTAL,
             (int)JV_TOTAL,
             (int)K_TOTAL,
-            (int)U,
-            num_paths
+            (int)U
         );
-
+    
         
         out = out.view({Z, K_TOTAL * U * V});
         CUDA_CHECK(cudaGetLastError());
@@ -1099,6 +1303,7 @@ torch::Tensor tp_channel_wise_pp_fwd_launch(
     torch::Tensor ell_ij,
     torch::Tensor ell_val,
 
+
     const int64_t U,
     const int64_t V,
     const int64_t K_TOTAL
@@ -1234,5 +1439,6 @@ torch::Tensor tp_channel_wise_pp_fwd_launch(
 TORCH_LIBRARY(cwtp_fwd, m)
 {
     m.def("forward", &tp_channel_wise_fwd_launch);
+    m.def("forward_cg", &tp_channel_wise_fwd_codegen_launch);
     m.def("forward_pp", &tp_channel_wise_pp_fwd_launch);
 }

@@ -3,6 +3,10 @@ import os, math, time
 from typing import List
 import fasteq.cuda 
 
+from collections import Counter
+from fasteq.tools.gen_cwtp_fwd import count_patterns_for_paths, analyze_topN, parse_patterns_text, generate_eval_pid_cuh, build_pid_table_from_torch, generate_pid_table_cuh
+
+
 class FastChannelWiseTensorProductFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, x, y, meta, ell_meta):
@@ -30,60 +34,77 @@ class FastChannelWiseTensorProductFunction(torch.autograd.Function):
         U = meta["U"]
         V = meta["V"]
         K_TOTAL = meta["K_TOTAL"]
-
         num_paths = nnz_per_path.shape[0]
-
-        '''
-        print(f"path_indices.shape:{path_indices.shape}, k_dims.shape:{k_dims.shape}, nnz_per_path.shape:{nnz_per_path.shape} \
-            nnz_offsets.shape:{nnz_offsets_groupk.shape}, iu_seg_offsets:{iu_seg_offsets.shape}, jv_seg_offsets:{jv_seg_offsets.shape} \
-            kv_k_offsets.shape:{kv_k_offsets.shape}")
-        
-        print(f"nnz_k_offsets.shape:{nnz_k_offsets_groupk.shape}, nnz_k_counts.shape:{nnz_k_counts_groupk.shape}, \
-            cg_i_groupk.shape:{cg_i_groupk.shape}, cg_j_groupk.shape:{cg_j_groupk.shape},cg_val_groupk.shape:{cg_val_groupk.shape}")
-        '''
         
         ell_E, ell_base, ell_ij, ell_val = ell_meta["ell_E"], ell_meta["ell_base"], ell_meta["ell_ij"], ell_meta["ell_val"]
         meta1, meta2 = ell_meta["meta1"], ell_meta["meta2"]
 
+
+        """
+        counter = count_patterns_for_paths(meta2, ell_ij)
+        TEXT = analyze_topN(counter, N=48)
+        patterns = parse_patterns_text(TEXT, keep_order=True)
+        # 生成 eval header（写文件）
+        cuh = generate_eval_pid_cuh(patterns)
+        open("eval_pid_generated.cuh", "w").write(cuh)
+        # 3) 生成 pid_table
+        pid_table = build_pid_table_from_torch(patterns, meta2.cpu(), ell_ij.cpu(), max_k_dim=8)
+        pid_cuh = generate_pid_table_cuh(pid_table, symbol_name="CWTP_PID_TABLE")
+        open("pid_table_generated.cuh", "w").write(pid_cuh)
+        
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
-        if num_paths == 19:
-            output = torch.ops.cwtp_fwd.forward_pp(
-                w, x, y,
-                c_all,
-                path_indices,
-                i_dims, j_dims, k_dims,
-                c_offsets,
-                iu_seg_offsets,
-                jv_seg_offsets,
-                kv_k_offsets,
-                ell_E, ell_base, ell_ij, ell_val,
-                U, V, K_TOTAL
-            )
+
+        output = torch.ops.cwtp_fwd.forward_cg(
+            w, x, y,
+            c_all,
+            path_indices,
+            i_dims, j_dims, k_dims,
+            c_offsets,
+            iu_seg_offsets,
+            jv_seg_offsets,
+            kv_k_offsets,
+            nnz_per_path,
+            nnz_offsets_groupk,
+            nnz_k_offsets_groupk,
+            nnz_k_counts_groupk,
+            cg_i_groupk,
+            cg_j_groupk,
+            cg_k_groupk,
+            cg_val_groupk,
+            #ell_E, ell_base, 
+            ell_ij, ell_val,
+            meta1, meta2,
+            U, V, K_TOTAL
+        )
+
+        """
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
             
-        else:
-            output = torch.ops.cwtp_fwd.forward(
-                w, x, y,
-                c_all,
-                path_indices,
-                i_dims, j_dims, k_dims,
-                c_offsets,
-                iu_seg_offsets,
-                jv_seg_offsets,
-                kv_k_offsets,
-                nnz_per_path,
-                nnz_offsets_groupk,
-                nnz_k_offsets_groupk,
-                nnz_k_counts_groupk,
-                cg_i_groupk,
-                cg_j_groupk,
-                cg_k_groupk,
-                cg_val_groupk,
-                #ell_E, ell_base, 
-                ell_ij, ell_val,
-                meta1, meta2,
-                U, V, K_TOTAL
-            )
+        output = torch.ops.cwtp_fwd.forward(
+            w, x, y,
+            c_all,
+            path_indices,
+            i_dims, j_dims, k_dims,
+            c_offsets,
+            iu_seg_offsets,
+            jv_seg_offsets,
+            kv_k_offsets,
+            nnz_per_path,
+            nnz_offsets_groupk,
+            nnz_k_offsets_groupk,
+            nnz_k_counts_groupk,
+            cg_i_groupk,
+            cg_j_groupk,
+            cg_k_groupk,
+            cg_val_groupk,
+            #ell_E, ell_base, 
+            ell_ij, ell_val,
+            meta1, meta2,
+            U, V, K_TOTAL
+        )
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
