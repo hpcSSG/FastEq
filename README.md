@@ -26,20 +26,19 @@ The operators implemented in FastEq include:
 3. Install the Python dependencies and the package itself
    ```bash
    pip install -r requirements.txt
-   pip install . --no-build-isolation 
+   TORCH_CUDA_ARCH_LIST="9.0;9.0a" pip install . --no-build-isolation 
    ```
    We recommend using Virtualenv or Conda to manage the dependencies.
-4. Install patched cuEquivariance_torch
-   ```bash
-   cd 3rdpatry/cuequivariance_torch
-   pip install . --no-build-isolation 
-   ```
-5. Install patched MACE
+4. Install patched MACE
    ```bash
    cd 3rdpatry/mace
    pip install . --no-build-isolation 
    ```
-
+5. Install patched cuEquivariance_torch
+   ```bash
+   cd 3rdpatry/cuequivariance_torch
+   pip install . --no-build-isolation 
+   ```
    
 
 # How to use FastEq

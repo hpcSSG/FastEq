@@ -1436,9 +1436,290 @@ torch::Tensor tp_channel_wise_pp_fwd_launch(
     return out;
 }
 
+
+
+// -------------------- kernel --------------------
+
+// -------------------- row eval: uses shared iu/jv, writes gxiu (no conflict) --------------------
+template <typename T, int E>
+__device__ __forceinline__ void bwd_row_shared_gather_V1(
+    const uint16_t* __restrict__ ij_row,
+    const T* __restrict__ val_row,
+    const T* __restrict__ s_iu, int iu_base, int U, int u,
+    const T* __restrict__ s_jv, int jv_base,
+    T gok, T xuv_u,
+    T& acc,
+    T* __restrict__ gxiu_z
+) {
+  T a = (T)0;
+
+  #pragma unroll
+  for (int e = 0; e < E; ++e) {
+    uint16_t ij = ij_row[e];
+    T c = val_row[e];
+    int i = (int)(ij & 0xFF);
+    int j = (int)(ij >> 8);
+
+    T xiu = s_iu[iu_base + i * U + u];
+    T xjv = s_jv[jv_base + j];
+
+    a = fma(c, xiu * xjv, a);
+
+    // gxiu[u,i] += go * xuv * c * xjv
+    T* gxiu_ptr = gxiu_z + (iu_base + i * U + u);
+    *gxiu_ptr = fma(gok * xuv_u * c, xjv, *gxiu_ptr);
+  }
+
+  acc += a;
+}
+
+template <typename T, int MAX_K_DIM = 8>
+__global__ void tp_cwtp_bwd_ell_packed(
+    const T* __restrict__ x_uv,
+    const T* __restrict__ x_iu,
+    const T* __restrict__ x_jv,
+    const T* __restrict__ grad_out,
+    const int4* __restrict__ meta1,
+    const int4* __restrict__ meta2,
+    T* __restrict__ grad_x_uv,
+    T* __restrict__ grad_x_iu,
+    T* __restrict__ grad_x_jv,
+    int Z, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL, int K_TOTAL, int U, int num_paths
+) {
+  int z = (int)blockIdx.x;
+  if (z >= Z) return;
+
+  int u = (int)threadIdx.x;
+  if (u >= U) return;
+
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  int num_warps = (blockDim.x + 31) >> 5;
+
+  extern __shared__ unsigned char smem_raw[];
+  T* s_iu = reinterpret_cast<T*>(smem_raw);
+  T* s_jv = s_iu + (size_t)IU_TOTAL;
+
+  // ---- extra shared: per-warp gxjv buffer (NO atomic, NO race) ----
+  // layout: s_gxjv_warp[ num_warps ][ JV_TOTAL ]
+  T* s_gxjv_warp = s_jv + (size_t)JV_TOTAL;
+  T* my_warp_gxjv = s_gxjv_warp + (size_t)warp * JV_TOTAL;
+
+  // stage iu/jv to shared
+  const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
+  const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
+  stage_gmem_to_smem_cpasync_16B<T>(s_iu, x_iu_z, IU_TOTAL);
+  stage_gmem_to_smem_cpasync_16B<T>(s_jv, x_jv_z, JV_TOTAL);
+  __syncthreads();
+
+  // init per-warp gxjv to 0
+  for (int j = lane; j < JV_TOTAL; j += 32) {
+    my_warp_gxjv[j] = (T)0;
+  }
+  __syncthreads();
+
+  const T* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
+  const T* go_z   = grad_out + (size_t)z * (size_t)(K_TOTAL * U);
+  T* gxuv_z = grad_x_uv + (size_t)z * UV_TOTAL;
+  T* gxiu_z = grad_x_iu + (size_t)z * IU_TOTAL;
+  T* gxjv_z = grad_x_jv + (size_t)z * JV_TOTAL;
+
+  const T* cval = ell_val_const_ptr<T>();
+
+  for (int p = 0; p < num_paths; ++p) {
+    int uv_base, iu_base, jv_base, k_base;
+    int k_dim, E, base;
+
+    if (lane == 0) {
+      int4 m1 = meta1[p];
+      int4 m2 = meta2[p];
+      uv_base = m1.x; iu_base = m1.y; jv_base = m1.z; k_base = m1.w;
+      k_dim   = m2.x; E       = m2.y; base   = m2.z;
+    } else {
+      uv_base = iu_base = jv_base = k_base = 0;
+      k_dim = E = base = 0;
+    }
+    uv_base = shfl_i32(uv_base);
+    iu_base = shfl_i32(iu_base);
+    jv_base = shfl_i32(jv_base);
+    k_base  = shfl_i32(k_base);
+    k_dim   = shfl_i32(k_dim);
+    E       = shfl_i32(E);
+    base    = shfl_i32(base);
+
+    if (k_dim <= 0 || k_dim > MAX_K_DIM) continue;
+
+    T xuv_u = x_uv_z[uv_base + u];
+    T gxuv_acc = (T)0;
+
+    #pragma unroll 1
+    for (int k_local = 0; k_local < k_dim; ++k_local) {
+      int row = base + k_local * E;
+      const uint16_t* ij_row = c_ell_ij + row;
+      const T*        v_row  = cval     + row;
+
+      T gok = go_z[(k_base + k_local) * U + u];
+
+      // 1) acc + gxiu update (no atomic)
+      T acc = (T)0;
+      switch (E) {
+        case 1: bwd_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        case 3: bwd_row_shared_gather_V1<T,3>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        case 4: bwd_row_shared_gather_V1<T,4>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        case 5: bwd_row_shared_gather_V1<T,5>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        case 6: bwd_row_shared_gather_V1<T,6>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        case 8: bwd_row_shared_gather_V1<T,8>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
+        default: break;
+      }
+      gxuv_acc = fma(gok, acc, gxuv_acc);
+
+      // 2) gxjv: warp 内按 j 聚合 -> 写 my_warp_gxjv[j]（无 atomic）
+      #pragma unroll 1
+      for (int e = 0; e < E; ++e) {
+        uint16_t ij = ij_row[e];
+        T c = v_row[e];
+        int i = (int)(ij & 0xFF);
+        int j = (int)(ij >> 8);
+        int j_abs = jv_base + j;
+
+        T xiu = s_iu[iu_base + i * U + u];
+        T pj  = ((gok * xuv_u) * c) * xiu;
+
+        unsigned m = __match_any_sync(0xffffffffu, j_abs); // lanes with same j_abs
+        int leader = __ffs(m) - 1;
+        T sum = warp_reduce_sum<T>(pj);
+        if (lane == leader) {
+          my_warp_gxjv[j_abs] += sum;  // 单 lane 写：无竞争
+        }
+      }
+    }
+
+    gxuv_z[uv_base + u] = gxuv_z[uv_base + u] + gxuv_acc;
+  }
+
+  __syncthreads();
+
+  // 3) reduce across warps once, write gxjv (no atomic, since only this block handles z)
+  if (warp == 0) {
+    for (int j = lane; j < JV_TOTAL; j += 32) {
+      T sum = (T)0;
+      #pragma unroll 1
+      for (int w = 0; w < 8; ++w) {  // 你用 MAX_WARPS=8 的话可写死，否则用循环到 num_warps
+        if (w < num_warps) sum += s_gxjv_warp[(size_t)w * JV_TOTAL + j];
+      }
+      gxjv_z[j] += sum;
+    }
+  }
+}
+
+
+
+std::vector<torch::Tensor> tp_channel_wise_bwd_ell_launch(
+    torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
+    torch::Tensor x_uv,          // [Z,UV_TOTAL]
+    torch::Tensor x_iu,          // [Z,IU_TOTAL]
+    torch::Tensor x_jv,          // [Z,JV_TOTAL]
+    torch::Tensor c_all,         // [C_TOTAL]
+    torch::Tensor path_indices,  // [17,4] int32
+    torch::Tensor uv_seg_offsets,// int32
+    torch::Tensor iu_seg_offsets,// int32
+    torch::Tensor jv_seg_offsets,// int32
+    torch::Tensor kv_k_offsets,  // int32
+    torch::Tensor meta1,
+    torch::Tensor meta2,
+    const int64_t K_TOTAL,
+    const int64_t U,
+    const int64_t V
+) {
+    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
+    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+
+    x_uv = x_uv.contiguous();
+    x_iu = x_iu.contiguous();
+    x_jv = x_jv.contiguous();
+    c_all = c_all.contiguous();
+    path_indices = path_indices.contiguous();
+    
+    iu_seg_offsets = iu_seg_offsets.contiguous();
+    jv_seg_offsets = jv_seg_offsets.contiguous();
+    kv_k_offsets = kv_k_offsets.contiguous();
+
+    auto meta1_i32 = meta1.contiguous();
+    auto meta2_i32 = meta2.contiguous();
+    TORCH_CHECK(meta1_i32.scalar_type() == at::kInt, "meta1 must be int32");
+    TORCH_CHECK(meta2_i32.scalar_type() == at::kInt, "meta2 must be int32");
+    TORCH_CHECK(meta1_i32.is_contiguous() && meta2_i32.is_contiguous(), "meta must be contiguous");
+    TORCH_CHECK(meta1_i32.size(1) == 4 && meta2_i32.size(1) == 4, "meta must be [P,4]");
+
+    const int4* meta1_ptr = reinterpret_cast<const int4*>(meta1_i32.data_ptr<int32_t>());
+    const int4* meta2_ptr = reinterpret_cast<const int4*>(meta2_i32.data_ptr<int32_t>());
+
+    auto Z = x_uv.size(0);
+    auto UV_TOTAL = x_uv.size(1);
+    auto IU_TOTAL = x_iu.size(1);
+    auto JV_TOTAL = x_jv.size(1);
+    int num_paths = path_indices.size(0);
+
+    TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch dim mismatch");
+    TORCH_CHECK(path_indices.dim() == 2 && path_indices.size(1) == 4,
+                "path_indices must be [num_paths,4]");
+
+    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
+    auto stream = at::cuda::getCurrentCUDAStream();
+    
+    TORCH_CHECK(num_paths <= MAX_PATHS_CONST, "num_paths exceeds MAX_PATHS_CONST");
+
+    grad_out = grad_out.view({Z, K_TOTAL, U*V}).contiguous();
+
+    auto grad_x_uv = torch::zeros_like(x_uv);
+    auto grad_x_iu = torch::zeros_like(x_iu);
+    auto grad_x_jv = torch::zeros_like(x_jv);
+
+    int threads = static_cast<int>(U);
+    if (threads < 32) threads = 32;
+    if (threads > 1024) threads = 1024;
+    int num_warps = ceil_div(threads, 32);
+    int blocks = static_cast<int>(Z);
+    size_t smem_bytes = (IU_TOTAL + JV_TOTAL + num_warps*16) * x_uv.element_size();
+
+    
+    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_cwtp_bwd_ell_packed", [&] {
+
+      tp_cwtp_bwd_ell_packed<scalar_t, MAX_K_DIM>
+      <<<blocks, threads, smem_bytes, stream>>>(
+          x_uv.data_ptr<scalar_t>(),
+          x_iu.data_ptr<scalar_t>(),
+          x_jv.data_ptr<scalar_t>(),
+          grad_out.data_ptr<scalar_t>(),
+          meta1_ptr,
+          meta2_ptr,
+          //k_dims.data_ptr<int>(),
+          grad_x_uv.data_ptr<scalar_t>(),
+          grad_x_iu.data_ptr<scalar_t>(),
+          grad_x_jv.data_ptr<scalar_t>(),
+          (int)Z,
+          (int)UV_TOTAL,
+          (int)IU_TOTAL,
+          (int)JV_TOTAL,
+          (int)K_TOTAL,
+          (int)U,
+          num_paths
+      );
+      
+      CUDA_CHECK(cudaGetLastError());
+    });
+
+    return {grad_x_uv, grad_x_iu, grad_x_jv};
+}
+
+
+
+
 TORCH_LIBRARY(cwtp_fwd, m)
 {
     m.def("forward", &tp_channel_wise_fwd_launch);
     m.def("forward_cg", &tp_channel_wise_fwd_codegen_launch);
     m.def("forward_pp", &tp_channel_wise_pp_fwd_launch);
+    m.def("backward_ell", tp_channel_wise_bwd_ell_launch);
 }
