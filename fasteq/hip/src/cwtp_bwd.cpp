@@ -198,11 +198,11 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-    TORCH_CHECK(x_uv.is_hip(), "x_uv must be HIP");
+    /* TORCH_CHECK(x_uv.is_hip(), "x_uv must be HIP");
     TORCH_CHECK(x_iu.is_hip(), "x_iu must be HIP");
     TORCH_CHECK(x_jv.is_hip(), "x_jv must be HIP");
     TORCH_CHECK(grad_out.is_hip(), "grad_out must be HIP");
-    TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP");
+    TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();

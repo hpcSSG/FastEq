@@ -216,9 +216,9 @@ std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-  TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "inputs must be HIP");
+  /* TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "inputs must be HIP");
   TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP");
-  TORCH_CHECK(sender.is_hip() && receiver.is_hip(), "sender/receiver must be HIP");
+  TORCH_CHECK(sender.is_hip() && receiver.is_hip(), "sender/receiver must be HIP"); */
 
   TORCH_CHECK(sender.scalar_type() == torch::kInt32, "sender must be int32 (sorted)");
   TORCH_CHECK(receiver.scalar_type() == torch::kInt32, "receiver must be int32");

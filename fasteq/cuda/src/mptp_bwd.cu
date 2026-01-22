@@ -238,9 +238,9 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-  TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
+  /* TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
   TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "x_uv/x_iu/x_jv must be CUDA");
-  TORCH_CHECK(receiver.is_cuda() && row_ptr_s.is_cuda(), "receiver/row_ptr_s must be CUDA");
+  TORCH_CHECK(receiver.is_cuda() && row_ptr_s.is_cuda(), "receiver/row_ptr_s must be CUDA"); */
 
   grad_out_nodes = grad_out_nodes.contiguous();
   x_uv = x_uv.contiguous();
@@ -1025,12 +1025,12 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
     int64_t K_TOTAL,
     int64_t num_paths             // 4/10/17 (or 16)
 ) {
-  TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
+  /* TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
   TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "x_uv/x_iu/x_jv must be CUDA");
   TORCH_CHECK(c_all.is_cuda(), "c_all must be CUDA");
   TORCH_CHECK(row_ptr_s.is_cuda() && receiver.is_cuda(), "row_ptr_s/receiver must be CUDA");
   TORCH_CHECK(uv_seg_offsets.is_cuda() && iu_seg_offsets.is_cuda() && jv_seg_offsets.is_cuda() &&
-              kv_k_offsets.is_cuda() && c_offsets.is_cuda(), "offset tensors must be CUDA");
+              kv_k_offsets.is_cuda() && c_offsets.is_cuda(), "offset tensors must be CUDA"); */
 
   // dtype checks
   TORCH_CHECK(row_ptr_s.scalar_type() == torch::kInt32, "row_ptr_s must be int32");

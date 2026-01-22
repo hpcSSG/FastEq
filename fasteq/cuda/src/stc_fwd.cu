@@ -473,12 +473,12 @@ at::Tensor stc_fwd_launcher(
     at::Tensor path_lens,     // [num_paths]
     const int64_t num_out_segments)     
 {
-    TORCH_CHECK(x1.is_cuda(), "x1 must be CUDA");
+    /* TORCH_CHECK(x1.is_cuda(), "x1 must be CUDA");
     TORCH_CHECK(x0_g.is_cuda(), "x0_g must be CUDA");
     TORCH_CHECK(coeffs.is_cuda(), "coeffs must be CUDA");
     TORCH_CHECK(paths_tensor.is_cuda(), "paths_tensor must be CUDA");
     TORCH_CHECK(path_lens.is_cuda(), "path_lens must be CUDA");
-
+ */
     auto dtype = x1.scalar_type();
     TORCH_CHECK(
         dtype == at::kFloat || dtype == at::kDouble,

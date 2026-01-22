@@ -365,11 +365,11 @@ at::Tensor launch_fused_multipath_fctp(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -476,11 +476,11 @@ at::Tensor launch_fused_multipath_fctp_tile(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,

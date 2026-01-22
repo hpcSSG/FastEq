@@ -477,11 +477,11 @@ at::Tensor stc_fwd_launcher(
     at::Tensor path_lens,     // [num_paths]
     const int64_t num_out_segments)     
 {
-    TORCH_CHECK(x1.is_hip(), "x1 must be HIP");
+    /* TORCH_CHECK(x1.is_hip(), "x1 must be HIP");
     TORCH_CHECK(x0_g.is_hip(), "x0_g must be HIP");
     TORCH_CHECK(coeffs.is_hip(), "coeffs must be HIP");
     TORCH_CHECK(paths_tensor.is_hip(), "paths_tensor must be HIP");
-    TORCH_CHECK(path_lens.is_hip(), "path_lens must be HIP");
+    TORCH_CHECK(path_lens.is_hip(), "path_lens must be HIP"); */
 
     auto dtype = x1.scalar_type();
     TORCH_CHECK(

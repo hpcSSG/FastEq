@@ -238,9 +238,9 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-  TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
+  /* TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
   TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "x_uv/x_iu/x_jv must be HIP");
-  TORCH_CHECK(receiver.is_hip() && row_ptr_s.is_hip(), "receiver/row_ptr_s must be HIP");
+  TORCH_CHECK(receiver.is_hip() && row_ptr_s.is_hip(), "receiver/row_ptr_s must be HIP"); */
 
   grad_out_nodes = grad_out_nodes.contiguous();
   x_uv = x_uv.contiguous();
@@ -1032,12 +1032,12 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
     int64_t K_TOTAL,
     int64_t num_paths             // 4/10/17 (or 16)
 ) {
-  TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
+  /* TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
   TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "x_uv/x_iu/x_jv must be HIP");
   TORCH_CHECK(c_all.is_hip(), "c_all must be HIP");
   TORCH_CHECK(row_ptr_s.is_hip() && receiver.is_hip(), "row_ptr_s/receiver must be HIP");
   TORCH_CHECK(uv_seg_offsets.is_hip() && iu_seg_offsets.is_hip() && jv_seg_offsets.is_hip() &&
-              kv_k_offsets.is_hip() && c_offsets.is_hip(), "offset tensors must be HIP");
+              kv_k_offsets.is_hip() && c_offsets.is_hip(), "offset tensors must be HIP"); */
 
   // dtype checks
   TORCH_CHECK(row_ptr_s.scalar_type() == torch::kInt32, "row_ptr_s must be int32");

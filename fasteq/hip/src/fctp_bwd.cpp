@@ -179,12 +179,12 @@ at::Tensor launch_fused_multipath_fctp_backward(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
+    /* TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
              && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
              && cg_val_all.is_hip() && nnz_per_path.is_hip()
              && K_per_path.is_hip() && path_offset.is_hip()
              && grad_out.is_hip(),
-             "all tensors must be HIP");
+             "all tensors must be HIP"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -462,12 +462,12 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
+    /* TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
              && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
              && cg_val_all.is_hip() && nnz_per_path.is_hip()
              && K_per_path.is_hip() && path_offset.is_hip()
              && grad_out.is_hip(),
-             "all tensors must be HIP");
+             "all tensors must be HIP"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,

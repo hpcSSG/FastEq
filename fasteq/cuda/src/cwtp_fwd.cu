@@ -557,10 +557,10 @@ torch::Tensor tp_channel_wise_fwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    /* TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
     TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
     TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
-    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
@@ -821,10 +821,10 @@ torch::Tensor tp_channel_wise_fwd_codegen_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    /* TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
     TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
     TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
-    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
+    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
@@ -1304,9 +1304,9 @@ torch::Tensor tp_channel_wise_pp_fwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    /* TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
     TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
-    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
@@ -1342,7 +1342,7 @@ torch::Tensor tp_channel_wise_pp_fwd_launch(
     ell_ij  = ell_ij.contiguous();
     ell_val = ell_val.contiguous();
 
-    TORCH_CHECK(ell_E.is_cuda() && ell_base.is_cuda() && ell_ij.is_cuda() && ell_val.is_cuda(), "ell_* must be CUDA");
+    //TORCH_CHECK(ell_E.is_cuda() && ell_base.is_cuda() && ell_ij.is_cuda() && ell_val.is_cuda(), "ell_* must be CUDA");
     TORCH_CHECK(ell_E.scalar_type() == at::kInt, "ell_E must be int32");
     TORCH_CHECK(ell_base.scalar_type() == at::kInt, "ell_base must be int32");
     TORCH_CHECK(ell_ij.scalar_type() == at::kUInt16, "ell_ij must be uint16");
@@ -1627,9 +1627,9 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_ell_launch(
     const int64_t U,
     const int64_t V
 ) {
-    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
+    /* TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
     TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
-    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
+    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();

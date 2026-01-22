@@ -586,14 +586,22 @@ torch::Tensor tp_channel_wise_fwd_launch(
     torch::Tensor cg_k_all,        // [nnz_total], int32
     torch::Tensor cg_val_all,      // [nnz_total], same dtype as x_uv
 
+    //ell data and Packed base offsets 
+    torch::Tensor ell_ij,
+    torch::Tensor ell_val,
+    torch::Tensor meta1,            // packed bases_offsets, [num_paths, 4], int32
+    torch::Tensor meta2,            // packed kdims, ell, [num_paths, 4], int32
+
     const int64_t U,
     const int64_t V,
     const int64_t K_TOTAL
 ) {
+    /*
     TORCH_CHECK(x_uv.is_hip(), "x_uv must be HIP");
     TORCH_CHECK(x_iu.is_hip(), "x_iu must be HIP");
     TORCH_CHECK(x_jv.is_hip(), "x_jv must be HIP");
     TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP");
+    */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
