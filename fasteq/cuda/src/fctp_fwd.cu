@@ -86,7 +86,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     // out_final[b]: [K_total, W]
     scalar_t* __restrict__ Ob_base    = out_final + (size_t)b * K_total * W;
 
-    // 1) 对该 (p,b) 做 argmax_v b[b,0,v]
+    //对该 (p,b) 做 argmax_v b[b,0,v]
     int vstar = 0;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         scalar_t best = std::numeric_limits<scalar_t>::lowest();
@@ -103,7 +103,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     __syncthreads();
     const int v = sh_v;
 
-    // 2) shared: Wt[W, U+1] + Asel[nnz_max, U+1]
+    //shared: Wt[W, U+1] + Asel[nnz_max, U+1]
     const int U_pad = U + 1;
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
     scalar_t* sh_Wt   = reinterpret_cast<scalar_t*>(shmem_raw);               // [W, U_pad]
@@ -121,7 +121,6 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     const int Wv  = W / 4;
     const int UWv = U * Wv;
 
-    // 2a) 把 W_p[:, v, :] → sh_Wt[w,u]（Vec4 向量读，scalar 写）
     for (int t = threadIdx.y * tx + threadIdx.x;
          t < UWv;
          t += tx * ty) {
@@ -138,7 +137,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
         sh_Wt[((size_t)w0 + 3) * U_pad + u] = (scalar_t)r.w;
     }
 
-    // 2b) 只加载 nnz_p 行 A[b, i_global, :] → sh_Asel[pidx, :]
+    // 只加载 nnz_p 行 A[b, i_global, :] → sh_Asel[pidx, :]
     for (int t = threadIdx.y * tx + threadIdx.x;
          t < nnz_p * U;
          t += tx * ty) {
@@ -149,7 +148,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     }
     __syncthreads();
 
-    // 3) 每个线程负责一个 (k_local, w)，k_global = k_base + k_local
+    // 每个线程负责一个 (k_local, w)，k_global = k_base + k_local
     const int w = threadIdx.x;
     const int k_local = threadIdx.y;       // 0..K_max-1
 
@@ -250,7 +249,6 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
     __syncthreads();
     const int v = sh_v;
 
-    // 2) shared: Wt[W_TILE, U+1] + Asel[nnz_max, U+1]
     const int U_pad = U + 1;
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
     scalar_t* sh_Wt   = reinterpret_cast<scalar_t*>(shmem_raw);               // [W_TILE, U_pad]
@@ -279,16 +277,13 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
     }
     __syncthreads();
 
-    // k_local 超出 K_p 的线程不参与计算，但必须参与所有 __syncthreads
     const bool alive = (k_local < K_p);
 
-    // 3) 沿 W 方向分块
+    // 沿 W 方向分块
     for (int w_base = 0; w_base < W; w_base += W_TILE) {
         const int W_this   = min(W_TILE, W - w_base);
-        const int Wv_this  = W_this / 4;       // Vec4 数量
-        const int Wv_off   = w_base / 4;       // 本 tile 在 Vec4 维度的起始偏移
-
-        // 3a) 把 W_p[:, v, :] 对当前 tile 的部分加载到 sh_Wt[w_local, u]
+        const int Wv_this  = W_this / 4;
+        const int Wv_off   = w_base / 4;       
         const int num_vec = U * Wv_this;
         for (int t = threadIdx.y * tx + threadIdx.x;
              t < num_vec;
@@ -309,7 +304,7 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
             sh_Wt[((size_t)w_local0 + 3) * U_pad + u] = (scalar_t)r.w;
         }
 
-        __syncthreads();  // 确保该 tile 的 W 已加载完
+        __syncthreads();
 
         const int w_local  = w_thread;           // 0..tx-1
         const bool active  = alive && (w_local < W_this);

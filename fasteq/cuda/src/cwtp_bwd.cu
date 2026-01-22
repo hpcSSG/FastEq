@@ -356,7 +356,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int i = 0; i < I; ++i) {
       T s = (T)0;
-#pragma unroll
+#pragma unroll 1
       for (int j = 0; j < J; ++j) {
         T c = c_ptr[((i * J + j) * K + kk)];
         s = fma(c, xj[j], s);
@@ -372,7 +372,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int j = 0; j < J; ++j) {
       T tj = (T)0;
-#pragma unroll
+#pragma unroll 1
       for (int i = 0; i < I; ++i) {
         T c = c_ptr[((i * J + j) * K + kk)];
         tj = fma(c, xiu[i], tj);
@@ -602,13 +602,12 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   T* smem_j = reinterpret_cast<T*>(smem_raw);          // [U*STRIDE]
   T* smem_c = smem_j + (int)(U * STRIDE);              // [C_TOTAL]
 
-  // 1) init smem_j
   if (active) {
 #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) smem_j[u * STRIDE + jj] = (T)0;
   }
 
-  // 2) cooperative load c_all -> smem_c
+  // cooperative load c_all -> smem_c
   const int C_TOTAL = (int)c_offsets[NUM_PATHS];
   for (int idx = tid; idx < C_TOTAL; idx += blockDim.x) {
     smem_c[idx] = ld_g(c_all + idx);
@@ -802,7 +801,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   }
   __syncthreads();
 
-  // 4) reduce smem_j over u for each jj (works for any blockDim.x <= 256)
+  //reduce smem_j over u for each jj
   __shared__ T warp_sum_sh[8][JJ + PAD];
 
   const int num_warps = (blockDim.x + 31) >> 5;
@@ -819,13 +818,12 @@ __global__ void tp_bwd_fused_kernel_sharedc(
       v += __shfl_down_sync(mask, v, off);
     }
     if (lane == 0) {
-      // 注意：warp 可能 >= num_warps 吗？不会，因为 warp = tid>>5，tid<blockDim
       warp_sum_sh[warp][jj] = v;
     }
   }
   __syncthreads();
 
-  // warp0 汇总所有 warp 的结果：只读取 [0, num_warps)
+  // warp0 汇总所有 warp 的结果
   if (warp == 0) {
   #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {
@@ -851,7 +849,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
 
 }
 
-std::vector<torch::Tensor> cwtp_bwd_fused(
+std::vector<torch::Tensor> tp_channel_wise_bwd_dense_launch(
     torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
     torch::Tensor x_uv,          // [Z,UV_TOTAL]
     torch::Tensor x_iu,          // [Z,IU_TOTAL]
@@ -982,426 +980,9 @@ std::vector<torch::Tensor> cwtp_bwd_fused(
   return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
-/*
-// ------------------------------
-// Backward row-eval (E known at compile time)
-//   forward: out = (sum_e c * xiu * xjv) * xuv
-//   bwd:
-//     grad_xiu += go*xuv*c*xjv
-//     grad_xjv += sum_u(go*xuv*c*xiu)
-//     grad_xuv += go*acc
-//     grad_w   += sum_u(go*xuv*xiu*xjv)   (note: no 'c' here; w is the coefficient)
-// ------------------------------
-// ---- row backward: update grad_x_iu, compute acc (for grad_x_uv) ----
-
-template <typename T, int E>
-__device__ __forceinline__ void bwd_row_shared_gather_V1(
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base,
-    T gok, T xuv_u,
-    T& acc,
-    T* __restrict__ gxiu_z
-) {
-  T a = (T)0;
-  #pragma unroll
-  for (int e = 0; e < E; ++e) {
-    uint16_t ij = ij_row[e];
-    T c = val_row[e];
-    int i = (int)(ij & 0xFF);
-    int j = (int)(ij >> 8);
-
-    T xiu = s_iu[iu_base + i * U + u];
-    T xjv = s_jv[jv_base + j];
-
-    a = fma(c, xiu * xjv, a);
-
-    // grad_xiu += go * xuv * c * xjv
-    gxiu_z[iu_base + i * U + u] = fma(gok * xuv_u * c, xjv,
-                                      gxiu_z[iu_base + i * U + u]);
-  }
-  acc += a;
-}
-
-template <typename T>
-__device__ __forceinline__ void bwd_row_shared_gather_V1_runtime(
-    int E,
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base,
-    T gok, T xuv_u,
-    T& acc,
-    T* __restrict__ gxiu_z
-) {
-  T a = (T)0;
-  #pragma unroll 1
-  for (int e = 0; e < E; ++e) {
-    uint16_t ij = ij_row[e];
-    T c = val_row[e];
-    int i = (int)(ij & 0xFF);
-    int j = (int)(ij >> 8);
-
-    T xiu = s_iu[iu_base + i * U + u];
-    T xjv = s_jv[jv_base + j];
-
-    a = fma(c, xiu * xjv, a);
-
-    gxiu_z[iu_base + i * U + u] = fma(gok * xuv_u * c, xjv,
-                                      gxiu_z[iu_base + i * U + u]);
-  }
-  acc += a;
-}
-
-template <typename T, int E, int IACC_PAD>
-__device__ __forceinline__ void bwd_row_shared_gather_IUACC_SHMEM(
-    const uint16_t* __restrict__ ij_row,
-    const T* __restrict__ val_row,
-    const T* __restrict__ s_iu, int iu_base, int U, int u,
-    const T* __restrict__ s_jv, int jv_base,
-    T gok, T xuv_u,
-    T& acc,
-    T* __restrict__ iuacc_row,   // 指向本线程的 shared 行：长度 IACC_PAD
-    T* __restrict__ gxiu_z
-) {
-  T a = (T)0;
-
-  #pragma unroll
-  for (int e = 0; e < E; ++e) {
-    uint16_t ij = ij_row[e];
-    T c = val_row[e];
-    int i = (int)(ij & 0xFF);
-    int j = (int)(ij >> 8);
-
-    T xiu = s_iu[iu_base + i * U + u];
-    T xjv = s_jv[jv_base + j];
-
-    a = fma(c, xiu * xjv, a);
-
-    // gi = go * xuv * c * xjv
-    T gi = ((gok * xuv_u) * c) * xjv;
-
-    iuacc_row[i] = iuacc_row[i] + gi;   // 无 atomic：每线程私有行
-    
-  }
-  acc = a;
-}
-
-
-
-// -------------------- kernel --------------------
-template <typename T, int MAX_K_DIM = 8>
-__global__ void tp_cwtp_bwd_ell_packed_meta2x16_opt(
-    const T* __restrict__ x_uv,          // [Z, UV_TOTAL] = [Z, K_TOTAL*U]
-    const T* __restrict__ x_iu,          // [Z, IU_TOTAL]
-    const T* __restrict__ x_jv,          // [Z, JV_TOTAL]
-    const T* __restrict__ grad_out,      // [Z, K_TOTAL*U]
-
-    const int4* __restrict__ meta1,      // [P] (uv_base, iu_base, jv_base, k_base)
-    const int4* __restrict__ meta2,      // [P] (k_dim, E, ell_base, pad)
-
-    T* __restrict__ grad_x_uv,           // [Z, UV_TOTAL]
-    T* __restrict__ grad_x_iu,           // [Z, IU_TOTAL]
-    T* __restrict__ grad_x_jv,           // [Z, JV_TOTAL]
-
-    int Z, int UV_TOTAL, int IU_TOTAL, int JV_TOTAL, int K_TOTAL, int U, int num_paths
-) {
-  int z = (int)blockIdx.x;
-  if (z >= Z) return;
-
-  int u = (int)threadIdx.x;
-  if (u >= U) return;
-
-  int lane = threadIdx.x & 31;
-  int warp = threadIdx.x >> 5;
-  int num_warps = (blockDim.x + 31) >> 5;
-
-  extern __shared__ unsigned char smem_raw[];
-  T* s_iu = reinterpret_cast<T*>(smem_raw);
-  T* s_jv = s_iu + (size_t)IU_TOTAL;
-
-  constexpr int IACC = 6; // IMAX=5
-  constexpr int IACC_PAD = IACC + 1; // padding
-
-  // shared for block-reduce (T)
-  T* sh_warp = reinterpret_cast<T*>(s_jv + (size_t)JV_TOTAL);
-  T* s_ju    = sh_warp + (size_t)num_warps * 32;   // [JV_TOTAL * U]
-  T* s_iuacc = s_ju    + (size_t)JV_TOTAL * U;         // [U*IACC_PAD]
-
-  const T* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
-  const T* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
-
-  stage_gmem_to_smem_cpasync_16B<T>(s_iu, x_iu_z, IU_TOTAL);
-  stage_gmem_to_smem_cpasync_16B<T>(s_jv, x_jv_z, JV_TOTAL);
-  __syncthreads();
-
-  const T* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
-  const T* go_z   = grad_out + (size_t)z * (size_t)(K_TOTAL * U);
-
-  T* gxuv_z = grad_x_uv + (size_t)z * UV_TOTAL;
-  T* gxiu_z = grad_x_iu + (size_t)z * IU_TOTAL;
-  T* gxjv_z = grad_x_jv + (size_t)z * JV_TOTAL;
-
-  const T* cval = ell_val_const_ptr<T>();
-
-  // -------- init s_ju row to 0 --------
-  #pragma unroll 1
-  for (int j = 0; j < JV_TOTAL; ++j) {
-    s_ju[(size_t)j * U + u] = (T)0;
-  }
-  __syncthreads();
-
-  for (int p = 0; p < num_paths; ++p) {
-    int uv_base, iu_base, jv_base, k_base;
-    int k_dim, E, base;
-
-    T* iuacc_row = s_iuacc + (size_t)u * IACC_PAD;
-    #pragma unroll
-    for (int ii = 0; ii < IACC; ++ii) iuacc_row[ii] = (T)0;
-
-    if (lane == 0) {
-      int4 m1 = meta1[p];
-      int4 m2 = meta2[p];
-      uv_base = m1.x; iu_base = m1.y; jv_base = m1.z; k_base = m1.w;
-      k_dim   = m2.x; E       = m2.y; base   = m2.z;
-    } else {
-      uv_base = iu_base = jv_base = k_base = 0;
-      k_dim = E = base = 0;
-    }
-    uv_base = shfl_i32(uv_base);
-    iu_base = shfl_i32(iu_base);
-    jv_base = shfl_i32(jv_base);
-    k_base  = shfl_i32(k_base);
-    k_dim   = shfl_i32(k_dim);
-    E       = shfl_i32(E);
-    base    = shfl_i32(base);
-
-    if (k_dim <= 0) continue;
-    if (k_dim > MAX_K_DIM) continue;
-
-    T xuv_u = x_uv_z[uv_base + u];
-
-    // grad_x_uv accumulator in T
-    T gxuv_acc = (T)0;
-
-    #pragma unroll 1
-    for (int k_local = 0; k_local < k_dim; ++k_local) {
-      int row = base + k_local * E;
-      const uint16_t* ij_row = c_ell_ij + row;
-      const T*        v_row  = cval     + row;
-
-      T gok = go_z[(k_base + k_local) * U + u];
-
-      // 1) compute acc + update grad_x_iu (no atomic)
-      T acc = (T)0;
-      switch (E) {
-        //case 1: bwd_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 3: bwd_row_shared_gather_V1<T,3>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 4: bwd_row_shared_gather_V1<T,4>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 5: bwd_row_shared_gather_V1<T,5>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 6: bwd_row_shared_gather_V1<T,6>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        //case 8: bwd_row_shared_gather_V1<T,8>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
-        
-        case 1:
-            bwd_row_shared_gather_IUACC_SHMEM<T,1,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-        case 3:
-            bwd_row_shared_gather_IUACC_SHMEM<T,3,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 4:
-            bwd_row_shared_gather_IUACC_SHMEM<T,4,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 5:
-            bwd_row_shared_gather_IUACC_SHMEM<T,5,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 6:
-            bwd_row_shared_gather_IUACC_SHMEM<T,6,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        case 8:
-            bwd_row_shared_gather_IUACC_SHMEM<T,8,IACC_PAD>(
-                ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base,
-                gok, xuv_u, acc, iuacc_row, gxiu_z);
-            break;
-
-        
-        default:
-          bwd_row_shared_gather_V1_runtime<T>(E, ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z);
-          break;
-      }
-
-      // gxuv_acc += gok * acc
-      gxuv_acc = fma(gok, acc, gxuv_acc);
-
-      // 2) grad_jv: 只累积到 shared s_ju (T)，不做reduce、不写global
-      #pragma unroll 1
-      for (int e = 0; e < E; ++e) {
-        uint16_t ij = ij_row[e];
-        T c = v_row[e];
-        int i = (int)(ij & 0xFF);
-        int j = (int)(ij >> 8);
-
-        T xiu = s_iu[iu_base + i * U + u];
-
-        // pj = go * xuv * c * xiu
-        T pj = ((gok * xuv_u) * c) * xiu;
-
-        int j_abs = jv_base + j;
-        s_ju[(size_t)j_abs * U + u] = s_ju[(size_t)j_abs * U + u] + pj;
-      }
-    }
-
-    int base_u = iu_base + u;
-    #pragma unroll
-    for (int ii = 0; ii < IACC; ++ii) {
-    T v = iuacc_row[ii];
-    if (v != (T)0) gxiu_z[base_u + ii * U] = gxiu_z[base_u + ii * U] + v;
-    }
-
-    // write grad_x_uv
-    gxuv_z[uv_base + u] = (T)(gxuv_z[uv_base + u] + gxuv_acc);
-  }
-
-  __syncthreads();
-
-  // 3) paths 全结束后：对每个 j 规约一次，再写回 global
-  #pragma unroll 1
-  for (int j = 0; j < JV_TOTAL; ++j) {
-    T pj_u = s_ju[(size_t)j * U + u];
-    T sum  = block_reduce_sum_scalar<T>(pj_u, sh_warp);
-    if (warp == 0 && lane == 0) gxjv_z[j] +=  sum;
-    __syncthreads();
-  }
-}
-
-std::vector<torch::Tensor> tp_channel_wise_bwd_template_launch(
-    torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
-    torch::Tensor x_uv,          // [Z,UV_TOTAL]
-    torch::Tensor x_iu,          // [Z,IU_TOTAL]
-    torch::Tensor x_jv,          // [Z,JV_TOTAL]
-    torch::Tensor c_all,         // [C_TOTAL]
-    torch::Tensor path_indices,  // [17,4] int32
-    torch::Tensor uv_seg_offsets,// int32
-    torch::Tensor iu_seg_offsets,// int32
-    torch::Tensor jv_seg_offsets,// int32
-    torch::Tensor kv_k_offsets,  // int32
-    torch::Tensor meta1,
-    torch::Tensor meta2,
-    const int64_t K_TOTAL,
-    const int64_t U,
-    const int64_t V
-) {
-    TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
-    TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
-    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
-
-    x_uv = x_uv.contiguous();
-    x_iu = x_iu.contiguous();
-    x_jv = x_jv.contiguous();
-    c_all = c_all.contiguous();
-    path_indices = path_indices.contiguous();
-    
-    iu_seg_offsets = iu_seg_offsets.contiguous();
-    jv_seg_offsets = jv_seg_offsets.contiguous();
-    kv_k_offsets = kv_k_offsets.contiguous();
-
-    auto meta1_i32 = meta1.contiguous();
-    auto meta2_i32 = meta2.contiguous();
-    TORCH_CHECK(meta1_i32.scalar_type() == at::kInt, "meta1 must be int32");
-    TORCH_CHECK(meta2_i32.scalar_type() == at::kInt, "meta2 must be int32");
-    TORCH_CHECK(meta1_i32.is_contiguous() && meta2_i32.is_contiguous(), "meta must be contiguous");
-    TORCH_CHECK(meta1_i32.size(1) == 4 && meta2_i32.size(1) == 4, "meta must be [P,4]");
-
-    const int4* meta1_ptr = reinterpret_cast<const int4*>(meta1_i32.data_ptr<int32_t>());
-    const int4* meta2_ptr = reinterpret_cast<const int4*>(meta2_i32.data_ptr<int32_t>());
-
-    auto Z = x_uv.size(0);
-    auto UV_TOTAL = x_uv.size(1);
-    auto IU_TOTAL = x_iu.size(1);
-    auto JV_TOTAL = x_jv.size(1);
-    int num_paths = path_indices.size(0);
-
-    TORCH_CHECK(x_iu.size(0) == Z && x_jv.size(0) == Z, "batch dim mismatch");
-    TORCH_CHECK(path_indices.dim() == 2 && path_indices.size(1) == 4,
-                "path_indices must be [num_paths,4]");
-
-    constexpr int MAX_K_DIM = 8; // 当前最大 k_dim = 7
-    auto stream = at::cuda::getCurrentCUDAStream();
-    
-    TORCH_CHECK(num_paths <= MAX_PATHS_CONST, "num_paths exceeds MAX_PATHS_CONST");
-
-    grad_out = grad_out.view({Z, K_TOTAL, U*V}).contiguous();
-
-    auto grad_x_uv = torch::zeros_like(x_uv);
-    auto grad_x_iu = torch::zeros_like(x_iu);
-    auto grad_x_jv = torch::zeros_like(x_jv);
-
-    int threads = static_cast<int>(U);
-    if (threads < 32) threads = 32;
-    if (threads > 1024) threads = 1024;
-    int num_warps = ceil_div(threads, 32);
-    int blocks = static_cast<int>(Z);
-    //size_t smem_bytes = (IU_TOTAL + JV_TOTAL + num_warps*16) * x_uv.element_size();
-
-    constexpr int IACC_PAD = 7;
-
-    size_t smem_bytes =
-    (size_t)IU_TOTAL * x_uv.element_size() +
-    (size_t)JV_TOTAL * x_uv.element_size() +
-    (size_t)num_warps * 32 * x_uv.element_size() +
-    (size_t)U * JV_TOTAL * x_uv.element_size() + 
-    (size_t)U * IACC_PAD * x_uv.element_size();
-    
-    AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_cwtp_bwd_ell_packed_meta2x16", [&] {
-      cudaFuncSetAttribute(
-        tp_cwtp_bwd_ell_packed_meta2x16_opt<scalar_t, MAX_K_DIM>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize,
-        (int)smem_bytes
-      );
-      tp_cwtp_bwd_ell_packed_meta2x16_opt<scalar_t, MAX_K_DIM>
-      <<<blocks, threads, smem_bytes, stream>>>(
-          x_uv.data_ptr<scalar_t>(),
-          x_iu.data_ptr<scalar_t>(),
-          x_jv.data_ptr<scalar_t>(),
-          grad_out.data_ptr<scalar_t>(),
-          meta1_ptr,
-          meta2_ptr,
-          //k_dims.data_ptr<int>(),
-          grad_x_uv.data_ptr<scalar_t>(),
-          grad_x_iu.data_ptr<scalar_t>(),
-          grad_x_jv.data_ptr<scalar_t>(),
-          (int)Z,
-          (int)UV_TOTAL,
-          (int)IU_TOTAL,
-          (int)JV_TOTAL,
-          (int)K_TOTAL,
-          (int)U,
-          num_paths
-      );
-      
-      CUDA_CHECK(cudaGetLastError());
-    });
-
-    return {grad_x_uv, grad_x_iu, grad_x_jv};
-}
-*/
 
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &cwtp_bwd_fused);
-   // m.def("backward_opt", &tp_channel_wise_bwd_template_launch);
+    m.def("backward", &tp_channel_wise_bwd_dense_launch);
+    //m.def("backward_opt", &tp_channel_wise_bwd_ell_launch);
 }

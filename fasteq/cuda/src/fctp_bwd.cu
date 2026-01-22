@@ -72,7 +72,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     scalar_t* __restrict__ dA_b = grad_a + (size_t)b * I_total * U;
 
     // -----------------------------
-    // 1) 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
+    // 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
     // -----------------------------
     int vstar = 0;
     if (threadIdx.x == 0) {
@@ -90,22 +90,12 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     __syncthreads();
     const int v = sh_v;
 
-    // -----------------------------
-    // 2) shared memory 布局
-    //
-    //    sh_Wt: [W, U+1]     → 存 W_p[:, v*, :]
-    //    sh_dO: [W]          → 存当前 triple 的 grad_out[b,k_global,:]
-    //
-    //    与 forward 一致地用 [w, u_pad] 来避免 bank 冲突:
-    //    index = w * U_pad + u
-    // -----------------------------
     const int U_pad = U + 1;
 
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
     scalar_t* sh_Wt = reinterpret_cast<scalar_t*>(shmem_raw);             // [W * U_pad]
     scalar_t* sh_dO = sh_Wt + (size_t)W * U_pad;                          // [W]
 
-    // Vec4 类型，用于 vectorized 读
     using Vec4 = typename std::conditional<
         std::is_same<scalar_t, float>::value,
         float4,
@@ -115,12 +105,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     const int tx = blockDim.x;    // = U
     const int u  = threadIdx.x;   // 0..U-1
 
-    // -----------------------------
-    // 3) 一次性把 W_p[:, v*, :] -> sh_Wt[w,u]
-    //    使用 Vec4 沿 w 维做 vector load:
-    //       Wv = W/4
-    //       t ∈ [0, U*Wv)
-    // -----------------------------
     const int Wv  = W / 4;
     const int UWv = U * Wv;
 
@@ -142,7 +126,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     if (u >= U) return;
 
     // -----------------------------
-    // 4) 对每个 triple (i_global, k_global, val)：
+    // 对每个 triple (i_global, k_global, val)：
     //
     //    先把 grad_out[b,k_global,:] 读入 sh_dO[W]
     //    再对该 triple 的所有 u（每个线程一个 u）：
@@ -154,7 +138,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         const int k_global = cg_k[t];
         const scalar_t val = cg_v[t];
 
-        // 4a) 用 Vec4 把 dO_b[k_global, :] -> sh_dO[w]
+        
         for (int tv = u; tv < Wv; tv += tx) {
             int w0 = tv << 2;
             const size_t off = (size_t)k_global * W + (size_t)w0;
@@ -166,7 +150,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         }
         __syncthreads();
 
-        // 4b) 当前线程负责固定的 u，遍历 w 做 inner product
+        
         scalar_t acc_u = scalar_t(0);
         for (int w = 0; w < W; ++w) {
             const scalar_t gout = sh_dO[w];
@@ -174,11 +158,10 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
             acc_u += gout * Wuv;
         }
 
-        // 4c) grad_a 累加:
         //     dL/dA[b,i_global,u] += val * acc_u
         atomicAdd(&dA_b[(size_t)i_global * U + u], val * acc_u);
 
-        __syncthreads();  // 确保所有线程用完当前 sh_dO 后再覆盖
+        __syncthreads();
     }
 }
 
@@ -354,7 +337,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     scalar_t* __restrict__ dA_b = grad_a + (size_t)b * I_total * U;
 
     // -----------------------------
-    // 1) 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
+    // 对该 (p,b) 计算 v* = argmax_v b[b,0,v]
     // -----------------------------
     int vstar = 0;
     if (threadIdx.x == 0) {
@@ -372,12 +355,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     __syncthreads();
     const int v = sh_v;
 
-    // -----------------------------
-    // 2) shared memory 布局 (tileU)
-    //
-    //    sh_Wt: [W, U_TILE+1] → 存 W_p[u_base : u_base+U_TILE, v*, :]
-    //    sh_dO: [W]           → 存当前 triple 的 grad_out[b,k_global,:]
-    // -----------------------------
     const int U_pad = U_TILE + 1;
 
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
@@ -398,17 +375,11 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     const int tv_stride = tx;
 
     // -----------------------------
-    // 3) 沿 U 方向分块：每个 tile 先把 W_p 的这一块 preload 到 shared
+    // 沿 U 方向分块：每个 tile 先把 W_p 的这一块 preload 到 shared
     // -----------------------------
     for (int u_base = 0; u_base < U; u_base += U_TILE) {
         const int U_this = min(U_TILE, U - u_base);
 
-        // 3a) 加载当前 U tile 的 W_p[u_base : u_base+U_this, v*, :] -> sh_Wt[w,u_off]
-        //
-        // t ∈ [0, U_this * Wv)
-        // u_off = t / Wv ∈ [0, U_this)
-        // wv    = t - u_off * Wv ∈ [0, Wv)
-        // w0    = wv * 4
         for (int t = u_local; t < U_this * Wv; t += tv_stride) {
             int u_off = t / Wv;           // tile 内 u 索引
             int wv    = t - u_off * Wv;
@@ -426,20 +397,11 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
         }
         __syncthreads();
 
-        // -----------------------------
-        // 4) 对每个 triple (i_global, k_global, val)：
-        //
-        //    先把 grad_out[b,k_global,:] 读入 sh_dO[W]
-        //    再对该 tile 内的所有 u_off（每个线程1~多个 u_off）：
-        //      acc_u = Σ_w sh_dO[w] * sh_Wt[w,u_off]
-        //      grad_a[b,i_global,u_glb] += val * acc_u
-        // -----------------------------
         for (int t = 0; t < nnz_p; ++t) {
             const int i_global = cg_i[t];
             const int k_global = cg_k[t];
             const scalar_t val = cg_v[t];
 
-            // 4a) 用 Vec4 把 dO_b[k_global, :] -> sh_dO[w]
             for (int tv = u_local; tv < Wv; tv += tv_stride) {
                 int w0 = tv << 2;
                 const size_t off = (size_t)k_global * W + (size_t)w0;
@@ -450,8 +412,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
                 sh_dO[w0 + 3] = (scalar_t)r.w;
             }
             __syncthreads();
-
-            // 4b) 当前线程负责 tile 内若干个 u_off（stride=blockDim.x）
+            
             for (int u_off = u_local; u_off < U_this; u_off += tx) {
                 int u_glb = u_base + u_off;   // 全局 u index
 
@@ -466,9 +427,8 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
                 atomicAdd(&dA_b[(size_t)i_global * U + u_glb], val * acc_u);
             }
 
-            __syncthreads();  // 确保所有线程用完当前 sh_dO 后再覆盖
+            __syncthreads();
         }
-        // 下一轮 u_base 会重新填充 sh_Wt；上一轮 triple 已全部用完当前 tile
     }
 }
 
@@ -548,7 +508,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
 
     auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
-    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
+    // K_max 目前只是为了接口对齐
     auto K_per_path_cpu = K_per_path.to(at::kCPU);
     int K_max = 0;
     for (int p = 0; p < P; ++p) {
