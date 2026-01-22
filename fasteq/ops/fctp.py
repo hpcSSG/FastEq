@@ -1,7 +1,6 @@
 import torch
 import os, math, time
 from typing import List
-import fasteq.cuda 
 
 
 class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):

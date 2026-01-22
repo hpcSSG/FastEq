@@ -26,6 +26,9 @@ if(NOT Torch_DIR)
   endif()
 endif()
 
+set(USE_KINETO OFF CACHE BOOL "" FORCE)
+set(USE_PROFILER OFF CACHE BOOL "" FORCE)
+
 find_package(hip REQUIRED)
 find_package(rocblas QUIET)
 find_package(hipblas QUIET)
