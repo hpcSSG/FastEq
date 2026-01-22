@@ -23,7 +23,6 @@ __global__ void stc_bwd_kernel(
     scalar_t* __restrict__ grad_x1,        // [B, num_a, u] -> flattened (output)
     int B, int num_paths, int u, int num_a, int num_i)
 {
-    // 动态 shared memory，按标量类型对齐
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char smem[];
     scalar_t* x1_shared  = reinterpret_cast<scalar_t*>(smem);           // size: num_a * u
     scalar_t* x0g_shared = x1_shared + num_a * u;                       // size: num_i * u
@@ -33,7 +32,7 @@ __global__ void stc_bwd_kernel(
 
     if (b >= B || j >= u) return;
 
-    // 预加载 x1[b, :, :] 与 x0_g[b, :, :]（与前向一致）
+    // 预加载 x1[b, :, :] 与 x0_g[b, :, :]
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
@@ -55,11 +54,9 @@ __global__ void stc_bwd_kernel(
         const int len = path_lens[p];
         const int* path = paths + p * 5;
 
-        // 基本索引
         const int a_idx = path[0];
         const int i_idx = (len == 3) ? path[1] : path[len - 2];
 
-        // 参与乘积的值
         const scalar_t x1_a = x1_shared[a_idx * u + j];
         const scalar_t x0g  = x0g_shared[i_idx * u + j];
 
@@ -97,7 +94,7 @@ __global__ void stc_bwd_kernel(
             atomicAdd(&grad_x1[b * num_a * u + b_idx * u + j], contrib_b);
             atomicAdd(&grad_x1[b * num_a * u + c_idx * u + j], contrib_c);
         }
-        // 其他 len 情形不在当前定义范围内，忽略
+        // 其他 len 情形暂不支持
     }
 }
 
@@ -203,25 +200,18 @@ __global__  void stc_bwd_kernel_v1(
 
     const int seg_lim = num_out_segments;
 
-    // -----------------------------
-    // 1. preload x1[b, :, :] 到 shared
-    // -----------------------------
     for (int idx = j; idx < num_a * u; idx += blockDim.x) {
         int a_idx = idx / u;
         int jj    = idx % u;
         x1_shared[idx] = x1[((b * num_a + a_idx) * u) + jj];
     }
 
-    // 2. 初始化 grad_x1_shared 为 0
     for (int idx = j; idx < num_a * u; idx += blockDim.x) {
         grad_x1_shared[idx] = scalar_t(0);
     }
 
     __syncthreads();
 
-    // -----------------------------
-    // 3. 遍历所有 paths，累加到 grad_x1_shared[a*u + j]
-    // -----------------------------
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -333,9 +323,6 @@ void stc_bwd_kernel_v2(
 
     const int seg_lim = num_out_segments;
 
-    // -----------------------------
-    // 1. preload x1[b, :, :] 到 shared
-    // -----------------------------
     for (int idx = j; idx < num_a * u; idx += blockDim.x) {
         int a_idx = idx / u;
         int jj    = idx % u;
@@ -344,9 +331,6 @@ void stc_bwd_kernel_v2(
 
     __syncthreads();
 
-    // -----------------------------
-    // 2. 遍历所有 paths，对 grad_x1[b, :, j] 直接累加
-    // -----------------------------
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -457,10 +441,6 @@ __global__ void stc_bwd_kernel_tiled(
 
     const int seg_lim = num_out_segments;
 
-    // -----------------------------
-    // 1. preload x1[b, :, j] 到 shared，初始化 grad_x1_shared=0
-    //    布局：[a, lj] -> x1_shared[a * TILE_U + lj]
-    // -----------------------------
     for (int a = 0; a < num_a; ++a) {
         const int idx_global = ((b * num_a + a) * u) + j;
         const int idx_shared = a * TILE_U + lj;
@@ -477,9 +457,6 @@ __global__ void stc_bwd_kernel_tiled(
         g_out_seg[s] = grad_out[((b * num_out_segments) + s) * u + j];
     }
 
-    // -----------------------------
-    // 2. 遍历所有 paths，累加到 grad_x1_shared[a * TILE_U + lj]
-    // -----------------------------
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -562,9 +539,6 @@ __global__ void stc_bwd_kernel_tiled(
 
     __syncthreads();
 
-    // -----------------------------
-    // 3. 把 grad_x1_shared 写回 global grad_x1[b, :, j]
-    // -----------------------------
     for (int a = 0; a < num_a; ++a) {
         const int idx_shared = a * TILE_U + lj;
         const int idx_global = ((b * num_a + a) * u) + j;

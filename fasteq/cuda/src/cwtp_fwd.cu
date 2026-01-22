@@ -70,7 +70,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     const scalar_t* x_iu_z = x_iu + z * IU_TOTAL;
     const scalar_t* x_jv_z = x_jv + z * JV_TOTAL;
 
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
     int threads_in_block = blockDim.x;
     for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
         s_iu[idx] = x_iu_z[idx];
@@ -83,7 +82,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     const scalar_t* x_uv_z = x_uv + z * UV_TOTAL;
     scalar_t* out_z = out + z * (K_TOTAL * U * V);
 
-    // 2. 遍历所有 path
     for (int p = 0; p < num_paths; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
@@ -198,7 +196,6 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
 
     int threads_in_block = blockDim.x;
 
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
     for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
         s_iu[idx] = x_iu_z[idx];
     }
@@ -210,7 +207,6 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
     const scalar_t* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
     scalar_t* out_z = out + (size_t)z * (K_TOTAL * U * V);
 
-    // 2. 遍历所有 path
     for (int p = 0; p < num_paths; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
@@ -967,7 +963,7 @@ __device__ __forceinline__ void eval_ell_innerk_sharedy_xscalar_k4(
       if (kk < kdim) { \
         int slot = base + kk * E + e; \
         uint16_t ij = c_ell_ij[slot]; \
-        T c = cval[slot];            /* padding c==0 ok */ \
+        T c = cval[slot];            \
         int i = (int)(ij & 0xFF); \
         int j = (int)(ij >> 8); \
         T xi = pick_x5_switch<T>(i, x0, x1, x2, x3, x4); \
@@ -1560,7 +1556,7 @@ __global__ void tp_cwtp_bwd_ell_packed(
 
       T gok = go_z[(k_base + k_local) * U + u];
 
-      // 1) acc + gxiu update (no atomic)
+      //acc + gxiu update
       T acc = (T)0;
       switch (E) {
         case 1: bwd_row_shared_gather_V1<T,1>(ij_row, v_row, s_iu, iu_base, U, u, s_jv, jv_base, gok, xuv_u, acc, gxiu_z); break;
@@ -1573,7 +1569,7 @@ __global__ void tp_cwtp_bwd_ell_packed(
       }
       gxuv_acc = fma(gok, acc, gxuv_acc);
 
-      // 2) gxjv: warp 内按 j 聚合 -> 写 my_warp_gxjv[j]（无 atomic）
+      //gxjv: warp 内按 j 聚合
       #pragma unroll 1
       for (int e = 0; e < E; ++e) {
         uint16_t ij = ij_row[e];
@@ -1599,12 +1595,12 @@ __global__ void tp_cwtp_bwd_ell_packed(
 
   __syncthreads();
 
-  // 3) reduce across warps once, write gxjv (no atomic, since only this block handles z)
+  // reduce across warps once, write gxjv
   if (warp == 0) {
     for (int j = lane; j < JV_TOTAL; j += 32) {
       T sum = (T)0;
       #pragma unroll 1
-      for (int w = 0; w < 8; ++w) {  // 你用 MAX_WARPS=8 的话可写死，否则用循环到 num_warps
+      for (int w = 0; w < 8; ++w) {
         if (w < num_warps) sum += s_gxjv_warp[(size_t)w * JV_TOTAL + j];
       }
       gxjv_z[j] += sum;
@@ -1714,12 +1710,10 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_ell_launch(
 }
 
 
-
-
 TORCH_LIBRARY(cwtp_fwd, m)
 {
     m.def("forward", &tp_channel_wise_fwd_launch);
     m.def("forward_cg", &tp_channel_wise_fwd_codegen_launch);
     m.def("forward_pp", &tp_channel_wise_pp_fwd_launch);
-    m.def("backward_ell", tp_channel_wise_bwd_ell_launch);
+    m.def("backward_ell", tp_channel_wise_bwd_ell_launch); // need constant so put backward here
 }

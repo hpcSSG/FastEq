@@ -25,14 +25,11 @@ __global__ void stc_fwd_kernel(
     if (b >= B || j >= u) return;
 
     // 每个 block 对应一个样本 b，每个线程处理一个 channel j
-    // 预加载 x1[b, :, :] 到 shared memory
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
         x1_shared[a] = x1[b * num_a * u + a_idx * u + u_idx];
     }
-
-    // 预加载 x0_g[b, :, :] 到 shared memory
     for (int i = threadIdx.x; i < num_i * u; i += blockDim.x) {
         int i_idx = i / u;
         int u_idx = i % u;
@@ -123,8 +120,6 @@ __global__ void stc_fwd_kernel_opt(
         acc_local_max[s] = scalar_t(0);
     }
 
-    // ---------------- 遍历所有 paths，累加到对应的 out_segment ----------------
-    
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -132,15 +127,11 @@ __global__ void stc_fwd_kernel_opt(
 
         // x1 indices
         const int a_idx = path[0];
-
-        // x0_g index d_idx: 倒数第二个
         const int d_idx = (len == 3) ? path[1] : path[len - 2];
-
-        // 输出段索引 out_seg: 最后一个
         const int out_seg = (len == 3) ? path[2] : path[len - 1];
 
         if (out_seg < 0 || out_seg >= seg_lim) {
-            continue; // 越界就直接跳过（理论上不该发生）
+            continue;
         }
 
         scalar_t val = x1_shared[a_idx * u + j];
@@ -165,7 +156,7 @@ __global__ void stc_fwd_kernel_opt(
     // out 逻辑形状: [B, num_out_segments, u]
     for (int s = 0; s < seg_lim; ++s) {
         const int out_idx = ((b * num_out_segments) + s) * u + j;
-        // 每个 (b, s, j) 只由该 thread 写一次，**不需要 atomicAdd**
+        // 每个 (b, s, j) 只由该 thread 写一次，不需要 atomicAdd
         out[out_idx] = acc_local_max[s];
     }
 }
@@ -405,28 +396,18 @@ __global__  void stc_fwd_kernel_notiled(
 
     const int seg_lim = num_out_segments;
 
-    // -----------------------------
-    // 1. 预加载 x1[b, :, :] 到 shared
-    // -----------------------------
     for (int idx = j; idx < num_a * u; idx += blockDim.x) {
         int a_idx = idx / u;   // 0 .. num_a-1
         int jj    = idx % u;   // 0 .. u-1
         x1_shared[idx] = x1[((b * num_a + a_idx) * u) + jj];
     }
 
-    // -----------------------------
-    // 2. 初始化 out_shared[seg, j] = 0
-    // 每个线程负责所有 seg 对应的这一列 j
-    // -----------------------------
     for (int s = 0; s < seg_lim; ++s) {
         out_shared[s * u + j] = scalar_t(0);
     }
 
     __syncthreads();
 
-    // -----------------------------
-    // 3. 遍历所有 paths，累加到 out_shared[seg, j]
-    // -----------------------------
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -475,9 +456,6 @@ __global__  void stc_fwd_kernel_notiled(
 
     __syncthreads();
 
-    // -----------------------------
-    // 4. 把 out_shared 写回 global out[b, seg, j]
-    // -----------------------------
     for (int s = 0; s < seg_lim; ++s) {
         out[((b * num_out_segments) + s) * u + j] = out_shared[s * u + j];
     }
@@ -560,9 +538,6 @@ at::Tensor stc_fwd_launcher(
 }
 
 
-// --------------------------------------
-// Torch 注册
-// --------------------------------------
 TORCH_LIBRARY(stc_fwd, m)
 {
     m.def("forward", &stc_fwd_launcher);

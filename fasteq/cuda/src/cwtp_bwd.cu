@@ -356,7 +356,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int i = 0; i < I; ++i) {
       T s = (T)0;
-#pragma unroll
+#pragma unroll 1
       for (int j = 0; j < J; ++j) {
         T c = c_ptr[((i * J + j) * K + kk)];
         s = fma(c, xj[j], s);
@@ -372,7 +372,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int j = 0; j < J; ++j) {
       T tj = (T)0;
-#pragma unroll
+#pragma unroll 1
       for (int i = 0; i < I; ++i) {
         T c = c_ptr[((i * J + j) * K + kk)];
         tj = fma(c, xiu[i], tj);
@@ -602,13 +602,12 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   T* smem_j = reinterpret_cast<T*>(smem_raw);          // [U*STRIDE]
   T* smem_c = smem_j + (int)(U * STRIDE);              // [C_TOTAL]
 
-  // 1) init smem_j
   if (active) {
 #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) smem_j[u * STRIDE + jj] = (T)0;
   }
 
-  // 2) cooperative load c_all -> smem_c
+  // cooperative load c_all -> smem_c
   const int C_TOTAL = (int)c_offsets[NUM_PATHS];
   for (int idx = tid; idx < C_TOTAL; idx += blockDim.x) {
     smem_c[idx] = ld_g(c_all + idx);
@@ -802,7 +801,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   }
   __syncthreads();
 
-  // 4) reduce smem_j over u for each jj (works for any blockDim.x <= 256)
+  //reduce smem_j over u for each jj
   __shared__ T warp_sum_sh[8][JJ + PAD];
 
   const int num_warps = (blockDim.x + 31) >> 5;
@@ -824,7 +823,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   }
   __syncthreads();
 
-  // warp0 汇总所有 warp 的结果：只读取 [0, num_warps)
+  // warp0 汇总所有 warp 的结果
   if (warp == 0) {
   #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {
@@ -850,7 +849,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
 
 }
 
-std::vector<torch::Tensor> tp_channel_wise_bwd_coo_launch(
+std::vector<torch::Tensor> tp_channel_wise_bwd_dense_launch(
     torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
     torch::Tensor x_uv,          // [Z,UV_TOTAL]
     torch::Tensor x_iu,          // [Z,IU_TOTAL]
@@ -984,6 +983,6 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_coo_launch(
 
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &tp_channel_wise_bwd_coo_launch);
+    m.def("backward", &tp_channel_wise_bwd_dense_launch);
     //m.def("backward_opt", &tp_channel_wise_bwd_ell_launch);
 }
