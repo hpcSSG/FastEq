@@ -25,7 +25,7 @@ dtype = "float64"
 mace_scale = str(sys.argv[1])
 dtype = str(sys.argv[2])
 
-calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_' + mace_scale + '.model', device=device, default_dtype=dtype, compile_mode=None, enable_cueq=False, use_batch_size=16)
+calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_' + mace_scale + '.model', device=device, default_dtype=dtype, compile_mode=None, enable_oeq=True, use_batch_size=16)
 
 file_list = []
 atoms_list = []
@@ -36,8 +36,6 @@ for file in tqdm(os.listdir(data_path), desc="Reading files", unit="file"):
         file_list.append(file)
 file_list.sort()
 print(file_list)
-
-file_list = file_list[48:]
 
 for file in file_list:
     atoms_list.append(ase.io.read(os.path.join(data_path, file), index=0))

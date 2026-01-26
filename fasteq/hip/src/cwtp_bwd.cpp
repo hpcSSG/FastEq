@@ -985,5 +985,6 @@ std::vector<torch::Tensor> cwtp_bwd_fused(
 
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &cwtp_bwd_fused);
+    m.def("backward_opt", &cwtp_bwd_fused); // TODO fix for hygon
+    m.def("backward", &tp_channel_wise_bwd_launch);
 }

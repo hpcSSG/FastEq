@@ -26,9 +26,11 @@ __device__ __forceinline__ T ld_g(const T* p) {
     return *p;
 }
 
+
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
     // AMD uses 64-wide wavefronts, use __shfl_down for reduction
+    #pragma unroll
     for (int offset = 32; offset > 0; offset >>= 1) {
         v += __shfl_down(v, offset);
     }
@@ -36,12 +38,23 @@ __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
 }
 
 template <typename T>
+__device__ __forceinline__ T wave_reduce_sum(T v) {
+  // HIP: warpSize is 64 (wave64) or 32 (wave32)
+  for (int off = WARP_SIZE / 2; off > 0; off >>= 1) {
+    v += __shfl_down(v, off, WARP_SIZE);   // width = warpSize
+  }
+  return v;
+}
+
+template <typename T>
 __device__ __forceinline__ T warp_sum(T v) {
+    #pragma unroll
     for (int d = 32; d > 0; d >>= 1) {
         v += __shfl_down(v, d);
     }
     return v;
 }
+
 
 __host__ __device__ inline int find_integer_divisor(int x, int bdim) {
     return (x + bdim - 1) / bdim;

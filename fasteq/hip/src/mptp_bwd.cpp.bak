@@ -6,15 +6,12 @@
 #include <vector>
 #include "hip_utils.hpp"
 
-
-// round up to multiple
-static inline int round_up(int x, int m) {
-  return ((x + m - 1) / m) * m;
-}
-
+// -------------------------------------------------------------------------------------------------
+// Backward kernel for fused sender-major TP + scatter_sum
+// -------------------------------------------------------------------------------------------------
 template <typename scalar_t, int MAX_K_DIM, int JV_MAX>
 __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_kernel(
-    const scalar_t* __restrict__ grad_out_nodes, // [N, K_TOTAL*U*V]
+    const scalar_t* __restrict__ grad_out_nodes, // [N, C]
     const scalar_t* __restrict__ x_uv_e,         // [E, UV_TOTAL]
     const scalar_t* __restrict__ x_jv_e,         // [E, JV_TOTAL]
     const scalar_t* __restrict__ x_iu_n,         // [N, IU_TOTAL]
@@ -24,9 +21,9 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
 
     const int32_t* __restrict__ path_indices,    // [P,4]
     const int32_t* __restrict__ k_dims,          // [P]
-    const int32_t* __restrict__ iu_seg_offsets,
-    const int32_t* __restrict__ jv_seg_offsets,
-    const int32_t* __restrict__ kv_k_offsets,
+    const int32_t* __restrict__ iu_seg_offsets,  // 
+    const int32_t* __restrict__ jv_seg_offsets,  // 
+    const int32_t* __restrict__ kv_k_offsets,    //
 
     const int32_t* __restrict__ nnz_per_path,    // [P]
     const int32_t* __restrict__ nnz_offsets,     // [P]
@@ -48,24 +45,23 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     int K_TOTAL, int U, int V,
     int num_paths)
 {
-  const int s   = (int)blockIdx.x;      // sender node
+  const int s = (int)blockIdx.x;      // sender node
   const int tid = (int)threadIdx.x;
-  const int u   = tid;                 // "u thread"
+  const int u = tid;
 
   if (s >= N) return;
-
-  // active lanes are those u < U, but do NOT early return (syncthreads safety)
   const bool active = (u < U);
+  if (!active) return;
 
   // ------ shared: cache sender feats + cache grad_x_iu for this sender ------
   extern __shared__ unsigned char smem_raw[];
-  scalar_t* s_iu  = reinterpret_cast<scalar_t*>(smem_raw);   // [IU_TOTAL]
-  scalar_t* s_giu = s_iu + IU_TOTAL;                         // [IU_TOTAL]
+  scalar_t* s_iu  = reinterpret_cast<scalar_t*>(smem_raw);              // [IU_TOTAL]
+  scalar_t* s_giu = s_iu + IU_TOTAL;                                     // [IU_TOTAL]
 
-  const scalar_t* xiu_s = x_iu_n + (size_t)s * (size_t)IU_TOTAL;
+  const scalar_t* xiu_s = x_iu_n + (size_t)s * IU_TOTAL;
 
-  // load xiu_s -> s_iu and init s_giu=0 (all threads participate)
-  for (int idx = tid; idx < IU_TOTAL; idx += (int)blockDim.x) {
+  // load xiu_s -> s_iu and init s_giu=0 (one-time per sender)
+  for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) {
     s_iu[idx]  = xiu_s[idx];
     s_giu[idx] = (scalar_t)0;
   }
@@ -78,34 +74,27 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     return;
   }
 
-  // wave/warp bookkeeping (HIP: warpSize=64 by default on AMD)
-  const int lane = tid & (64 - 1);
-  const int warp = tid / 64;
-  const int num_warps = ((int)blockDim.x + 64 - 1) / 64;
+  // warp reduce scratch: [max 8 warps][JV_MAX]
+  __shared__ scalar_t warp_sum_sh[8][JV_MAX];
 
-  // max warps per block: 1024/64=16 (wave64) or 1024/32=32 (wave32)
-  // here we size for wave64=16. If you enable wave32, bump this to 32.
-  constexpr int MAX_WARPS_PER_BLOCK = 16;
-
-  // If you might compile with wave32 on AMD, change MAX_WARPS_PER_BLOCK to 32.
-  // Safety guard:
-  if (warp >= MAX_WARPS_PER_BLOCK) return;
-
-  __shared__ scalar_t warp_sum_sh[MAX_WARPS_PER_BLOCK][JV_MAX];
+  const int lane = tid & 63 ;
+  const int warp = tid >> 6;
+  const int num_warps = (blockDim.x + 63) >> 6;
 
   // -------- process edges of this sender (sender-major) --------
   for (int e = e0; e < e1; ++e) {
     const int r = receiver[e];
 
-    const scalar_t* xuv = x_uv_e + (size_t)e * (size_t)UV_TOTAL;
-    const scalar_t* xjv = x_jv_e + (size_t)e * (size_t)JV_TOTAL;
+    const scalar_t* xuv = x_uv_e + (size_t)e * UV_TOTAL;
+    const scalar_t* xjv = x_jv_e + (size_t)e * JV_TOTAL;
 
-    scalar_t* gxuv = grad_x_uv_e + (size_t)e * (size_t)UV_TOTAL;
-    scalar_t* gxjv = grad_x_jv_e + (size_t)e * (size_t)JV_TOTAL;
+    scalar_t* gxuv = grad_x_uv_e + (size_t)e * UV_TOTAL;
+    scalar_t* gxjv = grad_x_jv_e + (size_t)e * JV_TOTAL;
 
     const scalar_t* go_r = grad_out_nodes + (size_t)r * (size_t)(K_TOTAL * U * V);
 
     // -------- jv partial: per-thread register accumulate over all contributions --------
+    // requires JV_TOTAL <= 16
     scalar_t jtmp[JV_MAX];
     #pragma unroll
     for (int jj = 0; jj < JV_MAX; ++jj) jtmp[jj] = (scalar_t)0;
@@ -122,7 +111,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
       const int nnz_off = nnz_offsets[p];
 
       if (k_dim <= 0 || nnz <= 0) continue;
-      if (k_dim > MAX_K_DIM) return; // uniform across block
+      if (k_dim > MAX_K_DIM) return;
 
       const int uv_base = uv_idx * (U * V);
       const int iu_base = iu_seg_offsets[iu_idx];
@@ -130,10 +119,8 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
       const int k_base  = kv_k_offsets[kv_idx];
 
       for (int v_idx = 0; v_idx < V; ++v_idx) {
-
-        // only active u threads do math; inactive contribute 0
         const int uv_off = uv_base + u * V + v_idx;
-        const scalar_t xuv_uv = active ? xuv[uv_off] : (scalar_t)0;
+        const scalar_t xuv_uv = xuv[uv_off];
 
         #pragma unroll
         for (int k_local = 0; k_local < MAX_K_DIM; ++k_local) {
@@ -146,8 +133,9 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
 
           const int global_k  = k_base + k_local;
           const int out_index = (global_k * U + u) * V + v_idx;
-          const scalar_t go   = active ? go_r[out_index] : (scalar_t)0;
+          const scalar_t go = go_r[out_index];
 
+          // d/dxuv for this (p,k_local,u,v): sum_{nnz} go*c*xiu*xjv
           scalar_t acc_duv = (scalar_t)0;
 
           #pragma unroll 1
@@ -159,65 +147,64 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
             const scalar_t c = cg_val_all[idx];
 
             const int iu_off = iu_base + i * U + u;
-            const int jv_off = jv_base + j * V + v_idx;
+            const int jv_off = jv_base + j * V + v_idx;   // global index inside [0, JV_TOTAL)
 
-            if (active) {
-              const scalar_t xiu = s_iu[iu_off];
-              const scalar_t xj  = xjv[jv_off];
+            const scalar_t xiu = s_iu[iu_off];
+            const scalar_t xj  = xjv[jv_off];
 
-              // grad x_uv
-              acc_duv = fma(go * c, xiu * xj, acc_duv);
+            // grad x_uv
+            acc_duv = fma(go * c, xiu * xj, acc_duv);
 
-              // grad x_iu (per-u unique, no atomic)
-              s_giu[iu_off] = fma(go * c, xuv_uv * xj, s_giu[iu_off]);
+            // grad x_iu (accumulate in shared cache, one-time global write at end)
+            s_giu[iu_off] = fma(go * c, xuv_uv * xj, s_giu[iu_off]);
 
-              // grad x_jv (register partial, later reduced over u)
-              if (jv_off < JV_MAX) {
-                jtmp[jv_off] = fma(go * c, xuv_uv * xiu, jtmp[jv_off]);
-              }
+            // grad x_jv (register partial, reduced over u later)
+            if (jv_off < JV_MAX) {
+              jtmp[jv_off] = fma(go * c, xuv_uv * xiu, jtmp[jv_off]);
             }
           }
 
           // write grad x_uv (per-edge, per-u unique, no atomic)
-          if (active) {
-            gxuv[uv_off] += acc_duv;
-          }
+          gxuv[uv_off] += acc_duv;
         }
       }
     }
 
     // -------- reduce jtmp over u threads and write grad_x_jv_e[e, :] --------
-    // (1) wave reduce inside each warp
+    // warp-level reduce for each jj in [0, JV_TOTAL)
     for (int jj = 0; jj < JV_TOTAL; ++jj) {
-      scalar_t v = (jj < JV_MAX) ? jtmp[jj] : (scalar_t)0;
-      v = wave_reduce_sum(v);
+      scalar_t v = jtmp[jj];
+
+      unsigned mask = __activemask();
+      warp_reduce_sum(v, mask);
       if (lane == 0) {
         warp_sum_sh[warp][jj] = v;
       }
     }
     __syncthreads();
 
-    // (2) warp0 reduces across warps (note: wave64 lane0..63, but num_warps<=16)
+    // warp0 reduces across warps
     if (warp == 0) {
       for (int jj = 0; jj < JV_TOTAL; ++jj) {
         scalar_t v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (scalar_t)0;
-        v = wave_reduce_sum(v);
-        if (lane == 0) {
-          gxjv[jj] += v;
+        unsigned mask0 = __activemask();
+        warp_reduce_sum(v, mask0);
+	if (lane == 0) {
+          gxjv[jj] += v;  // per-edge unique writer block -> no atomic
         }
       }
     }
     __syncthreads(); // reuse warp_sum_sh for next edge
   }
 
-  // -------- flush grad_x_iu_n for this sender once --------
-  scalar_t* gxi_s = grad_x_iu_n + (size_t)s * (size_t)IU_TOTAL;
-  for (int idx = tid; idx < IU_TOTAL; idx += (int)blockDim.x) {
+  // -------- flush grad_x_iu_n for this sender once (fix your L1->L2 pain point) --------
+  scalar_t* gxi_s = grad_x_iu_n + (size_t)s * IU_TOTAL;
+  for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) {
     gxi_s[idx] += s_giu[idx];
   }
 }
 
-// -------------------- launch (PyTorch extension) --------------------
+
 std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     torch::Tensor grad_out_nodes,   // [N, K_TOTAL*U*V]
     torch::Tensor x_uv,             // [E, UV_TOTAL]
@@ -244,6 +231,9 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
+  /* TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
+  TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "x_uv/x_iu/x_jv must be HIP");
+  TORCH_CHECK(receiver.is_hip() && row_ptr_s.is_hip(), "receiver/row_ptr_s must be HIP"); */
 
   grad_out_nodes = grad_out_nodes.contiguous();
   x_uv = x_uv.contiguous();
@@ -280,25 +270,19 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
   TORCH_CHECK(grad_out_nodes.size(0) == N && grad_out_nodes.size(1) == C,
               "grad_out_nodes must be [N, K_TOTAL*U*V]");
 
-  constexpr int MAX_K_DIM = 8;
-  constexpr int JV_MAX    = 32;
-  TORCH_CHECK(JV_TOTAL <= JV_MAX, "JV_TOTAL > JV_MAX needs tiling or bigger JV_MAX");
-  TORCH_CHECK(JV_TOTAL <= 32, "This kernel currently expects JV_TOTAL<=32 (raise JV_MAX + shared if needed)");
+  TORCH_CHECK(JV_TOTAL <= 32, "This bwd kernel assumes JV_TOTAL<=32. Need tiling otherwise.");
 
   auto grad_x_uv = torch::zeros_like(x_uv);
   auto grad_x_iu = torch::zeros_like(x_iu);
   auto grad_x_jv = torch::zeros_like(x_jv);
 
-  // HIP wave64 friendly block size: round up to multiple of warpSize (typically 64)
-  int block_u = (int)U;
-  // Note: warpSize is compile-time device builtin in kernel, but here on host we assume AMD wave64 => 64.
-  // If you compile wave32, set this to 32.
-  const int W = 64;
-  block_u = round_up(block_u, W);
-  if (block_u < W) block_u = W;
-  if (block_u > 1024) block_u = 1024;
+  constexpr int MAX_K_DIM = 8;
+  constexpr int JV_MAX = 16;
 
-  TORCH_CHECK((int)U <= block_u, "U>block_u needs tiling");
+  int block_u = (int)U;
+  if (block_u < 64) block_u = 64;
+  if (block_u > 1024) block_u = 1024;
+  TORCH_CHECK((int)U <= block_u, "U>1024 needs tiling");
 
   dim3 grid((unsigned int)N, 1, 1);
   dim3 block((unsigned int)block_u, 1, 1);
@@ -326,7 +310,7 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
         nnz_k_counts.data_ptr<int32_t>(),
         cg_i_all.data_ptr<uint8_t>(),
         cg_j_all.data_ptr<uint8_t>(),
-        (const scalar_t*)cg_val_all.data_ptr<scalar_t>(),
+        cg_val_all.data_ptr<scalar_t>(),
         (scalar_t*)grad_x_uv.data_ptr<scalar_t>(),
         (scalar_t*)grad_x_jv.data_ptr<scalar_t>(),
         (scalar_t*)grad_x_iu.data_ptr<scalar_t>(),
@@ -340,7 +324,6 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
   HIP_CHECK(hipGetLastError());
   return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
-
 
 
 template<typename T>
@@ -1187,6 +1170,6 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
 
 TORCH_LIBRARY(mptp_bwd, m)
 {
-    //m.def("backward_opt", &tp17_bwd_fused_sender_major_densec_launch);
+    m.def("backward_opt", &tp17_bwd_fused_sender_major_densec_launch);
     m.def("backward", &tp_groupk_fused_sender_scatter_bwd_launch);
 }

@@ -90,13 +90,24 @@ class FusedMPFunction(torch.autograd.Function):
         path_indices = meta["path_indices_tensor"]
         num_paths = path_indices.shape[0]
 
+        cg_i_groupk = meta["cg_i_all"]
+        cg_j_groupk  = meta["cg_j_all"]
+        cg_k_groupk  = meta["cg_k_all"]
+        cg_val_groupk  = meta["cg_val_all"]
+
+        nnz_per_path = meta["nnz_per_path"]
+        nnz_offsets_groupk = meta["nnz_offsets"]
+        nnz_k_offsets_groupk = meta["nnz_k_offsets"]
+        nnz_k_counts_groupk = meta["nnz_k_counts"]
+
         U, V, K_TOTAL = meta["U"], meta["V"], meta["K_TOTAL"]
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
+        '''
         # To be implemented: backward logic for fused message passing
-        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward(
+        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward_opt(
             grad_out_nodes, tp_weights, node_feats, edge_attrs, row_ptr_s, receiver.to(torch.int32),
             c_all,
             #path_indices,
@@ -110,6 +121,26 @@ class FusedMPFunction(torch.autograd.Function):
             c_offsets,
             U, V, K_TOTAL,
             num_paths,
+        )
+        '''
+
+
+        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward(
+            grad_out_nodes, tp_weights, node_feats, edge_attrs, 
+            receiver.to(torch.int32), row_ptr_s,
+            path_indices,
+            k_dims,
+            iu_seg_offsets,
+            jv_seg_offsets,
+            kv_k_offsets,
+            nnz_per_path,
+            nnz_offsets_groupk,
+            nnz_k_offsets_groupk,
+            nnz_k_counts_groupk,
+            cg_i_groupk,
+            cg_j_groupk,
+            cg_val_groupk,
+            U, V, K_TOTAL,
         )
 
         torch.cuda.synchronize()
