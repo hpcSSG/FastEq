@@ -55,6 +55,15 @@ __device__ __forceinline__ T warp_sum(T v) {
     return v;
 }
 
+template <typename T>
+__device__ __forceinline__ T hip_shfl_bcast(T v, int src_lane) {
+  return __shfl(v, src_lane, warpSize);
+}
+
+template <typename T>
+__device__ __forceinline__ T hip_shfl_down(T v, int delta) {
+  return __shfl_down(v, delta, warpSize);
+}
 
 __host__ __device__ inline int find_integer_divisor(int x, int bdim) {
     return (x + bdim - 1) / bdim;

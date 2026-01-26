@@ -79,9 +79,9 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
   }
 
   // wave/warp bookkeeping (HIP: warpSize=64 by default on AMD)
-  const int lane = tid & (64 - 1);
-  const int warp = tid / 64;
-  const int num_warps = ((int)blockDim.x + 64 - 1) / 64;
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int num_warps = ((int)blockDim.x + warpSize - 1) / warpSize;
 
   // max warps per block: 1024/64=16 (wave64) or 1024/32=32 (wave32)
   // here we size for wave64=16. If you enable wave32, bump this to 32.
@@ -557,7 +557,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
   for (int j = 0; j < J; ++j) {
     T v = (lane == 0) ? x_jv_e[jv_base + j] : (T)0;
     //xj[j] = __shfl(0xffffffff, v, 0);
-    xj[j] = __shfl(v, 0, 64);
+    xj[j] = hip_shfl_bcast(v, 0); 
   }
 
   // xiu[I] from shared
@@ -631,34 +631,35 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
     T* __restrict__ gx_jv_e,                 // [JV_TOTAL] per-edge grad
     const int32_t* __restrict__ jv_seg_offsets
 ){
-  __shared__ T warp_sum_sh[8][JJ]; // blockDim<=256 -> max 8 warps
+  // blockDim<=256: NVIDIA(32)-><=8 warps, AMD(64)-><=4 warps
+  __shared__ T warp_sum_sh[8][JJ];
 
-  // warp reduce each jj
+  // 1) warp 内 reduce：每个 jj 一个值
 #pragma unroll
   for (int jj = 0; jj < JJ; ++jj) {
     T v = active ? jtmp[jj] : (T)0;
-    unsigned mask = __ballot(1);
-#pragma unroll
-    for (int off = 32; off > 0; off >>= 1) {
-      v += __shfl_down(mask, v, off);
+
+    // 全 warp reduce（不依赖 activemask；inactive 线程已置 0）
+    for (int off = warpSize / 2; off > 0; off >>= 1) {
+      v += hip_shfl_down(v, off);
     }
+
     if (lane == 0) warp_sum_sh[warp][jj] = v;
   }
   __syncthreads();
 
-  // warp0 sum across warps (assume num_warps <= 8)
+  // 2) warp0 汇总所有 warp（num_warps<=8 仍成立，AMD 下一般<=4）
   if (warp == 0) {
 #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {
       T v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (T)0;
-#pragma unroll
-      // good for <=8 warps
-      for (int off = 4; off > 0; off >>= 1) {
-        v += __shfl_down(v, off, 8);   // width = 8
+
+      for (int off = warpSize / 2; off > 0; off >>= 1) {
+        v += hip_shfl_down(v, off);
       }
 
       if (lane == 0) {
-        // same jj mapping as your cwtp
+        // jj -> (jv_idx, j_local) mapping: 保持你原来的规则
         int jv_idx, j_local;
         if (jj == 0) { jv_idx = 0; j_local = 0; }
         else if (jj < 4) { jv_idx = 1; j_local = jj - 1; }
@@ -666,12 +667,11 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
         else { jv_idx = 3; j_local = jj - 9; }
 
         int jv_base = (int)jv_seg_offsets[jv_idx];
-        gx_jv_e[jv_base + j_local] += v; // per-edge write
+        gx_jv_e[jv_base + j_local] += v;
       }
     }
   }
   __syncthreads();
-  return;
 }
 
 
@@ -709,9 +709,9 @@ __global__ void tp17_bwd_fused_sender_major_densec_kernel(
   if (s >= N) return;
   const bool active = (u < U);
 
-  const int lane = tid & 63;
-  const int warp = tid >> 6;
-  const int num_warps = (blockDim.x + 63) >> 6; // assume <= 8
+  const int lane = tid & (warpSize - 1);
+  const int warp = tid / warpSize;
+  const int num_warps = (blockDim.x + (warpSize - 1)) / warpSize; // assume <= 8
 
   // shared: [xiu][g_xiu]
   extern __shared__ unsigned char smem_raw[];
@@ -1187,6 +1187,6 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
 
 TORCH_LIBRARY(mptp_bwd, m)
 {
-    //m.def("backward_opt", &tp17_bwd_fused_sender_major_densec_launch);
+    m.def("backward_opt", &tp17_bwd_fused_sender_major_densec_launch);
     m.def("backward", &tp_groupk_fused_sender_scatter_bwd_launch);
 }
