@@ -553,7 +553,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
 
   // xj[J] : warp broadcast (same trick as your code)
   T xj[J];
-  #pragma unroll
+  #pragma unroll 1
   for (int j = 0; j < J; ++j) {
     T v = (lane == 0) ? x_jv_e[jv_base + j] : (T)0;
     //xj[j] = __shfl(0xffffffff, v, 0);
@@ -575,7 +575,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
   #pragma unroll
   for (int j = 0; j < J; ++j) jloc[j] = (T)0;
 
-  #pragma unroll
+  #pragma unroll 2
   for (int kk = 0; kk < K; ++kk) {
     const T go = go_edge[(int64_t)(k_base + kk) * (int64_t)U_runtime + u];
 
@@ -635,7 +635,7 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
   __shared__ T warp_sum_sh[8][JJ];
 
   // 1) warp 内 reduce：每个 jj 一个值
-#pragma unroll
+#pragma unroll 1
   for (int jj = 0; jj < JJ; ++jj) {
     T v = active ? jtmp[jj] : (T)0;
 
@@ -650,7 +650,7 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
 
   // 2) warp0 汇总所有 warp（num_warps<=8 仍成立，AMD 下一般<=4）
   if (warp == 0) {
-#pragma unroll
+#pragma unroll 1
     for (int jj = 0; jj < JJ; ++jj) {
       T v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (T)0;
 

@@ -530,9 +530,9 @@ at::Tensor launch_fused_multipath_fctp_tile(
 
     size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)nnz_max * U_pad;
     size_t shmem_bytes = shmem_elems * a_all.element_size();
-    //std::cout << "fast fctp launch param, P:" << P
-    //        << " B:" << B
-    //        << " shmem_byte:" << shmem_bytes << std::endl;
+    std::cout << "fast fctp launch param, P:" << P
+            << " B:" << B
+            << " shmem_byte:" << shmem_bytes << std::endl;
 
     hipStream_t stream = at::hip::getCurrentHIPStream();
 
