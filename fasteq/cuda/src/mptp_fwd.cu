@@ -72,7 +72,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
     const int32_t* __restrict__ receiver,   // [E]
     const int32_t* __restrict__ row_ptr_s,  // [N+1]
 
-    // TP meta (same as your group-k kernel)
+    // TP meta
     const int32_t* __restrict__ path_indices,   // [P,4]
     const int32_t* __restrict__ k_dims,         // [P]
     const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
@@ -123,7 +123,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
     const scalar_t* x_uv = x_uv_e + (size_t)e * UV_TOTAL;
     const scalar_t* x_jv = x_jv_e + (size_t)e * JV_TOTAL;
 
-    // ---- same inner structure as your group-k TP ----
     for (int p = 0; p < num_paths; ++p) {
       int uv_idx = path_indices[p * 4 + 0];
       int iu_idx = path_indices[p * 4 + 1];

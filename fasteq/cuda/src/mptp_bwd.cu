@@ -204,7 +204,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     __syncthreads(); // reuse warp_sum_sh for next edge
   }
 
-  // -------- flush grad_x_iu_n for this sender once (fix your L1->L2 pain point) --------
+  // -------- flush grad_x_iu_n for this sender once --------
   scalar_t* gxi_s = grad_x_iu_n + (size_t)s * IU_TOTAL;
   for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) {
     gxi_s[idx] += s_giu[idx];
@@ -536,7 +536,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
   // xuv
   const T xuv = x_uv_e[uv_base + u];
 
-  // xj[J] : warp broadcast (same trick as your code)
+  // xj[J] : warp broadcast
   T xj[J];
   #pragma unroll
   for (int j = 0; j < J; ++j) {
@@ -640,7 +640,6 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
       }
 
       if (lane == 0) {
-        // same jj mapping as your cwtp
         int jv_idx, j_local;
         if (jj == 0) { jv_idx = 0; j_local = 0; }
         else if (jj < 4) { jv_idx = 1; j_local = jj - 1; }
