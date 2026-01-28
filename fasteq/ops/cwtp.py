@@ -1,7 +1,6 @@
 import torch
 import os, math, time
 from typing import List
-import fasteq.cuda 
 
 from collections import Counter
 from fasteq.tools.gen_cwtp_fwd import count_patterns_for_paths, analyze_topN, parse_patterns_text, generate_eval_pid_cuh, build_pid_table_from_torch, generate_pid_table_cuh

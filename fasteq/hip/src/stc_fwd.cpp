@@ -1,9 +1,9 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #include <torch/extension.h>
 #include <torch/script.h>
 #include <torch/torch.h>
-#include <c10/cuda/CUDAStream.h>
+#include <c10/hip/HIPStream.h>
 
 template <typename scalar_t>
 __global__ void stc_fwd_kernel(
@@ -25,11 +25,14 @@ __global__ void stc_fwd_kernel(
     if (b >= B || j >= u) return;
 
     // 每个 block 对应一个样本 b，每个线程处理一个 channel j
+    // 预加载 x1[b, :, :] 到 shared memory
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
         x1_shared[a] = x1[b * num_a * u + a_idx * u + u_idx];
     }
+
+    // 预加载 x0_g[b, :, :] 到 shared memory
     for (int i = threadIdx.x; i < num_i * u; i += blockDim.x) {
         int i_idx = i / u;
         int u_idx = i % u;
@@ -120,6 +123,8 @@ __global__ void stc_fwd_kernel_opt(
         acc_local_max[s] = scalar_t(0);
     }
 
+    // ---------------- 遍历所有 paths，累加到对应的 out_segment ----------------
+    
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len        = path_lens[p];
@@ -127,11 +132,15 @@ __global__ void stc_fwd_kernel_opt(
 
         // x1 indices
         const int a_idx = path[0];
+
+        // x0_g index d_idx: 倒数第二个
         const int d_idx = (len == 3) ? path[1] : path[len - 2];
+
+        // 输出段索引 out_seg: 最后一个
         const int out_seg = (len == 3) ? path[2] : path[len - 1];
 
         if (out_seg < 0 || out_seg >= seg_lim) {
-            continue;
+            continue; // 越界就直接跳过（理论上不该发生）
         }
 
         scalar_t val = x1_shared[a_idx * u + j];
@@ -156,7 +165,7 @@ __global__ void stc_fwd_kernel_opt(
     // out 逻辑形状: [B, num_out_segments, u]
     for (int s = 0; s < seg_lim; ++s) {
         const int out_idx = ((b * num_out_segments) + s) * u + j;
-        // 每个 (b, s, j) 只由该 thread 写一次，不需要 atomicAdd
+        // 每个 (b, s, j) 只由该 thread 写一次，**不需要 atomicAdd**
         out[out_idx] = acc_local_max[s];
     }
 }
@@ -185,7 +194,6 @@ __global__ void stc_fwd_kernel_tiled(
     for (int base_u = 0; base_u < u; base_u += TILE_U) {
         const int j = base_u + tx;  // 全局 channel index
 
-        // ---------------- 预加载 x1[b, :, j..j+TILE_U) 到 shared ----------------
         // x1_shared shape: [num_a, TILE_U] -> 下标 a*TILE_U + local_u
         for (int idx = tx; idx < num_a * TILE_U; idx += blockDim.x) {
             int a_idx    = idx / TILE_U;
@@ -198,7 +206,6 @@ __global__ void stc_fwd_kernel_tiled(
             x1_shared[idx] = v;
         }
 
-        // ---------------- 预加载 x0_g[b, :, j..j+TILE_U) 到 shared ----------------
         // x0g_shared shape: [num_i, TILE_U]
         for (int idx = tx; idx < num_i * TILE_U; idx += blockDim.x) {
             int i_idx    = idx / TILE_U;
@@ -370,7 +377,7 @@ __global__ void stc_fwd_kernel_tiled_opt(
     }
 }
 
-// 当前Path数量不多<400，基于warp在path维度并行实现的segmented reduce 会导致大量atomic
+
 template <typename scalar_t>
 __global__  void stc_fwd_kernel_notiled(
     const scalar_t* __restrict__ x1,        // [B, num_a, u] -> flattened
@@ -462,9 +469,6 @@ __global__  void stc_fwd_kernel_notiled(
 }
 
 
-// --------------------------------------
-// Launcher：支持 float32 / float64
-// --------------------------------------
 at::Tensor stc_fwd_launcher(
     at::Tensor x1,            // [B, num_a, u]
     at::Tensor x0_g,          // [B, num_i, u]
@@ -473,12 +477,12 @@ at::Tensor stc_fwd_launcher(
     at::Tensor path_lens,     // [num_paths]
     const int64_t num_out_segments)     
 {
-    /* TORCH_CHECK(x1.is_cuda(), "x1 must be CUDA");
-    TORCH_CHECK(x0_g.is_cuda(), "x0_g must be CUDA");
-    TORCH_CHECK(coeffs.is_cuda(), "coeffs must be CUDA");
-    TORCH_CHECK(paths_tensor.is_cuda(), "paths_tensor must be CUDA");
-    TORCH_CHECK(path_lens.is_cuda(), "path_lens must be CUDA");
- */
+    /* TORCH_CHECK(x1.is_hip(), "x1 must be HIP");
+    TORCH_CHECK(x0_g.is_hip(), "x0_g must be HIP");
+    TORCH_CHECK(coeffs.is_hip(), "coeffs must be HIP");
+    TORCH_CHECK(paths_tensor.is_hip(), "paths_tensor must be HIP");
+    TORCH_CHECK(path_lens.is_hip(), "path_lens must be HIP"); */
+
     auto dtype = x1.scalar_type();
     TORCH_CHECK(
         dtype == at::kFloat || dtype == at::kDouble,
@@ -517,8 +521,8 @@ at::Tensor stc_fwd_launcher(
     const size_t shared_mem_bytes = shared_elems * x1.element_size();
     
 
-    cudaStream_t cur_stream =
-        c10::cuda::getCurrentCUDAStream(x1.device().index()).stream();
+    hipStream_t cur_stream =
+        c10::hip::getCurrentHIPStream(x1.device().index()).stream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "stc_fwd_kernel_tiled", [&] {
         using scalar_t = scalar_t;
@@ -533,10 +537,9 @@ at::Tensor stc_fwd_launcher(
             B, num_paths, u, num_a, num_i, num_out_segments);
     });
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return out;
 }
-
 
 TORCH_LIBRARY(stc_fwd, m)
 {

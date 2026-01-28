@@ -1,9 +1,9 @@
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
 
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #include <limits>
 #include <type_traits>
 
@@ -12,7 +12,7 @@ __host__ __device__ inline T ceil_div(T a, T b) {
     return (a + b - 1) / b;
 }
 
-// 多 path 版：
+// 多 path 版 fast kernel（concat 输出）：
 //
 // a_all:        [B, I_total, U]
 // b_all:        [B, 1, V]          // fast path: J==1
@@ -45,7 +45,7 @@ Compute (SM) Throughput           %        32.64
 template<typename scalar_t>
 __global__ void fused_fctp_kernel_fwd_multipath(
     const scalar_t* __restrict__ a_all,        // [B, I_total, U]
-    const scalar_t* __restrict__ b_all,        // [B, 1, V], J = 1
+    const scalar_t* __restrict__ b_all,        // [B, 1, V]
     const scalar_t* __restrict__ w_all,        // [P, U, V, W]
     const int*     __restrict__ cg_i_all,      // [P, nnz_max]
     const int*     __restrict__ cg_j_all,      // [P, nnz_max]
@@ -86,7 +86,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     // out_final[b]: [K_total, W]
     scalar_t* __restrict__ Ob_base    = out_final + (size_t)b * K_total * W;
 
-    //对该 (p,b) 做 argmax_v b[b,0,v]
+    // 1) 对该 (p,b) 做 argmax_v b[b,0,v]
     int vstar = 0;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         scalar_t best = std::numeric_limits<scalar_t>::lowest();
@@ -103,7 +103,7 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     __syncthreads();
     const int v = sh_v;
 
-    //shared: Wt[W, U+1] + Asel[nnz_max, U+1]
+    // 2) shared: Wt[W, U+1] + Asel[nnz_max, U+1]
     const int U_pad = U + 1;
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
     scalar_t* sh_Wt   = reinterpret_cast<scalar_t*>(shmem_raw);               // [W, U_pad]
@@ -136,8 +136,6 @@ __global__ void fused_fctp_kernel_fwd_multipath(
         sh_Wt[((size_t)w0 + 2) * U_pad + u] = (scalar_t)r.z;
         sh_Wt[((size_t)w0 + 3) * U_pad + u] = (scalar_t)r.w;
     }
-
-    // 只加载 nnz_p 行 A[b, i_global, :] → sh_Asel[pidx, :]
     for (int t = threadIdx.y * tx + threadIdx.x;
          t < nnz_p * U;
          t += tx * ty) {
@@ -148,7 +146,6 @@ __global__ void fused_fctp_kernel_fwd_multipath(
     }
     __syncthreads();
 
-    // 每个线程负责一个 (k_local, w)，k_global = k_base + k_local
     const int w = threadIdx.x;
     const int k_local = threadIdx.y;       // 0..K_max-1
 
@@ -232,7 +229,7 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
     // out_final[b]: [K_total, W]
     scalar_t* __restrict__ Ob_base    = out_final + (size_t)b * K_total * W;
 
-    // 1) 对该 (p,b) 做 argmax_v b[b,0,v]
+    //对该 (p,b) 做 argmax_v b[b,0,v]
     int vstar = 0;
     if (threadIdx.x == 0 && threadIdx.y == 0) {
         scalar_t best = std::numeric_limits<scalar_t>::lowest();
@@ -277,13 +274,14 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
     }
     __syncthreads();
 
+    // k_local 超出 K_p 的线程不参与计算，但必须参与所有 __syncthreads
     const bool alive = (k_local < K_p);
 
-    // 沿 W 方向分块
     for (int w_base = 0; w_base < W; w_base += W_TILE) {
         const int W_this   = min(W_TILE, W - w_base);
-        const int Wv_this  = W_this / 4;
-        const int Wv_off   = w_base / 4;       
+        const int Wv_this  = W_this / 4;       // Vec4 数量
+        const int Wv_off   = w_base / 4;       // 本 tile 在 Vec4 维度的起始偏移
+
         const int num_vec = U * Wv_this;
         for (int t = threadIdx.y * tx + threadIdx.x;
              t < num_vec;
@@ -339,15 +337,13 @@ __global__ void fused_fctp_kernel_fwd_multipath_tiledW(
 
                 acc += s * cg_v[pidx];
             }
-
-            // 写 tile (k_global, w_global)
             Ob_base[(size_t)k_global * W + w_global] = acc;
         }
         __syncthreads();
     }
 }
 
-// 当前只适配J=1的情况
+
 at::Tensor launch_fused_multipath_fctp(
     at::Tensor w_all,        // [P, U, V, W]
     at::Tensor a_all,        // [B, I_total, U]
@@ -365,11 +361,11 @@ at::Tensor launch_fused_multipath_fctp(
     const int64_t K_total
 )
 {
-    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
-             && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
-             && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
-             && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA"); */
+    /* TORCH_CHECK(a_all.is_hip() && b_all.is_hip() && w_all.is_hip()
+             && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
+             && cg_val_all.is_hip() && nnz_per_path.is_hip()
+             && K_per_path.is_hip() && path_offset.is_hip(),
+             "all tensors must be HIP"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -379,7 +375,7 @@ at::Tensor launch_fused_multipath_fctp(
                 cg_val_all.scalar_type() == dtype,
                 "dtypes must match");
 
-    // c10::cuda::CUDAGuard device_guard(a_all.get_device());
+    // c10::hip::HIPGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
     TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
@@ -425,13 +421,13 @@ at::Tensor launch_fused_multipath_fctp(
     size_t shmem_bytes = shmem_elems * a_all.element_size();
     //std::cout<<"fast fctp launch param, P:"<<P<<" B:"<<B<<" shmem_byte:"<<shmem_bytes<<std::endl;
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_forward_multipath_concat", [&] {
         using scalar_t_ = scalar_t;
-        cudaFuncSetAttribute(
-            fused_fctp_kernel_fwd_multipath<scalar_t_>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
+        hipFuncSetAttribute(
+            (const void *)fused_fctp_kernel_fwd_multipath<scalar_t_>,
+            hipFuncAttributeMaxDynamicSharedMemorySize,
             (int)shmem_bytes);
 
         fused_fctp_kernel_fwd_multipath<scalar_t_>
@@ -454,7 +450,7 @@ at::Tensor launch_fused_multipath_fctp(
 
     out = out.view({B, K_total * W});
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return out;
 }
 
@@ -476,11 +472,11 @@ at::Tensor launch_fused_multipath_fctp_tile(
     const int64_t K_total
 )
 {
-    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
-             && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
-             && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
-             && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA"); */
+    /* TORCH_CHECK(a_all.is_hip() && b_all.is_hip() && w_all.is_hip()
+             && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
+             && cg_val_all.is_hip() && nnz_per_path.is_hip()
+             && K_per_path.is_hip() && path_offset.is_hip(),
+             "all tensors must be HIP"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -490,7 +486,7 @@ at::Tensor launch_fused_multipath_fctp_tile(
                 cg_val_all.scalar_type() == dtype,
                 "dtypes must match");
 
-    // c10::cuda::CUDAGuard device_guard(a_all.get_device());
+    // c10::hip::HIPGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
     TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
@@ -534,11 +530,11 @@ at::Tensor launch_fused_multipath_fctp_tile(
 
     size_t shmem_elems = (size_t)W_TILE * U_pad + (size_t)nnz_max * U_pad;
     size_t shmem_bytes = shmem_elems * a_all.element_size();
-    //std::cout << "fast fctp launch param, P:" << P
-    //        << " B:" << B
-    //        << " shmem_byte:" << shmem_bytes << std::endl;
+    std::cout << "fast fctp launch param, P:" << P
+            << " B:" << B
+            << " shmem_byte:" << shmem_bytes << std::endl;
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_kernel_fwd_multipath_tiledW", [&] {
         using scalar_t_ = scalar_t;
@@ -564,7 +560,7 @@ at::Tensor launch_fused_multipath_fctp_tile(
 
     out = out.view({B, K_total * W});
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return out;
 }
 

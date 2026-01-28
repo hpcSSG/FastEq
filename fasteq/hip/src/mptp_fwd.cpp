@@ -1,11 +1,11 @@
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include <vector>
-#include <cub/cub.cuh>
-#include "cuda_utils.hpp"
+#include <hipcub/hipcub.hpp>
+#include "hip_utils.hpp"
 
 // ----------------------------------------------------------------------------
 // 1) row_ptr_s 构建：sender 已排序（非降序），写 run 边界
@@ -33,24 +33,24 @@ __global__ void build_row_ptr_from_sorted_sender(
 
 // CUB inclusive max scan to fill holes in row_ptr_s
 static void fill_row_ptr_holes_prefix_max_int32(
-    int32_t* d_row_ptr, int n_plus_1, cudaStream_t stream)
+    int32_t* d_row_ptr, int n_plus_1, hipStream_t stream)
 {
   void* d_temp = nullptr;
   size_t temp_bytes = 0;
-  cub::DeviceScan::InclusiveScan(
+  hipcub::DeviceScan::InclusiveScan(
       d_temp, temp_bytes,
       d_row_ptr, d_row_ptr,
-      cub::Max(),
+      hipcub::Max(),
       n_plus_1,
       stream);
-  CUDA_CHECK(cudaMallocAsync(&d_temp, temp_bytes, stream));
-  cub::DeviceScan::InclusiveScan(
+  HIP_CHECK(hipMallocAsync(&d_temp, temp_bytes, stream));
+  hipcub::DeviceScan::InclusiveScan(
       d_temp, temp_bytes,
       d_row_ptr, d_row_ptr,
-      cub::Max(),
+      hipcub::Max(),
       n_plus_1,
       stream);
-  CUDA_CHECK(cudaFreeAsync(d_temp, stream));
+  HIP_CHECK(hipFreeAsync(d_temp, stream));
 }
 
 // ----------------------------------------------------------------------------
@@ -72,7 +72,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
     const int32_t* __restrict__ receiver,   // [E]
     const int32_t* __restrict__ row_ptr_s,  // [N+1]
 
-    // TP meta
+    // TP meta (same as your group-k kernel)
     const int32_t* __restrict__ path_indices,   // [P,4]
     const int32_t* __restrict__ k_dims,         // [P]
     const int32_t* __restrict__ iu_seg_offsets, // [iu_seg_count]
@@ -123,6 +123,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_kernel(
     const scalar_t* x_uv = x_uv_e + (size_t)e * UV_TOTAL;
     const scalar_t* x_jv = x_jv_e + (size_t)e * JV_TOTAL;
 
+    // ---- same inner structure as your group-k TP ----
     for (int p = 0; p < num_paths; ++p) {
       int uv_idx = path_indices[p * 4 + 0];
       int iu_idx = path_indices[p * 4 + 1];
@@ -215,9 +216,9 @@ std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-  /* TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "inputs must be CUDA");
-  TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA");
-  TORCH_CHECK(sender.is_cuda() && receiver.is_cuda(), "sender/receiver must be CUDA"); */
+  /* TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "inputs must be HIP");
+  TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP");
+  TORCH_CHECK(sender.is_hip() && receiver.is_hip(), "sender/receiver must be HIP"); */
 
   TORCH_CHECK(sender.scalar_type() == torch::kInt32, "sender must be int32 (sorted)");
   TORCH_CHECK(receiver.scalar_type() == torch::kInt32, "receiver must be int32");
@@ -267,7 +268,7 @@ std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
   row_ptr_s.index_put_({0}, 0);
   row_ptr_s.index_put_({N}, (int)E);
 
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::hip::getCurrentHIPStream();
 
   int threads = 256;
   int blocks = (E + threads - 1) / threads;
@@ -275,11 +276,11 @@ std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
       sender.data_ptr<int32_t>(),
       row_ptr_s.data_ptr<int32_t>(),
       (int)E);
-  CUDA_CHECK(cudaGetLastError());
+  HIP_CHECK(hipGetLastError());
 
   // fill holes with inclusive max scan
   fill_row_ptr_holes_prefix_max_int32(row_ptr_s.data_ptr<int32_t>(), (int)(N + 1), stream);
-  CUDA_CHECK(cudaGetLastError());
+  HIP_CHECK(hipGetLastError());
 
   int64_t C = K_TOTAL * U * V;
   auto out_nodes = torch::zeros({N, C}, x_uv.options());
@@ -322,7 +323,7 @@ std::vector<torch::Tensor> tp_channel_wise_fused_sender_scatter_launch(
       );
   });
 
-  CUDA_CHECK(cudaGetLastError());
+  HIP_CHECK(hipGetLastError());
   return {out_nodes, row_ptr_s} ; // out_nodes: [N, K_TOTAL*U*V]
 }
 

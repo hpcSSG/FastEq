@@ -1,14 +1,14 @@
 #include <torch/extension.h>
 #include <torch/script.h>
 #include <torch/torch.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-#include <c10/cuda/CUDAStream.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
+#include <c10/hip/HIPStream.h>
 
-#define CUDA_CHECK(expr) do { \
-  cudaError_t _err = (expr);  \
-  if (_err != cudaSuccess)    \
-    AT_ERROR("CUDA error: ", cudaGetErrorString(_err), " at ", __FILE__, ":", __LINE__); \
+#define HIP_CHECK(expr) do { \
+  hipError_t _err = (expr);  \
+  if (_err != hipSuccess)    \
+    AT_ERROR("HIP error: ", hipGetErrorString(_err), " at ", __FILE__, ":", __LINE__); \
 } while(0)
 
 
@@ -32,7 +32,6 @@ __global__ void stc_bwd_kernel(
 
     if (b >= B || j >= u) return;
 
-    // 预加载 x1[b, :, :] 与 x0_g[b, :, :]
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
@@ -47,8 +46,6 @@ __global__ void stc_bwd_kernel(
     __syncthreads();
 
     const scalar_t go = grad_out[b * u + j];  // dL/d out[b,j]
-
-    // 遍历所有 path，累加对参与的 x1 索引的梯度
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len = path_lens[p];
@@ -66,7 +63,6 @@ __global__ void stc_bwd_kernel(
             atomicAdd(&grad_x1[b * num_a * u + a_idx * u + j], contrib_a);
 
         } else if (len == 4) {
-            // path: [a, b, i, *]
             const int b_idx = path[1];
             const scalar_t x1_b = x1_shared[b_idx * u + j];
 
@@ -78,7 +74,6 @@ __global__ void stc_bwd_kernel(
             atomicAdd(&grad_x1[b * num_a * u + b_idx * u + j], contrib_b);
 
         } else if (len == 5) {
-            // path: [a, b, c, i, *]
             const int b_idx = path[1];
             const int c_idx = path[2];
             const scalar_t x1_b = x1_shared[b_idx * u + j];
@@ -94,7 +89,6 @@ __global__ void stc_bwd_kernel(
             atomicAdd(&grad_x1[b * num_a * u + b_idx * u + j], contrib_b);
             atomicAdd(&grad_x1[b * num_a * u + c_idx * u + j], contrib_c);
         }
-        // 其他 len 情形暂不支持
     }
 }
 
@@ -109,12 +103,12 @@ at::Tensor stc_bwd_launcher(
     at::Tensor paths_tensor, // [num_paths, 5], int
     at::Tensor path_lens     // [num_paths],  int
 ) {
-    /* TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
-    TORCH_CHECK(x1.is_cuda(),       "x1 must be CUDA");
-    TORCH_CHECK(x0_g.is_cuda(),     "x0_g must be CUDA");
-    TORCH_CHECK(coeffs.is_cuda(),   "coeffs must be CUDA");
-    TORCH_CHECK(paths_tensor.is_cuda(), "paths_tensor must be CUDA");
-    TORCH_CHECK(path_lens.is_cuda(),    "path_lens must be CUDA"); */
+    /* TORCH_CHECK(grad_out.is_hip(), "grad_out must be HIP");
+    TORCH_CHECK(x1.is_hip(),       "x1 must be HIP");
+    TORCH_CHECK(x0_g.is_hip(),     "x0_g must be HIP");
+    TORCH_CHECK(coeffs.is_hip(),   "coeffs must be HIP");
+    TORCH_CHECK(paths_tensor.is_hip(), "paths_tensor must be HIP");
+    TORCH_CHECK(path_lens.is_hip(),    "path_lens must be HIP"); */
 
     auto dtype = x1.scalar_type();
     TORCH_CHECK(
@@ -155,8 +149,8 @@ at::Tensor stc_bwd_launcher(
                               + static_cast<size_t>(num_i) * u;
     const size_t shared_mem_bytes = shared_elems * x1.element_size();
 
-    cudaStream_t cur_stream =
-        c10::cuda::getCurrentCUDAStream(grad_out.device().index()).stream();
+    hipStream_t cur_stream =
+        c10::hip::getCurrentHIPStream(grad_out.device().index()).stream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "stc_bwd_kernel", [&] {
         using scalar_t = scalar_t;
@@ -172,7 +166,7 @@ at::Tensor stc_bwd_launcher(
         );
     });
 
-    CUDA_CHECK(cudaGetLastError());
+    HIP_CHECK(hipGetLastError());
     return grad_x1;
 }
 
@@ -555,12 +549,12 @@ at::Tensor stc_bwd_x1_launcher(
     at::Tensor path_lens,      // [num_paths]
     const int64_t num_out_segments)
 {
-    /* TORCH_CHECK(x1.is_cuda(), "x1 must be CUDA");
-    TORCH_CHECK(x0_g.is_cuda(), "x0_g must be CUDA");
-    TORCH_CHECK(coeffs.is_cuda(), "coeffs must be CUDA");
-    TORCH_CHECK(paths_tensor.is_cuda(), "paths_tensor must be CUDA");
-    TORCH_CHECK(path_lens.is_cuda(), "path_lens must be CUDA");
-    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA"); */
+    /* TORCH_CHECK(x1.is_hip(), "x1 must be HIP");
+    TORCH_CHECK(x0_g.is_hip(), "x0_g must be HIP");
+    TORCH_CHECK(coeffs.is_hip(), "coeffs must be HIP");
+    TORCH_CHECK(paths_tensor.is_hip(), "paths_tensor must be HIP");
+    TORCH_CHECK(path_lens.is_hip(), "path_lens must be HIP");
+    TORCH_CHECK(grad_out.is_hip(), "grad_out must be HIP"); */
 
     auto dtype = x1.scalar_type();
     TORCH_CHECK(
@@ -607,8 +601,8 @@ at::Tensor stc_bwd_x1_launcher(
         const size_t shared_mem_bytes =
             shared_elems * x1.element_size();
 
-        cudaStream_t cur_stream =
-            c10::cuda::getCurrentCUDAStream(x1.device().index()).stream();
+        hipStream_t cur_stream =
+            c10::hip::getCurrentHIPStream(x1.device().index()).stream();
 
         AT_DISPATCH_FLOATING_TYPES(dtype, "stc_bwd_kernel_v1", [&] {
             using scalar_t = scalar_t;
@@ -644,8 +638,8 @@ at::Tensor stc_bwd_x1_launcher(
         const size_t shared_mem_bytes =
             shared_elems * x1.element_size();
 
-        cudaStream_t cur_stream =
-            c10::cuda::getCurrentCUDAStream(x1.device().index()).stream();
+        hipStream_t cur_stream =
+            c10::hip::getCurrentHIPStream(x1.device().index()).stream();
 
         AT_DISPATCH_FLOATING_TYPES(dtype, "stc_bwd_kernel_tiled", [&] {
             using scalar_t = scalar_t;
@@ -662,7 +656,7 @@ at::Tensor stc_bwd_x1_launcher(
         });
     }
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return grad_x1;
 }
 
