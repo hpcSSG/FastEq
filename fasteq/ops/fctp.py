@@ -3,11 +3,209 @@ import os, math, time
 from typing import List
 import fasteq.cuda 
 
+import triton
+import triton.language as tl
+
+
+# -------------------------
+# Triton fused kernel (no materialize)
+# out[b, k, w] = alpha * val[k] * sum_u x[b, i[k], u] * w_table[p[k], klocal[k], vstar[b],u, w]
+# -------------------------
+@triton.jit
+def fused_onehot_wpuvw_kernel(
+    x_ptr,            # *fp64, [B, I, U]
+    w_ptr,            # *fp64, [P, U, V, W]
+    vstar_ptr,        # *int32, [B]
+    p_for_k_ptr,      # *int32, [K]
+    i_for_k_ptr,      # *int32, [K]  (-1 => empty)
+    val_for_k_ptr,    # *fp64,  [K]
+    out_ptr,          # *fp64,  [B, K, W]
+    B: tl.constexpr, I: tl.constexpr, K: tl.constexpr, U: tl.constexpr,
+    P: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
+    alpha: tl.constexpr,
+    BK: tl.constexpr, BW: tl.constexpr, BU: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    k_ids = pid_k * BK + tl.arange(0, BK)
+    w_ids = pid_w * BW + tl.arange(0, BW)
+
+    mk = k_ids < K
+    mw = w_ids < W
+
+    v = tl.load(vstar_ptr + pid_b).to(tl.int32)  # scalar
+    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)      # [BK]
+    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)     # [BK]
+    val = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(tl.float64)  # [BK]
+    mk2 = mk & (i_ids >= 0)
+
+    acc = tl.zeros((BK, BW), dtype=tl.float64)
+
+    for u0 in range(0, U, BU):
+        u_ids = u0 + tl.arange(0, BU)
+        mu = u_ids < U
+
+        # x: [BK, BU], row reads x[b, i_ids[row], u]
+        x_off = ((pid_b * I + i_ids)[:, None] * U + u_ids[None, :])
+        x_val = tl.load(
+            x_ptr + x_off,
+            mask=mk2[:, None] & mu[None, :],
+            other=0.0
+        ).to(tl.float64)
+
+        # w: [BK, BU, BW] where w index: (((p*U + u)*V + v)*W + w)
+        w_off = (((p_ids[:, None, None] * U + u_ids[None, :, None]) * V + v) * W + w_ids[None, None, :])
+        w_val = tl.load(
+            w_ptr + w_off,
+            mask=mk2[:, None, None] & mu[None, :, None] & mw[None, None, :],
+            other=0.0
+        ).to(tl.float64)
+
+        acc += tl.sum(x_val[:, :, None] * w_val, axis=1)
+
+    acc *= (val[:, None] * alpha)
+
+    out_off = (pid_b * K + k_ids)[:, None] * W + w_ids[None, :]
+    tl.store(out_ptr + out_off, acc, mask=mk[:, None] & mw[None, :])
+
+# -------------------------
+# Triton wrapper
+# -------------------------
+@torch.no_grad()
+def triton_fused_fctp_fwd(x_biu, vstar, w_puvw, p_for_k, i_for_k, val_for_k, alpha, K_total,
+                                BK=8, BW=64, BU=32, num_warps=4):
+    device = x_biu.device
+    B, I, U = x_biu.shape
+    P, U2, V, W = w_puvw.shape
+    assert U == U2
+
+    out = torch.empty((B, K_total, W), device=x_biu.device, dtype=torch.float64)
+
+    grid = (B, triton.cdiv(K_total, BK), triton.cdiv(W, BW))
+    fused_onehot_wpuvw_kernel[grid](
+        x_biu, w_puvw, vstar,
+        p_for_k, i_for_k, val_for_k,
+        out,
+        B=B, I=I, K=K_total, U=U, P=P, V=V, W=W,
+        alpha=float(alpha.item()),
+        BK=BK, BW=BW, BU=BU,
+        num_warps=num_warps,
+    )
+    out = out.view(B, -1)
+    return out
+
+
+@triton.jit
+def fused_onehot_wpuvw_bwd_dx_noatomic_kernel(
+    grad_out_ptr,     # *fp64, [B, K, W]
+    w_ptr,            # *fp64, [P, U, V, W]
+    vstar_ptr,        # *int32, [B]
+    p_for_k_ptr,      # *int32, [K]
+    i_for_k_ptr,      # *int32, [K]   (-1 => empty)
+    val_for_k_ptr,    # *fp64,  [K]
+    grad_x_ptr,       # *fp64, [B, I, U]  (direct store, no atomic)
+    B: tl.constexpr, I: tl.constexpr, K: tl.constexpr, U: tl.constexpr,
+    P: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
+    alpha: tl.constexpr,
+    BK: tl.constexpr, BU: tl.constexpr, BW: tl.constexpr,
+):
+    pid_b = tl.program_id(0)   # batch
+    pid_k = tl.program_id(1)   # k tile
+    pid_u = tl.program_id(2)   # u tile
+
+    k_ids = pid_k * BK + tl.arange(0, BK)          # [BK]
+    u_ids = pid_u * BU + tl.arange(0, BU)          # [BU]
+
+    mk = k_ids < K
+    mu = u_ids < U
+
+    v = tl.load(vstar_ptr + pid_b).to(tl.int32)    # scalar
+
+    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)      # [BK]
+    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)     # [BK]
+    val   = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(tl.float64)# [BK]
+    mk2 = mk & (i_ids >= 0)
+
+    acc = tl.zeros((BK, BU), dtype=tl.float64)
+
+    # sum_w grad_out[b,k,w] * w[p,u,v,w]
+    for w0 in range(0, W, BW):
+        w_ids = w0 + tl.arange(0, BW)
+        mw = w_ids < W
+
+        go_off = (pid_b * K + k_ids)[:, None] * W + w_ids[None, :]
+        go = tl.load(
+            grad_out_ptr + go_off,
+            mask=mk2[:, None] & mw[None, :],
+            other=0.0
+        ).to(tl.float64)
+
+        w_off = (((p_ids[:, None, None] * U + u_ids[None, :, None]) * V + v) * W
+                 + w_ids[None, None, :])
+        ww = tl.load(
+            w_ptr + w_off,
+            mask=mk2[:, None, None] & mu[None, :, None] & mw[None, None, :],
+            other=0.0
+        ).to(tl.float64)
+
+        acc += tl.sum(go[:, None, :] * ww, axis=2)   # [BK,BU]
+
+    acc *= (val[:, None] * alpha)
+
+    # direct store (no atomic) because i_for_k is one-to-one
+    gx_off = ((pid_b * I + i_ids)[:, None] * U + u_ids[None, :])
+    tl.store(
+        grad_x_ptr + gx_off,
+        acc,
+        mask=mk2[:, None] & mu[None, :]
+    )
+
+
+@torch.no_grad()
+def triton_fused_fctp_bwd(
+    grad_out: torch.Tensor,    # [B,K,W] fp64
+    w: torch.Tensor,           # [P,U,V,W] fp64
+    vstar: torch.Tensor,       # [B] int32
+    p_for_k: torch.Tensor,     # [K] int32
+    i_for_k: torch.Tensor,     # [K] int32, one-to-one mapping
+    val_for_k: torch.Tensor,   # [K] fp64
+    I: int,
+    alpha: float,
+    BU=32, BW=32, BK=8, num_warps=4
+):
+    assert grad_out.is_cuda and w.is_cuda
+    assert grad_out.dtype == torch.float64 and w.dtype == torch.float64
+    assert vstar.dtype == torch.int32
+    assert p_for_k.dtype == torch.int32 and i_for_k.dtype == torch.int32
+    assert val_for_k.dtype == torch.float64
+
+    B, K, W_ = grad_out.shape
+    P, U, V, W = w.shape
+    assert W_ == W
+
+    # grad_x must be zero-init because we only write used i's
+    grad_x = torch.zeros((B, I, U), device=grad_out.device, dtype=torch.float64)
+
+    grid = (B, triton.cdiv(K, BK), triton.cdiv(U, BU))
+    fused_onehot_wpuvw_bwd_dx_noatomic_kernel[grid](
+        grad_out, w, vstar, p_for_k, i_for_k, val_for_k, grad_x,
+        B=B, I=I, K=K, U=U, P=P, V=V, W=W,
+        alpha=float(alpha),
+        BK=BK, BU=BU, BW=BW,
+        num_warps=num_warps,
+    )
+    grad_x = grad_x.view(B, -1)
+    return grad_x
+
 
 class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, x, y, meta):
 
+        cg_indices = meta["cg_indices"]
+        cg_values = meta["cg_values"]
         cg_i_all = meta["cg_i_all"]
         cg_j_all = meta["cg_j_all"]
         cg_k_all = meta["cg_k_all"]
@@ -15,23 +213,56 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         nnz_per_path = meta["nnz_per_path"]
         K_per_path = meta["K_per_path"]
         path_offset = meta["path_offset"]
-        U, V, W, K_total = meta["U"], meta["V"], meta["W"], meta["K_total"]
-        
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
-        
-        output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, 
+        i_for_k = meta["i_for_k"]
+        val_for_k = meta["val_for_k"]
+        p_for_k = meta["p_for_k"]
+        U, V, W, K_total, I_total = meta["U"], meta["V"], meta["W"], meta["K_total"], meta["I_total"]
+        cg_val = cg_values[0]
+        B = x.shape[0]
+        path_num = nnz_per_path.shape[0]
+
+        print(f"i_for_k:{i_for_k}")
+        print(f"val_for_k:{val_for_k}")
+        print(f"p_for_k:{p_for_k}")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        #triton_fused_fctp_fwd()
+        x = x.view(B, I_total, U)
+        y = y.view(B, V)
+        w = w.view(path_num, U, V, W)
+        vstar = torch.argmax(y, dim=1).to(torch.int32).contiguous()
+        output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
+                                                         BK=8, BW=64, BU=32, num_warps=4)
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq triton fctp forward cost: {execution_time_ms:.3f} ms >>")
+
+        '''
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+ 
+        output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, vstar,
                 cg_i_all, cg_j_all, cg_k_all, cg_val_all,
                 nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
         
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+
+        diff = triton_out - output
+        abs_err = diff.abs()
+        max_abs = abs_err.max().item()
+        print(f"fctp max_abs={max_abs:.3e}")
+        '''
+
         ctx.save_for_backward(w, x, y)
         ctx.meta = meta
-
-
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #execution_time_ms = end_time - start_time
-        #print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+        ctx.vstar = vstar
 
         return output
     
@@ -40,6 +271,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         w, x, y = ctx.saved_tensors
 
         meta = ctx.meta
+        cg_values = meta["cg_values"]
         cg_i_all = meta["cg_i_all"]
         cg_j_all = meta["cg_j_all"]
         cg_k_all = meta["cg_k_all"]
@@ -47,19 +279,46 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         nnz_per_path = meta["nnz_per_path"]
         K_per_path = meta["K_per_path"]
         path_offset = meta["path_offset"]
-        U, V, W, K_total = meta["U"], meta["V"], meta["W"], meta["K_total"]
+        i_for_k = meta["i_for_k"]
+        val_for_k = meta["val_for_k"]
+        p_for_k = meta["p_for_k"]
+        U, V, W, K_total, I_total = meta["U"], meta["V"], meta["W"], meta["K_total"], meta["I_total"]
+        cg_val = cg_values[0]
+        B = x.shape[0]
+        path_num = nnz_per_path.shape[0]
+
+        grad_out = grad_out.view(B, K_total, W)
+        w = w.view(path_num, U, V, W)
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val,
+                                                         BK=8, BW=32, BU=32, num_warps=4)
         
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq triton fctp backward cost: {execution_time_ms:.3f} ms >>")
         
-        grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, 
+        '''
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
+        grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, ctx.vstar, 
                 cg_i_all, cg_j_all, cg_k_all, cg_val_all,
                 nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
         
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #execution_time_ms = end_time - start_time
-        #print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
+
+        diff = triton_grad_x - grad_x
+        abs_err = diff.abs()
+        max_abs = abs_err.max().item()
+        print(f"fctp bwd max_abs={max_abs:.3e}")
+        '''
 
 
         return None, grad_x, None, None  # None for w, y, meta gradients
