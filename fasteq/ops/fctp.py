@@ -1,7 +1,6 @@
 import torch
 import os, math, time
 from typing import List
-import fasteq.cuda 
 
 import triton
 import triton.language as tl

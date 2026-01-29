@@ -1,10 +1,10 @@
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 #include <vector>
-#include "cuda_utils.hpp"
+#include "hip_utils.hpp"
 
 // -------------------------------------------------------------------------------------------------
 // Backward kernel for fused sender-major TP + scatter_sum
@@ -77,9 +77,9 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
   // warp reduce scratch: [max 8 warps][JV_MAX]
   __shared__ scalar_t warp_sum_sh[8][JV_MAX];
 
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  const int num_warps = (blockDim.x + 31) >> 5;
+  const int lane = tid & 63 ;
+  const int warp = tid >> 6;
+  const int num_warps = (blockDim.x + 63) >> 6;
 
   // -------- process edges of this sender (sender-major) --------
   for (int e = e0; e < e1; ++e) {
@@ -175,12 +175,8 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     for (int jj = 0; jj < JV_TOTAL; ++jj) {
       scalar_t v = jtmp[jj];
 
-      unsigned mask = 0xffffffffu;
-      // warp reduce
-      #pragma unroll
-      for (int off = 16; off > 0; off >>= 1) {
-        v += __shfl_down_sync(mask, v, off);
-      }
+      unsigned mask = __activemask();
+      warp_reduce_sum(v, mask);
       if (lane == 0) {
         warp_sum_sh[warp][jj] = v;
       }
@@ -191,12 +187,9 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     if (warp == 0) {
       for (int jj = 0; jj < JV_TOTAL; ++jj) {
         scalar_t v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (scalar_t)0;
-        unsigned mask0 = 0xffffffffu;
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-          v += __shfl_down_sync(mask0, v, off);
-        }
-        if (lane == 0) {
+        unsigned mask0 = __activemask();
+        warp_reduce_sum(v, mask0);
+	if (lane == 0) {
           gxjv[jj] += v;  // per-edge unique writer block -> no atomic
         }
       }
@@ -204,7 +197,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     __syncthreads(); // reuse warp_sum_sh for next edge
   }
 
-  // -------- flush grad_x_iu_n for this sender once --------
+  // -------- flush grad_x_iu_n for this sender once (fix your L1->L2 pain point) --------
   scalar_t* gxi_s = grad_x_iu_n + (size_t)s * IU_TOTAL;
   for (int idx = u; idx < IU_TOTAL; idx += blockDim.x) {
     gxi_s[idx] += s_giu[idx];
@@ -238,9 +231,9 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-  /* TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
-  TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "x_uv/x_iu/x_jv must be CUDA");
-  TORCH_CHECK(receiver.is_cuda() && row_ptr_s.is_cuda(), "receiver/row_ptr_s must be CUDA"); */
+  /* TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
+  TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "x_uv/x_iu/x_jv must be HIP");
+  TORCH_CHECK(receiver.is_hip() && row_ptr_s.is_hip(), "receiver/row_ptr_s must be HIP"); */
 
   grad_out_nodes = grad_out_nodes.contiguous();
   x_uv = x_uv.contiguous();
@@ -287,7 +280,7 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
   constexpr int JV_MAX = 16;
 
   int block_u = (int)U;
-  if (block_u < 32) block_u = 32;
+  if (block_u < 64) block_u = 64;
   if (block_u > 1024) block_u = 1024;
   TORCH_CHECK((int)U <= block_u, "U>1024 needs tiling");
 
@@ -295,7 +288,7 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
   dim3 block((unsigned int)block_u, 1, 1);
 
   size_t shmem = (size_t)2 * (size_t)IU_TOTAL * (size_t)x_uv.element_size();
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::hip::getCurrentHIPStream();
 
   AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp_groupk_fused_sender_scatter_bwd", [&](){
     tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_kernel<scalar_t, MAX_K_DIM, JV_MAX>
@@ -328,7 +321,7 @@ std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
       );
   });
 
-  CUDA_CHECK(cudaGetLastError());
+  HIP_CHECK(hipGetLastError());
   return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
@@ -346,6 +339,7 @@ struct XiuAcc {
   __device__ __forceinline__ void add(int i, int u, T v) const {
     int off = iu_base + i * U + u;
     s_giu[off] = (T)(s_giu[off] + v);
+    return ;
   }
 };
 
@@ -386,6 +380,7 @@ __device__ __forceinline__ void tp17_eval_single_edge_sender(
   grad_x_uv_e[uv_base + u] += gc * xiu0 * xjv;
   xiu.add(0, u, gc * xuv * xjv);
   jtmp[JB + 0] += gc * xuv * xiu0;
+  return ;
 }
 
 template<typename T, int D, int JB>
@@ -426,6 +421,7 @@ __device__ __forceinline__ void tp17_eval_diag_jk_i0_edge_sender(
     xiu.add(0, u, gc * xuv * xjv);
     jtmp[JB + t] += gc * xuv * xiu0;
   }
+  return ;
 }
 
 template<typename T, int D, int JB>
@@ -466,6 +462,7 @@ __device__ __forceinline__ void tp17_eval_diag_ik_j0_edge_sender(
     xiu.add(t, u, gc * xuv * xjv0);
     jtmp[JB + 0] += gc * xuv * xiu_t; // j only 0 -> global jj=JB
   }
+  return ;
 }
 
 template<typename T, int D, int JB>
@@ -506,6 +503,7 @@ __device__ __forceinline__ void tp17_eval_diag_ij_k0_edge_sender(
     xiu.add(t, u, gc * xuv * xjv_t);
     jtmp[JB + t] += gc * xuv * xiu_t;
   }
+  return ;
 }
 
 template<int P, int UV, int IU, int JV, int KV, int I, int J, int K, int JB, typename T>
@@ -536,12 +534,13 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
   // xuv
   const T xuv = x_uv_e[uv_base + u];
 
-  // xj[J] : warp broadcast
+  // xj[J] : warp broadcast (same trick as your code)
   T xj[J];
   #pragma unroll
   for (int j = 0; j < J; ++j) {
     T v = (lane == 0) ? x_jv_e[jv_base + j] : (T)0;
-    xj[j] = __shfl_sync(0xffffffff, v, 0);
+    //xj[j] = __shfl(0xffffffff, v, 0);
+    xj[j] = __shfl(v, 0, 64);
   }
 
   // xiu[I] from shared
@@ -604,6 +603,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc_edge_sender(
   for (int j = 0; j < J; ++j) {
     jtmp[JB + j] += jloc[j];
   }
+  return ;
 }
 
 // ---- jv reduce helper (per-edge) ----
@@ -620,10 +620,10 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
 #pragma unroll
   for (int jj = 0; jj < JJ; ++jj) {
     T v = active ? jtmp[jj] : (T)0;
-    unsigned mask = __activemask();
+    unsigned mask = __ballot(1);
 #pragma unroll
-    for (int off = 16; off > 0; off >>= 1) {
-      v += __shfl_down_sync(mask, v, off);
+    for (int off = 32; off > 0; off >>= 1) {
+      v += __shfl_down(mask, v, off);
     }
     if (lane == 0) warp_sum_sh[warp][jj] = v;
   }
@@ -635,11 +635,13 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
     for (int jj = 0; jj < JJ; ++jj) {
       T v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (T)0;
 #pragma unroll
-      for (int off = 4; off > 0; off >>= 1) {  // good for <=8 warps
-        v += __shfl_down_sync(0xffffffffu, v, off);
+      // good for <=8 warps
+      for (int off = 4; off > 0; off >>= 1) {
+        v += __shfl_down(v, off, 8);   // width = 8
       }
 
       if (lane == 0) {
+        // same jj mapping as your cwtp
         int jv_idx, j_local;
         if (jj == 0) { jv_idx = 0; j_local = 0; }
         else if (jj < 4) { jv_idx = 1; j_local = jj - 1; }
@@ -652,6 +654,7 @@ __device__ __forceinline__ void reduce_jtmp_write_grad_jv_per_edge(
     }
   }
   __syncthreads();
+  return;
 }
 
 
@@ -689,9 +692,9 @@ __global__ void tp17_bwd_fused_sender_major_densec_kernel(
   if (s >= N) return;
   const bool active = (u < U);
 
-  const int lane = tid & 31;
-  const int warp = tid >> 5;
-  const int num_warps = (blockDim.x + 31) >> 5; // assume <= 8
+  const int lane = tid & 63;
+  const int warp = tid >> 6;
+  const int num_warps = (blockDim.x + 63) >> 6; // assume <= 8
 
   // shared: [xiu][g_xiu]
   extern __shared__ unsigned char smem_raw[];
@@ -1024,12 +1027,12 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
     int64_t K_TOTAL,
     int64_t num_paths             // 4/10/17 (or 16)
 ) {
-  /* TORCH_CHECK(grad_out_nodes.is_cuda(), "grad_out_nodes must be CUDA");
-  TORCH_CHECK(x_uv.is_cuda() && x_iu.is_cuda() && x_jv.is_cuda(), "x_uv/x_iu/x_jv must be CUDA");
-  TORCH_CHECK(c_all.is_cuda(), "c_all must be CUDA");
-  TORCH_CHECK(row_ptr_s.is_cuda() && receiver.is_cuda(), "row_ptr_s/receiver must be CUDA");
-  TORCH_CHECK(uv_seg_offsets.is_cuda() && iu_seg_offsets.is_cuda() && jv_seg_offsets.is_cuda() &&
-              kv_k_offsets.is_cuda() && c_offsets.is_cuda(), "offset tensors must be CUDA"); */
+  /* TORCH_CHECK(grad_out_nodes.is_hip(), "grad_out_nodes must be HIP");
+  TORCH_CHECK(x_uv.is_hip() && x_iu.is_hip() && x_jv.is_hip(), "x_uv/x_iu/x_jv must be HIP");
+  TORCH_CHECK(c_all.is_hip(), "c_all must be HIP");
+  TORCH_CHECK(row_ptr_s.is_hip() && receiver.is_hip(), "row_ptr_s/receiver must be HIP");
+  TORCH_CHECK(uv_seg_offsets.is_hip() && iu_seg_offsets.is_hip() && jv_seg_offsets.is_hip() &&
+              kv_k_offsets.is_hip() && c_offsets.is_hip(), "offset tensors must be HIP"); */
 
   // dtype checks
   TORCH_CHECK(row_ptr_s.scalar_type() == torch::kInt32, "row_ptr_s must be int32");
@@ -1090,7 +1093,7 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
   int threads = 256;
   if (U <= 128) threads = 128;
   // still must be multiple of 32
-  if (threads % 32) threads = ((threads + 31) / 32) * 32;
+  if (threads % 64) threads = ((threads + 63) / 64) * 64;
   TORCH_CHECK(threads <= 256, "threads must be <=256 for current warp0 reduce impl");
 
   dim3 grid((unsigned)N);
@@ -1099,7 +1102,7 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
   // shared: s_iu + s_giu
   const size_t shmem = (size_t)2 * (size_t)IU_TOTAL * (size_t)x_uv.element_size();
 
-  auto stream = at::cuda::getCurrentCUDAStream();
+  auto stream = at::hip::getCurrentHIPStream();
 
   AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(), "tp17_bwd_fused_sender_major_densec_launch", [&] {
     const auto* go_ptr   = (const scalar_t*)grad_out_nodes.data_ptr<scalar_t>();
@@ -1157,7 +1160,7 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
       TORCH_CHECK(false, "Unsupported num_paths = ", n_paths, " (expected 4/10/17)");
     }
 
-    CUDA_CHECK(cudaGetLastError());
+    HIP_CHECK(hipGetLastError());
   });
 
   return {grad_x_uv, grad_x_iu, grad_x_jv};
@@ -1167,5 +1170,6 @@ std::vector<torch::Tensor> tp17_bwd_fused_sender_major_densec_launch(
 
 TORCH_LIBRARY(mptp_bwd, m)
 {
-    m.def("backward", &tp17_bwd_fused_sender_major_densec_launch);
+    m.def("backward_opt", &tp17_bwd_fused_sender_major_densec_launch);
+    m.def("backward", &tp_groupk_fused_sender_scatter_bwd_launch);
 }

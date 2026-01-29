@@ -1,10 +1,10 @@
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAException.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPGuard.h>
+#include <c10/hip/HIPException.h>
 
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #include <limits>
 #include <type_traits>
 
@@ -89,13 +89,13 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         sh_v = vstar;
     __syncthreads();
     const int v = sh_v;
-
     const int U_pad = U + 1;
 
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
     scalar_t* sh_Wt = reinterpret_cast<scalar_t*>(shmem_raw);             // [W * U_pad]
     scalar_t* sh_dO = sh_Wt + (size_t)W * U_pad;                          // [W]
 
+    // Vec4 类型，用于 vectorized 读
     using Vec4 = typename std::conditional<
         std::is_same<scalar_t, float>::value,
         float4,
@@ -126,8 +126,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     if (u >= U) return;
 
     // -----------------------------
-    // 对每个 triple (i_global, k_global, val)：
-    //
     //    先把 grad_out[b,k_global,:] 读入 sh_dO[W]
     //    再对该 triple 的所有 u（每个线程一个 u）：
     //      acc_u = Σ_w sh_dO[w] * sh_Wt[w,u]
@@ -138,7 +136,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         const int k_global = cg_k[t];
         const scalar_t val = cg_v[t];
 
-        
         for (int tv = u; tv < Wv; tv += tx) {
             int w0 = tv << 2;
             const size_t off = (size_t)k_global * W + (size_t)w0;
@@ -150,7 +147,6 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         }
         __syncthreads();
 
-        
         scalar_t acc_u = scalar_t(0);
         for (int w = 0; w < W; ++w) {
             const scalar_t gout = sh_dO[w];
@@ -161,7 +157,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
         //     dL/dA[b,i_global,u] += val * acc_u
         atomicAdd(&dA_b[(size_t)i_global * U + u], val * acc_u);
 
-        __syncthreads();
+        __syncthreads();  // 确保所有线程用完当前 sh_dO 后再覆盖
     }
 }
 
@@ -183,12 +179,12 @@ at::Tensor launch_fused_multipath_fctp_backward(
     const int64_t K_total
 )
 {
-    /* TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
-             && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
-             && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
-             && K_per_path.is_cuda() && path_offset.is_cuda()
-             && grad_out.is_cuda(),
-             "all tensors must be CUDA"); */
+    /* TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
+             && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
+             && cg_val_all.is_hip() && nnz_per_path.is_hip()
+             && K_per_path.is_hip() && path_offset.is_hip()
+             && grad_out.is_hip(),
+             "all tensors must be HIP"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -198,7 +194,7 @@ at::Tensor launch_fused_multipath_fctp_backward(
                 grad_out.scalar_type()  == dtype,
                 "dtypes must match");
 
-    c10::cuda::CUDAGuard device_guard(b_all.get_device());
+    c10::hip::HIPGuard device_guard(b_all.get_device());
 
     const int B       = (int)b_all.size(0);
     const int P       = (int)nnz_per_path.size(0);
@@ -241,7 +237,6 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
-    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
     auto K_per_path_cpu = K_per_path.to(at::kCPU);
     int K_max = 0;
     for (int p = 0; p < P; ++p) {
@@ -259,13 +254,13 @@ at::Tensor launch_fused_multipath_fctp_backward(
     size_t shmem_elems = (size_t)W * U_pad + (size_t)W;
     size_t shmem_bytes = shmem_elems * grad_a.element_size();
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath", [&] {
         using scalar_t_ = scalar_t;
-        cudaFuncSetAttribute(
-            fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
+        hipFuncSetAttribute(
+            (const void *)fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>,
+            hipFuncAttributeMaxDynamicSharedMemorySize,
             (int)shmem_bytes);
 
         fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>
@@ -288,7 +283,7 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     grad_a = grad_a.view({B, I_total * U});
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return grad_a;
 }
 
@@ -355,6 +350,10 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     __syncthreads();
     const int v = sh_v;
 
+    // -----------------------------
+    //    sh_Wt: [W, U_TILE+1] → 存 W_p[u_base : u_base+U_TILE, v*, :]
+    //    sh_dO: [W]           → 存当前 triple 的 grad_out[b,k_global,:]
+    // -----------------------------
     const int U_pad = U_TILE + 1;
 
     extern __shared__ __align__(sizeof(scalar_t)) unsigned char shmem_raw[];
@@ -380,6 +379,10 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     for (int u_base = 0; u_base < U; u_base += U_TILE) {
         const int U_this = min(U_TILE, U - u_base);
 
+        // t ∈ [0, U_this * Wv)
+        // u_off = t / Wv ∈ [0, U_this)
+        // wv    = t - u_off * Wv ∈ [0, Wv)
+        // w0    = wv * 4
         for (int t = u_local; t < U_this * Wv; t += tv_stride) {
             int u_off = t / Wv;           // tile 内 u 索引
             int wv    = t - u_off * Wv;
@@ -397,11 +400,20 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
         }
         __syncthreads();
 
+        // -----------------------------
+        //对每个 triple (i_global, k_global, val)：
+        //
+        //    先把 grad_out[b,k_global,:] 读入 sh_dO[W]
+        //    再对该 tile 内的所有 u_off（每个线程1~多个 u_off）：
+        //      acc_u = Σ_w sh_dO[w] * sh_Wt[w,u_off]
+        //      grad_a[b,i_global,u_glb] += val * acc_u
+        // -----------------------------
         for (int t = 0; t < nnz_p; ++t) {
             const int i_global = cg_i[t];
             const int k_global = cg_k[t];
             const scalar_t val = cg_v[t];
 
+            // 4a) 用 Vec4 把 dO_b[k_global, :] -> sh_dO[w]
             for (int tv = u_local; tv < Wv; tv += tv_stride) {
                 int w0 = tv << 2;
                 const size_t off = (size_t)k_global * W + (size_t)w0;
@@ -412,7 +424,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
                 sh_dO[w0 + 3] = (scalar_t)r.w;
             }
             __syncthreads();
-            
+
             for (int u_off = u_local; u_off < U_this; u_off += tx) {
                 int u_glb = u_base + u_off;   // 全局 u index
 
@@ -450,12 +462,12 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     const int64_t K_total
 )
 {
-    /* TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
-             && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
-             && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
-             && K_per_path.is_cuda() && path_offset.is_cuda()
-             && grad_out.is_cuda(),
-             "all tensors must be CUDA"); */
+    /* TORCH_CHECK(b_all.is_hip() && w_all.is_hip()
+             && cg_i_all.is_hip() && cg_j_all.is_hip() && cg_k_all.is_hip()
+             && cg_val_all.is_hip() && nnz_per_path.is_hip()
+             && K_per_path.is_hip() && path_offset.is_hip()
+             && grad_out.is_hip(),
+             "all tensors must be HIP"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -465,7 +477,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
                 grad_out.scalar_type()  == dtype,
                 "dtypes must match");
 
-    c10::cuda::CUDAGuard device_guard(b_all.get_device());
+    c10::hip::HIPGuard device_guard(b_all.get_device());
 
     const int B       = (int)b_all.size(0);
     const int P       = (int)nnz_per_path.size(0);
@@ -508,7 +520,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
 
     auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
-    // K_max 目前只是为了接口对齐
+    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
     auto K_per_path_cpu = K_per_path.to(at::kCPU);
     int K_max = 0;
     for (int p = 0; p < P; ++p) {
@@ -516,7 +528,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
         if (Kp > K_max) K_max = Kp;
     }
 
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    hipStream_t stream = at::hip::getCurrentHIPStream();
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath_tiledU", [&] {
         using scalar_t_ = scalar_t;
@@ -578,7 +590,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
 
     grad_a = grad_a.view({B, I_total * U});
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    C10_HIP_KERNEL_LAUNCH_CHECK();
     return grad_a;
 }
 

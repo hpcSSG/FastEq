@@ -1,15 +1,14 @@
 import torch
 import os, math, time
 from typing import List
-import fasteq.cuda 
 
 class FusedMPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tp_weights, node_feats, edge_attrs, sender,
                 receiver, meta):
         
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
         
         '''
         out, start_idx, end_idx = torch.ops.fused_mp_fwd.forward(node_feats, edge_attrs, tp_weights,
@@ -66,10 +65,10 @@ class FusedMPFunction(torch.autograd.Function):
         ctx.save_for_backward(node_feats, edge_attrs, tp_weights, sender, receiver, row_ptr_s)
         ctx.meta = meta
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #execution_time_ms = end_time - start_time
-        #print(f"<< fasteq mptp forward cost: {execution_time_ms:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq mptp forward cost: {execution_time_ms:.3f} ms >>")
         return output
 
     @staticmethod
@@ -91,13 +90,22 @@ class FusedMPFunction(torch.autograd.Function):
         path_indices = meta["path_indices_tensor"]
         num_paths = path_indices.shape[0]
 
+        cg_i_groupk = meta["cg_i_all"]
+        cg_j_groupk  = meta["cg_j_all"]
+        cg_k_groupk  = meta["cg_k_all"]
+        cg_val_groupk  = meta["cg_val_all"]
+
+        nnz_per_path = meta["nnz_per_path"]
+        nnz_offsets_groupk = meta["nnz_offsets"]
+        nnz_k_offsets_groupk = meta["nnz_k_offsets"]
+        nnz_k_counts_groupk = meta["nnz_k_counts"]
+
         U, V, K_TOTAL = meta["U"], meta["V"], meta["K_TOTAL"]
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
-        # To be implemented: backward logic for fused message passing
-        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward(
+        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward_opt(
             grad_out_nodes, tp_weights, node_feats, edge_attrs, row_ptr_s, receiver.to(torch.int32),
             c_all,
             #path_indices,
@@ -113,10 +121,34 @@ class FusedMPFunction(torch.autograd.Function):
             num_paths,
         )
 
+        '''
+        
+        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward(
+            grad_out_nodes, tp_weights, node_feats, edge_attrs, 
+            receiver.to(torch.int32), row_ptr_s,
+            path_indices,
+            k_dims,
+            iu_seg_offsets,
+            jv_seg_offsets,
+            kv_k_offsets,
+            nnz_per_path,
+            nnz_offsets_groupk,
+            nnz_k_offsets_groupk,
+            nnz_k_counts_groupk,
+            cg_i_groupk,
+            cg_j_groupk,
+            cg_val_groupk,
+            U, V, K_TOTAL,
+        )
+        ''' 
+
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"<< fasteq mptp backward cost: {execution_time_ms:.3f} ms >>")
+        #print(f"grad_tp_weights:{grad_tp_weights}")
+        #print(f"grad_node_feats:{grad_node_feats}")
+        #print(f"grad_edge_attrs:{grad_edge_attrs}")
         return (grad_tp_weights,
                 grad_node_feats,
                 grad_edge_attrs,

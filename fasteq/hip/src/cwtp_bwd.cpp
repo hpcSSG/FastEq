@@ -1,16 +1,15 @@
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_runtime.h>
 #include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
+#include <ATen/hip/HIPContext.h>
 
 #include <vector>
 #include <algorithm>
 #include <cstdint>
 
-#include "cwtp_helper.cuh"
-#include "cuda_utils.hpp"
+#include "hip_utils.hpp"
 
-
+// 1. 分组规约减少global write back & 2. warp reduce 减少原子写操作
 template <typename scalar_t, int MAX_K_DIM>
 __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     const scalar_t* __restrict__ x_uv,          // [Z, UV_TOTAL]
@@ -83,7 +82,9 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
 
     // 2. 遍历所有 path
-    for (int p = 0; p < num_paths; ++p) {
+    int start = 8;
+    int end = 17;
+    for (int p = start; p < end; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
         int jv_idx = path_indices[p * 4 + 2];
@@ -153,7 +154,7 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
                     // --- dL/d x_jv[j,v] += g * c * x_iu * x_uv ---
                     scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
                     // warp 内归约：同一个 (p,k_local,v_idx,tt) 的 xjv_index 对所有 u 都相同
-                    unsigned mask = __activemask();                 // 当前 warp 活跃线程掩码
+                    unsigned mask = __ballot(1);                 // 当前 warp 活跃线程掩码
                     scalar_t warp_sum = warp_reduce_sum(d_xjv, mask);
                     if ((threadIdx.x & 31) == 0) {                  // lane0
                         atomicAdd(&grad_x_jv_z[xjv_index], warp_sum);
@@ -197,11 +198,11 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
     const int64_t V,
     const int64_t K_TOTAL
 ) {
-    /* TORCH_CHECK(x_uv.is_cuda(), "x_uv must be CUDA");
-    TORCH_CHECK(x_iu.is_cuda(), "x_iu must be CUDA");
-    TORCH_CHECK(x_jv.is_cuda(), "x_jv must be CUDA");
-    TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
-    TORCH_CHECK(cg_val_all.is_cuda(), "cg_val_all must be CUDA"); */
+    /* TORCH_CHECK(x_uv.is_hip(), "x_uv must be HIP");
+    TORCH_CHECK(x_iu.is_hip(), "x_iu must be HIP");
+    TORCH_CHECK(x_jv.is_hip(), "x_jv must be HIP");
+    TORCH_CHECK(grad_out.is_hip(), "grad_out must be HIP");
+    TORCH_CHECK(cg_val_all.is_hip(), "cg_val_all must be HIP"); */
 
     x_uv = x_uv.contiguous();
     x_iu = x_iu.contiguous();
@@ -248,7 +249,7 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
 
     int blocks = static_cast<int>(Z);
     size_t smem_bytes = (IU_TOTAL + JV_TOTAL) * x_uv.element_size();
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = at::hip::getCurrentHIPStream();
 
     AT_DISPATCH_FLOATING_TYPES(x_uv.scalar_type(),
                                "tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel",
@@ -283,7 +284,7 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_launch(
                 (int)V,
                 num_paths
             );
-        CUDA_CHECK(cudaGetLastError());
+        HIP_CHECK(hipGetLastError());
     });
 
     return {grad_x_uv, grad_x_iu, grad_x_jv};
@@ -327,7 +328,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
   for (int j = 0; j < J; ++j) {
     T v = (lane == 0) ? ld_g(x_jv + (int64_t)z * JV_TOTAL + (jv_base + j)) : (T)0;
-    xj[j] = __shfl_sync(0xffffffff, v, 0);
+    xj[j] = __shfl(0xffffffff, v, 0);
   }
 
   // xiu[I]
@@ -356,7 +357,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int i = 0; i < I; ++i) {
       T s = (T)0;
-#pragma unroll 1
+#pragma unroll
       for (int j = 0; j < J; ++j) {
         T c = c_ptr[((i * J + j) * K + kk)];
         s = fma(c, xj[j], s);
@@ -372,7 +373,7 @@ __device__ __forceinline__ void tp17_path_eval_sharedc(
 #pragma unroll
     for (int j = 0; j < J; ++j) {
       T tj = (T)0;
-#pragma unroll 1
+#pragma unroll
       for (int i = 0; i < I; ++i) {
         T c = c_ptr[((i * J + j) * K + kk)];
         tj = fma(c, xiu[i], tj);
@@ -602,12 +603,13 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   T* smem_j = reinterpret_cast<T*>(smem_raw);          // [U*STRIDE]
   T* smem_c = smem_j + (int)(U * STRIDE);              // [C_TOTAL]
 
+  // 1) init smem_j
   if (active) {
 #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) smem_j[u * STRIDE + jj] = (T)0;
   }
 
-  // cooperative load c_all -> smem_c
+  // 2) cooperative load c_all -> smem_c
   const int C_TOTAL = (int)c_offsets[NUM_PATHS];
   for (int idx = tid; idx < C_TOTAL; idx += blockDim.x) {
     smem_c[idx] = ld_g(c_all + idx);
@@ -801,7 +803,8 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   }
   __syncthreads();
 
-  //reduce smem_j over u for each jj
+  
+  // 4) reduce smem_j over u for each jj (works for any blockDim.x <= 256)
   __shared__ T warp_sum_sh[8][JJ + PAD];
 
   const int num_warps = (blockDim.x + 31) >> 5;
@@ -812,18 +815,19 @@ __global__ void tp_bwd_fused_kernel_sharedc(
     T v = (T)0;
     if (active) v = smem_j[u * STRIDE + jj];
 
-    unsigned mask = __activemask();
+    unsigned mask = __ballot(1);
   #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-      v += __shfl_down_sync(mask, v, off);
+      v += __shfl_down(mask, v, off);
     }
     if (lane == 0) {
+      // 注意：warp 可能 >= num_warps 吗？不会，因为 warp = tid>>5，tid<blockDim
       warp_sum_sh[warp][jj] = v;
     }
   }
   __syncthreads();
 
-  // warp0 汇总所有 warp 的结果
+  // warp0 汇总所有 warp 的结果：只读取 [0, num_warps)
   if (warp == 0) {
   #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {
@@ -831,7 +835,7 @@ __global__ void tp_bwd_fused_kernel_sharedc(
       unsigned mask0 = 0xffffffffu;
   #pragma unroll
       for (int off = 4; off > 0; off >>= 1) {
-        v += __shfl_down_sync(mask0, v, off);
+        v += __shfl_down(mask0, v, off);
       }
 
       if (lane == 0) {
@@ -846,10 +850,9 @@ __global__ void tp_bwd_fused_kernel_sharedc(
       }
     }
   }
-
 }
 
-std::vector<torch::Tensor> tp_channel_wise_bwd_dense_launch(
+std::vector<torch::Tensor> cwtp_bwd_fused(
     torch::Tensor grad_out,      // [Z,K_TOTAL,U]  (V=1)
     torch::Tensor x_uv,          // [Z,UV_TOTAL]
     torch::Tensor x_iu,          // [Z,IU_TOTAL]
@@ -980,9 +983,8 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_dense_launch(
   return {grad_x_uv, grad_x_iu, grad_x_jv};
 }
 
-
 TORCH_LIBRARY(cwtp_bwd, m)
 {
-    m.def("backward", &tp_channel_wise_bwd_dense_launch);
-    //m.def("backward_opt", &tp_channel_wise_bwd_ell_launch);
+    m.def("backward_opt", &cwtp_bwd_fused); // TODO fix for hygon
+    m.def("backward", &tp_channel_wise_bwd_launch);
 }
