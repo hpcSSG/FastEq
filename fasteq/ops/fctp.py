@@ -10,19 +10,25 @@ import triton.language as tl
 # Triton fused kernel (no materialize)
 # out[b, k, w] = alpha * val[k] * sum_u x[b, i[k], u] * w_table[p[k], klocal[k], vstar[b],u, w]
 # -------------------------
+import torch
+import triton
+import triton.language as tl
+
+
 @triton.jit
 def fused_onehot_wpuvw_kernel(
-    x_ptr,            # *fp64, [B, I, U]
-    w_ptr,            # *fp64, [P, U, V, W]
-    vstar_ptr,        # *int32, [B]
-    p_for_k_ptr,      # *int32, [K]
-    i_for_k_ptr,      # *int32, [K]  (-1 => empty)
-    val_for_k_ptr,    # *fp64,  [K]
-    out_ptr,          # *fp64,  [B, K, W]
+    x_ptr,            # *fp32/fp64, [B, I, U]
+    w_ptr,            # *fp32/fp64, [P, U, V, W]
+    vstar_ptr,        # *int32,     [B]
+    p_for_k_ptr,      # *int32,     [K]
+    i_for_k_ptr,      # *int32,     [K]  (-1 => empty)
+    val_for_k_ptr,    # *fp32/fp64, [K]
+    out_ptr,          # *fp32/fp64, [B, K, W]
     B: tl.constexpr, I: tl.constexpr, K: tl.constexpr, U: tl.constexpr,
     P: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
     alpha: tl.constexpr,
     BK: tl.constexpr, BW: tl.constexpr, BU: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,          # tl.float32 or tl.float64
 ):
     pid_b = tl.program_id(0)
     pid_k = tl.program_id(1)
@@ -34,81 +40,117 @@ def fused_onehot_wpuvw_kernel(
     mk = k_ids < K
     mw = w_ids < W
 
-    v = tl.load(vstar_ptr + pid_b).to(tl.int32)  # scalar
-    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)      # [BK]
-    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)     # [BK]
-    val = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(tl.float64)  # [BK]
+    # scalar v = vstar[b]
+    v = tl.load(vstar_ptr + pid_b).to(tl.int32)
+
+    # gather per-k metadata
+    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)   # [BK]
+    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)  # [BK]
     mk2 = mk & (i_ids >= 0)
 
-    acc = tl.zeros((BK, BW), dtype=tl.float64)
+    # val_for_k (scale per k)
+    val = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(ACC_DTYPE)  # [BK]
 
+    # accumulator
+    acc = tl.zeros((BK, BW), dtype=ACC_DTYPE)
+
+    # reduction over U in chunks of BU
     for u0 in range(0, U, BU):
         u_ids = u0 + tl.arange(0, BU)
         mu = u_ids < U
 
-        # x: [BK, BU], row reads x[b, i_ids[row], u]
+        # x: [BK, BU]  x[b, i_ids[row], u]
+        # offset = ((b*I + i)*U + u)
         x_off = ((pid_b * I + i_ids)[:, None] * U + u_ids[None, :])
         x_val = tl.load(
             x_ptr + x_off,
             mask=mk2[:, None] & mu[None, :],
             other=0.0
-        ).to(tl.float64)
+        ).to(ACC_DTYPE)
 
-        # w: [BK, BU, BW] where w index: (((p*U + u)*V + v)*W + w)
+        # w: [BK, BU, BW]  w[p, u, v, w]
+        # offset = (((p*U + u)*V + v)*W + w)
         w_off = (((p_ids[:, None, None] * U + u_ids[None, :, None]) * V + v) * W + w_ids[None, None, :])
         w_val = tl.load(
             w_ptr + w_off,
             mask=mk2[:, None, None] & mu[None, :, None] & mw[None, None, :],
             other=0.0
-        ).to(tl.float64)
+        ).to(ACC_DTYPE)
 
+        # acc[k,w] += sum_u x[k,u] * w[k,u,w]
         acc += tl.sum(x_val[:, :, None] * w_val, axis=1)
 
-    acc *= (val[:, None] * alpha)
+    # scale
+    acc *= (val[:, None] * tl.full((), alpha, ACC_DTYPE))
 
+    # store
     out_off = (pid_b * K + k_ids)[:, None] * W + w_ids[None, :]
     tl.store(out_ptr + out_off, acc, mask=mk[:, None] & mw[None, :])
 
-# -------------------------
-# Triton wrapper
-# -------------------------
+
 @torch.no_grad()
-def triton_fused_fctp_fwd(x_biu, vstar, w_puvw, p_for_k, i_for_k, val_for_k, alpha, K_total,
-                                BK=8, BW=64, BU=32, num_warps=4):
-    device = x_biu.device
+def triton_fused_fctp_fwd(
+    x_biu,            # [B, I, U] fp32/fp64
+    vstar,            # [B] int32
+    w_puvw,           # [P, U, V, W] same dtype as x
+    p_for_k,          # [K] int32
+    i_for_k,          # [K] int32
+    val_for_k,        # [K] same dtype as x (recommended)
+    alpha,            # python float or 0-d tensor
+    K_total: int,
+    BK=8, BW=64, BU=32,
+    num_warps=4,
+):
+    assert x_biu.is_cuda, "Triton kernel expects CUDA/ROCm tensor"
+    assert x_biu.dtype in (torch.float32, torch.float64), "Only fp32/fp64 supported here"
+    assert w_puvw.dtype == x_biu.dtype
+    assert val_for_k.dtype == x_biu.dtype
+
     B, I, U = x_biu.shape
     P, U2, V, W = w_puvw.shape
     assert U == U2
 
-    out = torch.empty((B, K_total, W), device=x_biu.device, dtype=torch.float64)
+    out = torch.empty((B, K_total, W), device=x_biu.device, dtype=x_biu.dtype)
+
+    # pick accumulator dtype
+    ACC_DTYPE = tl.float64 if x_biu.dtype == torch.float64 else tl.float32
+
+    # alpha to python float
+    if isinstance(alpha, torch.Tensor):
+        alpha = float(alpha.item())
+    else:
+        alpha = float(alpha)
 
     grid = (B, triton.cdiv(K_total, BK), triton.cdiv(W, BW))
+
     fused_onehot_wpuvw_kernel[grid](
         x_biu, w_puvw, vstar,
         p_for_k, i_for_k, val_for_k,
         out,
         B=B, I=I, K=K_total, U=U, P=P, V=V, W=W,
-        alpha=float(alpha.item()),
+        alpha=alpha,
         BK=BK, BW=BW, BU=BU,
+        ACC_DTYPE=ACC_DTYPE,
         num_warps=num_warps,
     )
-    out = out.view(B, -1)
-    return out
+    return out.view(B, -1)
+
 
 
 @triton.jit
 def fused_onehot_wpuvw_bwd_dx_noatomic_kernel(
-    grad_out_ptr,     # *fp64, [B, K, W]
-    w_ptr,            # *fp64, [P, U, V, W]
+    grad_out_ptr,     # *fp32/fp64, [B, K, W]
+    w_ptr,            # *fp32/fp64, [P, U, V, W]
     vstar_ptr,        # *int32, [B]
     p_for_k_ptr,      # *int32, [K]
     i_for_k_ptr,      # *int32, [K]   (-1 => empty)
-    val_for_k_ptr,    # *fp64,  [K]
-    grad_x_ptr,       # *fp64, [B, I, U]  (direct store, no atomic)
+    val_for_k_ptr,    # *fp32/fp64, [K]
+    grad_x_ptr,       # *fp32/fp64, [B, I, U]  (direct store, no atomic)
     B: tl.constexpr, I: tl.constexpr, K: tl.constexpr, U: tl.constexpr,
     P: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
     alpha: tl.constexpr,
     BK: tl.constexpr, BU: tl.constexpr, BW: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,          # tl.float32 or tl.float64
 ):
     pid_b = tl.program_id(0)   # batch
     pid_k = tl.program_id(1)   # k tile
@@ -120,38 +162,45 @@ def fused_onehot_wpuvw_bwd_dx_noatomic_kernel(
     mk = k_ids < K
     mu = u_ids < U
 
-    v = tl.load(vstar_ptr + pid_b).to(tl.int32)    # scalar
+    # scalar v
+    v = tl.load(vstar_ptr + pid_b).to(tl.int32)
 
-    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)      # [BK]
-    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)     # [BK]
-    val   = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(tl.float64)# [BK]
+    # per-k metadata
+    p_ids = tl.load(p_for_k_ptr + k_ids, mask=mk, other=0).to(tl.int32)       # [BK]
+    i_ids = tl.load(i_for_k_ptr + k_ids, mask=mk, other=-1).to(tl.int32)      # [BK]
     mk2 = mk & (i_ids >= 0)
 
-    acc = tl.zeros((BK, BU), dtype=tl.float64)
+    val = tl.load(val_for_k_ptr + k_ids, mask=mk, other=0.0).to(ACC_DTYPE)    # [BK]
 
-    # sum_w grad_out[b,k,w] * w[p,u,v,w]
+    # acc[k,u] = sum_w go[k,w] * w[p,u,v,w]
+    acc = tl.zeros((BK, BU), dtype=ACC_DTYPE)
+
+    # iterate W in BW chunks
     for w0 in range(0, W, BW):
         w_ids = w0 + tl.arange(0, BW)
         mw = w_ids < W
 
+        # go: [BK, BW]
         go_off = (pid_b * K + k_ids)[:, None] * W + w_ids[None, :]
         go = tl.load(
             grad_out_ptr + go_off,
             mask=mk2[:, None] & mw[None, :],
             other=0.0
-        ).to(tl.float64)
+        ).to(ACC_DTYPE)
 
+        # w: [BK, BU, BW] for given v
         w_off = (((p_ids[:, None, None] * U + u_ids[None, :, None]) * V + v) * W
                  + w_ids[None, None, :])
         ww = tl.load(
             w_ptr + w_off,
             mask=mk2[:, None, None] & mu[None, :, None] & mw[None, None, :],
             other=0.0
-        ).to(tl.float64)
+        ).to(ACC_DTYPE)
 
         acc += tl.sum(go[:, None, :] * ww, axis=2)   # [BK,BU]
 
-    acc *= (val[:, None] * alpha)
+    # scale
+    acc *= (val[:, None] * tl.full((), alpha, ACC_DTYPE))
 
     # direct store (no atomic) because i_for_k is one-to-one
     gx_off = ((pid_b * I + i_ids)[:, None] * U + u_ids[None, :])
@@ -164,28 +213,31 @@ def fused_onehot_wpuvw_bwd_dx_noatomic_kernel(
 
 @torch.no_grad()
 def triton_fused_fctp_bwd(
-    grad_out: torch.Tensor,    # [B,K,W] fp64
-    w: torch.Tensor,           # [P,U,V,W] fp64
+    grad_out: torch.Tensor,    # [B,K,W] fp32/fp64
+    w: torch.Tensor,           # [P,U,V,W] fp32/fp64
     vstar: torch.Tensor,       # [B] int32
     p_for_k: torch.Tensor,     # [K] int32
     i_for_k: torch.Tensor,     # [K] int32, one-to-one mapping
-    val_for_k: torch.Tensor,   # [K] fp64
+    val_for_k: torch.Tensor,   # [K] fp32/fp64
     I: int,
     alpha: float,
-    BU=32, BW=32, BK=8, num_warps=4
+    BU=32, BW=32, BK=8,
+    num_warps=4,
 ):
     assert grad_out.is_cuda and w.is_cuda
-    assert grad_out.dtype == torch.float64 and w.dtype == torch.float64
+    assert grad_out.dtype in (torch.float32, torch.float64)
+    assert w.dtype == grad_out.dtype
+    assert val_for_k.dtype == grad_out.dtype
     assert vstar.dtype == torch.int32
     assert p_for_k.dtype == torch.int32 and i_for_k.dtype == torch.int32
-    assert val_for_k.dtype == torch.float64
 
     B, K, W_ = grad_out.shape
     P, U, V, W = w.shape
     assert W_ == W
 
-    # grad_x must be zero-init because we only write used i's
-    grad_x = torch.zeros((B, I, U), device=grad_out.device, dtype=torch.float64)
+    grad_x = torch.zeros((B, I, U), device=grad_out.device, dtype=grad_out.dtype)
+
+    ACC_DTYPE = tl.float64 if grad_out.dtype == torch.float64 else tl.float32
 
     grid = (B, triton.cdiv(K, BK), triton.cdiv(U, BU))
     fused_onehot_wpuvw_bwd_dx_noatomic_kernel[grid](
@@ -193,11 +245,10 @@ def triton_fused_fctp_bwd(
         B=B, I=I, K=K, U=U, P=P, V=V, W=W,
         alpha=float(alpha),
         BK=BK, BU=BU, BW=BW,
+        ACC_DTYPE=ACC_DTYPE,
         num_warps=num_warps,
     )
-    grad_x = grad_x.view(B, -1)
-    return grad_x
-
+    return grad_x.view(B, -1)
 
 class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
     @staticmethod
