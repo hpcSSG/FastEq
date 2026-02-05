@@ -25,7 +25,7 @@ dtype = "float64"
 mace_scale = str(sys.argv[1])
 dtype = str(sys.argv[2])
 
-calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_' + mace_scale + '.model', device=device, default_dtype=dtype, compile_mode=None, enable_cueq=False, use_batch_size=16)
+calculator = MACECalculator(model_paths='../../mace_bench/models/MACE-OFF23_' + mace_scale + '.model', device=device, default_dtype=dtype, compile_mode=None, enable_cueq=True, use_batch_size=16)
 
 file_list = []
 atoms_list = []
