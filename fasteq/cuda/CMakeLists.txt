@@ -9,7 +9,13 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # Hopper H100
-set(CMAKE_CUDA_ARCHITECTURES 90-real)
+set(CMAKE_CUDA_ARCHITECTURES "90a-real")
+
+# 添加子目录 - 先编译CUDA内核
+# 重要：一定要在find_package(Torch REQUIRED)之前执行
+# 因为torch的cmake配置会覆盖掉 arch=sm90a的设置，并以arch=sm90代替，导致部分sm90a的ptx inline asm编译失败
+find_package(CUDA REQUIRED)
+add_subdirectory(src/equi_linear_kernels)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
@@ -27,7 +33,7 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
-find_package(CUDAToolkit REQUIRED)
+include_directories(src)
 
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(CUDA_SRCS
@@ -71,6 +77,7 @@ target_link_libraries(_cuda PRIVATE
   Python3::Module
   ${TORCH_LIBRARIES}
   CUDA::cudart
+  equi_kernels
 )
 
 set_target_properties(_cuda PROPERTIES
