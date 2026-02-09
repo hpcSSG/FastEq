@@ -114,7 +114,7 @@ def main():
     #.to_csv(topk_path, index=False)
 
     print("\n=== Top buckets per group ===")
-    print(topk.to_string(index=False))
+    # print(topk.to_string(index=False))
     print(f"\nWrote: {all_path}")
     #print(f"Wrote: {topk_path}")
 
