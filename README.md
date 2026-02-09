@@ -38,7 +38,8 @@ The operators implemented in FastEq include:
 5. Install patched cuEquivariance_torch
    ```bash
    pip install cuequivariance==0.8.0 cuequivariance-torch==0.8.0 cuequivariance-ops-torch-cu12==0.8.0
-   cd 3rdpatry/cuequivariance_torch
+   cd 3rdparty/cuequivariance_torch/cuequivariance_torch
+   pip install hatchling twine editables
    pip install -e . --no-build-isolation 
    ```
    
