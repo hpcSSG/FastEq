@@ -105,7 +105,7 @@ class FusedMPFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
         
-        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward_opt(
+        grad_tp_weights, grad_node_feats, grad_edge_attrs  = torch.ops.mptp_bwd.backward(
             grad_out_nodes, tp_weights, node_feats, edge_attrs, row_ptr_s, receiver.to(torch.int32),
             c_all,
             #path_indices,

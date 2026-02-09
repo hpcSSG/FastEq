@@ -1,0 +1,125 @@
+#pragma once
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+#define WARP_SIZE 32
+#define WARPGROUP_SIZE 4
+
+#define CEIL_DIV(m, n) (((m) + (n) - 1) / (n))
+
+#define FETCH_16B(src) (reinterpret_cast<float4 *>(&(src))[0])
+#define FETCH_8B(src) (reinterpret_cast<float2 *>(&(src))[0])
+
+/* Double presision MMA instruction
+ * mma.sync.aligned.shape.row.col.f64.f64.f64.f64 d, a, b, c;
+ * .shape = {.m8n8k4, .m16n8k4, .m16n8k8, .m16n8k16};
+ * "h" = .u16 reg, "r" = .u32 reg, "l" = .u64 reg, "f" = .f32 reg, "d" = .f64 reg
+ */
+#define asm_mma_m8n8k4_f64_f64_f64_f64(RD0, RD1, RA0, RB0, RC0, RC1)                                                   \
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f64.f64.f64.f64 {%0, %1}, {%2}, {%3}, {%4, %5};\n"                   \
+                 : "=d"(RD0), "=d"(RD1)                                                                                \
+                 : "d"(RA0), "d"(RB0), "d"(RC0), "d"(RC1))
+
+#define asm_mma_m16n8k4_f64_f64_f64_f64(RD0, RD1, RD2, RD3, RA0, RA1, RB0, RC0, RC1, RC2, RC3)                         \
+    asm volatile(                                                                                                      \
+        "mma.sync.aligned.m16n8k4.row.col.f64.f64.f64.f64 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%7, %8, %9, %10};\n"      \
+        : "=d"(RD0), "=d"(RD1), "=d"(RD2), "=d"(RD3)                                                                   \
+        : "d"(RA0), "d"(RA1), "d"(RB0), "d"(RC0), "d"(RC1), "d"(RC2), "d"(RC3))
+
+#define asm_cp_async_ca(SMEM_ADDR, GMEM_ADDR, _Byte)                                                                   \
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+
+#define asm_cp_async_cg(SMEM_ADDR, GMEM_ADDR, _Byte)                                                                   \
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+
+#define asm_cp_async_ca_l2_prefetch_64B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                   \
+    asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+
+#define asm_cp_async_ca_l2_prefetch_128B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                  \
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+
+#define asm_cp_async_ca_l2_prefetch_256B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                  \
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+
+#define asm_cp_async_commit_group() asm volatile("cp.async.commit_group;\n" : : : "memory")
+
+#define asm_cp_async_waitgroup(_N) asm volatile("cp.async.wait_group %0;\n" : : "n"(_N) : "memory")
+
+#define asm_ldmatrix_x1(R, addr)                                                                                       \
+    asm volatile("ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];\n" : "=f"(R) : "r"(addr))
+
+#define asm_ldmatrix_x2(R0, R1, addr)                                                                                  \
+    asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n" : "=f"(R0), "=f"(R1) : "r"(addr))
+
+#define asm_ldmatrix_x4(R0, R1, R2, R3, addr)                                                                          \
+    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n"                                  \
+                 : "=f"(R0), "=f"(R1), "=f"(R2), "=f"(R3)                                                              \
+                 : "r"(addr))
+
+#define asm_cvt_tf32_f32(DST, SRC) asm("cvt.rna.tf32.f32 %0, %1;\n" : "=r"(DST) : "f"(SRC));
+
+template <int32_t ScaleD, int32_t ScaleA, int32_t ScaleB>
+__device__ __forceinline__ void asm_wgmma_m64n96k8_tf32(float d[12][4], const float &a0, const float &a1,
+                                                        const float &a2, const float &a3, const uint64_t &desc_b)
+{
+    asm volatile("{\n"
+                 "wgmma.mma_async.sync.aligned.m64n96k8.f32.tf32.tf32"
+                 "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,  "
+                 " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15, "
+                 " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23, "
+                 " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31, "
+                 " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39, "
+                 " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47}, " // d
+                 "{%48, %49, %50, %51},"                             // a
+                 " %52,"                                             // b-desc
+                 " %53, %54, %55;\n"                                 // scale-d, imm-scale-a, imm-scale-b
+                 "}\n"
+                 : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]),
+                   "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]),
+                   "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[4][0]), "+f"(d[4][1]),
+                   "+f"(d[4][2]), "+f"(d[4][3]), "+f"(d[5][0]), "+f"(d[5][1]), "+f"(d[5][2]), "+f"(d[5][3]),
+                   "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[7][0]), "+f"(d[7][1]),
+                   "+f"(d[7][2]), "+f"(d[7][3]), "+f"(d[8][0]), "+f"(d[8][1]), "+f"(d[8][2]), "+f"(d[8][3]),
+                   "+f"(d[9][0]), "+f"(d[9][1]), "+f"(d[9][2]), "+f"(d[9][3]), "+f"(d[10][0]), "+f"(d[10][1]),
+                   "+f"(d[10][2]), "+f"(d[10][3]), "+f"(d[11][0]), "+f"(d[11][1]), "+f"(d[11][2]), "+f"(d[11][3])
+                 : "r"(__float_as_uint(a0)), "r"(__float_as_uint(a1)), "r"(__float_as_uint(a2)),
+                   "r"(__float_as_uint(a3)), "l"(desc_b), "n"(ScaleD), "n"(ScaleA), "n"(ScaleB));
+}
+
+template <int32_t ScaleD, int32_t ScaleA, int32_t ScaleB>
+__device__ __forceinline__ void asm_wgmma_m64n32k8_tf32(float d[4][4], const float &a0, const float &a1,
+                                                        const float &a2, const float &a3, const uint64_t &desc_b)
+{
+    asm volatile("{\n"
+                 "wgmma.mma_async.sync.aligned.m64n32k8.f32.tf32.tf32"
+                 "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,  "
+                 " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15}, " // d
+                 "{%16, %17, %18, %19},"                             // a
+                 " %20,"                                             // b-desc
+                 " %21, %22, %23;\n"                                 // scale-d, imm-scale-a, imm-scale-b
+                 "}\n"
+                 : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[1][0]), "+f"(d[1][1]),
+                   "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[2][0]), "+f"(d[2][1]), "+f"(d[2][2]), "+f"(d[2][3]),
+                   "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3])
+                 : "r"(__float_as_uint(a0)), "r"(__float_as_uint(a1)), "r"(__float_as_uint(a2)),
+                   "r"(__float_as_uint(a3)), "l"(desc_b), "n"(ScaleD), "n"(ScaleA), "n"(ScaleB));
+}
+
+__device__ static __forceinline__ uint64_t matrix_descriptor_encode(uint64_t x)
+{
+    return (((x) & 0x3FFFF) >> 0x4);
+}
+
+#define asm_warpgroup_arrive() asm volatile("wgmma.fence.sync.aligned;\n" : : : "memory")
+
+#define asm_warpgroup_commit_batch() asm volatile("wgmma.commit_group.sync.aligned;\n" : : : "memory")
+
+#define asm_warpgroup_wait(_N) asm volatile("wgmma.wait_group.sync.aligned %0;\n" : : "n"(_N) : "memory")
+
+#define asm_cp_async_bulk_prefetch_tensor_3d_l2(TENSOR_MAP, COORD_N0, COORD_N1, COORD_N2)                              \
+    asm volatile("cp.async.bulk.prefetch.tensor.3d.L2.global.tile"                                                     \
+                 " [%0, {%1, %2, %3}];"                                                                                \
+                 :                                                                                                     \
+                 : "l"(TENSOR_MAP), "r"(COORD_N0), "r"(COORD_N1), "r"(COORD_N2)                                        \
+                 : "memory")

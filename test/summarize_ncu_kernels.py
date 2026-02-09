@@ -16,7 +16,8 @@ KERNEL_GROUPS = {
     "stc_fwd": ["stc_fwd_kernel_notiled"],
     "stc_bwd": ["stc_bwd_kernel_v1", "stc_bwd_kernel_tiled"],
 
-    "equi_linear": ["fused_gmm_kernel_v2"],
+    "equi_linear_f64": ["mutipath_equi_linear_f64_f64_kernel"],
+    "equi_linear_f32": ["mutipath_equi_linear_f32_tf32_kernel"],
 }
 
 def read_ncu_raw_csv(path: str | Path) -> pd.DataFrame:
@@ -113,7 +114,7 @@ def main():
     #.to_csv(topk_path, index=False)
 
     print("\n=== Top buckets per group ===")
-    print(topk.to_string(index=False))
+    # print(topk.to_string(index=False))
     print(f"\nWrote: {all_path}")
     #print(f"Wrote: {topk_path}")
 

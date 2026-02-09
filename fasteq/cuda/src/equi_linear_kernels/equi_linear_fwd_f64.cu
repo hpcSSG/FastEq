@@ -1,12 +1,20 @@
-#include "hip_inst.hpp"
-#include <c10/hip/HIPStream.h>
+#include <cuda.h>
+#include <cuda/barrier>
+#include <cuda/ptx>
+#include <cudaTypedefs.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
 #include <iostream>
-#include <torch/script.h>
-#include <torch/torch.h>
+#include <stdexcept>
+#include <utility>
 
-struct idim_T
+#include "./device_cuda_helper.cuh"
+#include "./impl.h"
+#include "./ptx_inst.cuh"
+
+template <uint32_t NUM_PATHS> struct idim_T
 {
-    uint32_t _i[4];
+    uint32_t _i[NUM_PATHS];
 };
 
 template <uint32_t WARP_PER_BLOCK>
@@ -48,7 +56,8 @@ __device__ __forceinline__ void WarpATileG2SSwizzleAsync(
     uint32_t smem_y = smem_swizzle_y0 + wid * WARP_TAKE_SMEM_LINES + m_count * WARP_PER_BLOCK * WARP_TAKE_SMEM_LINES;
     uint32_t smem_x = smem_swizzle_x0 * THREAD_LD_DOUBLES;
     uint32_t smem_offset = smem_y * DOUBLE_NUMS_PER_SMEM_LINE + smem_x;
-    uint32_t real_smem_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_ptr0 + smem_offset));
+    uint32_t real_smem_ptr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<void *>(smem_ptr0 + smem_offset)));
 
     // fetch req
     if (t_batch < B)
@@ -96,7 +105,8 @@ __device__ __forceinline__ void WarpBTileG2SSwizzleAsync(double *smem_ptr0,     
                       warp_group_id * 2 * N8K4X2_TAKE_SMEM_LINES + k_count * WARP_PER_BLOCK * N8K4X2_TAKE_SMEM_LINES;
     uint32_t smem_x = smem_swizzle_x0 * THREAD_LD_DOUBLES;
     uint32_t smem_offset = smem_y * DOUBLE_NUMS_PER_SMEM_LINE + smem_x;
-    uint32_t real_smem_ptr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(smem_ptr0 + smem_offset));
+    uint32_t real_smem_ptr =
+        static_cast<uint32_t>(__cvta_generic_to_shared(reinterpret_cast<void *>(smem_ptr0 + smem_offset)));
 
     // fetch req
     asm_cp_async_ca_l2_prefetch_256B(real_smem_ptr, B_ptr, 16);
@@ -157,22 +167,22 @@ __device__ __forceinline__ void WarpBSubtileN8K4S2RSwizzleSync(double &b_reg,   
  *      https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#unified-shared-memory-l1-texture-cache
  * 4. better blocking strategy
  */
-template <uint32_t M_WARPS = 2,                                   // m方向warp数量
-          uint32_t N_WARPS = 2,                                   // n方向warp数量
-          uint32_t W_TILE_M = 16,                                 // 每个warp的tile m大小
-          uint32_t W_TILE_N = 16,                                 // 每个warp的tile n大小
-          uint32_t TILE_K = 16>                                   // tile k大小
-__global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i, U]
-                                    const double *__restrict__ w, // [num_paths, U, V]
-                                    double *__restrict__ out,     // [B, total_i, V]
-                                    idim_T i_dims,                // [num_paths]
-                                    idim_T prefex_i_sum,          // [num_paths]
-                                    uint32_t num_paths,           // path数量
-                                    uint32_t total_i,             // i的总数
-                                    uint32_t B,                   // batch size
-                                    uint32_t U,                   // U
-                                    uint32_t V,                   // V
-                                    double cg_val                 // val
+template <uint32_t M_WARPS = 2,                                                     // m方向warp数量
+          uint32_t N_WARPS = 2,                                                     // n方向warp数量
+          uint32_t W_TILE_M = 16,                                                   // 每个warp的tile m大小
+          uint32_t W_TILE_N = 16,                                                   // 每个warp的tile n大小
+          uint32_t TILE_K = 16,                                                     // tile k大小
+          uint32_t NUM_PATHS = 4>                                                   // path
+__global__ void mutipath_equi_linear_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
+                                                    const double *__restrict__ w,   // [num_paths, U, V]
+                                                    double *__restrict__ out,       // [B, total_i, V]
+                                                    idim_T<NUM_PATHS> i_dims,       // [num_paths]
+                                                    idim_T<NUM_PATHS> prefex_i_sum, // [num_paths]
+                                                    uint32_t total_i,               // i的总数
+                                                    uint32_t B,                     // batch size
+                                                    uint32_t U,                     // U
+                                                    uint32_t V,                     // V
+                                                    double cg_val                   // val
 )
 {
     constexpr uint32_t TILE_M = M_WARPS * W_TILE_M;
@@ -189,9 +199,9 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
 
     uint32_t block_nums_per_bi = CEIL_DIV(B, TILE_M);
     uint32_t b_i_id = b_bi_id / block_nums_per_bi;
-    uint32_t b_path_id = 3;
+    uint32_t b_path_id = NUM_PATHS - 1;
 #pragma unroll
-    for (uint32_t _p = 0; _p < 3; ++_p)
+    for (uint32_t _p = 0; _p < (NUM_PATHS - 1); ++_p)
     {
         b_path_id = (b_i_id >= prefex_i_sum._i[_p] && b_i_id < prefex_i_sum._i[_p + 1]) ? _p : b_path_id;
     }
@@ -426,34 +436,39 @@ __global__ void fused_gmm_kernel_v2(const double *__restrict__ x, // [B, total_i
     }
 }
 
-torch::Tensor fused_gmm(const torch::Tensor &x,                 // [B, total_i, U]
-                        const torch::Tensor &w,                 // [num_paths, U, V]
-                        const std::vector<int64_t> &i_dims_vec, // i dims
-                        double val)
+template <uint32_t N> void cal_prefex_sum(idim_T<N> &dst, const std::vector<int64_t> &src)
 {
-    TORCH_CHECK(x.dtype() == torch::kFloat64, "X must be float64");
-    TORCH_CHECK(x.dim() == 3, "X must be of 3 dimention");
-    TORCH_CHECK(w.dtype() == torch::kFloat64, "Y must be float64");
-    TORCH_CHECK(w.dim() == 3, "Y must be of 3 dimention");
-
-    uint32_t B = x.size(0);
-    uint32_t total_i = x.size(1);
-    uint32_t U = x.size(2);
-    uint32_t V = w.size(2);
-
-    uint32_t num_paths = i_dims_vec.size();
-    TORCH_CHECK(num_paths == 4, "num_paths must be 4");
-
-    torch::Tensor out = torch::empty({B, total_i, V}, x.options());
-
-    idim_T i_dims = {
-        {(uint32_t)i_dims_vec[0], (uint32_t)i_dims_vec[1], (uint32_t)i_dims_vec[2], (uint32_t)i_dims_vec[3]}};
-    idim_T prefix_i_sum = {{0, 0, 0, 0}};
+    dst._i[0] = 0;
 #pragma unroll
-    for (uint32_t i = 1; i < 4; ++i)
+    for (uint32_t i = 1; i < N; ++i)
     {
-        prefix_i_sum._i[i] = prefix_i_sum._i[i - 1] + i_dims_vec[i - 1];
+        dst._i[i] = dst._i[i - 1] + (uint32_t)src[i - 1];
     }
+}
+
+template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
+void mutipath_equi_linear_kernel_impl(double *out,                                // [B, out_total_i, V]
+                                      double *x,                                  // [B, in_total_i, U]
+                                      double *w,                                  // [IN_NUM_PATHS, U, V]
+                                      const std::vector<int64_t> &in_i_dims_vec,  // in i dims
+                                      const std::vector<int64_t> &out_i_dims_vec, // out i dims
+                                      const uint32_t &B,                          // batch
+                                      const uint32_t &in_total_i,                 // in_total_i
+                                      const uint32_t &out_total_i,                // out_total_i
+                                      const uint32_t &U,                          // U
+                                      const uint32_t &V,                          // V
+                                      const double &val,                          // cg_val
+                                      const cudaStream_t &cur_stream              // current stream
+)
+{
+    idim_T<IN_NUM_PATHS> i_dims;
+#pragma unroll
+    for (uint32_t i = 0; i < IN_NUM_PATHS; ++i)
+    {
+        i_dims._i[i] = (uint32_t)in_i_dims_vec[i];
+    }
+    idim_T<IN_NUM_PATHS> prefix_i_sum;
+    cal_prefex_sum<IN_NUM_PATHS>(prefix_i_sum, in_i_dims_vec);
 
     constexpr uint32_t M_WARPS = 2;
     constexpr uint32_t N_WARPS = 2;
@@ -464,26 +479,53 @@ torch::Tensor fused_gmm(const torch::Tensor &x,                 // [B, total_i, 
     constexpr uint32_t TILE_N = N_WARPS * W_TILE_N;
     constexpr uint32_t WARP_PER_BLOCK = M_WARPS * N_WARPS;
 
-    TORCH_CHECK(V % TILE_N == 0, "Dim V must be divisible by %u", TILE_N);
-    // TORCH_CHECK(B % TILE_M == 0, "Dim B must be divisible by %u", TILE_M);
-    dim3 grid(CEIL_DIV(V, TILE_N), total_i * CEIL_DIV(B, TILE_M));
+    assert(V % TILE_N == 0);
+
+    dim3 grid(CEIL_DIV(V, TILE_N), in_total_i * CEIL_DIV(B, TILE_M));
     dim3 block(WARP_SIZE, WARP_PER_BLOCK);
-
     constexpr uint32_t SMEM_SIZE = (TILE_M * TILE_K + TILE_N * TILE_K) * 2 * 8; // 2 stage, 8 B/Double
-    hipStream_t cur_stream = c10::hip::getCurrentHIPStream(x.device().index()).stream();
 
-    auto hip_kernel = fused_gmm_kernel_v2<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K>;
-    hipFuncSetAttribute((const void *)hip_kernel, hipFuncAttributePreferredSharedMemoryCarveout,
-                        57); // 128 KB （128/228）
+    auto cuda_kernel = mutipath_equi_linear_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
+    cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
 
-    hip_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x.data_ptr<double>(), w.data_ptr<double>(),
-                                                       out.data_ptr<double>(), i_dims, prefix_i_sum, num_paths, total_i,
-                                                       B, U, V, val);
-
-    return out;
+    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x, w, out, i_dims, prefix_i_sum, in_total_i, B, U, V, val);
 }
 
-TORCH_LIBRARY(equi_linear, m)
+// wrapper
+void mutipath_equi_linear_f64_impl(const uint32_t &IN_NUM_PATHS,           // path nums
+                                   double *out,                            // [B, out_total_i, V]
+                                   double *x,                              // [B, in_total_i, U]
+                                   double *w,                              // [IN_NUM_PATHS, U, V]
+                                   const uint32_t &B,                      // batch
+                                   const uint32_t &total_i,                // in_total_i
+                                   const std::vector<int64_t> &i_dims_vec, // i dims
+                                   const uint32_t &U,                      // U
+                                   const uint32_t &V,                      // V
+                                   const double &val,                      // cg_val
+                                   const cudaStream_t &cur_stream          // current stream
+)
 {
-    m.def("forward", &fused_gmm);
+    const std::vector<int64_t> out_i_dims_vec = {1, 3, 5, 7};
+    const uint32_t out_total_i = 16;
+    auto call_impl = [&](auto &&...forwarded_args) {
+        switch (IN_NUM_PATHS)
+        {
+        case 4: // small
+            mutipath_equi_linear_kernel_impl<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            break;
+        // case 10: // medium
+        //     printf("F64 eqlinear-Medium not implimented!!!");
+        //     exit(1);
+        //     break;
+        // case 17: // large
+        //     printf("F64 eqlinear-Large not implimented!!!");
+        //     exit(1);
+        //     break;
+        default:
+            throw std::invalid_argument("Unsupported number of paths: " + std::to_string(IN_NUM_PATHS) +
+                                        ". Supported values are 4");
+        }
+    };
+    // 调用lambda，完美转发参数
+    call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, val, cur_stream);
 }
