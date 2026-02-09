@@ -8,15 +8,15 @@ import matplotlib.pyplot as plt
 # only forward
 df_time = pd.DataFrame(
     {
-        "other": [1.0,  0.7,  1.4, 6.4],
-        "cwtp": [1.13, 2.21, 25.0, 8.79],
-        "fctp": [1.20,  1.37,  2.7, 0],
-        "stc":  [2.04,  4.23, 8.5, 0],
-        "eq-linear": [0.91, 1.35, 2.1, 13.4],
+        "other": [1.0,  0.7, 1.4, 4.2, 6.4],
+        "cwtp": [1.13, 2.21, 25.0, 9.78, 8.79],
+        "fctp": [1.20,  1.37,  2.7, 3.25, 0],
+        "stc":  [2.04,  4.23, 8.5, 7.02, 0],
+        "eq-linear": [0.91, 1.35, 2.1, 12.81, 13.4],
         
     },
 
-    index=["MACE-OFF small", "MACE-OFF medium", "MACE-OFF large", "SevenNet-0"],
+    index=["MACE-OFF small", "MACE-OFF medium", "MACE-OFF large", "MACE-MP-0 medium", "SevenNet-0"],
 )
 
 df_pct = df_time.div(df_time.sum(axis=1), axis=0) * 100
