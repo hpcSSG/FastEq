@@ -16,12 +16,13 @@ class FastUniform1dFunction(torch.autograd.Function):
         w_seg_num = meta["w_seg_num"]
         x_seg_num = meta["x_seg_num"]
         y_seg_num = meta["y_seg_num"]
+        u_dim = meta["u_dim"]
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        w = w.view(-1, w_seg_num, self.u_dim)
-        x = x.view(-1, x_seg_num, self.u_dim)
+        w = w.view(-1, w_seg_num, u_dim)
+        x = x.view(-1, x_seg_num, u_dim)
         y = y.view(-1, y_seg_num, 1)
 
         scatter_sum_dim = x.shape[0]
@@ -32,6 +33,8 @@ class FastUniform1dFunction(torch.autograd.Function):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         print(f"<< fasteq uniform1d forward cost: {execution_time_ms:.3f} ms >>")
+
+        
         
         ctx.save_for_backward(w, x, y)
         ctx.i_list = i_list
@@ -40,6 +43,8 @@ class FastUniform1dFunction(torch.autograd.Function):
         ctx.coeff_list = coeff_list
         ctx.v_offsets = v_offsets
         ctx.out_seg_num = out_seg_num
+
+        print(f"u1d out.shape:{out.shape}, out.device:{out.device}")
 
         return out
 
