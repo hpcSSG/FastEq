@@ -184,6 +184,8 @@ DEVICE inline T *shared_array(unsigned int n_elements, void *&ptr,
   return reinterpret_cast<T *>(inptr);
 }
 
+static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
+
 /*
 // forward declare multiple types...
 template float *shared_array<float>(unsigned int n_elements, void *&ptr,

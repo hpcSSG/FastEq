@@ -8,14 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Hopper H100
 set(CMAKE_CUDA_ARCHITECTURES "90a-real")
-
-# 添加子目录 - 先编译CUDA内核
-# 重要：一定要在find_package(Torch REQUIRED)之前执行
-# 因为torch的cmake配置会覆盖掉 arch=sm90a的设置，并以arch=sm90代替，导致部分sm90a的ptx inline asm编译失败
-find_package(CUDA REQUIRED)
-add_subdirectory(src/equi_linear_kernels)
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
@@ -33,8 +29,24 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
-include_directories(src)
 
+# ---- Find CUDA runtime shipped with PyTorch (pip wheel) ----
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}" -c
+    "import os, torch; \
+p=os.path.join(os.path.dirname(torch.__file__),'..','nvidia','cuda_runtime','lib'); \
+print(os.path.abspath(p))"
+  OUTPUT_VARIABLE TORCH_CUDA_RUNTIME_LIBDIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
+  message(STATUS "Using PyTorch CUDA runtime libdir: ${TORCH_CUDA_RUNTIME_LIBDIR}")
+else()
+  message(WARNING "PyTorch CUDA runtime libdir not found: ${TORCH_CUDA_RUNTIME_LIBDIR} (libcudart.so.12 missing)")
+endif()
+
+include_directories(src)
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
@@ -46,8 +58,12 @@ set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
+
+add_subdirectory(src/equi_linear_kernels)
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
 foreach(_f IN LISTS CUDA_SRCS)
@@ -56,11 +72,23 @@ foreach(_f IN LISTS CUDA_SRCS)
   endif()
 endforeach()
 
-add_library(_cuda MODULE ${CUDA_SRCS})
+add_library(_cuda MODULE
+  ${CUDA_SRCS}
+  $<TARGET_OBJECTS:equi_kernels_obj>
+)
+
+# Prefer PyTorch-shipped CUDA runtime at runtime
+if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
+  set_target_properties(_cuda PROPERTIES
+    BUILD_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
+    INSTALL_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
+  )
+endif()
 
 target_include_directories(_cuda PRIVATE
   ${Python3_INCLUDE_DIRS}
   ${TORCH_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear_kernels
 )
 
 target_compile_options(_cuda PRIVATE
@@ -76,8 +104,10 @@ target_compile_options(_cuda PRIVATE
 target_link_libraries(_cuda PRIVATE
   Python3::Module
   ${TORCH_LIBRARIES}
-  CUDA::cudart
-  equi_kernels
+)
+
+target_compile_options(_cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--gpu-architecture=sm_90a>
 )
 
 set_target_properties(_cuda PROPERTIES
