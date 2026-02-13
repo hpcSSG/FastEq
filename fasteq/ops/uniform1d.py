@@ -44,8 +44,6 @@ class FastUniform1dFunction(torch.autograd.Function):
         ctx.v_offsets = v_offsets
         ctx.out_seg_num = out_seg_num
 
-        print(f"u1d out.shape:{out.shape}, out.device:{out.device}")
-
         return out
 
     @staticmethod

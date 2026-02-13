@@ -60,6 +60,8 @@ set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
 
