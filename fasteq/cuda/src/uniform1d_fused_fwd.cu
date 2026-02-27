@@ -57,13 +57,16 @@ __global__ void u1d_groupout_fwd_gather_scatter_csr(
 
             // y[b,k,0] broadcast within warp
             scalar_t yval;
-            if (lane == 0) {
-                yval = y[(b * Ky + k)];
-            }
-            yval = __shfl_sync(0xffffffff, yval, 0);
+            
+            int64_t w_off = ((int64_t)b * Iw + i) * (int64_t)U + u;
+            int64_t x_off = ((int64_t)src * Ix + j) * (int64_t)U + u;
+            int64_t y_off = (int64_t)b * Ky + k;
+            int64_t o_off = ((int64_t)cls * V + v) * (int64_t)U + u;
 
-            scalar_t wval = w[((b   * Iw + i)   * U) + u];
-            scalar_t xval = x_all[((src * Ix + j) * U) + u];
+            scalar_t wval = w[w_off];
+            scalar_t xval = x_all[x_off];
+            if (lane == 0) yval = y[y_off];
+            yval = __shfl_sync(0xffffffff, yval, 0);
 
             acc += c * wval * xval * yval;
         }
