@@ -2,42 +2,9 @@ import torch
 import os, math, time
 from typing import List
 
-def stats_cls_bucket(cls_offsets):
-    cls_offsets = torch.as_tensor(cls_offsets)
-
-    bucket_sizes = cls_offsets[1:] - cls_offsets[:-1]
-
-    avg_size = bucket_sizes.float().mean().item()
-    max_size = bucket_sizes.max().item()
-    min_size = bucket_sizes.min().item()
-
-    print("=== CLS bucket stats ===")
-    print("num classes:", len(bucket_sizes))
-    print("avg  bi1-bi0:", avg_size)
-    print("max  bi1-bi0:", max_size)
-    print("min  bi1-bi0:", min_size)
-
-    return bucket_sizes
-
-def stats_v_bucket(v_offsets):
-    v_offsets = torch.as_tensor(v_offsets)
-
-    t_sizes = v_offsets[1:] - v_offsets[:-1]
-
-    avg_t = t_sizes.float().mean().item()
-    max_t = t_sizes.max().item()
-    min_t = t_sizes.min().item()
-
-    print("=== V bucket stats ===")
-    print("num v:", len(t_sizes))
-    print("avg  t_len:", avg_t)
-    print("max  t_len:", max_t)
-    print("min  t_len:", min_t)
-
-    return t_sizes
-
-
-import torch
+from collections import defaultdict, OrderedDict
+import numpy as np
+from .code_gen import generate_code
 
 def pack_paths32(i_list: torch.Tensor,
                  j_list: torch.Tensor,
@@ -70,6 +37,8 @@ def pack_paths32(i_list: torch.Tensor,
 
     return packed
 
+
+
 class FastUniform1dFusedFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, x, y, src_idx, dst_idx, b_list, cls_offsets, meta):
@@ -77,6 +46,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         i_list = meta["i_list"].to(torch.int32)
         j_list = meta["j_list"].to(torch.int32)
         k_list = meta["k_list"].to(torch.int32)
+        v_list = meta["v_list"].to(torch.int32)
         coeff_list = meta["coeff_list"]
         v_offsets = meta["v_offsets"].to(torch.int32)
         out_seg_num = meta["out_seg_num"]
@@ -85,22 +55,16 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
         w = w.view(-1, w_seg_num, u_dim)
         x = x.view(-1, x_seg_num, u_dim)
         y = y.view(-1, y_seg_num, 1)
 
-        #print(f"w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
-        #stats_cls_bucket(cls_offsets)
-        #stats_v_bucket(v_offsets)
 
         src_idx = src_idx.to(torch.int32)
         dst_idx = dst_idx.to(torch.int32)
         b_list = b_list.to(torch.int32)
         cls_offsets = cls_offsets.to(torch.int32)
-
+        
         '''
         print(f"i len:{len(i_list)}, j len:{len(j_list)}, k len:{len(k_list)}, coeff len:{len(coeff_list)}, v len:{len(v_offsets)}")
 
@@ -136,32 +100,61 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         print("global unique ratio:", unique_ratio)
         '''
 
-        bi_counts = cls_offsets[1:] - cls_offsets[:-1]
-
-        print("num segments:", bi_counts.numel())
-        print("mean:", bi_counts.float().mean().item())
-        print("median:", bi_counts.float().median().item())
-        print("max:", bi_counts.max().item())
-        print("min:", bi_counts.min().item())
-
-        for p in [50, 90, 95, 99]:
-            print(f"p{p}:", torch.quantile(bi_counts.float(), p/100).item())
-
         packed = pack_paths32(i_list, j_list, k_list, coeff_list)
+        
+        if torch.max(v_list) == 242:
+            generate_code(i_list, j_list, k_list, v_list, coeff_list)
+
+        '''
+        for idx in range(0, len(i_list)):
+            print(f"i:{i_list[idx]}, j:{j_list[idx]}, k:{k_list[idx]}, v:{v_list[idx]}")
+        '''
+
+        #print(f"b_list 10:{b_list[:10]}")
+        #print(f"cls_offsets 10:{cls_offsets[:10]}")
+
+
+        print(f"max i:{torch.max(i_list)}, max j:{torch.max(j_list)}, max k:{torch.max(k_list)}, max v:{torch.max(v_list)}")
+        print(f"w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
         if u_dim == 32:
-            '''
-            out = torch.ops.u1d_fused_fwd.forward_ep(
-                w, x, y, 
-                src_idx, dst_idx, 
-                i_list, j_list, k_list, coeff_list, packed,
-                v_offsets, out_seg_num
-            )
+
+            if torch.max(v_list) == 242:
+                print(f"===== call uniform1d code gen ======")
+                out = torch.ops.u1d_cg.forward(
+                    w, x, y, 
+                    src_idx, dst_idx, b_list, cls_offsets,
+                    i_list, j_list, k_list, v_list, coeff_list, packed,
+                    v_offsets, out_seg_num
+                )
+            else:
+                out = torch.ops.u1d_fused_fwd.forward_ep(
+                    w, x, y, 
+                    src_idx, dst_idx, b_list, cls_offsets,
+                    i_list, j_list, k_list, v_list, coeff_list, packed,
+                    v_offsets, out_seg_num
+                )
+            
             '''
             out = torch.ops.u1d_fused_fwd.forward_np(
                 w, x, y, 
-                src_idx, b_list, cls_offsets, packed, v_offsets, out_seg_num
+                src_idx, b_list, cls_offsets,
+                i_list, j_list, k_list, coeff_list,
+                packed, v_offsets, out_seg_num
             )
+            '''
+
+            '''
+            out = torch.ops.u1d_fused_fwd.forward(
+                w, x, y, 
+                src_idx, b_list, cls_offsets, 
+                i_list, j_list, k_list, 
+                coeff_list, v_offsets, out_seg_num
+            )
+            '''
 
         else:
             out = torch.ops.u1d_fused_fwd.forward(
