@@ -3,6 +3,9 @@
 #include <vector>
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/script.h>
+#include <torch/torch.h>
+#include <iostream>
 
 template <typename T>
 __device__ __forceinline__ T fmaT(T a, T b, T c) {
@@ -104,7 +107,155 @@ torch::Tensor commutator3x3_extract(torch::Tensor A, torch::Tensor B, int64_t Fd
   return out;
 }
 
+template <typename T>
+__global__ void commutator3x3_extract_backward_kernel(
+    const T* __restrict__ A,         // [N,9]
+    const T* __restrict__ B,         // [N,9]
+    const T* __restrict__ grad_out,  // [E,3,Fdim]
+    T* __restrict__ grad_A,          // [N,9]
+    T* __restrict__ grad_B,          // [N,9]
+    int64_t N,
+    int64_t Fdim)
+{
+  int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= N) return;
+
+  // idx -> (e, f)
+  int64_t f = idx % Fdim;
+  int64_t e = idx / Fdim;
+
+  const T* a = A + idx * 9;
+  const T* b = B + idx * 9;
+
+  T* gA = grad_A + idx * 9;
+  T* gB = grad_B + idx * 9;
+
+  // grad_out[e, :, f]
+  int64_t base = (e * 3) * Fdim + f;
+  T gx = grad_out[base + 0 * Fdim];  // dL/drx
+  T gy = grad_out[base + 1 * Fdim];  // dL/dry
+  T gz = grad_out[base + 2 * Fdim];  // dL/drz
+
+  // load A
+  T a0 = a[0], a1 = a[1], a2 = a[2];
+  T a3 = a[3], a4 = a[4], a5 = a[5];
+  T a6 = a[6], a7 = a[7], a8 = a[8];
+
+  // load B
+  T b0 = b[0], b1 = b[1], b2 = b[2];
+  T b3 = b[3], b4 = b[4], b5 = b[5];
+  T b6 = b[6], b7 = b[7], b8 = b[8];
+
+  // grad A
+  gA[0] = fmaT(gy, b2, -gz * b3);
+  gA[1] = fmaT(gy, b5, -gx * b6);
+  gA[2] = gy * (b8 - b0);
+
+  gA[3] = gz * (b0 - b4);
+  gA[4] = fmaT(gz, b3, -gx * b7);
+  gA[5] = fmaT(gz, b6, -gy * b1);
+
+  gA[6] = fmaT(gx, b1, -gz * b5);
+  gA[7] = gx * (b4 - b8);
+  gA[8] = fmaT(gx, b7, -gy * b2);
+
+  // grad B
+  gB[0] = fmaT(gz, a3, -gy * a2);
+  gB[1] = fmaT(gx, a6, -gy * a5);
+  gB[2] = gy * (a0 - a8);
+
+  gB[3] = gz * (a4 - a0);
+  gB[4] = fmaT(gx, a7, -gz * a3);
+  gB[5] = fmaT(gy, a1, -gz * a6);
+
+  gB[6] = fmaT(gz, a5, -gx * a1);
+  gB[7] = gx * (a8 - a4);
+  gB[8] = fmaT(gy, a2, -gx * a7);
+}
+
+template <typename T>
+void launch_commutator3x3_extract_backward(
+    const T* A,
+    const T* B,
+    const T* grad_out,
+    T* grad_A,
+    T* grad_B,
+    int64_t N,
+    int64_t Fdim,
+    cudaStream_t stream)
+{
+  constexpr int threads = 256;
+  int64_t blocks = (N + threads - 1) / threads;
+  commutator3x3_extract_backward_kernel<T>
+      <<< (uint32_t)blocks, threads, 0, stream >>>(
+          A, B, grad_out, grad_A, grad_B, N, Fdim);
+}
+
+void commutator3x3_extract_backward_cuda(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor grad_out,
+    torch::Tensor grad_A,
+    torch::Tensor grad_B,
+    int64_t Fdim)
+{
+  auto N = A.size(0);
+  auto stream = at::cuda::getDefaultCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES(A.scalar_type(), "commutator3x3_extract_backward_cuda", [&] {
+    launch_commutator3x3_extract_backward<scalar_t>(
+      (const scalar_t*)A.data_ptr<scalar_t>(),
+      (const scalar_t*)B.data_ptr<scalar_t>(),
+      (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+      (scalar_t*)grad_A.data_ptr<scalar_t>(),
+      (scalar_t*)grad_B.data_ptr<scalar_t>(),
+      N, Fdim, stream.stream());
+  });
+}
+
+std::vector<torch::Tensor> commutator3x3_extract_backward(
+    torch::Tensor A,
+    torch::Tensor B,
+    torch::Tensor grad_out,
+    int64_t Fdim)
+{
+  TORCH_CHECK(A.is_cuda() && B.is_cuda() && grad_out.is_cuda(),
+              "A/B/grad_out must be CUDA tensors");
+  TORCH_CHECK(A.scalar_type() == B.scalar_type(),
+              "A/B dtype must match");
+  TORCH_CHECK(A.scalar_type() == grad_out.scalar_type(),
+              "grad_out dtype must match A/B");
+  TORCH_CHECK(A.dim() == 3 && B.dim() == 3,
+              "A/B must be [N,3,3]");
+  TORCH_CHECK(A.size(1) == 3 && A.size(2) == 3,
+              "A must be [N,3,3]");
+  TORCH_CHECK(B.size(1) == 3 && B.size(2) == 3,
+              "B must be [N,3,3]");
+  TORCH_CHECK(A.is_contiguous() && B.is_contiguous(),
+              "A/B must be contiguous [N,3,3]");
+
+  auto N = A.size(0);
+  TORCH_CHECK(Fdim > 0 && (N % Fdim) == 0,
+              "Require N % Fdim == 0, got N=", N, " Fdim=", Fdim);
+
+  auto E = N / Fdim;
+  TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [E,3,Fdim]");
+  TORCH_CHECK(grad_out.size(0) == E &&
+              grad_out.size(1) == 3 &&
+              grad_out.size(2) == Fdim,
+              "grad_out must have shape [E,3,Fdim]");
+  TORCH_CHECK(grad_out.is_contiguous(),
+              "grad_out must be contiguous [E,3,Fdim]");
+
+  auto grad_A = torch::empty_like(A);
+  auto grad_B = torch::empty_like(B);
+
+  commutator3x3_extract_backward_cuda(A, B, grad_out, grad_A, grad_B, Fdim);
+  return {grad_A, grad_B};
+}
+
 TORCH_LIBRARY(fused_commutator, m)
 {
     m.def("forward", &commutator3x3_extract);
+    m.def("backward", &commutator3x3_extract_backward);
 }

@@ -46,26 +46,43 @@ else()
   message(WARNING "PyTorch CUDA runtime libdir not found: ${TORCH_CUDA_RUNTIME_LIBDIR} (libcudart.so.12 missing)")
 endif()
 
+add_library(fasteq_deps INTERFACE)
+target_include_directories(fasteq_deps INTERFACE
+  ${Python3_INCLUDE_DIRS}
+  ${TORCH_INCLUDE_DIRS}
+)
+target_link_libraries(fasteq_deps INTERFACE
+  Python3::Module
+  ${TORCH_LIBRARIES}
+)
+target_compile_options(fasteq_deps INTERFACE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)
+
 include_directories(src)
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(CUDA_SRCS
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
+  #"${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
 
 add_subdirectory(src/equi_linear_kernels)
+add_subdirectory(src/atombit)
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
 foreach(_f IN LISTS CUDA_SRCS)
@@ -77,7 +94,9 @@ endforeach()
 add_library(_cuda MODULE
   ${CUDA_SRCS}
   $<TARGET_OBJECTS:equi_kernels_obj>
+  $<TARGET_OBJECTS:atombit_obj>
 )
+
 
 # Prefer PyTorch-shipped CUDA runtime at runtime
 if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
@@ -91,6 +110,7 @@ target_include_directories(_cuda PRIVATE
   ${Python3_INCLUDE_DIRS}
   ${TORCH_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear_kernels
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/atombit_obj
 )
 
 target_compile_options(_cuda PRIVATE

@@ -4,8 +4,10 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 add_library(atombit_obj OBJECT
     fused_commutator.cu
+    fused_bmm_sym.cu
 )
 
+target_link_libraries(atombit_obj PUBLIC fasteq_deps)
 target_include_directories(atombit_obj PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
