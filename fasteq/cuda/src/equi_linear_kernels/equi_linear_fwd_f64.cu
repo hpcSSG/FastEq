@@ -12,11 +12,6 @@
 #include "./impl.h"
 #include "./ptx_inst.cuh"
 
-template <uint32_t NUM_PATHS> struct idim_T
-{
-    uint32_t _i[NUM_PATHS];
-};
-
 template <uint32_t WARP_PER_BLOCK>
 __device__ __forceinline__ void WarpATileG2SSwizzleAsync(
     double *smem_ptr0,            // 共享内存基地址
@@ -167,22 +162,22 @@ __device__ __forceinline__ void WarpBSubtileN8K4S2RSwizzleSync(double &b_reg,   
  *      https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html#unified-shared-memory-l1-texture-cache
  * 4. better blocking strategy
  */
-template <uint32_t M_WARPS = 2,                                                     // m方向warp数量
-          uint32_t N_WARPS = 2,                                                     // n方向warp数量
-          uint32_t W_TILE_M = 16,                                                   // 每个warp的tile m大小
-          uint32_t W_TILE_N = 16,                                                   // 每个warp的tile n大小
-          uint32_t TILE_K = 16,                                                     // tile k大小
-          uint32_t NUM_PATHS = 4>                                                   // path
-__global__ void mutipath_equi_linear_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
-                                                    const double *__restrict__ w,   // [num_paths, U, V]
-                                                    double *__restrict__ out,       // [B, total_i, V]
-                                                    idim_T<NUM_PATHS> i_dims,       // [num_paths]
-                                                    idim_T<NUM_PATHS> prefex_i_sum, // [num_paths]
-                                                    uint32_t total_i,               // i的总数
-                                                    uint32_t B,                     // batch size
-                                                    uint32_t U,                     // U
-                                                    uint32_t V,                     // V
-                                                    double cg_val                   // val
+template <uint32_t M_WARPS = 2,                                                         // m方向warp数量
+          uint32_t N_WARPS = 2,                                                         // n方向warp数量
+          uint32_t W_TILE_M = 16,                                                       // 每个warp的tile m大小
+          uint32_t W_TILE_N = 16,                                                       // 每个warp的tile n大小
+          uint32_t TILE_K = 16,                                                         // tile k大小
+          uint32_t NUM_PATHS = 4>                                                       // path
+__global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
+                                                        const double *__restrict__ w,   // [num_paths, U, V]
+                                                        double *__restrict__ out,       // [B, total_i, V]
+                                                        idim_T<NUM_PATHS> i_dims,       // [num_paths]
+                                                        idim_T<NUM_PATHS> prefex_i_sum, // [num_paths]
+                                                        uint32_t total_i,               // i的总数
+                                                        uint32_t B,                     // batch size
+                                                        uint32_t U,                     // U
+                                                        uint32_t V,                     // V
+                                                        double cg_val                   // val
 )
 {
     constexpr uint32_t TILE_M = M_WARPS * W_TILE_M;
@@ -436,29 +431,19 @@ __global__ void mutipath_equi_linear_f64_f64_kernel(const double *__restrict__ x
     }
 }
 
-template <uint32_t N> void cal_prefex_sum(idim_T<N> &dst, const std::vector<int64_t> &src)
-{
-    dst._i[0] = 0;
-#pragma unroll
-    for (uint32_t i = 1; i < N; ++i)
-    {
-        dst._i[i] = dst._i[i - 1] + (uint32_t)src[i - 1];
-    }
-}
-
 template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
-void mutipath_equi_linear_kernel_impl(double *out,                                // [B, out_total_i, V]
-                                      double *x,                                  // [B, in_total_i, U]
-                                      double *w,                                  // [IN_NUM_PATHS, U, V]
-                                      const std::vector<int64_t> &in_i_dims_vec,  // in i dims
-                                      const std::vector<int64_t> &out_i_dims_vec, // out i dims
-                                      const uint32_t &B,                          // batch
-                                      const uint32_t &in_total_i,                 // in_total_i
-                                      const uint32_t &out_total_i,                // out_total_i
-                                      const uint32_t &U,                          // U
-                                      const uint32_t &V,                          // V
-                                      const double &val,                          // cg_val
-                                      const cudaStream_t &cur_stream              // current stream
+void mutipath_equi_linear_fwd_f64(double *out,                                // [B, out_total_i, V]
+                                  double *x,                                  // [B, in_total_i, U]
+                                  double *w,                                  // [IN_NUM_PATHS, U, V]
+                                  const std::vector<int64_t> &in_i_dims_vec,  // in i dims
+                                  const std::vector<int64_t> &out_i_dims_vec, // out i dims
+                                  const uint32_t &B,                          // batch
+                                  const uint32_t &in_total_i,                 // in_total_i
+                                  const uint32_t &out_total_i,                // out_total_i
+                                  const uint32_t &U,                          // U
+                                  const uint32_t &V,                          // V
+                                  const double &val,                          // cg_val
+                                  const cudaStream_t &cur_stream              // current stream
 )
 {
     idim_T<IN_NUM_PATHS> i_dims;
@@ -485,24 +470,25 @@ void mutipath_equi_linear_kernel_impl(double *out,                              
     dim3 block(WARP_SIZE, WARP_PER_BLOCK);
     constexpr uint32_t SMEM_SIZE = (TILE_M * TILE_K + TILE_N * TILE_K) * 2 * 8; // 2 stage, 8 B/Double
 
-    auto cuda_kernel = mutipath_equi_linear_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
+    auto cuda_kernel =
+        mutipath_equi_linear_fwd_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
 
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x, w, out, i_dims, prefix_i_sum, in_total_i, B, U, V, val);
 }
 
 // wrapper
-void mutipath_equi_linear_f64_impl(const uint32_t &IN_NUM_PATHS,           // path nums
-                                   double *out,                            // [B, out_total_i, V]
-                                   double *x,                              // [B, in_total_i, U]
-                                   double *w,                              // [IN_NUM_PATHS, U, V]
-                                   const uint32_t &B,                      // batch
-                                   const uint32_t &total_i,                // in_total_i
-                                   const std::vector<int64_t> &i_dims_vec, // i dims
-                                   const uint32_t &U,                      // U
-                                   const uint32_t &V,                      // V
-                                   const double &val,                      // cg_val
-                                   const cudaStream_t &cur_stream          // current stream
+void mutipath_equi_linear_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           // path nums
+                                       double *out,                            // [B, out_total_i, V]
+                                       double *x,                              // [B, in_total_i, U]
+                                       double *w,                              // [IN_NUM_PATHS, U, V]
+                                       const uint32_t &B,                      // batch
+                                       const uint32_t &total_i,                // in_total_i
+                                       const std::vector<int64_t> &i_dims_vec, // i dims
+                                       const uint32_t &U,                      // U
+                                       const uint32_t &V,                      // V
+                                       const double &val,                      // cg_val
+                                       const cudaStream_t &cur_stream          // current stream
 )
 {
     const std::vector<int64_t> out_i_dims_vec = {1, 3, 5, 7};
@@ -511,7 +497,7 @@ void mutipath_equi_linear_f64_impl(const uint32_t &IN_NUM_PATHS,           // pa
         switch (IN_NUM_PATHS)
         {
         case 4: // small
-            mutipath_equi_linear_kernel_impl<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            mutipath_equi_linear_fwd_f64<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         // case 10: // medium
         //     printf("F64 eqlinear-Medium not implimented!!!");

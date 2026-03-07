@@ -5,6 +5,7 @@ set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 add_library(equi_kernels_obj OBJECT
     equi_linear_fwd_f64.cu
     equi_linear_fwd_f32.cu
+    equi_linear_bwd_f32.cu
 )
 
 target_include_directories(equi_kernels_obj PUBLIC

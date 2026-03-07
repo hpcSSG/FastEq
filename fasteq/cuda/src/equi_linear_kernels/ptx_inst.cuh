@@ -28,19 +28,34 @@
         : "d"(RA0), "d"(RA1), "d"(RB0), "d"(RC0), "d"(RC1), "d"(RC2), "d"(RC3))
 
 #define asm_cp_async_ca(SMEM_ADDR, GMEM_ADDR, _Byte)                                                                   \
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+    asm volatile("cp.async.ca.shared.global [%0], [%1], %2;\n"                                                         \
+                 :                                                                                                     \
+                 : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte)                                                          \
+                 : "memory")
 
 #define asm_cp_async_cg(SMEM_ADDR, GMEM_ADDR, _Byte)                                                                   \
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n"                                                         \
+                 :                                                                                                     \
+                 : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte)                                                          \
+                 : "memory")
 
 #define asm_cp_async_ca_l2_prefetch_64B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                   \
-    asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+    asm volatile("cp.async.cg.shared.global.L2::64B [%0], [%1], %2;\n"                                                 \
+                 :                                                                                                     \
+                 : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte)                                                          \
+                 : "memory")
 
 #define asm_cp_async_ca_l2_prefetch_128B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                  \
-    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n"                                                \
+                 :                                                                                                     \
+                 : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte)                                                          \
+                 : "memory")
 
 #define asm_cp_async_ca_l2_prefetch_256B(SMEM_ADDR, GMEM_ADDR, _Byte)                                                  \
-    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n" : : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte) : "memory")
+    asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], %2;\n"                                                \
+                 :                                                                                                     \
+                 : "r"(SMEM_ADDR), "l"(GMEM_ADDR), "n"(_Byte)                                                          \
+                 : "memory")
 
 #define asm_cp_async_commit_group() asm volatile("cp.async.commit_group;\n" : : : "memory")
 

@@ -38,7 +38,7 @@ class _FastEquiLinearFn(torch.autograd.Function):
         ctx.I_list = I_list
         ctx.I_total = I_total
         ctx.cg_val = cg_val
-        ctx.u = u
+        ctx.v = v
         return out
 
     @staticmethod
@@ -48,9 +48,8 @@ class _FastEquiLinearFn(torch.autograd.Function):
         start_time = time.perf_counter() * 1000
 
         w, = ctx.saved_tensors
-        wt = w.transpose(1, 2).contiguous()
-        grad_out = grad_out.view(ctx.B, ctx.I_total, ctx.u).contiguous()
-        grad_x = torch.ops.equi_linear.backward(grad_out, wt, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
+        grad_out = grad_out.view(ctx.B, ctx.I_total, ctx.v).contiguous()
+        grad_x = torch.ops.equi_linear.backward(grad_out, w, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
