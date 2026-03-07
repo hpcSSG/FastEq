@@ -186,6 +186,22 @@ DEVICE inline T *shared_array(unsigned int n_elements, void *&ptr,
 
 static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
 
+template <typename T>
+__device__ __forceinline__ T fma_acc(T a, T b, T c) {
+    // default: fallback (for e.g. half/bfloat16 you might want custom)
+    return a * b + c;
+}
+
+template <>
+__device__ __forceinline__ float fma_acc<float>(float a, float b, float c) {
+    return fmaf(a, b, c);
+}
+
+template <>
+__device__ __forceinline__ double fma_acc<double>(double a, double b, double c) {
+    return fma(a, b, c);
+}
+
 /*
 // forward declare multiple types...
 template float *shared_array<float>(unsigned int n_elements, void *&ptr,

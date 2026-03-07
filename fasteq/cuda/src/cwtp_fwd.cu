@@ -1744,20 +1744,25 @@ __global__ void cwtp_u1d_groupout(
         int k = k_list[t];
         scalar_t c = coeff_list[t];
 
-        // y[b,k,0] 对该 path 的所有 u 都是同一个标量：每个 warp 用 lane0 读一次，然后 warp 内广播
+        int64_t w_off = (((int64_t)b * Iw + i) * U) + u;
+        int64_t x_off = (((int64_t)b * Ix + j) * U) + u;
+        int64_t y_off = (int64_t)b * Ky + k;
+
         scalar_t yval;
         if (lane == 0) {
-            yval = y[(b * Ky + k) * 1 + 0];
+            yval = y[y_off];
         }
         yval = __shfl_sync(0xffffffff, yval, 0);
 
-        scalar_t wval = w[((b * Iw + i) * U) + u];
-        scalar_t xval = x[((b * Ix + j) * U) + u];
+        scalar_t wval = w[w_off];
+        scalar_t xval = x[x_off];
 
         acc += c * wval * xval * yval;
     }
 
-    out[((b * V + v) * U) + u] += acc;
+    int64_t o_off = ((int64_t)(b * V + v) * U) + u;
+
+    out[o_off] += acc;
 }
 
 torch::Tensor tp_channel_wise_u1d_fwd_launch(
