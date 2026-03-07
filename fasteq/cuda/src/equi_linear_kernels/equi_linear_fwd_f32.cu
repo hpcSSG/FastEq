@@ -332,7 +332,10 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
     uint32_t coord_n1 = b_in_i_id * 1;
     uint32_t coord_n2 = b_mtile_id * TILE_M;
     // prefetch
-    asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, 0, coord_n1, coord_n2);
+    if (in_wg_tid == 0)
+    {
+        asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, 0, coord_n1, coord_n2);
+    }
     // loop
     uint32_t k_count;
     for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
