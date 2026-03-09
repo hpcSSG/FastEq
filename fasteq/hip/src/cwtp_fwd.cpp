@@ -62,9 +62,9 @@ __global__ void fwd_mace_small_kernel(
     double* __restrict__ b_buf,       // [B,4,U]
     int B, int U, int KS, int P)
 {
-    const int lane  = threadIdx.x & 31;    // 单 warp
-    const int slots = U / 4;               // 96/4=24
-    if (lane >= slots) return;             // 其余 8 lane 直接退出
+    const int lane  = threadIdx.x & 31;
+    const int slots = U / 4;
+    if (lane >= slots) return;
 
     for (int b = grid_b0(); b < B; b += grid_bstride()) {
 
@@ -78,10 +78,8 @@ __global__ void fwd_mace_small_kernel(
         const size_t off_bu  = size_t(b) * U + off_u;
         const size_t off_bk0 = size_t(b) * KS * U;
 
-        // 读取 x4，一次即可
         const double4 x4 = *reinterpret_cast<const double4*>(&x[off_bu]);
 
-        // 预读四条 w_p4，计算 base_p4 = x4 * w_p4，并写入 b_buf
         const size_t off_w0 = (size_t(b)*P + 0) * U + off_u;
         const size_t off_w1 = (size_t(b)*P + 1) * U + off_u;
         const size_t off_w2 = (size_t(b)*P + 2) * U + off_u;
@@ -213,16 +211,15 @@ __global__ void tp_channel_wise_kernel(
     int V,
     int num_paths
 ) {
-    int z = blockIdx.x;  // 一个 block 处理一个 batch 元素
+    int z = blockIdx.x;
     if (z >= Z) return;
 
-    int tu = threadIdx.x;  // 映射到 u 维
+    int tu = threadIdx.x;
 
     extern __shared__ unsigned char smem_raw[];
     scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
     scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
 
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
     const scalar_t* x_iu_z = x_iu + z * IU_TOTAL;
     const scalar_t* x_jv_z = x_jv + z * JV_TOTAL;
 
@@ -251,10 +248,10 @@ __global__ void tp_channel_wise_kernel(
 
         int c_offset = c_offsets[p];
 
-        int uv_base = uv_idx * (U * V);          // 每个 uv seg 长度 U*V
-        int iu_base = iu_seg_offsets[iu_idx];    // x_iu row 内的 offset
-        int jv_base = jv_seg_offsets[jv_idx];    // x_jv row 内的 offset
-        int k_base  = kv_k_offsets[kv_idx];      // K 维起始 index
+        int uv_base = uv_idx * (U * V);
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
 
         const scalar_t* c_path = c_all + c_offset;   // [i_dim * j_dim * k_dim]
 
@@ -349,7 +346,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     const scalar_t* x_iu_z = x_iu + z * IU_TOTAL;
     const scalar_t* x_jv_z = x_jv + z * JV_TOTAL;
 
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
     int threads_in_block = blockDim.x;
     for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
         s_iu[idx] = x_iu_z[idx];
@@ -362,7 +358,6 @@ __global__ void tp_channel_wise_sparse_kernel(
     const scalar_t* x_uv_z = x_uv + z * UV_TOTAL;
     scalar_t* out_z = out + z * (K_TOTAL * U * V);
 
-    // 2. 遍历所有 path
     for (int p = 0; p < num_paths; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
@@ -380,12 +375,11 @@ __global__ void tp_channel_wise_sparse_kernel(
             return;
         }
 
-        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
-        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
-        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
-        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+        int uv_base = uv_idx * (U * V);
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
 
-        // 对每个 v:
         for (int v_idx = 0; v_idx < V; ++v_idx) {
             // x_uv[z, uv_seg][u, v]
             scalar_t xuv_uv = x_uv_z[uv_base + u * V + v_idx];
@@ -501,7 +495,6 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
     const scalar_t* x_uv_z = x_uv + (size_t)z * UV_TOTAL;
     scalar_t* out_z = out + (size_t)z * (K_TOTAL * U * V);
 
-    // 2. 遍历所有 path
     for (int p = 0; p < num_paths; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
@@ -519,10 +512,10 @@ __global__ void tp_channel_wise_sparse_groupk_kernel(
             return;
         }
 
-        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
-        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
-        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
-        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+        int uv_base = uv_idx * (U * V);
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
 
         // In Mace-OFF, V=1
         for (int v_idx = 0; v_idx < V; ++v_idx) {

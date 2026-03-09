@@ -11,8 +11,8 @@
 
 #define CWTP_DEFINE_CONSTANTS
 #include "cwtp_helper.cuh"
-#include "codegen/eval_pid_generated.cuh"
-#include "codegen/pid_table_generated.cuh"
+#include "cwtp_codegen/eval_pid_generated.cuh"
+#include "cwtp_codegen/pid_table_generated.cuh"
 
 // opt1: CG sparse + path 内groupk, 由于MACE 中 V=1， 所以暂时不放到 shared memory 里
 /*

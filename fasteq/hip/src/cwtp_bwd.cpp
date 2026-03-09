@@ -50,22 +50,21 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     int V,
     int num_paths
 ) {
-    int z = blockIdx.x;   // 一个 block 一个 batch
+    int z = blockIdx.x;
     if (z >= Z) return;
 
-    int u = threadIdx.x;  // 每个 thread 一个 u
+    int u = threadIdx.x;
     if (u >= U) return;
 
     extern __shared__ unsigned char smem_raw[];
-    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);          // [IU_TOTAL]
-    scalar_t* s_jv = s_iu + IU_TOTAL;                                // [JV_TOTAL]
+    scalar_t* s_iu = reinterpret_cast<scalar_t*>(smem_raw);
+    scalar_t* s_jv = s_iu + IU_TOTAL;
 
     const scalar_t* x_iu_z = x_iu + (size_t)z * IU_TOTAL;
     const scalar_t* x_jv_z = x_jv + (size_t)z * JV_TOTAL;
 
     int threads_in_block = blockDim.x;
 
-    // 1. 把 x_iu[z,:], x_jv[z,:] 搬到 shared
     for (int idx = u; idx < IU_TOTAL; idx += threads_in_block) {
         s_iu[idx] = x_iu_z[idx];
     }
@@ -81,9 +80,8 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
     scalar_t* grad_x_iu_z = grad_x_iu + (size_t)z * IU_TOTAL;
     scalar_t* grad_x_jv_z = grad_x_jv + (size_t)z * JV_TOTAL;
 
-    // 2. 遍历所有 path
-    int start = 8;
-    int end = 17;
+    int start = 0;
+    int end = num_paths;
     for (int p = start; p < end; ++p) {
         int uv_idx = path_indices[p * 4 + 0];
         int iu_idx = path_indices[p * 4 + 1];
@@ -101,10 +99,10 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
             return;
         }
 
-        int uv_base = uv_idx * (U * V);         // 该 uv seg 在 x_uv[z,:] 中的起点
-        int iu_base = iu_seg_offsets[iu_idx];   // 该 iu seg 在 x_iu[z,:] 中的起点
-        int jv_base = jv_seg_offsets[jv_idx];   // 该 jv seg 在 x_jv[z,:] 中的起点
-        int k_base  = kv_k_offsets[kv_idx];     // 该 kv seg 在 K 维的起点
+        int uv_base = uv_idx * (U * V);
+        int iu_base = iu_seg_offsets[iu_idx];
+        int jv_base = jv_seg_offsets[jv_idx];
+        int k_base  = kv_k_offsets[kv_idx];
 
         for (int v_idx = 0; v_idx < V; ++v_idx) {
             int xuv_index = uv_base + u * V + v_idx;
@@ -133,7 +131,7 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
                 // 遍历这个 k 的所有 nnz
                 for (int tt = 0; tt < local_count; ++tt) {
                     int t   = local_off + tt;
-                    int idx = nnz_off + t; // global nnz index
+                    int idx = nnz_off + t;
 
                     int i = static_cast<int>(cg_i_all[idx]);
                     int j = static_cast<int>(cg_j_all[idx]);
@@ -153,14 +151,12 @@ __global__ void tp_channel_wise_sparse_groupk_warpreduce_bwd_kernel(
 
                     // --- dL/d x_jv[j,v] += g * c * x_iu * x_uv ---
                     scalar_t d_xjv = g * c * xiu_iu * xuv_uv;
-                    // warp 内归约：同一个 (p,k_local,v_idx,tt) 的 xjv_index 对所有 u 都相同
-                    unsigned mask = __ballot(1);                 // 当前 warp 活跃线程掩码
+                    unsigned mask = __ballot(1);
                     scalar_t warp_sum = warp_reduce_sum(d_xjv, mask);
                     if ((threadIdx.x & 31) == 0) {                  // lane0
                         atomicAdd(&grad_x_jv_z[xjv_index], warp_sum);
                     }
 
-                    // --- 对 x_uv 的贡献项累加 ---
                     sum_all_ij += c * xiu_iu * xjv_jv;
                 }
 
@@ -804,12 +800,10 @@ __global__ void tp_bwd_fused_kernel_sharedc(
   __syncthreads();
 
   
-  // 4) reduce smem_j over u for each jj (works for any blockDim.x <= 256)
   __shared__ T warp_sum_sh[8][JJ + PAD];
 
   const int num_warps = (blockDim.x + 31) >> 5;
 
-  // 每个 warp 对每个 jj 做一次 warp-reduce，把 lane0 的和写到 shared
   #pragma unroll
   for (int jj = 0; jj < JJ; ++jj) {
     T v = (T)0;
@@ -821,13 +815,11 @@ __global__ void tp_bwd_fused_kernel_sharedc(
       v += __shfl_down(mask, v, off);
     }
     if (lane == 0) {
-      // 注意：warp 可能 >= num_warps 吗？不会，因为 warp = tid>>5，tid<blockDim
       warp_sum_sh[warp][jj] = v;
     }
   }
   __syncthreads();
 
-  // warp0 汇总所有 warp 的结果：只读取 [0, num_warps)
   if (warp == 0) {
   #pragma unroll
     for (int jj = 0; jj < JJ; ++jj) {

@@ -10,7 +10,7 @@ from sevenn.calculator import SevenNetCalculator
 
 cutoff = 4.0
 
-_atoms = bulk("NaCl", "rocksalt", a=4.00) * (2, 2, 2)
+_atoms = bulk("NaCl", "rocksalt", a=4.00) * (8, 8, 8)
 _atoms.rattle()
 
 
@@ -111,7 +111,7 @@ def main():
     print("sevenn =", sevenn.__version__)
 
     # 你给的 checkpoint
-    path = "../models/checkpoint_sevennet_omni.pth"
+    path = "/home/malixian/repos/SevenNet/models/checkpoint_sevennet_omni.pth"
     modal = "mpa"
 
     torch.set_grad_enabled(True)

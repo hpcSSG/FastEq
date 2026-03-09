@@ -26,7 +26,7 @@ The operators implemented in FastEq include:
 3. Install the Python dependencies and the package itself
    ```bash
    pip install -r requirements.txt
-   TORCH_CUDA_ARCH_LIST="9.0;9.0a" pip install . --no-build-isolation
+   TORCH_CUDA_ARCH_LIST="9.0a" pip install . --no-build-isolation
    pip install -e . --no-build-isolation 
    ```
    We recommend using Virtualenv or Conda to manage the dependencies.

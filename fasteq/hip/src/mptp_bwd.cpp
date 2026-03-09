@@ -78,7 +78,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     return;
   }
 
-  // wave/warp bookkeeping (HIP: warpSize=64 by default on AMD)
   const int lane = tid & (warpSize - 1);
   const int warp = tid / warpSize;
   const int num_warps = ((int)blockDim.x + warpSize - 1) / warpSize;
@@ -87,8 +86,7 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
   // here we size for wave64=16. If you enable wave32, bump this to 32.
   constexpr int MAX_WARPS_PER_BLOCK = 16;
 
-  // If you might compile with wave32 on AMD, change MAX_WARPS_PER_BLOCK to 32.
-  // Safety guard:
+
   if (warp >= MAX_WARPS_PER_BLOCK) return;
 
   __shared__ scalar_t warp_sum_sh[MAX_WARPS_PER_BLOCK][JV_MAX];
@@ -186,8 +184,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
       }
     }
 
-    // -------- reduce jtmp over u threads and write grad_x_jv_e[e, :] --------
-    // (1) wave reduce inside each warp
     for (int jj = 0; jj < JV_TOTAL; ++jj) {
       scalar_t v = (jj < JV_MAX) ? jtmp[jj] : (scalar_t)0;
       v = wave_reduce_sum(v);
@@ -197,7 +193,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
     }
     __syncthreads();
 
-    // (2) warp0 reduces across warps (note: wave64 lane0..63, but num_warps<=16)
     if (warp == 0) {
       for (int jj = 0; jj < JV_TOTAL; ++jj) {
         scalar_t v = (lane < num_warps) ? warp_sum_sh[lane][jj] : (scalar_t)0;
@@ -217,7 +212,6 @@ __global__ void tp_channel_wise_sparse_groupk_fused_scatter_sender_major_bwd_ker
   }
 }
 
-// -------------------- launch (PyTorch extension) --------------------
 std::vector<torch::Tensor> tp_groupk_fused_sender_scatter_bwd_launch(
     torch::Tensor grad_out_nodes,   // [N, K_TOTAL*U*V]
     torch::Tensor x_uv,             // [E, UV_TOTAL]

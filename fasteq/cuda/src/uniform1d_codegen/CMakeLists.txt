@@ -3,9 +3,14 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 #set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 
 add_library(uniform1d_codegen_obj OBJECT
-    uniform1d_codegen_path777.cu
-    uniform1d_codegen_path1490.cu
-    uniform1d_codegen_path1554.cu
+    uniform1d_codegen_path777_u32_fwd.cu
+    uniform1d_codegen_path777_u32_bwd.cu
+    uniform1d_codegen_path1490_u32_fwd.cu
+    uniform1d_codegen_path1490_u32_bwd.cu
+    uniform1d_codegen_path1554_u32_fwd.cu
+    uniform1d_codegen_path1554_u32_bwd.cu
+    uniform1d_codegen_path215_u224_fwd.cu
+    uniform1d_codegen_path215_u224_bwd.cu
     uniform1d_launcher.cu
 )
 
