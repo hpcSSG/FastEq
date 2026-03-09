@@ -59,7 +59,7 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
                                        const std::vector<int64_t> &out_i_dims_vec, // i dims
                                        double val)
 {
-    TORCH_CHECK(grad.dtype() == torch::kFloat32 || x.dtype() == torch::kFloat64, "grad must be float32 or float64");
+    TORCH_CHECK(grad.dtype() == torch::kFloat32 || grad.dtype() == torch::kFloat64, "grad must be float32 or float64");
     TORCH_CHECK(grad.dim() == 3, "grad must be of 3 dimention");
     TORCH_CHECK(w.dtype() == grad.dtype(), "W must be the same type of grad");
     TORCH_CHECK(w.dim() == 3, "W must be of 3 dimention");
@@ -92,9 +92,9 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
         // Not implimented, fall back to fwd
         torch::Tensor wt = w.transpose(1, 2).contiguous();
         void *wt_ptr = wt.data_ptr();
-        mutipath_equi_linear_fwd_f64_impl(num_paths, static_cast<double *>(out_ptr), static_cast<double *>(grad_ptr),
-                                          static_cast<double *>(wt_ptr), B, out_total_i, out_i_dims_vec, V, U, val,
-                                          cur_stream);
+        mutipath_equi_linear_fwd_f64_impl(out_num_paths, static_cast<double *>(out_ptr),
+                                          static_cast<double *>(grad_ptr), static_cast<double *>(wt_ptr), B,
+                                          out_total_i, out_i_dims_vec, V, U, val, cur_stream);
     }
 
     return out;
