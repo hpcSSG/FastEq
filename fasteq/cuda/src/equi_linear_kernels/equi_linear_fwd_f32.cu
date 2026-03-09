@@ -15,19 +15,7 @@
 using barrier = cuda::barrier<cuda::thread_scope_block>;
 namespace cde = cuda::device::experimental;
 
-template <uint32_t _N> struct idim_T
-{
-    uint32_t _i[_N];
-};
-
-struct param_maps_T
-{
-    CUtensorMap _x_map;
-    CUtensorMap _w_map;
-};
-
 /* ===================== Device Helper Functions ===================== */
-
 __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
     float *out_smem_ptr,            // out buffer ptr to store output 32*32 data
     float *tmp_smem_ptr,            // tmp buffer ptr containning input 16x32 data
@@ -332,7 +320,10 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
     uint32_t coord_n1 = b_in_i_id * 1;
     uint32_t coord_n2 = b_mtile_id * TILE_M;
     // prefetch
-    asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, 0, coord_n1, coord_n2);
+    if (in_wg_tid == 0)
+    {
+        asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, 0, coord_n1, coord_n2);
+    }
     // loop
     uint32_t k_count;
     for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
@@ -529,7 +520,6 @@ __device__ void store_re_async_consumer(
 
 /* ============================================================= */
 /* =================== Main Kernel Functions =================== */
-
 template <uint32_t IN_NUM_PATHS,        // in path数量
           uint32_t OUT_NUM_PATHS,       // out path数量
           uint32_t TILE_M,              // tile m大小
@@ -538,19 +528,19 @@ template <uint32_t IN_NUM_PATHS,        // in path数量
           uint32_t PRODUCER_WG_NUM = 1, // producer warpgroup数量
           uint32_t CONSUMER_WG_NUM = 2  // consumer warpgroup数量
           >
-__global__ void mutipath_equi_linear_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
-                                                     const __grid_constant__ CUtensorMap w_map,   // w tensor maps
-                                                     const __grid_constant__ CUtensorMap out_map, // out tensor maps
-                                                     idim_T<IN_NUM_PATHS> in_prefex_i_sum,        // [IN_NUM_PATHS]
-                                                     idim_T<OUT_NUM_PATHS> out_prefex_i_sum,      // [OUT_NUM_PATHS]
-                                                     idim_T<OUT_NUM_PATHS> out_path_count,        // [OUT_NUM_PATHS]
-                                                     idim_T<OUT_NUM_PATHS> out_path_in_istart,    // [OUT_NUM_PATHS]
-                                                     uint32_t B,                                  // batch size
-                                                     uint32_t U,                                  // U
-                                                     uint32_t V,                                  // V
-                                                     uint32_t in_total_i,                         // input i的总数
-                                                     uint32_t out_total_i,                        // output i的总数
-                                                     float cg_val                                 // val
+__global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
+                                                         const __grid_constant__ CUtensorMap w_map,   // w tensor maps
+                                                         const __grid_constant__ CUtensorMap out_map, // out tensor maps
+                                                         idim_T<IN_NUM_PATHS> in_prefex_i_sum,        // [IN_NUM_PATHS]
+                                                         idim_T<OUT_NUM_PATHS> out_prefex_i_sum,      // [OUT_NUM_PATHS]
+                                                         idim_T<OUT_NUM_PATHS> out_path_count,        // [OUT_NUM_PATHS]
+                                                         idim_T<OUT_NUM_PATHS> out_path_in_istart,    // [OUT_NUM_PATHS]
+                                                         uint32_t B,                                  // batch size
+                                                         uint32_t U,                                  // U
+                                                         uint32_t V,                                  // V
+                                                         uint32_t in_total_i,                         // input i的总数
+                                                         uint32_t out_total_i,                        // output i的总数
+                                                         float cg_val                                 // val
 )
 {
     /* tensor shape:
@@ -712,98 +702,19 @@ __global__ void mutipath_equi_linear_f32_tf32_kernel(const __grid_constant__ CUt
     }
 }
 
-PFN_cuTensorMapEncodeTiled_v12000 get_cuTensorMapEncodeTiled()
-{
-    // Get pointer to cuTensorMapEncodeTiled
-    static void *cuTensorMapEncodeTiled_ptr = nullptr;
-    if (cuTensorMapEncodeTiled_ptr == nullptr)
-    {
-        cudaDriverEntryPointQueryResult driver_status;
-        cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &cuTensorMapEncodeTiled_ptr, 12000,
-                                         cudaEnableDefault, &driver_status);
-        assert(driver_status == cudaDriverEntryPointSuccess);
-    }
-    return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(cuTensorMapEncodeTiled_ptr);
-}
-
-// reates a tensor map to describe a two-dimensional row-major array of size B x M x N
-//      https://docs.nvidia.com/cuda/cuda-c-programming-guide/#using-tma-to-transfer-multi-dimensional-arrays
-void init_3d_tensormap(
-    CUtensorMap *tensor_map_ptr,                                                      // Host empty tensor map
-    void *tensor_ptr,                                                                 // global addr
-    const uint32_t &B,                                                                // B
-    const uint32_t &M,                                                                // M
-    const uint32_t &N,                                                                // N
-    const uint32_t &stride_B,                                                         // stride_B (elems)
-    const uint32_t &stride_M,                                                         // stride_M (elems)
-    const uint32_t &box_B,                                                            // B of shared memory buffer
-    const uint32_t &box_M,                                                            // M of shared memory buffer
-    const uint32_t &box_N,                                                            // N of shared memory buffer
-    CUtensorMapSwizzle swizzle_mode = CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_NONE, // swizzle_mode
-    CUtensorMapL2promotion l2_promotion = CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE, // l2 promotion type
-    CUtensorMapFloatOOBfill oob_fill =
-        CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE // out-of-bounds fill type
-)
-{
-    // rank is the number of dimensions of the array.
-    constexpr uint32_t rank = 3;
-    uint64_t size[rank] = {static_cast<uint64_t>(N), static_cast<uint64_t>(M), static_cast<uint64_t>(B)};
-    // The stride is the number of bytes to traverse from the first element of one row to the next.
-    // It must be a multiple of 16.
-    uint64_t stride[rank - 1] = {static_cast<uint64_t>(stride_M) * sizeof(float),
-                                 static_cast<uint64_t>(stride_B) * sizeof(float)};
-    // The box_size is the size of the shared memory buffer that is used as the
-    // destination of a TMA transfer.
-    uint32_t box_size[rank] = {box_N, box_M, box_B};
-    // The distance between elements in units of sizeof(element). A stride of 2
-    // can be used to load only the real component of a complex-valued tensor, for instance.
-    static const uint32_t elem_stride[3] = {1, 1, 1};
-    // Create the tensor descriptor.
-    auto cuTensorMapEncodeTiled = get_cuTensorMapEncodeTiled();
-    CUresult res =
-        cuTensorMapEncodeTiled(tensor_map_ptr, // CUtensorMap *tensorMap,
-                               CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
-                               rank,        // cuuint32_t tensorRank,
-                               tensor_ptr,  // void *globalAddress,
-                               size,        // const cuuint64_t *globalDim,
-                               stride,      // const cuuint64_t *globalStrides,
-                               box_size,    // const cuuint32_t *boxDim,
-                               elem_stride, // const cuuint32_t *elementStrides,
-                               // Interleave patterns can be used to accelerate loading of values that
-                               // are less than 4 bytes long.
-                               CUtensorMapInterleave::CU_TENSOR_MAP_INTERLEAVE_NONE,
-                               // Swizzling can be used to avoid shared memory bank conflicts.
-                               swizzle_mode,
-                               // L2 Promotion can be used to widen the effect of a cache-policy to a wider
-                               // set of L2 cache lines.
-                               l2_promotion,
-                               // Any element that is outside of bounds will be set to zero by the TMA transfer.
-                               oob_fill);
-}
-
-template <uint32_t N> void cal_prefex_sum(idim_T<N> &dst, const std::vector<int64_t> &src)
-{
-    dst._i[0] = 0;
-#pragma unroll
-    for (uint32_t i = 1; i < N; ++i)
-    {
-        dst._i[i] = dst._i[i - 1] + (uint32_t)src[i - 1];
-    }
-}
-
 template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
-void mutipath_equi_linear_kernel_impl(float *out,                                 // [B, out_total_i, V]
-                                      float *x,                                   // [B, in_total_i, U]
-                                      float *w,                                   // [IN_NUM_PATHS, U, V]
-                                      const std::vector<int64_t> &in_i_dims_vec,  // in i dims
-                                      const std::vector<int64_t> &out_i_dims_vec, // out i dims
-                                      const uint32_t &B,                          // batch
-                                      const uint32_t &in_total_i,                 // in_total_i
-                                      const uint32_t &out_total_i,                // out_total_i
-                                      const uint32_t &U,                          // U
-                                      const uint32_t &V,                          // V
-                                      const double &val,                          // cg_val
-                                      const cudaStream_t &cur_stream              // current stream
+void mutipath_equi_linear_fwd_f32(float *out,                                 // [B, out_total_i, V]
+                                  float *x,                                   // [B, in_total_i, U]
+                                  float *w,                                   // [IN_NUM_PATHS, U, V]
+                                  const std::vector<int64_t> &in_i_dims_vec,  // in i dims
+                                  const std::vector<int64_t> &out_i_dims_vec, // out i dims
+                                  const uint32_t &B,                          // batch
+                                  const uint32_t &in_total_i,                 // in_total_i
+                                  const uint32_t &out_total_i,                // out_total_i
+                                  const uint32_t &U,                          // U
+                                  const uint32_t &V,                          // V
+                                  const double &val,                          // cg_val
+                                  const cudaStream_t &cur_stream              // current stream
 )
 {
     constexpr uint32_t PRODUCER_WG_NUM = 1; // producer warpgroup数量
@@ -896,8 +807,8 @@ void mutipath_equi_linear_kernel_impl(float *out,                               
                                         + (TILE_M * TILE_N)        // Out_smem
                                        );
 
-    auto cuda_kernel = mutipath_equi_linear_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
-                                                            PRODUCER_WG_NUM, CONSUMER_WG_NUM>;
+    auto cuda_kernel = mutipath_equi_linear_fwd_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
+                                                                PRODUCER_WG_NUM, CONSUMER_WG_NUM>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x_map, w_map, out_map, in_prefex_i_sum, out_prefex_i_sum,
                                                         out_path_count, out_path_in_istart, B, U, V, in_total_i,
@@ -905,17 +816,17 @@ void mutipath_equi_linear_kernel_impl(float *out,                               
 }
 
 // wrapper
-void mutipath_equi_linear_f32_impl(const uint32_t &IN_NUM_PATHS,           // path nums
-                                   float *out,                             // [B, out_total_i, V]
-                                   float *x,                               // [B, in_total_i, U]
-                                   float *w,                               // [IN_NUM_PATHS, U, V]
-                                   const uint32_t &B,                      // batch
-                                   const uint32_t &total_i,                // in_total_i
-                                   const std::vector<int64_t> &i_dims_vec, // i dims
-                                   const uint32_t &U,                      // U
-                                   const uint32_t &V,                      // V
-                                   const double &val,                      // cg_val
-                                   const cudaStream_t &cur_stream          // current stream
+void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           // path nums
+                                       float *out,                             // [B, out_total_i, V]
+                                       float *x,                               // [B, in_total_i, U]
+                                       float *w,                               // [IN_NUM_PATHS, U, V]
+                                       const uint32_t &B,                      // batch
+                                       const uint32_t &total_i,                // in_total_i
+                                       const std::vector<int64_t> &i_dims_vec, // i dims
+                                       const uint32_t &U,                      // U
+                                       const uint32_t &V,                      // V
+                                       const double &val,                      // cg_val
+                                       const cudaStream_t &cur_stream          // current stream
 )
 {
     const std::vector<int64_t> out_i_dims_vec = {1, 3, 5, 7};
@@ -924,13 +835,13 @@ void mutipath_equi_linear_f32_impl(const uint32_t &IN_NUM_PATHS,           // pa
         switch (IN_NUM_PATHS)
         {
         case 4: // small
-            mutipath_equi_linear_kernel_impl<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            mutipath_equi_linear_fwd_f32<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 10: // medium
-            mutipath_equi_linear_kernel_impl<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            mutipath_equi_linear_fwd_f32<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 17: // large
-            mutipath_equi_linear_kernel_impl<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            mutipath_equi_linear_fwd_f32<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         default:
             throw std::invalid_argument("Unsupported number of paths: " + std::to_string(IN_NUM_PATHS) +

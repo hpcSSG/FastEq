@@ -65,20 +65,20 @@ target_compile_options(fasteq_deps INTERFACE
 include_directories(src)
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(CUDA_SRCS
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
 
 add_subdirectory(src/equi_linear_kernels)
