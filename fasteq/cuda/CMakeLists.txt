@@ -78,8 +78,8 @@ set(CUDA_SRCS
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_cg.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_fwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
-  #"${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
 
 add_subdirectory(src/equi_linear_kernels)
