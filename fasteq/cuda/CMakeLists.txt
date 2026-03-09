@@ -76,6 +76,7 @@ set(CUDA_SRCS
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fwd.cu"
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_bwd.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_cg.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_fwd.cu"
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_fused_bwd.cu"
   #"${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
@@ -83,6 +84,7 @@ set(CUDA_SRCS
 
 add_subdirectory(src/equi_linear_kernels)
 add_subdirectory(src/atombit)
+add_subdirectory(src/uniform1d_codegen)
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
 foreach(_f IN LISTS CUDA_SRCS)
@@ -94,6 +96,7 @@ endforeach()
 add_library(_cuda MODULE
   ${CUDA_SRCS}
   $<TARGET_OBJECTS:equi_kernels_obj>
+  $<TARGET_OBJECTS:uniform1d_codegen_obj>
   $<TARGET_OBJECTS:atombit_obj>
 )
 
@@ -110,7 +113,8 @@ target_include_directories(_cuda PRIVATE
   ${Python3_INCLUDE_DIRS}
   ${TORCH_INCLUDE_DIRS}
   ${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear_kernels
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/atombit_obj
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/uniform1d_codegen
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/atombit
 )
 
 target_compile_options(_cuda PRIVATE

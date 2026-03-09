@@ -102,8 +102,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         packed = pack_paths32(i_list, j_list, k_list, coeff_list)
         
-        if torch.max(v_list) == 242:
-            generate_code(i_list, j_list, k_list, v_list, coeff_list)
+        #generate_code(i_list, j_list, k_list, v_list, coeff_list)
 
         '''
         for idx in range(0, len(i_list)):
@@ -117,14 +116,17 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         print(f"max i:{torch.max(i_list)}, max j:{torch.max(j_list)}, max k:{torch.max(k_list)}, max v:{torch.max(v_list)}")
         print(f"w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
+        P = i_list.numel()
+        print(f"Path num P={P}")
+
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
         if u_dim == 32:
 
-            if torch.max(v_list) == 242:
+            if P > 100:
                 print(f"===== call uniform1d code gen ======")
-                out = torch.ops.u1d_cg.forward(
+                out = torch.ops.uniform1d_codegen.forward(
                     w, x, y, 
                     src_idx, dst_idx, b_list, cls_offsets,
                     i_list, j_list, k_list, v_list, coeff_list, packed,
