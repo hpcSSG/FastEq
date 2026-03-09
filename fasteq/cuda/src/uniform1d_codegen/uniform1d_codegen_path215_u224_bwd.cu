@@ -1,6 +1,5 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
-
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
@@ -15,53 +14,55 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
     const int32_t* __restrict__ src_idx,
     const int32_t* __restrict__ dst_idx,
     const int32_t* __restrict__ b_list,
-    int B, int Iw, int Ix, int Ky, int V)
+    int B, int Iw, int Ix, int Ky, int V, int U)
 {
     int b_global = (int)blockIdx.x;
+    int ublk     = (int)blockIdx.y;
     if (b_global >= B) return;
-    int b = b_list ? b_list[b_global] : b_global;
 
+    int b = b_list ? b_list[b_global] : b_global;
     int tid  = threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
     if (warp >= 2) return;
 
+    int u = (ublk << 5) + lane;
+    if (u >= U) return;
+
     int src = src_idx[b];
     int dst = dst_idx[b];
 
-    int64_t w_base  = (int64_t)b   * Iw * 32;
-    int64_t x_base  = (int64_t)src * Ix * 32;
-    int64_t y_base  = (int64_t)b   * Ky;
-    int64_t go_base = ((int64_t)dst * V) * 32 + lane;
+    // flattened row-major offsets with true U stride
+    int64_t y_base = (int64_t)b * Ky;
 
     if (warp == 0) {
-        // preload w(i)
-        scalar_t wi_7 = w[w_base + 7LL * 32 + lane];
-        scalar_t wi_16 = w[w_base + 16LL * 32 + lane];
-        scalar_t wi_12 = w[w_base + 12LL * 32 + lane];
-        scalar_t wi_15 = w[w_base + 15LL * 32 + lane];
-        scalar_t wi_6 = w[w_base + 6LL * 32 + lane];
-        scalar_t wi_11 = w[w_base + 11LL * 32 + lane];
-        scalar_t wi_10 = w[w_base + 10LL * 32 + lane];
-        scalar_t wi_1 = w[w_base + 1LL * 32 + lane];
-        scalar_t wi_5 = w[w_base + 5LL * 32 + lane];
-        scalar_t wi_14 = w[w_base + 14LL * 32 + lane];
-        scalar_t wi_9 = w[w_base + 9LL * 32 + lane];
-        scalar_t wi_4 = w[w_base + 4LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
-        scalar_t wi_8 = w[w_base + 8LL * 32 + lane];
-        scalar_t wi_13 = w[w_base + 13LL * 32 + lane];
+        // preload w(i, u)
+        scalar_t wi_7 = w[((int64_t)b * Iw + 7) * (int64_t)U + u];
+        scalar_t wi_16 = w[((int64_t)b * Iw + 16) * (int64_t)U + u];
+        scalar_t wi_12 = w[((int64_t)b * Iw + 12) * (int64_t)U + u];
+        scalar_t wi_15 = w[((int64_t)b * Iw + 15) * (int64_t)U + u];
+        scalar_t wi_6 = w[((int64_t)b * Iw + 6) * (int64_t)U + u];
+        scalar_t wi_11 = w[((int64_t)b * Iw + 11) * (int64_t)U + u];
+        scalar_t wi_10 = w[((int64_t)b * Iw + 10) * (int64_t)U + u];
+        scalar_t wi_1 = w[((int64_t)b * Iw + 1) * (int64_t)U + u];
+        scalar_t wi_5 = w[((int64_t)b * Iw + 5) * (int64_t)U + u];
+        scalar_t wi_14 = w[((int64_t)b * Iw + 14) * (int64_t)U + u];
+        scalar_t wi_9 = w[((int64_t)b * Iw + 9) * (int64_t)U + u];
+        scalar_t wi_4 = w[((int64_t)b * Iw + 4) * (int64_t)U + u];
+        scalar_t wi_3 = w[((int64_t)b * Iw + 3) * (int64_t)U + u];
+        scalar_t wi_8 = w[((int64_t)b * Iw + 8) * (int64_t)U + u];
+        scalar_t wi_13 = w[((int64_t)b * Iw + 13) * (int64_t)U + u];
 
-        // preload x(j)
-        scalar_t xj_4 = x_all[x_base + 4LL * 32 + lane];
-        scalar_t xj_5 = x_all[x_base + 5LL * 32 + lane];
-        scalar_t xj_6 = x_all[x_base + 6LL * 32 + lane];
-        scalar_t xj_7 = x_all[x_base + 7LL * 32 + lane];
-        scalar_t xj_8 = x_all[x_base + 8LL * 32 + lane];
-        scalar_t xj_1 = x_all[x_base + 1LL * 32 + lane];
-        scalar_t xj_2 = x_all[x_base + 2LL * 32 + lane];
-        scalar_t xj_3 = x_all[x_base + 3LL * 32 + lane];
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        // preload x(j, u)
+        scalar_t xj_4 = x_all[((int64_t)src * Ix + 4) * (int64_t)U + u];
+        scalar_t xj_5 = x_all[((int64_t)src * Ix + 5) * (int64_t)U + u];
+        scalar_t xj_6 = x_all[((int64_t)src * Ix + 6) * (int64_t)U + u];
+        scalar_t xj_7 = x_all[((int64_t)src * Ix + 7) * (int64_t)U + u];
+        scalar_t xj_8 = x_all[((int64_t)src * Ix + 8) * (int64_t)U + u];
+        scalar_t xj_1 = x_all[((int64_t)src * Ix + 1) * (int64_t)U + u];
+        scalar_t xj_2 = x_all[((int64_t)src * Ix + 2) * (int64_t)U + u];
+        scalar_t xj_3 = x_all[((int64_t)src * Ix + 3) * (int64_t)U + u];
+        scalar_t xj_0 = x_all[((int64_t)src * Ix + 0) * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_13 = y[y_base + 13];
@@ -81,43 +82,43 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         scalar_t yk_1 = y[y_base + 1];
         scalar_t yk_0 = y[y_base + 0];
 
-        // preload grad_out(v)
-        scalar_t go_v_15 = grad_out[go_base + (15LL << 5)];
-        scalar_t go_v_16 = grad_out[go_base + (16LL << 5)];
-        scalar_t go_v_66 = grad_out[go_base + (66LL << 5)];
-        scalar_t go_v_64 = grad_out[go_base + (64LL << 5)];
-        scalar_t go_v_41 = grad_out[go_base + (41LL << 5)];
-        scalar_t go_v_40 = grad_out[go_base + (40LL << 5)];
-        scalar_t go_v_38 = grad_out[go_base + (38LL << 5)];
-        scalar_t go_v_59 = grad_out[go_base + (59LL << 5)];
-        scalar_t go_v_14 = grad_out[go_base + (14LL << 5)];
-        scalar_t go_v_60 = grad_out[go_base + (60LL << 5)];
-        scalar_t go_v_58 = grad_out[go_base + (58LL << 5)];
-        scalar_t go_v_65 = grad_out[go_base + (65LL << 5)];
-        scalar_t go_v_37 = grad_out[go_base + (37LL << 5)];
-        scalar_t go_v_36 = grad_out[go_base + (36LL << 5)];
-        scalar_t go_v_34 = grad_out[go_base + (34LL << 5)];
-        scalar_t go_v_32 = grad_out[go_base + (32LL << 5)];
-        scalar_t go_v_29 = grad_out[go_base + (29LL << 5)];
-        scalar_t go_v_30 = grad_out[go_base + (30LL << 5)];
-        scalar_t go_v_1 = grad_out[go_base + (1LL << 5)];
-        scalar_t go_v_9 = grad_out[go_base + (9LL << 5)];
-        scalar_t go_v_53 = grad_out[go_base + (53LL << 5)];
-        scalar_t go_v_52 = grad_out[go_base + (52LL << 5)];
-        scalar_t go_v_51 = grad_out[go_base + (51LL << 5)];
-        scalar_t go_v_50 = grad_out[go_base + (50LL << 5)];
-        scalar_t go_v_27 = grad_out[go_base + (27LL << 5)];
-        scalar_t go_v_24 = grad_out[go_base + (24LL << 5)];
-        scalar_t go_v_8 = grad_out[go_base + (8LL << 5)];
-        scalar_t go_v_6 = grad_out[go_base + (6LL << 5)];
-        scalar_t go_v_3 = grad_out[go_base + (3LL << 5)];
-        scalar_t go_v_5 = grad_out[go_base + (5LL << 5)];
-        scalar_t go_v_19 = grad_out[go_base + (19LL << 5)];
-        scalar_t go_v_21 = grad_out[go_base + (21LL << 5)];
-        scalar_t go_v_43 = grad_out[go_base + (43LL << 5)];
-        scalar_t go_v_45 = grad_out[go_base + (45LL << 5)];
-        scalar_t go_v_47 = grad_out[go_base + (47LL << 5)];
-        scalar_t go_v_49 = grad_out[go_base + (49LL << 5)];
+        // preload grad_out(v, u)
+        scalar_t go_v_15 = grad_out[((int64_t)dst * V + 15) * (int64_t)U + u];
+        scalar_t go_v_16 = grad_out[((int64_t)dst * V + 16) * (int64_t)U + u];
+        scalar_t go_v_66 = grad_out[((int64_t)dst * V + 66) * (int64_t)U + u];
+        scalar_t go_v_64 = grad_out[((int64_t)dst * V + 64) * (int64_t)U + u];
+        scalar_t go_v_41 = grad_out[((int64_t)dst * V + 41) * (int64_t)U + u];
+        scalar_t go_v_40 = grad_out[((int64_t)dst * V + 40) * (int64_t)U + u];
+        scalar_t go_v_38 = grad_out[((int64_t)dst * V + 38) * (int64_t)U + u];
+        scalar_t go_v_59 = grad_out[((int64_t)dst * V + 59) * (int64_t)U + u];
+        scalar_t go_v_14 = grad_out[((int64_t)dst * V + 14) * (int64_t)U + u];
+        scalar_t go_v_60 = grad_out[((int64_t)dst * V + 60) * (int64_t)U + u];
+        scalar_t go_v_58 = grad_out[((int64_t)dst * V + 58) * (int64_t)U + u];
+        scalar_t go_v_65 = grad_out[((int64_t)dst * V + 65) * (int64_t)U + u];
+        scalar_t go_v_37 = grad_out[((int64_t)dst * V + 37) * (int64_t)U + u];
+        scalar_t go_v_36 = grad_out[((int64_t)dst * V + 36) * (int64_t)U + u];
+        scalar_t go_v_34 = grad_out[((int64_t)dst * V + 34) * (int64_t)U + u];
+        scalar_t go_v_32 = grad_out[((int64_t)dst * V + 32) * (int64_t)U + u];
+        scalar_t go_v_29 = grad_out[((int64_t)dst * V + 29) * (int64_t)U + u];
+        scalar_t go_v_30 = grad_out[((int64_t)dst * V + 30) * (int64_t)U + u];
+        scalar_t go_v_1 = grad_out[((int64_t)dst * V + 1) * (int64_t)U + u];
+        scalar_t go_v_9 = grad_out[((int64_t)dst * V + 9) * (int64_t)U + u];
+        scalar_t go_v_53 = grad_out[((int64_t)dst * V + 53) * (int64_t)U + u];
+        scalar_t go_v_52 = grad_out[((int64_t)dst * V + 52) * (int64_t)U + u];
+        scalar_t go_v_51 = grad_out[((int64_t)dst * V + 51) * (int64_t)U + u];
+        scalar_t go_v_50 = grad_out[((int64_t)dst * V + 50) * (int64_t)U + u];
+        scalar_t go_v_27 = grad_out[((int64_t)dst * V + 27) * (int64_t)U + u];
+        scalar_t go_v_24 = grad_out[((int64_t)dst * V + 24) * (int64_t)U + u];
+        scalar_t go_v_8 = grad_out[((int64_t)dst * V + 8) * (int64_t)U + u];
+        scalar_t go_v_6 = grad_out[((int64_t)dst * V + 6) * (int64_t)U + u];
+        scalar_t go_v_3 = grad_out[((int64_t)dst * V + 3) * (int64_t)U + u];
+        scalar_t go_v_5 = grad_out[((int64_t)dst * V + 5) * (int64_t)U + u];
+        scalar_t go_v_19 = grad_out[((int64_t)dst * V + 19) * (int64_t)U + u];
+        scalar_t go_v_21 = grad_out[((int64_t)dst * V + 21) * (int64_t)U + u];
+        scalar_t go_v_43 = grad_out[((int64_t)dst * V + 43) * (int64_t)U + u];
+        scalar_t go_v_45 = grad_out[((int64_t)dst * V + 45) * (int64_t)U + u];
+        scalar_t go_v_47 = grad_out[((int64_t)dst * V + 47) * (int64_t)U + u];
+        scalar_t go_v_49 = grad_out[((int64_t)dst * V + 49) * (int64_t)U + u];
 
         // grad_w accumulate by unique i
         scalar_t gw_acc_i_7 = scalar_t(0);
@@ -134,7 +135,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_7 += scalar_t(0.507092553f) * xj_6 * yk_12 * go_v_16;
         gw_acc_i_7 += scalar_t(0.478091444f) * xj_7 * yk_13 * go_v_16;
         gw_acc_i_7 += scalar_t(0.377964473f) * xj_8 * yk_14 * go_v_16;
-        atomicAdd(&grad_w[w_base + 7LL * 32 + lane], gw_acc_i_7);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 7) * (int64_t)U + u], gw_acc_i_7);
 
         scalar_t gw_acc_i_16 = scalar_t(0);
         gw_acc_i_16 += scalar_t(0.447213595f) * xj_4 * yk_13 * go_v_66;
@@ -155,7 +156,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_16 += scalar_t(-0.456435465f) * xj_5 * yk_15 * go_v_65;
         gw_acc_i_16 += scalar_t(0.456435465f) * xj_7 * yk_9 * go_v_65;
         gw_acc_i_16 += scalar_t(0.353553391f) * xj_7 * yk_11 * go_v_65;
-        atomicAdd(&grad_w[w_base + 16LL * 32 + lane], gw_acc_i_16);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 16) * (int64_t)U + u], gw_acc_i_16);
 
         scalar_t gw_acc_i_12 = scalar_t(0);
         gw_acc_i_12 += scalar_t(0.46291005f) * xj_4 * yk_5 * go_v_41;
@@ -173,7 +174,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_12 += scalar_t(0.46291005f) * xj_5 * yk_7 * go_v_38;
         gw_acc_i_12 += scalar_t(-0.534522484f) * xj_6 * yk_4 * go_v_38;
         gw_acc_i_12 += scalar_t(0.46291005f) * xj_7 * yk_5 * go_v_38;
-        atomicAdd(&grad_w[w_base + 12LL * 32 + lane], gw_acc_i_12);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 12) * (int64_t)U + u], gw_acc_i_12);
 
         scalar_t gw_acc_i_15 = scalar_t(0);
         gw_acc_i_15 += scalar_t(-0.182574186f) * xj_4 * yk_3 * go_v_59;
@@ -186,20 +187,20 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_15 += scalar_t(0.577350269f) * xj_4 * yk_2 * go_v_58;
         gw_acc_i_15 += scalar_t(0.577350269f) * xj_5 * yk_3 * go_v_58;
         gw_acc_i_15 += scalar_t(0.577350269f) * xj_7 * yk_1 * go_v_58;
-        atomicAdd(&grad_w[w_base + 15LL * 32 + lane], gw_acc_i_15);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 15) * (int64_t)U + u], gw_acc_i_15);
 
         scalar_t gw_acc_i_6 = scalar_t(0);
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_4 * yk_1 * go_v_14;
         gw_acc_i_6 += scalar_t(-0.316227766f) * xj_6 * yk_3 * go_v_14;
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_7 * yk_2 * go_v_14;
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_8 * yk_3 * go_v_14;
-        atomicAdd(&grad_w[w_base + 6LL * 32 + lane], gw_acc_i_6);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 6) * (int64_t)U + u], gw_acc_i_6);
 
         scalar_t gw_acc_i_11 = scalar_t(0);
         gw_acc_i_11 += xj_8 * yk_0 * go_v_37;
         gw_acc_i_11 += xj_7 * yk_0 * go_v_36;
         gw_acc_i_11 += xj_5 * yk_0 * go_v_34;
-        atomicAdd(&grad_w[w_base + 11LL * 32 + lane], gw_acc_i_11);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 11) * (int64_t)U + u], gw_acc_i_11);
 
         scalar_t gw_acc_i_10 = scalar_t(0);
         gw_acc_i_10 += scalar_t(0.597614305f) * xj_1 * yk_9 * go_v_32;
@@ -214,20 +215,20 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_10 += scalar_t(0.534522484f) * xj_1 * yk_11 * go_v_30;
         gw_acc_i_10 += scalar_t(0.654653671f) * xj_2 * yk_12 * go_v_30;
         gw_acc_i_10 += scalar_t(0.534522484f) * xj_3 * yk_13 * go_v_30;
-        atomicAdd(&grad_w[w_base + 10LL * 32 + lane], gw_acc_i_10);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 10) * (int64_t)U + u], gw_acc_i_10);
 
         scalar_t gw_acc_i_1 = scalar_t(0);
         gw_acc_i_1 += scalar_t(0.577350269f) * xj_1 * yk_1 * go_v_1;
         gw_acc_i_1 += scalar_t(0.577350269f) * xj_2 * yk_2 * go_v_1;
         gw_acc_i_1 += scalar_t(0.577350269f) * xj_3 * yk_3 * go_v_1;
-        atomicAdd(&grad_w[w_base + 1LL * 32 + lane], gw_acc_i_1);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 1) * (int64_t)U + u], gw_acc_i_1);
 
         scalar_t gw_acc_i_5 = scalar_t(0);
         gw_acc_i_5 += scalar_t(-0.316227766f) * xj_1 * yk_6 * go_v_9;
         gw_acc_i_5 += scalar_t(-0.547722558f) * xj_1 * yk_8 * go_v_9;
         gw_acc_i_5 += scalar_t(0.547722558f) * xj_2 * yk_5 * go_v_9;
         gw_acc_i_5 += scalar_t(0.547722558f) * xj_3 * yk_4 * go_v_9;
-        atomicAdd(&grad_w[w_base + 5LL * 32 + lane], gw_acc_i_5);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 5) * (int64_t)U + u], gw_acc_i_5);
 
         scalar_t gw_acc_i_14 = scalar_t(0);
         gw_acc_i_14 += scalar_t(-0.447213595f) * xj_1 * yk_5 * go_v_53;
@@ -242,36 +243,36 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_14 += scalar_t(0.577350269f) * xj_3 * yk_5 * go_v_51;
         gw_acc_i_14 += scalar_t(0.707106781f) * xj_1 * yk_8 * go_v_50;
         gw_acc_i_14 += scalar_t(0.707106781f) * xj_3 * yk_4 * go_v_50;
-        atomicAdd(&grad_w[w_base + 14LL * 32 + lane], gw_acc_i_14);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 14) * (int64_t)U + u], gw_acc_i_14);
 
         scalar_t gw_acc_i_9 = scalar_t(0);
         gw_acc_i_9 += scalar_t(-0.707106781f) * xj_1 * yk_1 * go_v_27;
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_3 * yk_3 * go_v_27;
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_1 * yk_2 * go_v_24;
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_2 * yk_1 * go_v_24;
-        atomicAdd(&grad_w[w_base + 9LL * 32 + lane], gw_acc_i_9);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 9) * (int64_t)U + u], gw_acc_i_9);
 
         scalar_t gw_acc_i_4 = scalar_t(0);
         gw_acc_i_4 += xj_3 * yk_0 * go_v_8;
         gw_acc_i_4 += xj_1 * yk_0 * go_v_6;
-        atomicAdd(&grad_w[w_base + 4LL * 32 + lane], gw_acc_i_4);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 4) * (int64_t)U + u], gw_acc_i_4);
 
         scalar_t gw_acc_i_3 = scalar_t(0);
         gw_acc_i_3 += xj_0 * yk_1 * go_v_3;
         gw_acc_i_3 += xj_0 * yk_3 * go_v_5;
-        atomicAdd(&grad_w[w_base + 3LL * 32 + lane], gw_acc_i_3);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 3) * (int64_t)U + u], gw_acc_i_3);
 
         scalar_t gw_acc_i_8 = scalar_t(0);
         gw_acc_i_8 += xj_0 * yk_5 * go_v_19;
         gw_acc_i_8 += xj_0 * yk_7 * go_v_21;
-        atomicAdd(&grad_w[w_base + 8LL * 32 + lane], gw_acc_i_8);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 8) * (int64_t)U + u], gw_acc_i_8);
 
         scalar_t gw_acc_i_13 = scalar_t(0);
         gw_acc_i_13 += xj_0 * yk_9 * go_v_43;
         gw_acc_i_13 += xj_0 * yk_11 * go_v_45;
         gw_acc_i_13 += xj_0 * yk_13 * go_v_47;
         gw_acc_i_13 += xj_0 * yk_15 * go_v_49;
-        atomicAdd(&grad_w[w_base + 13LL * 32 + lane], gw_acc_i_13);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 13) * (int64_t)U + u], gw_acc_i_13);
 
         // grad_x accumulate by unique j
         scalar_t gx_acc_j_4 = scalar_t(0);
@@ -288,7 +289,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_4 += scalar_t(0.547722558f) * wi_6 * yk_1 * go_v_14;
         gx_acc_j_4 += scalar_t(0.577350269f) * wi_15 * yk_2 * go_v_58;
         gx_acc_j_4 += scalar_t(-0.577350269f) * wi_16 * yk_12 * go_v_65;
-        atomicAdd(&grad_x[x_base + 4LL * 32 + lane], gx_acc_j_4);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 4) * (int64_t)U + u], gx_acc_j_4);
 
         scalar_t gx_acc_j_5 = scalar_t(0);
         gx_acc_j_5 += scalar_t(-0.292770022f) * wi_7 * yk_12 * go_v_15;
@@ -306,7 +307,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_5 += scalar_t(0.353553391f) * wi_16 * yk_13 * go_v_65;
         gx_acc_j_5 += scalar_t(-0.456435465f) * wi_16 * yk_15 * go_v_65;
         gx_acc_j_5 += wi_11 * yk_0 * go_v_34;
-        atomicAdd(&grad_x[x_base + 5LL * 32 + lane], gx_acc_j_5);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 5) * (int64_t)U + u], gx_acc_j_5);
 
         scalar_t gx_acc_j_6 = scalar_t(0);
         gx_acc_j_6 += scalar_t(0.414039336f) * wi_7 * yk_11 * go_v_15;
@@ -319,7 +320,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_6 += scalar_t(0.632455532f) * wi_15 * yk_1 * go_v_59;
         gx_acc_j_6 += scalar_t(-0.316227766f) * wi_6 * yk_3 * go_v_14;
         gx_acc_j_6 += scalar_t(0.774596669f) * wi_15 * yk_2 * go_v_60;
-        atomicAdd(&grad_x[x_base + 6LL * 32 + lane], gx_acc_j_6);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 6) * (int64_t)U + u], gx_acc_j_6);
 
         scalar_t gx_acc_j_7 = scalar_t(0);
         gx_acc_j_7 += scalar_t(0.377964473f) * wi_7 * yk_10 * go_v_15;
@@ -336,7 +337,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_7 += scalar_t(0.456435465f) * wi_16 * yk_9 * go_v_65;
         gx_acc_j_7 += scalar_t(0.353553391f) * wi_16 * yk_11 * go_v_65;
         gx_acc_j_7 += wi_11 * yk_0 * go_v_36;
-        atomicAdd(&grad_x[x_base + 7LL * 32 + lane], gx_acc_j_7);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 7) * (int64_t)U + u], gx_acc_j_7);
 
         scalar_t gx_acc_j_8 = scalar_t(0);
         gx_acc_j_8 += scalar_t(0.46291005f) * wi_7 * yk_9 * go_v_15;
@@ -350,7 +351,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_8 += scalar_t(0.182574186f) * wi_15 * yk_1 * go_v_59;
         gx_acc_j_8 += scalar_t(0.547722558f) * wi_6 * yk_3 * go_v_14;
         gx_acc_j_8 += wi_11 * yk_0 * go_v_37;
-        atomicAdd(&grad_x[x_base + 8LL * 32 + lane], gx_acc_j_8);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 8) * (int64_t)U + u], gx_acc_j_8);
 
         scalar_t gx_acc_j_1 = scalar_t(0);
         gx_acc_j_1 += scalar_t(0.597614305f) * wi_10 * yk_9 * go_v_32;
@@ -369,7 +370,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_1 += scalar_t(-0.707106781f) * wi_9 * yk_1 * go_v_27;
         gx_acc_j_1 += scalar_t(0.707106781f) * wi_9 * yk_2 * go_v_24;
         gx_acc_j_1 += wi_4 * yk_0 * go_v_6;
-        atomicAdd(&grad_x[x_base + 1LL * 32 + lane], gx_acc_j_1);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 1) * (int64_t)U + u], gx_acc_j_1);
 
         scalar_t gx_acc_j_2 = scalar_t(0);
         gx_acc_j_2 += scalar_t(0.487950036f) * wi_10 * yk_14 * go_v_32;
@@ -381,7 +382,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_2 += scalar_t(0.730296743f) * wi_14 * yk_5 * go_v_52;
         gx_acc_j_2 += scalar_t(0.577350269f) * wi_14 * yk_4 * go_v_51;
         gx_acc_j_2 += scalar_t(0.707106781f) * wi_9 * yk_1 * go_v_24;
-        atomicAdd(&grad_x[x_base + 2LL * 32 + lane], gx_acc_j_2);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 2) * (int64_t)U + u], gx_acc_j_2);
 
         scalar_t gx_acc_j_3 = scalar_t(0);
         gx_acc_j_3 += scalar_t(-0.15430335f) * wi_10 * yk_13 * go_v_32;
@@ -396,7 +397,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_3 += scalar_t(0.707106781f) * wi_14 * yk_4 * go_v_50;
         gx_acc_j_3 += scalar_t(0.707106781f) * wi_9 * yk_3 * go_v_27;
         gx_acc_j_3 += wi_4 * yk_0 * go_v_8;
-        atomicAdd(&grad_x[x_base + 3LL * 32 + lane], gx_acc_j_3);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 3) * (int64_t)U + u], gx_acc_j_3);
 
         scalar_t gx_acc_j_0 = scalar_t(0);
         gx_acc_j_0 += wi_3 * yk_1 * go_v_3;
@@ -407,9 +408,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_0 += wi_13 * yk_11 * go_v_45;
         gx_acc_j_0 += wi_13 * yk_13 * go_v_47;
         gx_acc_j_0 += wi_13 * yk_15 * go_v_49;
-        atomicAdd(&grad_x[x_base + 0LL * 32 + lane], gx_acc_j_0);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 0) * (int64_t)U + u], gx_acc_j_0);
 
-        // grad_y accumulate by unique k (warp-reduce across lane)
+        // grad_y accumulate by unique k, reduced across current 32-channel tile
         scalar_t gy_lane_k_13 = scalar_t(0);
         gy_lane_k_13 += scalar_t(-0.119522861f) * wi_7 * xj_4 * go_v_15;
         gy_lane_k_13 += scalar_t(0.478091444f) * wi_7 * xj_7 * go_v_16;
@@ -585,34 +586,34 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
     }
 
     if (warp == 1) {
-        // preload w(i)
-        scalar_t wi_7 = w[w_base + 7LL * 32 + lane];
-        scalar_t wi_16 = w[w_base + 16LL * 32 + lane];
-        scalar_t wi_12 = w[w_base + 12LL * 32 + lane];
-        scalar_t wi_2 = w[w_base + 2LL * 32 + lane];
-        scalar_t wi_6 = w[w_base + 6LL * 32 + lane];
-        scalar_t wi_15 = w[w_base + 15LL * 32 + lane];
-        scalar_t wi_11 = w[w_base + 11LL * 32 + lane];
-        scalar_t wi_10 = w[w_base + 10LL * 32 + lane];
-        scalar_t wi_9 = w[w_base + 9LL * 32 + lane];
-        scalar_t wi_5 = w[w_base + 5LL * 32 + lane];
-        scalar_t wi_14 = w[w_base + 14LL * 32 + lane];
-        scalar_t wi_4 = w[w_base + 4LL * 32 + lane];
-        scalar_t wi_0 = w[w_base + 0LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
-        scalar_t wi_8 = w[w_base + 8LL * 32 + lane];
-        scalar_t wi_13 = w[w_base + 13LL * 32 + lane];
+        // preload w(i, u)
+        scalar_t wi_7 = w[((int64_t)b * Iw + 7) * (int64_t)U + u];
+        scalar_t wi_16 = w[((int64_t)b * Iw + 16) * (int64_t)U + u];
+        scalar_t wi_12 = w[((int64_t)b * Iw + 12) * (int64_t)U + u];
+        scalar_t wi_2 = w[((int64_t)b * Iw + 2) * (int64_t)U + u];
+        scalar_t wi_6 = w[((int64_t)b * Iw + 6) * (int64_t)U + u];
+        scalar_t wi_15 = w[((int64_t)b * Iw + 15) * (int64_t)U + u];
+        scalar_t wi_11 = w[((int64_t)b * Iw + 11) * (int64_t)U + u];
+        scalar_t wi_10 = w[((int64_t)b * Iw + 10) * (int64_t)U + u];
+        scalar_t wi_9 = w[((int64_t)b * Iw + 9) * (int64_t)U + u];
+        scalar_t wi_5 = w[((int64_t)b * Iw + 5) * (int64_t)U + u];
+        scalar_t wi_14 = w[((int64_t)b * Iw + 14) * (int64_t)U + u];
+        scalar_t wi_4 = w[((int64_t)b * Iw + 4) * (int64_t)U + u];
+        scalar_t wi_0 = w[((int64_t)b * Iw + 0) * (int64_t)U + u];
+        scalar_t wi_3 = w[((int64_t)b * Iw + 3) * (int64_t)U + u];
+        scalar_t wi_8 = w[((int64_t)b * Iw + 8) * (int64_t)U + u];
+        scalar_t wi_13 = w[((int64_t)b * Iw + 13) * (int64_t)U + u];
 
-        // preload x(j)
-        scalar_t xj_4 = x_all[x_base + 4LL * 32 + lane];
-        scalar_t xj_5 = x_all[x_base + 5LL * 32 + lane];
-        scalar_t xj_6 = x_all[x_base + 6LL * 32 + lane];
-        scalar_t xj_7 = x_all[x_base + 7LL * 32 + lane];
-        scalar_t xj_8 = x_all[x_base + 8LL * 32 + lane];
-        scalar_t xj_1 = x_all[x_base + 1LL * 32 + lane];
-        scalar_t xj_2 = x_all[x_base + 2LL * 32 + lane];
-        scalar_t xj_3 = x_all[x_base + 3LL * 32 + lane];
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        // preload x(j, u)
+        scalar_t xj_4 = x_all[((int64_t)src * Ix + 4) * (int64_t)U + u];
+        scalar_t xj_5 = x_all[((int64_t)src * Ix + 5) * (int64_t)U + u];
+        scalar_t xj_6 = x_all[((int64_t)src * Ix + 6) * (int64_t)U + u];
+        scalar_t xj_7 = x_all[((int64_t)src * Ix + 7) * (int64_t)U + u];
+        scalar_t xj_8 = x_all[((int64_t)src * Ix + 8) * (int64_t)U + u];
+        scalar_t xj_1 = x_all[((int64_t)src * Ix + 1) * (int64_t)U + u];
+        scalar_t xj_2 = x_all[((int64_t)src * Ix + 2) * (int64_t)U + u];
+        scalar_t xj_3 = x_all[((int64_t)src * Ix + 3) * (int64_t)U + u];
+        scalar_t xj_0 = x_all[((int64_t)src * Ix + 0) * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_9 = y[y_base + 9];
@@ -632,42 +633,42 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         scalar_t yk_1 = y[y_base + 1];
         scalar_t yk_0 = y[y_base + 0];
 
-        // preload grad_out(v)
-        scalar_t go_v_17 = grad_out[go_base + (17LL << 5)];
-        scalar_t go_v_68 = grad_out[go_base + (68LL << 5)];
-        scalar_t go_v_67 = grad_out[go_base + (67LL << 5)];
-        scalar_t go_v_70 = grad_out[go_base + (70LL << 5)];
-        scalar_t go_v_39 = grad_out[go_base + (39LL << 5)];
-        scalar_t go_v_2 = grad_out[go_base + (2LL << 5)];
-        scalar_t go_v_42 = grad_out[go_base + (42LL << 5)];
-        scalar_t go_v_12 = grad_out[go_base + (12LL << 5)];
-        scalar_t go_v_61 = grad_out[go_base + (61LL << 5)];
-        scalar_t go_v_13 = grad_out[go_base + (13LL << 5)];
-        scalar_t go_v_69 = grad_out[go_base + (69LL << 5)];
-        scalar_t go_v_62 = grad_out[go_base + (62LL << 5)];
-        scalar_t go_v_63 = grad_out[go_base + (63LL << 5)];
-        scalar_t go_v_57 = grad_out[go_base + (57LL << 5)];
-        scalar_t go_v_35 = grad_out[go_base + (35LL << 5)];
-        scalar_t go_v_33 = grad_out[go_base + (33LL << 5)];
-        scalar_t go_v_28 = grad_out[go_base + (28LL << 5)];
-        scalar_t go_v_31 = grad_out[go_base + (31LL << 5)];
-        scalar_t go_v_25 = grad_out[go_base + (25LL << 5)];
-        scalar_t go_v_11 = grad_out[go_base + (11LL << 5)];
-        scalar_t go_v_10 = grad_out[go_base + (10LL << 5)];
-        scalar_t go_v_54 = grad_out[go_base + (54LL << 5)];
-        scalar_t go_v_55 = grad_out[go_base + (55LL << 5)];
-        scalar_t go_v_56 = grad_out[go_base + (56LL << 5)];
-        scalar_t go_v_23 = grad_out[go_base + (23LL << 5)];
-        scalar_t go_v_26 = grad_out[go_base + (26LL << 5)];
-        scalar_t go_v_7 = grad_out[go_base + (7LL << 5)];
-        scalar_t go_v_0 = grad_out[go_base + (0LL << 5)];
-        scalar_t go_v_4 = grad_out[go_base + (4LL << 5)];
-        scalar_t go_v_18 = grad_out[go_base + (18LL << 5)];
-        scalar_t go_v_20 = grad_out[go_base + (20LL << 5)];
-        scalar_t go_v_22 = grad_out[go_base + (22LL << 5)];
-        scalar_t go_v_44 = grad_out[go_base + (44LL << 5)];
-        scalar_t go_v_46 = grad_out[go_base + (46LL << 5)];
-        scalar_t go_v_48 = grad_out[go_base + (48LL << 5)];
+        // preload grad_out(v, u)
+        scalar_t go_v_17 = grad_out[((int64_t)dst * V + 17) * (int64_t)U + u];
+        scalar_t go_v_68 = grad_out[((int64_t)dst * V + 68) * (int64_t)U + u];
+        scalar_t go_v_67 = grad_out[((int64_t)dst * V + 67) * (int64_t)U + u];
+        scalar_t go_v_70 = grad_out[((int64_t)dst * V + 70) * (int64_t)U + u];
+        scalar_t go_v_39 = grad_out[((int64_t)dst * V + 39) * (int64_t)U + u];
+        scalar_t go_v_2 = grad_out[((int64_t)dst * V + 2) * (int64_t)U + u];
+        scalar_t go_v_42 = grad_out[((int64_t)dst * V + 42) * (int64_t)U + u];
+        scalar_t go_v_12 = grad_out[((int64_t)dst * V + 12) * (int64_t)U + u];
+        scalar_t go_v_61 = grad_out[((int64_t)dst * V + 61) * (int64_t)U + u];
+        scalar_t go_v_13 = grad_out[((int64_t)dst * V + 13) * (int64_t)U + u];
+        scalar_t go_v_69 = grad_out[((int64_t)dst * V + 69) * (int64_t)U + u];
+        scalar_t go_v_62 = grad_out[((int64_t)dst * V + 62) * (int64_t)U + u];
+        scalar_t go_v_63 = grad_out[((int64_t)dst * V + 63) * (int64_t)U + u];
+        scalar_t go_v_57 = grad_out[((int64_t)dst * V + 57) * (int64_t)U + u];
+        scalar_t go_v_35 = grad_out[((int64_t)dst * V + 35) * (int64_t)U + u];
+        scalar_t go_v_33 = grad_out[((int64_t)dst * V + 33) * (int64_t)U + u];
+        scalar_t go_v_28 = grad_out[((int64_t)dst * V + 28) * (int64_t)U + u];
+        scalar_t go_v_31 = grad_out[((int64_t)dst * V + 31) * (int64_t)U + u];
+        scalar_t go_v_25 = grad_out[((int64_t)dst * V + 25) * (int64_t)U + u];
+        scalar_t go_v_11 = grad_out[((int64_t)dst * V + 11) * (int64_t)U + u];
+        scalar_t go_v_10 = grad_out[((int64_t)dst * V + 10) * (int64_t)U + u];
+        scalar_t go_v_54 = grad_out[((int64_t)dst * V + 54) * (int64_t)U + u];
+        scalar_t go_v_55 = grad_out[((int64_t)dst * V + 55) * (int64_t)U + u];
+        scalar_t go_v_56 = grad_out[((int64_t)dst * V + 56) * (int64_t)U + u];
+        scalar_t go_v_23 = grad_out[((int64_t)dst * V + 23) * (int64_t)U + u];
+        scalar_t go_v_26 = grad_out[((int64_t)dst * V + 26) * (int64_t)U + u];
+        scalar_t go_v_7 = grad_out[((int64_t)dst * V + 7) * (int64_t)U + u];
+        scalar_t go_v_0 = grad_out[((int64_t)dst * V + 0) * (int64_t)U + u];
+        scalar_t go_v_4 = grad_out[((int64_t)dst * V + 4) * (int64_t)U + u];
+        scalar_t go_v_18 = grad_out[((int64_t)dst * V + 18) * (int64_t)U + u];
+        scalar_t go_v_20 = grad_out[((int64_t)dst * V + 20) * (int64_t)U + u];
+        scalar_t go_v_22 = grad_out[((int64_t)dst * V + 22) * (int64_t)U + u];
+        scalar_t go_v_44 = grad_out[((int64_t)dst * V + 44) * (int64_t)U + u];
+        scalar_t go_v_46 = grad_out[((int64_t)dst * V + 46) * (int64_t)U + u];
+        scalar_t go_v_48 = grad_out[((int64_t)dst * V + 48) * (int64_t)U + u];
 
         // grad_w accumulate by unique i
         scalar_t gw_acc_i_7 = scalar_t(0);
@@ -679,7 +680,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_7 += scalar_t(0.377964473f) * xj_7 * yk_14 * go_v_17;
         gw_acc_i_7 += scalar_t(-0.119522861f) * xj_8 * yk_13 * go_v_17;
         gw_acc_i_7 += scalar_t(0.46291005f) * xj_8 * yk_15 * go_v_17;
-        atomicAdd(&grad_w[w_base + 7LL * 32 + lane], gw_acc_i_7);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 7) * (int64_t)U + u], gw_acc_i_7);
 
         scalar_t gw_acc_i_16 = scalar_t(0);
         gw_acc_i_16 += scalar_t(-0.288675135f) * xj_4 * yk_9 * go_v_68;
@@ -705,7 +706,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_16 += scalar_t(0.353553391f) * xj_7 * yk_13 * go_v_69;
         gw_acc_i_16 += scalar_t(0.456435465f) * xj_7 * yk_15 * go_v_69;
         gw_acc_i_16 += scalar_t(-0.577350269f) * xj_8 * yk_12 * go_v_69;
-        atomicAdd(&grad_w[w_base + 16LL * 32 + lane], gw_acc_i_16);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 16) * (int64_t)U + u], gw_acc_i_16);
 
         scalar_t gw_acc_i_12 = scalar_t(0);
         gw_acc_i_12 += scalar_t(0.46291005f) * xj_4 * yk_7 * go_v_39;
@@ -718,7 +719,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_12 += scalar_t(-0.534522484f) * xj_6 * yk_8 * go_v_42;
         gw_acc_i_12 += scalar_t(0.46291005f) * xj_7 * yk_7 * go_v_42;
         gw_acc_i_12 += scalar_t(-0.534522484f) * xj_8 * yk_6 * go_v_42;
-        atomicAdd(&grad_w[w_base + 12LL * 32 + lane], gw_acc_i_12);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 12) * (int64_t)U + u], gw_acc_i_12);
 
         scalar_t gw_acc_i_2 = scalar_t(0);
         gw_acc_i_2 += scalar_t(0.447213595f) * xj_4 * yk_4 * go_v_2;
@@ -726,7 +727,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_2 += scalar_t(0.447213595f) * xj_6 * yk_6 * go_v_2;
         gw_acc_i_2 += scalar_t(0.447213595f) * xj_7 * yk_7 * go_v_2;
         gw_acc_i_2 += scalar_t(0.447213595f) * xj_8 * yk_8 * go_v_2;
-        atomicAdd(&grad_w[w_base + 2LL * 32 + lane], gw_acc_i_2);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 2) * (int64_t)U + u], gw_acc_i_2);
 
         scalar_t gw_acc_i_6 = scalar_t(0);
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_4 * yk_3 * go_v_12;
@@ -736,7 +737,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_5 * yk_1 * go_v_13;
         gw_acc_i_6 += scalar_t(0.632455532f) * xj_6 * yk_2 * go_v_13;
         gw_acc_i_6 += scalar_t(0.547722558f) * xj_7 * yk_3 * go_v_13;
-        atomicAdd(&grad_w[w_base + 6LL * 32 + lane], gw_acc_i_6);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 6) * (int64_t)U + u], gw_acc_i_6);
 
         scalar_t gw_acc_i_15 = scalar_t(0);
         gw_acc_i_15 += scalar_t(-0.182574186f) * xj_4 * yk_1 * go_v_61;
@@ -750,12 +751,12 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_15 += scalar_t(0.707106781f) * xj_8 * yk_3 * go_v_63;
         gw_acc_i_15 += scalar_t(0.707106781f) * xj_4 * yk_3 * go_v_57;
         gw_acc_i_15 += scalar_t(0.707106781f) * xj_8 * yk_1 * go_v_57;
-        atomicAdd(&grad_w[w_base + 15LL * 32 + lane], gw_acc_i_15);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 15) * (int64_t)U + u], gw_acc_i_15);
 
         scalar_t gw_acc_i_11 = scalar_t(0);
         gw_acc_i_11 += xj_6 * yk_0 * go_v_35;
         gw_acc_i_11 += xj_4 * yk_0 * go_v_33;
-        atomicAdd(&grad_w[w_base + 11LL * 32 + lane], gw_acc_i_11);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 11) * (int64_t)U + u], gw_acc_i_11);
 
         scalar_t gw_acc_i_10 = scalar_t(0);
         gw_acc_i_10 += scalar_t(-0.15430335f) * xj_1 * yk_13 * go_v_28;
@@ -767,7 +768,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_10 += scalar_t(0.6172134f) * xj_2 * yk_13 * go_v_31;
         gw_acc_i_10 += scalar_t(-0.377964473f) * xj_3 * yk_12 * go_v_31;
         gw_acc_i_10 += scalar_t(0.487950036f) * xj_3 * yk_14 * go_v_31;
-        atomicAdd(&grad_w[w_base + 10LL * 32 + lane], gw_acc_i_10);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 10) * (int64_t)U + u], gw_acc_i_10);
 
         scalar_t gw_acc_i_9 = scalar_t(0);
         gw_acc_i_9 += scalar_t(-0.40824829f) * xj_1 * yk_1 * go_v_25;
@@ -777,7 +778,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_3 * yk_1 * go_v_23;
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_2 * yk_3 * go_v_26;
         gw_acc_i_9 += scalar_t(0.707106781f) * xj_3 * yk_2 * go_v_26;
-        atomicAdd(&grad_w[w_base + 9LL * 32 + lane], gw_acc_i_9);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 9) * (int64_t)U + u], gw_acc_i_9);
 
         scalar_t gw_acc_i_5 = scalar_t(0);
         gw_acc_i_5 += scalar_t(0.547722558f) * xj_1 * yk_4 * go_v_11;
@@ -787,7 +788,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_5 += scalar_t(0.547722558f) * xj_1 * yk_5 * go_v_10;
         gw_acc_i_5 += scalar_t(0.632455532f) * xj_2 * yk_6 * go_v_10;
         gw_acc_i_5 += scalar_t(0.547722558f) * xj_3 * yk_7 * go_v_10;
-        atomicAdd(&grad_w[w_base + 5LL * 32 + lane], gw_acc_i_5);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 5) * (int64_t)U + u], gw_acc_i_5);
 
         scalar_t gw_acc_i_14 = scalar_t(0);
         gw_acc_i_14 += scalar_t(-0.182574186f) * xj_1 * yk_4 * go_v_54;
@@ -799,31 +800,31 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gw_acc_i_14 += scalar_t(0.577350269f) * xj_3 * yk_7 * go_v_55;
         gw_acc_i_14 += scalar_t(-0.707106781f) * xj_1 * yk_4 * go_v_56;
         gw_acc_i_14 += scalar_t(0.707106781f) * xj_3 * yk_8 * go_v_56;
-        atomicAdd(&grad_w[w_base + 14LL * 32 + lane], gw_acc_i_14);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 14) * (int64_t)U + u], gw_acc_i_14);
 
         scalar_t gw_acc_i_4 = scalar_t(0);
         gw_acc_i_4 += xj_2 * yk_0 * go_v_7;
-        atomicAdd(&grad_w[w_base + 4LL * 32 + lane], gw_acc_i_4);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 4) * (int64_t)U + u], gw_acc_i_4);
 
         scalar_t gw_acc_i_0 = scalar_t(0);
         gw_acc_i_0 += xj_0 * yk_0 * go_v_0;
-        atomicAdd(&grad_w[w_base + 0LL * 32 + lane], gw_acc_i_0);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 0) * (int64_t)U + u], gw_acc_i_0);
 
         scalar_t gw_acc_i_3 = scalar_t(0);
         gw_acc_i_3 += xj_0 * yk_2 * go_v_4;
-        atomicAdd(&grad_w[w_base + 3LL * 32 + lane], gw_acc_i_3);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 3) * (int64_t)U + u], gw_acc_i_3);
 
         scalar_t gw_acc_i_8 = scalar_t(0);
         gw_acc_i_8 += xj_0 * yk_4 * go_v_18;
         gw_acc_i_8 += xj_0 * yk_6 * go_v_20;
         gw_acc_i_8 += xj_0 * yk_8 * go_v_22;
-        atomicAdd(&grad_w[w_base + 8LL * 32 + lane], gw_acc_i_8);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 8) * (int64_t)U + u], gw_acc_i_8);
 
         scalar_t gw_acc_i_13 = scalar_t(0);
         gw_acc_i_13 += xj_0 * yk_10 * go_v_44;
         gw_acc_i_13 += xj_0 * yk_12 * go_v_46;
         gw_acc_i_13 += xj_0 * yk_14 * go_v_48;
-        atomicAdd(&grad_w[w_base + 13LL * 32 + lane], gw_acc_i_13);
+        atomicAdd(&grad_w[((int64_t)b * Iw + 13) * (int64_t)U + u], gw_acc_i_13);
 
         // grad_x accumulate by unique j
         scalar_t gx_acc_j_4 = scalar_t(0);
@@ -840,7 +841,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_4 += scalar_t(-0.707106781f) * wi_15 * yk_1 * go_v_63;
         gx_acc_j_4 += scalar_t(0.707106781f) * wi_15 * yk_3 * go_v_57;
         gx_acc_j_4 += wi_11 * yk_0 * go_v_33;
-        atomicAdd(&grad_x[x_base + 4LL * 32 + lane], gx_acc_j_4);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 4) * (int64_t)U + u], gx_acc_j_4);
 
         scalar_t gx_acc_j_5 = scalar_t(0);
         gx_acc_j_5 += scalar_t(0.377964473f) * wi_7 * yk_10 * go_v_17;
@@ -856,7 +857,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_5 += scalar_t(0.456435465f) * wi_16 * yk_9 * go_v_69;
         gx_acc_j_5 += scalar_t(-0.353553391f) * wi_16 * yk_11 * go_v_69;
         gx_acc_j_5 += scalar_t(-0.577350269f) * wi_15 * yk_1 * go_v_62;
-        atomicAdd(&grad_x[x_base + 5LL * 32 + lane], gx_acc_j_5);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 5) * (int64_t)U + u], gx_acc_j_5);
 
         scalar_t gx_acc_j_6 = scalar_t(0);
         gx_acc_j_6 += scalar_t(0.414039336f) * wi_7 * yk_13 * go_v_17;
@@ -870,7 +871,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_6 += scalar_t(0.632455532f) * wi_15 * yk_3 * go_v_61;
         gx_acc_j_6 += scalar_t(0.632455532f) * wi_6 * yk_2 * go_v_13;
         gx_acc_j_6 += wi_11 * yk_0 * go_v_35;
-        atomicAdd(&grad_x[x_base + 6LL * 32 + lane], gx_acc_j_6);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 6) * (int64_t)U + u], gx_acc_j_6);
 
         scalar_t gx_acc_j_7 = scalar_t(0);
         gx_acc_j_7 += scalar_t(-0.292770022f) * wi_7 * yk_12 * go_v_17;
@@ -887,7 +888,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_7 += scalar_t(0.353553391f) * wi_16 * yk_13 * go_v_69;
         gx_acc_j_7 += scalar_t(0.456435465f) * wi_16 * yk_15 * go_v_69;
         gx_acc_j_7 += scalar_t(0.577350269f) * wi_15 * yk_3 * go_v_62;
-        atomicAdd(&grad_x[x_base + 7LL * 32 + lane], gx_acc_j_7);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 7) * (int64_t)U + u], gx_acc_j_7);
 
         scalar_t gx_acc_j_8 = scalar_t(0);
         gx_acc_j_8 += scalar_t(-0.119522861f) * wi_7 * yk_13 * go_v_17;
@@ -905,7 +906,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_8 += scalar_t(0.577350269f) * wi_15 * yk_2 * go_v_62;
         gx_acc_j_8 += scalar_t(0.707106781f) * wi_15 * yk_3 * go_v_63;
         gx_acc_j_8 += scalar_t(0.707106781f) * wi_15 * yk_1 * go_v_57;
-        atomicAdd(&grad_x[x_base + 8LL * 32 + lane], gx_acc_j_8);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 8) * (int64_t)U + u], gx_acc_j_8);
 
         scalar_t gx_acc_j_1 = scalar_t(0);
         gx_acc_j_1 += scalar_t(-0.15430335f) * wi_10 * yk_13 * go_v_28;
@@ -918,7 +919,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_1 += scalar_t(-0.577350269f) * wi_14 * yk_5 * go_v_55;
         gx_acc_j_1 += scalar_t(-0.707106781f) * wi_14 * yk_4 * go_v_56;
         gx_acc_j_1 += scalar_t(0.707106781f) * wi_9 * yk_3 * go_v_23;
-        atomicAdd(&grad_x[x_base + 1LL * 32 + lane], gx_acc_j_1);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 1) * (int64_t)U + u], gx_acc_j_1);
 
         scalar_t gx_acc_j_2 = scalar_t(0);
         gx_acc_j_2 += scalar_t(0.487950036f) * wi_10 * yk_10 * go_v_28;
@@ -930,7 +931,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_2 += scalar_t(0.577350269f) * wi_14 * yk_8 * go_v_55;
         gx_acc_j_2 += scalar_t(0.707106781f) * wi_9 * yk_3 * go_v_26;
         gx_acc_j_2 += wi_4 * yk_0 * go_v_7;
-        atomicAdd(&grad_x[x_base + 2LL * 32 + lane], gx_acc_j_2);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 2) * (int64_t)U + u], gx_acc_j_2);
 
         scalar_t gx_acc_j_3 = scalar_t(0);
         gx_acc_j_3 += scalar_t(0.597614305f) * wi_10 * yk_9 * go_v_28;
@@ -947,7 +948,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_3 += scalar_t(0.707106781f) * wi_14 * yk_8 * go_v_56;
         gx_acc_j_3 += scalar_t(0.707106781f) * wi_9 * yk_1 * go_v_23;
         gx_acc_j_3 += scalar_t(0.707106781f) * wi_9 * yk_2 * go_v_26;
-        atomicAdd(&grad_x[x_base + 3LL * 32 + lane], gx_acc_j_3);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 3) * (int64_t)U + u], gx_acc_j_3);
 
         scalar_t gx_acc_j_0 = scalar_t(0);
         gx_acc_j_0 += wi_0 * yk_0 * go_v_0;
@@ -958,9 +959,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
         gx_acc_j_0 += wi_13 * yk_10 * go_v_44;
         gx_acc_j_0 += wi_13 * yk_12 * go_v_46;
         gx_acc_j_0 += wi_13 * yk_14 * go_v_48;
-        atomicAdd(&grad_x[x_base + 0LL * 32 + lane], gx_acc_j_0);
+        atomicAdd(&grad_x[((int64_t)src * Ix + 0) * (int64_t)U + u], gx_acc_j_0);
 
-        // grad_y accumulate by unique k (warp-reduce across lane)
+        // grad_y accumulate by unique k, reduced across current 32-channel tile
         scalar_t gy_lane_k_9 = scalar_t(0);
         gy_lane_k_9 += scalar_t(0.46291005f) * wi_7 * xj_4 * go_v_17;
         gy_lane_k_9 += scalar_t(-0.288675135f) * wi_16 * xj_4 * go_v_68;
@@ -1148,12 +1149,12 @@ void launch_uniform1d_codegen_two_warp_vgroup_path215_u224_bwd(
     const int32_t* src_idx,
     const int32_t* dst_idx,
     const int32_t* b_list,
-    int B, int Iw, int Ix, int Ky, int V,
+    int B, int Iw, int Ix, int Ky, int V, int U,
     cudaStream_t stream)
 {
-    dim3 block(64);  // 2 warps
-    dim3 grid(B);
+    dim3 block(64);
+    dim3 grid(B, (U + 31) / 32);
     uniform1d_codegen_two_warp_vgroup_path215_u224_bwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, grad_out, grad_w, grad_x, grad_y,
-        src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V);
+        src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V, U);
 }

@@ -69,7 +69,7 @@ torch::Tensor uniform1d_codegen_fwd_launch(
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "u1d_fused_fwd_atomic", [&]{
         
         dim3 block(64);  // 2 warps
-        dim3 grid(B);
+        dim3 grid(B, (U + 31) / 32);
 
         if (P == 777 && U == 32)
             uniform1d_codegen_two_warp_vgroup_path777_u32_fwd<scalar_t><<<grid, block, 0, stream>>>(
@@ -112,7 +112,7 @@ torch::Tensor uniform1d_codegen_fwd_launch(
                 (const int32_t*)src_idx.data_ptr<int32_t>(),
                 (const int32_t*)dst_idx.data_ptr<int32_t>(),
                 (const int32_t*)b_list.data_ptr<int32_t>(),
-                B, Iw, Ix, Ky, V);
+                B, Iw, Ix, Ky, V, U);
 
         else
             TORCH_CHECK(false, "Uniform1d Unsupported P: ", P);
@@ -188,7 +188,7 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_codegen_bwd_launch", [&] {
         dim3 block(64);  // 2 warps
-        dim3 grid(B);
+        dim3 grid(B, (U + 31) / 32);
         
         if (P == 777 && U == 32) {
             uniform1d_codegen_two_warp_vgroup_path777_u32_bwd<scalar_t><<<grid, block, 0, stream>>>(
@@ -244,7 +244,7 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
                 (const int32_t*)src_idx.data_ptr<int32_t>(),
                 (const int32_t*)dst_idx.data_ptr<int32_t>(),
                 (const int32_t*)b_list.data_ptr<int32_t>(),
-                B, Iw, Ix, Ky, V);
+                B, Iw, Ix, Ky, V, U);
         }
         else {
             TORCH_CHECK(false, "Uniform1d backward unsupported P: ", P, ", U: ", U);

@@ -72,13 +72,11 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         packed = pack_paths32(i_list, j_list, k_list, coeff_list)
         
-        '''
-        generate_code_uniform1d_fwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
-        print(f"generate_code_uniform1d_fwd called, P={P}, u_dim={u_dim}")
+        #generate_code_uniform1d_fwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
+        #print(f"generate_code_uniform1d_fwd called, P={P}, u_dim={u_dim}")
 
-        generate_code_uniform1d_bwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
-        print(f"generate_code_uniform1d_bwd called, P={P}, u_dim={u_dim}")
-        '''
+        #generate_code_uniform1d_bwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
+        #print(f"generate_code_uniform1d_bwd called, P={P}, u_dim={u_dim}")
 
         #print(f"b_list 10:{b_list[:10]}")
         #print(f"cls_offsets 10:{cls_offsets[:10]}")
@@ -87,44 +85,53 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         #print(f"max i:{torch.max(i_list)}, max j:{torch.max(j_list)}, max k:{torch.max(k_list)}, max v:{torch.max(v_list)}")
         #print(f"w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
+        '''
+        out = torch.ops.u1d_fused_fwd.forward_np(
+            w, x, y, 
+            src_idx, b_list, cls_offsets,
+            i_list, j_list, k_list, coeff_list,
+            packed, v_offsets, out_seg_num
+        )
+        '''
+
+        '''
+        out = torch.ops.u1d_fused_fwd.forward(
+            w, x, y, 
+            src_idx, b_list, cls_offsets, 
+            i_list, j_list, k_list, 
+            coeff_list, v_offsets, out_seg_num
+        )
+        '''
+
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        if u_dim == 32:
-
+        if u_dim == 32 or u_dim == 224:
             if P > 100:
                 print(f"===== call uniform1d code gen ======")
-                out = torch.ops.uniform1d_codegen.forward(
-                    w, x, y, 
-                    src_idx, dst_idx, b_list, cls_offsets,
-                    i_list, j_list, k_list, v_list, coeff_list, packed,
-                    v_offsets, out_seg_num
-                )
-            else:
-                out = torch.ops.u1d_fused_fwd.forward_ep(
-                    w, x, y, 
-                    src_idx, dst_idx, b_list, cls_offsets,
-                    i_list, j_list, k_list, v_list, coeff_list, packed,
-                    v_offsets, out_seg_num
-                )
-            
-            '''
-            out = torch.ops.u1d_fused_fwd.forward_np(
-                w, x, y, 
-                src_idx, b_list, cls_offsets,
-                i_list, j_list, k_list, coeff_list,
-                packed, v_offsets, out_seg_num
-            )
-            '''
 
-            '''
-            out = torch.ops.u1d_fused_fwd.forward(
-                w, x, y, 
-                src_idx, b_list, cls_offsets, 
-                i_list, j_list, k_list, 
-                coeff_list, v_offsets, out_seg_num
-            )
-            '''
+                out = torch.ops.u1d_fused_fwd.forward(
+                    w, x, y, 
+                    src_idx, b_list, cls_offsets, 
+                    i_list, j_list, k_list, 
+                    coeff_list, v_offsets, out_seg_num
+                )
+
+                ref = torch.ops.uniform1d_codegen.forward(
+                    w, x, y, 
+                    src_idx, dst_idx, b_list, cls_offsets,
+                    i_list, j_list, k_list, v_list, coeff_list, packed,
+                    v_offsets, out_seg_num
+                )
+                print(f"uniform1d fwd out.shape{out.shape}, {out}")
+                print(f"uniform1d fwd ref.shape{ref.shape}, {ref}")
+            else:
+                out = torch.ops.u1d_fused_fwd.forward(
+                    w, x, y, 
+                    src_idx, b_list, cls_offsets, 
+                    i_list, j_list, k_list, 
+                    coeff_list, v_offsets, out_seg_num
+                )
 
         else:
             out = torch.ops.u1d_fused_fwd.forward(
@@ -176,21 +183,49 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         x = x.view(-1, ctx.x_seg_num, ctx.u_dim)
         y = y.view(-1, ctx.y_seg_num, 1)
 
-        if ctx.P < 100:
-            grad_w, grad_x, grad_y = torch.ops.u1d_fused_bwd.backward(
+        if ctx.P > 100:
+            '''
+            ref_w, ref_x, ref_y = torch.ops.u1d_fused_bwd.backward(
                 grad_out, w, x, y, 
                 ctx.src_idx, ctx.b_list, ctx.cls_offsets, 
                 ctx.i_list, ctx.j_list, ctx.k_list, 
                 ctx.coeff_list, ctx.v_offsets,
                 ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num, ctx.u_dim
             )
+            '''
 
-        else:
             grad_w, grad_x, grad_y = torch.ops.uniform1d_codegen.backward(
                 grad_out, w, x, y, 
                 ctx.src_idx, ctx.dst_idx, ctx.b_list, ctx.cls_offsets, 
                 ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
                 ctx.path_packed, ctx.v_offsets, ctx.out_seg_num
+            )
+
+            '''
+            grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)
+            grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.u_dim)
+            grad_y = grad_y.view(-1, ctx.y_seg_num)
+
+            ref_w = ref_w.view(-1, ctx.w_seg_num * ctx.u_dim)
+            ref_x = ref_x.view(-1, ctx.x_seg_num * ctx.u_dim)
+            ref_y = ref_y.view(-1, ctx.y_seg_num)
+
+            print(f"grad_w.shape:{grad_w.shape}, ref_w.shape:{ref_w.shape}")
+            print(f"grad_x.shape:{grad_x.shape}, ref_x.shape:{ref_x.shape}")
+            print(f"grad_y.shape:{grad_y.shape}, ref_y.shape:{ref_y.shape}")
+
+            print(f"grad_w:{grad_w}, ref_w:{ref_w}")
+            print(f"grad_x:{grad_x}, ref_x:{ref_x}")
+            print(f"grad_y:{grad_y}, ref_y:{ref_y}")
+            '''
+
+        else:
+            grad_w, grad_x, grad_y = torch.ops.u1d_fused_bwd.backward(
+                grad_out, w, x, y, 
+                ctx.src_idx, ctx.b_list, ctx.cls_offsets, 
+                ctx.i_list, ctx.j_list, ctx.k_list, 
+                ctx.coeff_list, ctx.v_offsets,
+                ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num, ctx.u_dim
             )
 
         grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)

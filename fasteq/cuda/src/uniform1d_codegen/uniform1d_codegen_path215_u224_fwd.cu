@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
+#include "../cuda_utils.hpp"
 
 template <typename scalar_t>
 __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
@@ -10,9 +11,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
     const int32_t* __restrict__ src_idx,
     const int32_t* __restrict__ dst_idx,
     const int32_t* __restrict__ b_list,
-    int B, int Iw, int Ix, int Ky, int V)
+    int B, int Iw, int Ix, int Ky, int V, int U)
 {
     int b_global = (int)blockIdx.x;
+    int ublk     = (int)blockIdx.y;
     if (b_global >= B) return;
     int b = b_list ? b_list[b_global] : b_global;
 
@@ -21,42 +23,42 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
     int warp = tid >> 5;
     if (warp >= 2) return;
 
+    int u = (ublk << 5) + lane;
+    if (u >= U) return;
+
     int src = src_idx[b];
     int dst = dst_idx[b];
 
-    int64_t w_base = (int64_t)b   * Iw * 32;
-    int64_t x_base = (int64_t)src * Ix * 32;
-    int64_t y_base = (int64_t)b   * Ky;
-    int64_t o_base = ((int64_t)dst * V) * 32 + lane;
+    int64_t y_base = (int64_t)b * Ky;
 
     if (warp == 0) {
-        // preload w(i)
-        scalar_t wi_7 = w[w_base + 7LL * 32 + lane];
-        scalar_t wi_16 = w[w_base + 16LL * 32 + lane];
-        scalar_t wi_12 = w[w_base + 12LL * 32 + lane];
-        scalar_t wi_15 = w[w_base + 15LL * 32 + lane];
-        scalar_t wi_6 = w[w_base + 6LL * 32 + lane];
-        scalar_t wi_11 = w[w_base + 11LL * 32 + lane];
-        scalar_t wi_10 = w[w_base + 10LL * 32 + lane];
-        scalar_t wi_1 = w[w_base + 1LL * 32 + lane];
-        scalar_t wi_5 = w[w_base + 5LL * 32 + lane];
-        scalar_t wi_14 = w[w_base + 14LL * 32 + lane];
-        scalar_t wi_9 = w[w_base + 9LL * 32 + lane];
-        scalar_t wi_4 = w[w_base + 4LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
-        scalar_t wi_8 = w[w_base + 8LL * 32 + lane];
-        scalar_t wi_13 = w[w_base + 13LL * 32 + lane];
+        // preload w(i, u)
+        scalar_t wi_7 = w[((int64_t)b * Iw + 7) * (int64_t)U + u];
+        scalar_t wi_16 = w[((int64_t)b * Iw + 16) * (int64_t)U + u];
+        scalar_t wi_12 = w[((int64_t)b * Iw + 12) * (int64_t)U + u];
+        scalar_t wi_15 = w[((int64_t)b * Iw + 15) * (int64_t)U + u];
+        scalar_t wi_6 = w[((int64_t)b * Iw + 6) * (int64_t)U + u];
+        scalar_t wi_11 = w[((int64_t)b * Iw + 11) * (int64_t)U + u];
+        scalar_t wi_10 = w[((int64_t)b * Iw + 10) * (int64_t)U + u];
+        scalar_t wi_1 = w[((int64_t)b * Iw + 1) * (int64_t)U + u];
+        scalar_t wi_5 = w[((int64_t)b * Iw + 5) * (int64_t)U + u];
+        scalar_t wi_14 = w[((int64_t)b * Iw + 14) * (int64_t)U + u];
+        scalar_t wi_9 = w[((int64_t)b * Iw + 9) * (int64_t)U + u];
+        scalar_t wi_4 = w[((int64_t)b * Iw + 4) * (int64_t)U + u];
+        scalar_t wi_3 = w[((int64_t)b * Iw + 3) * (int64_t)U + u];
+        scalar_t wi_8 = w[((int64_t)b * Iw + 8) * (int64_t)U + u];
+        scalar_t wi_13 = w[((int64_t)b * Iw + 13) * (int64_t)U + u];
 
-        // preload x(j)
-        scalar_t xj_4 = x_all[x_base + 4LL * 32 + lane];
-        scalar_t xj_5 = x_all[x_base + 5LL * 32 + lane];
-        scalar_t xj_6 = x_all[x_base + 6LL * 32 + lane];
-        scalar_t xj_7 = x_all[x_base + 7LL * 32 + lane];
-        scalar_t xj_8 = x_all[x_base + 8LL * 32 + lane];
-        scalar_t xj_1 = x_all[x_base + 1LL * 32 + lane];
-        scalar_t xj_2 = x_all[x_base + 2LL * 32 + lane];
-        scalar_t xj_3 = x_all[x_base + 3LL * 32 + lane];
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        // preload x(j, u)
+        scalar_t xj_4 = x_all[((int64_t)src * Ix + 4) * (int64_t)U + u];
+        scalar_t xj_5 = x_all[((int64_t)src * Ix + 5) * (int64_t)U + u];
+        scalar_t xj_6 = x_all[((int64_t)src * Ix + 6) * (int64_t)U + u];
+        scalar_t xj_7 = x_all[((int64_t)src * Ix + 7) * (int64_t)U + u];
+        scalar_t xj_8 = x_all[((int64_t)src * Ix + 8) * (int64_t)U + u];
+        scalar_t xj_1 = x_all[((int64_t)src * Ix + 1) * (int64_t)U + u];
+        scalar_t xj_2 = x_all[((int64_t)src * Ix + 2) * (int64_t)U + u];
+        scalar_t xj_3 = x_all[((int64_t)src * Ix + 3) * (int64_t)U + u];
+        scalar_t xj_0 = x_all[((int64_t)src * Ix + 0) * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_13 = y[y_base + 13];
@@ -258,73 +260,73 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
         sum_v_49 += wi_13 * xj_0 * yk_15;
 
         // writeback
-        atomicAdd(&out[o_base + (15LL << 5)], sum_v_15);
-        atomicAdd(&out[o_base + (16LL << 5)], sum_v_16);
-        atomicAdd(&out[o_base + (66LL << 5)], sum_v_66);
-        atomicAdd(&out[o_base + (64LL << 5)], sum_v_64);
-        atomicAdd(&out[o_base + (41LL << 5)], sum_v_41);
-        atomicAdd(&out[o_base + (40LL << 5)], sum_v_40);
-        atomicAdd(&out[o_base + (38LL << 5)], sum_v_38);
-        atomicAdd(&out[o_base + (59LL << 5)], sum_v_59);
-        atomicAdd(&out[o_base + (14LL << 5)], sum_v_14);
-        atomicAdd(&out[o_base + (60LL << 5)], sum_v_60);
-        atomicAdd(&out[o_base + (58LL << 5)], sum_v_58);
-        atomicAdd(&out[o_base + (65LL << 5)], sum_v_65);
-        atomicAdd(&out[o_base + (37LL << 5)], sum_v_37);
-        atomicAdd(&out[o_base + (36LL << 5)], sum_v_36);
-        atomicAdd(&out[o_base + (34LL << 5)], sum_v_34);
-        atomicAdd(&out[o_base + (32LL << 5)], sum_v_32);
-        atomicAdd(&out[o_base + (29LL << 5)], sum_v_29);
-        atomicAdd(&out[o_base + (30LL << 5)], sum_v_30);
-        atomicAdd(&out[o_base + (1LL << 5)], sum_v_1);
-        atomicAdd(&out[o_base + (9LL << 5)], sum_v_9);
-        atomicAdd(&out[o_base + (53LL << 5)], sum_v_53);
-        atomicAdd(&out[o_base + (52LL << 5)], sum_v_52);
-        atomicAdd(&out[o_base + (51LL << 5)], sum_v_51);
-        atomicAdd(&out[o_base + (50LL << 5)], sum_v_50);
-        atomicAdd(&out[o_base + (27LL << 5)], sum_v_27);
-        atomicAdd(&out[o_base + (24LL << 5)], sum_v_24);
-        atomicAdd(&out[o_base + (8LL << 5)], sum_v_8);
-        atomicAdd(&out[o_base + (6LL << 5)], sum_v_6);
-        atomicAdd(&out[o_base + (3LL << 5)], sum_v_3);
-        atomicAdd(&out[o_base + (5LL << 5)], sum_v_5);
-        atomicAdd(&out[o_base + (19LL << 5)], sum_v_19);
-        atomicAdd(&out[o_base + (21LL << 5)], sum_v_21);
-        atomicAdd(&out[o_base + (43LL << 5)], sum_v_43);
-        atomicAdd(&out[o_base + (45LL << 5)], sum_v_45);
-        atomicAdd(&out[o_base + (47LL << 5)], sum_v_47);
-        atomicAdd(&out[o_base + (49LL << 5)], sum_v_49);
+        atomicAdd(&out[((int64_t)dst * V + 15) * (int64_t)U + u], sum_v_15);
+        atomicAdd(&out[((int64_t)dst * V + 16) * (int64_t)U + u], sum_v_16);
+        atomicAdd(&out[((int64_t)dst * V + 66) * (int64_t)U + u], sum_v_66);
+        atomicAdd(&out[((int64_t)dst * V + 64) * (int64_t)U + u], sum_v_64);
+        atomicAdd(&out[((int64_t)dst * V + 41) * (int64_t)U + u], sum_v_41);
+        atomicAdd(&out[((int64_t)dst * V + 40) * (int64_t)U + u], sum_v_40);
+        atomicAdd(&out[((int64_t)dst * V + 38) * (int64_t)U + u], sum_v_38);
+        atomicAdd(&out[((int64_t)dst * V + 59) * (int64_t)U + u], sum_v_59);
+        atomicAdd(&out[((int64_t)dst * V + 14) * (int64_t)U + u], sum_v_14);
+        atomicAdd(&out[((int64_t)dst * V + 60) * (int64_t)U + u], sum_v_60);
+        atomicAdd(&out[((int64_t)dst * V + 58) * (int64_t)U + u], sum_v_58);
+        atomicAdd(&out[((int64_t)dst * V + 65) * (int64_t)U + u], sum_v_65);
+        atomicAdd(&out[((int64_t)dst * V + 37) * (int64_t)U + u], sum_v_37);
+        atomicAdd(&out[((int64_t)dst * V + 36) * (int64_t)U + u], sum_v_36);
+        atomicAdd(&out[((int64_t)dst * V + 34) * (int64_t)U + u], sum_v_34);
+        atomicAdd(&out[((int64_t)dst * V + 32) * (int64_t)U + u], sum_v_32);
+        atomicAdd(&out[((int64_t)dst * V + 29) * (int64_t)U + u], sum_v_29);
+        atomicAdd(&out[((int64_t)dst * V + 30) * (int64_t)U + u], sum_v_30);
+        atomicAdd(&out[((int64_t)dst * V + 1) * (int64_t)U + u], sum_v_1);
+        atomicAdd(&out[((int64_t)dst * V + 9) * (int64_t)U + u], sum_v_9);
+        atomicAdd(&out[((int64_t)dst * V + 53) * (int64_t)U + u], sum_v_53);
+        atomicAdd(&out[((int64_t)dst * V + 52) * (int64_t)U + u], sum_v_52);
+        atomicAdd(&out[((int64_t)dst * V + 51) * (int64_t)U + u], sum_v_51);
+        atomicAdd(&out[((int64_t)dst * V + 50) * (int64_t)U + u], sum_v_50);
+        atomicAdd(&out[((int64_t)dst * V + 27) * (int64_t)U + u], sum_v_27);
+        atomicAdd(&out[((int64_t)dst * V + 24) * (int64_t)U + u], sum_v_24);
+        atomicAdd(&out[((int64_t)dst * V + 8) * (int64_t)U + u], sum_v_8);
+        atomicAdd(&out[((int64_t)dst * V + 6) * (int64_t)U + u], sum_v_6);
+        atomicAdd(&out[((int64_t)dst * V + 3) * (int64_t)U + u], sum_v_3);
+        atomicAdd(&out[((int64_t)dst * V + 5) * (int64_t)U + u], sum_v_5);
+        atomicAdd(&out[((int64_t)dst * V + 19) * (int64_t)U + u], sum_v_19);
+        atomicAdd(&out[((int64_t)dst * V + 21) * (int64_t)U + u], sum_v_21);
+        atomicAdd(&out[((int64_t)dst * V + 43) * (int64_t)U + u], sum_v_43);
+        atomicAdd(&out[((int64_t)dst * V + 45) * (int64_t)U + u], sum_v_45);
+        atomicAdd(&out[((int64_t)dst * V + 47) * (int64_t)U + u], sum_v_47);
+        atomicAdd(&out[((int64_t)dst * V + 49) * (int64_t)U + u], sum_v_49);
     }
 
     if (warp == 1) {
-        // preload w(i)
-        scalar_t wi_7 = w[w_base + 7LL * 32 + lane];
-        scalar_t wi_16 = w[w_base + 16LL * 32 + lane];
-        scalar_t wi_12 = w[w_base + 12LL * 32 + lane];
-        scalar_t wi_2 = w[w_base + 2LL * 32 + lane];
-        scalar_t wi_6 = w[w_base + 6LL * 32 + lane];
-        scalar_t wi_15 = w[w_base + 15LL * 32 + lane];
-        scalar_t wi_11 = w[w_base + 11LL * 32 + lane];
-        scalar_t wi_10 = w[w_base + 10LL * 32 + lane];
-        scalar_t wi_9 = w[w_base + 9LL * 32 + lane];
-        scalar_t wi_5 = w[w_base + 5LL * 32 + lane];
-        scalar_t wi_14 = w[w_base + 14LL * 32 + lane];
-        scalar_t wi_4 = w[w_base + 4LL * 32 + lane];
-        scalar_t wi_0 = w[w_base + 0LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
-        scalar_t wi_8 = w[w_base + 8LL * 32 + lane];
-        scalar_t wi_13 = w[w_base + 13LL * 32 + lane];
+        // preload w(i, u)
+        scalar_t wi_7 = w[((int64_t)b * Iw + 7) * (int64_t)U + u];
+        scalar_t wi_16 = w[((int64_t)b * Iw + 16) * (int64_t)U + u];
+        scalar_t wi_12 = w[((int64_t)b * Iw + 12) * (int64_t)U + u];
+        scalar_t wi_2 = w[((int64_t)b * Iw + 2) * (int64_t)U + u];
+        scalar_t wi_6 = w[((int64_t)b * Iw + 6) * (int64_t)U + u];
+        scalar_t wi_15 = w[((int64_t)b * Iw + 15) * (int64_t)U + u];
+        scalar_t wi_11 = w[((int64_t)b * Iw + 11) * (int64_t)U + u];
+        scalar_t wi_10 = w[((int64_t)b * Iw + 10) * (int64_t)U + u];
+        scalar_t wi_9 = w[((int64_t)b * Iw + 9) * (int64_t)U + u];
+        scalar_t wi_5 = w[((int64_t)b * Iw + 5) * (int64_t)U + u];
+        scalar_t wi_14 = w[((int64_t)b * Iw + 14) * (int64_t)U + u];
+        scalar_t wi_4 = w[((int64_t)b * Iw + 4) * (int64_t)U + u];
+        scalar_t wi_0 = w[((int64_t)b * Iw + 0) * (int64_t)U + u];
+        scalar_t wi_3 = w[((int64_t)b * Iw + 3) * (int64_t)U + u];
+        scalar_t wi_8 = w[((int64_t)b * Iw + 8) * (int64_t)U + u];
+        scalar_t wi_13 = w[((int64_t)b * Iw + 13) * (int64_t)U + u];
 
-        // preload x(j)
-        scalar_t xj_4 = x_all[x_base + 4LL * 32 + lane];
-        scalar_t xj_5 = x_all[x_base + 5LL * 32 + lane];
-        scalar_t xj_6 = x_all[x_base + 6LL * 32 + lane];
-        scalar_t xj_7 = x_all[x_base + 7LL * 32 + lane];
-        scalar_t xj_8 = x_all[x_base + 8LL * 32 + lane];
-        scalar_t xj_1 = x_all[x_base + 1LL * 32 + lane];
-        scalar_t xj_2 = x_all[x_base + 2LL * 32 + lane];
-        scalar_t xj_3 = x_all[x_base + 3LL * 32 + lane];
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        // preload x(j, u)
+        scalar_t xj_4 = x_all[((int64_t)src * Ix + 4) * (int64_t)U + u];
+        scalar_t xj_5 = x_all[((int64_t)src * Ix + 5) * (int64_t)U + u];
+        scalar_t xj_6 = x_all[((int64_t)src * Ix + 6) * (int64_t)U + u];
+        scalar_t xj_7 = x_all[((int64_t)src * Ix + 7) * (int64_t)U + u];
+        scalar_t xj_8 = x_all[((int64_t)src * Ix + 8) * (int64_t)U + u];
+        scalar_t xj_1 = x_all[((int64_t)src * Ix + 1) * (int64_t)U + u];
+        scalar_t xj_2 = x_all[((int64_t)src * Ix + 2) * (int64_t)U + u];
+        scalar_t xj_3 = x_all[((int64_t)src * Ix + 3) * (int64_t)U + u];
+        scalar_t xj_0 = x_all[((int64_t)src * Ix + 0) * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_9 = y[y_base + 9];
@@ -523,41 +525,41 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
         sum_v_48 += wi_13 * xj_0 * yk_14;
 
         // writeback
-        atomicAdd(&out[o_base + (17LL << 5)], sum_v_17);
-        atomicAdd(&out[o_base + (68LL << 5)], sum_v_68);
-        atomicAdd(&out[o_base + (67LL << 5)], sum_v_67);
-        atomicAdd(&out[o_base + (70LL << 5)], sum_v_70);
-        atomicAdd(&out[o_base + (39LL << 5)], sum_v_39);
-        atomicAdd(&out[o_base + (2LL << 5)], sum_v_2);
-        atomicAdd(&out[o_base + (42LL << 5)], sum_v_42);
-        atomicAdd(&out[o_base + (12LL << 5)], sum_v_12);
-        atomicAdd(&out[o_base + (61LL << 5)], sum_v_61);
-        atomicAdd(&out[o_base + (13LL << 5)], sum_v_13);
-        atomicAdd(&out[o_base + (69LL << 5)], sum_v_69);
-        atomicAdd(&out[o_base + (62LL << 5)], sum_v_62);
-        atomicAdd(&out[o_base + (63LL << 5)], sum_v_63);
-        atomicAdd(&out[o_base + (57LL << 5)], sum_v_57);
-        atomicAdd(&out[o_base + (35LL << 5)], sum_v_35);
-        atomicAdd(&out[o_base + (33LL << 5)], sum_v_33);
-        atomicAdd(&out[o_base + (28LL << 5)], sum_v_28);
-        atomicAdd(&out[o_base + (31LL << 5)], sum_v_31);
-        atomicAdd(&out[o_base + (25LL << 5)], sum_v_25);
-        atomicAdd(&out[o_base + (11LL << 5)], sum_v_11);
-        atomicAdd(&out[o_base + (10LL << 5)], sum_v_10);
-        atomicAdd(&out[o_base + (54LL << 5)], sum_v_54);
-        atomicAdd(&out[o_base + (55LL << 5)], sum_v_55);
-        atomicAdd(&out[o_base + (56LL << 5)], sum_v_56);
-        atomicAdd(&out[o_base + (23LL << 5)], sum_v_23);
-        atomicAdd(&out[o_base + (26LL << 5)], sum_v_26);
-        atomicAdd(&out[o_base + (7LL << 5)], sum_v_7);
-        atomicAdd(&out[o_base + (0LL << 5)], sum_v_0);
-        atomicAdd(&out[o_base + (4LL << 5)], sum_v_4);
-        atomicAdd(&out[o_base + (18LL << 5)], sum_v_18);
-        atomicAdd(&out[o_base + (20LL << 5)], sum_v_20);
-        atomicAdd(&out[o_base + (22LL << 5)], sum_v_22);
-        atomicAdd(&out[o_base + (44LL << 5)], sum_v_44);
-        atomicAdd(&out[o_base + (46LL << 5)], sum_v_46);
-        atomicAdd(&out[o_base + (48LL << 5)], sum_v_48);
+        atomicAdd(&out[((int64_t)dst * V + 17) * (int64_t)U + u], sum_v_17);
+        atomicAdd(&out[((int64_t)dst * V + 68) * (int64_t)U + u], sum_v_68);
+        atomicAdd(&out[((int64_t)dst * V + 67) * (int64_t)U + u], sum_v_67);
+        atomicAdd(&out[((int64_t)dst * V + 70) * (int64_t)U + u], sum_v_70);
+        atomicAdd(&out[((int64_t)dst * V + 39) * (int64_t)U + u], sum_v_39);
+        atomicAdd(&out[((int64_t)dst * V + 2) * (int64_t)U + u], sum_v_2);
+        atomicAdd(&out[((int64_t)dst * V + 42) * (int64_t)U + u], sum_v_42);
+        atomicAdd(&out[((int64_t)dst * V + 12) * (int64_t)U + u], sum_v_12);
+        atomicAdd(&out[((int64_t)dst * V + 61) * (int64_t)U + u], sum_v_61);
+        atomicAdd(&out[((int64_t)dst * V + 13) * (int64_t)U + u], sum_v_13);
+        atomicAdd(&out[((int64_t)dst * V + 69) * (int64_t)U + u], sum_v_69);
+        atomicAdd(&out[((int64_t)dst * V + 62) * (int64_t)U + u], sum_v_62);
+        atomicAdd(&out[((int64_t)dst * V + 63) * (int64_t)U + u], sum_v_63);
+        atomicAdd(&out[((int64_t)dst * V + 57) * (int64_t)U + u], sum_v_57);
+        atomicAdd(&out[((int64_t)dst * V + 35) * (int64_t)U + u], sum_v_35);
+        atomicAdd(&out[((int64_t)dst * V + 33) * (int64_t)U + u], sum_v_33);
+        atomicAdd(&out[((int64_t)dst * V + 28) * (int64_t)U + u], sum_v_28);
+        atomicAdd(&out[((int64_t)dst * V + 31) * (int64_t)U + u], sum_v_31);
+        atomicAdd(&out[((int64_t)dst * V + 25) * (int64_t)U + u], sum_v_25);
+        atomicAdd(&out[((int64_t)dst * V + 11) * (int64_t)U + u], sum_v_11);
+        atomicAdd(&out[((int64_t)dst * V + 10) * (int64_t)U + u], sum_v_10);
+        atomicAdd(&out[((int64_t)dst * V + 54) * (int64_t)U + u], sum_v_54);
+        atomicAdd(&out[((int64_t)dst * V + 55) * (int64_t)U + u], sum_v_55);
+        atomicAdd(&out[((int64_t)dst * V + 56) * (int64_t)U + u], sum_v_56);
+        atomicAdd(&out[((int64_t)dst * V + 23) * (int64_t)U + u], sum_v_23);
+        atomicAdd(&out[((int64_t)dst * V + 26) * (int64_t)U + u], sum_v_26);
+        atomicAdd(&out[((int64_t)dst * V + 7) * (int64_t)U + u], sum_v_7);
+        atomicAdd(&out[((int64_t)dst * V + 0) * (int64_t)U + u], sum_v_0);
+        atomicAdd(&out[((int64_t)dst * V + 4) * (int64_t)U + u], sum_v_4);
+        atomicAdd(&out[((int64_t)dst * V + 18) * (int64_t)U + u], sum_v_18);
+        atomicAdd(&out[((int64_t)dst * V + 20) * (int64_t)U + u], sum_v_20);
+        atomicAdd(&out[((int64_t)dst * V + 22) * (int64_t)U + u], sum_v_22);
+        atomicAdd(&out[((int64_t)dst * V + 44) * (int64_t)U + u], sum_v_44);
+        atomicAdd(&out[((int64_t)dst * V + 46) * (int64_t)U + u], sum_v_46);
+        atomicAdd(&out[((int64_t)dst * V + 48) * (int64_t)U + u], sum_v_48);
     }
 
 }
@@ -572,12 +574,12 @@ void launch_uniform1d_codegen_two_warp_vgroup_path215_u224_fwd(
     const int32_t* src_idx,
     const int32_t* dst_idx,
     const int32_t* b_list,
-    int B, int Iw, int Ix, int Ky, int V,
+    int B, int Iw, int Ix, int Ky, int V, int U,
     cudaStream_t stream)
 {
     dim3 block(64);  // 2 warps
-    dim3 grid(B);
+    dim3 grid(B, (U + 31) / 32);
     uniform1d_codegen_two_warp_vgroup_path215_u224_fwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, out, src_idx, dst_idx, b_list,
-        B, Iw, Ix, Ky, V);
+        B, Iw, Ix, Ky, V, U);
 }

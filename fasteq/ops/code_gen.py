@@ -180,20 +180,18 @@ def split_groups_into_two_warps(groups: OrderedDict):
     return warp0_vs, warp1_vs
 
 
-# ============================================================
-# CUDA emitter
-# ============================================================
-
 def emit_two_warp_vgroup_forward_kernel(
     groups: OrderedDict,
     kernel_name: str = "stp_codegen_two_warp_vgroup",
     scalar_t: str = "float",
 ) -> str:
     """
-    生成一个固定 2 warp 的 kernel:
-      warp0 处理一部分 v
-      warp1 处理另一部分 v
-    按 v 粒度展开
+    生成一个固定 2 warp 的 tiled-U forward kernel:
+      - warp0 处理一部分 v
+      - warp1 处理另一部分 v
+      - blockIdx.x -> b
+      - blockIdx.y -> u tile (32 channels)
+    支持 U % 32 == 0
     """
     warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
 
@@ -205,16 +203,17 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("")
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
-    ap("    const scalar_t* __restrict__ w,")        # [B, Iw, 32]
-    ap("    const scalar_t* __restrict__ x_all,")    # [S, Ix, 32]
-    ap("    const scalar_t* __restrict__ y,")        # [B, Ky]
-    ap("    scalar_t* __restrict__ out,")            # [Dst, V, 32]
+    ap("    const scalar_t* __restrict__ w,")        # [B, Iw, U]
+    ap("    const scalar_t* __restrict__ x_all,")    # [S, Ix, U]
+    ap("    const scalar_t* __restrict__ y,")        # [B, Ky, 1] flatten as [B,Ky]
+    ap("    scalar_t* __restrict__ out,")            # [S, V, U]
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
     ap("    const int32_t* __restrict__ b_list,")
-    ap("    int B, int Iw, int Ix, int Ky, int V)")
+    ap("    int B, int Iw, int Ix, int Ky, int V, int U)")
     ap("{")
     ap("    int b_global = (int)blockIdx.x;")
+    ap("    int ublk     = (int)blockIdx.y;")
     ap("    if (b_global >= B) return;")
     ap("    int b = b_list ? b_list[b_global] : b_global;")
     ap("")
@@ -223,13 +222,13 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("    int warp = tid >> 5;")
     ap("    if (warp >= 2) return;")
     ap("")
+    ap("    int u = (ublk << 5) + lane;")
+    ap("    if (u >= U) return;")
+    ap("")
     ap("    int src = src_idx[b];")
     ap("    int dst = dst_idx[b];")
     ap("")
-    ap("    int64_t w_base = (int64_t)b   * Iw * 32;")
-    ap("    int64_t x_base = (int64_t)src * Ix * 32;")
-    ap("    int64_t y_base = (int64_t)b   * Ky;")
-    ap("    int64_t o_base = ((int64_t)dst * V) * 32 + lane;")
+    ap("    int64_t y_base = (int64_t)b * Ky;")
     ap("")
 
     def emit_warp_body(warp_id: int, warp_vs: List[int]):
@@ -240,7 +239,6 @@ def emit_two_warp_vgroup_forward_kernel(
             ap("")
             return
 
-        # preload 该 warp 用到的 unique i/j/k
         uniq_i = []
         uniq_j = []
         uniq_k = []
@@ -262,14 +260,14 @@ def emit_two_warp_vgroup_forward_kernel(
                     seen_k.add(kk)
                     uniq_k.append(kk)
 
-        ap("        // preload w(i)")
+        ap("        // preload w(i, u)")
         for ii in uniq_i:
-            ap(f"        scalar_t wi_{ii} = w[w_base + {ii}LL * 32 + lane];")
+            ap(f"        scalar_t wi_{ii} = w[((int64_t)b * Iw + {ii}) * (int64_t)U + u];")
         ap("")
 
-        ap("        // preload x(j)")
+        ap("        // preload x(j, u)")
         for jj in uniq_j:
-            ap(f"        scalar_t xj_{jj} = x_all[x_base + {jj}LL * 32 + lane];")
+            ap(f"        scalar_t xj_{jj} = x_all[((int64_t)src * Ix + {jj}) * (int64_t)U + u];")
         ap("")
 
         ap("        // preload y(k)")
@@ -294,7 +292,7 @@ def emit_two_warp_vgroup_forward_kernel(
 
         ap("        // writeback")
         for vv in warp_vs:
-            ap(f"        atomicAdd(&out[o_base + ({vv}LL << 5)], sum_v_{vv});")
+            ap(f"        atomicAdd(&out[((int64_t)dst * V + {vv}) * (int64_t)U + u], sum_v_{vv});")
         ap("    }")
         ap("")
 
@@ -313,14 +311,14 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
     ap("    const int32_t* b_list,")
-    ap("    int B, int Iw, int Ix, int Ky, int V,")
+    ap("    int B, int Iw, int Ix, int Ky, int V, int U,")
     ap("    cudaStream_t stream)")
     ap("{")
     ap("    dim3 block(64);  // 2 warps")
-    ap("    dim3 grid(B);")
+    ap("    dim3 grid(B, (U + 31) / 32);")
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
     ap("        w, x_all, y, out, src_idx, dst_idx, b_list,")
-    ap("        B, Iw, Ix, Ky, V);")
+    ap("        B, Iw, Ix, Ky, V, U);")
     ap("}")
 
     return "\n".join(lines)
@@ -395,7 +393,6 @@ def generate_code_uniform1d_fwd(
     }
     return stats
 
-
 def emit_two_warp_vgroup_backward_kernel(
     groups: OrderedDict,
     kernel_name: str = "stp_codegen_two_warp_vgroup_bwd",
@@ -420,34 +417,36 @@ def emit_two_warp_vgroup_backward_kernel(
     ap("")
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
-    ap("    const scalar_t* __restrict__ w,")          # [B, Iw, 32]
-    ap("    const scalar_t* __restrict__ x_all,")      # [S, Ix, 32]
-    ap("    const scalar_t* __restrict__ y,")          # [B, Ky]
-    ap("    const scalar_t* __restrict__ grad_out,")   # [Dst, V, 32]
-    ap("    scalar_t* __restrict__ grad_w,")           # [B, Iw, 32]
-    ap("    scalar_t* __restrict__ grad_x,")           # [S, Ix, 32]
-    ap("    scalar_t* __restrict__ grad_y,")           # [B, Ky]
+    ap("    const scalar_t* __restrict__ w,")          # [B, Iw, U]
+    ap("    const scalar_t* __restrict__ x_all,")      # [S, Ix, U]
+    ap("    const scalar_t* __restrict__ y,")          # [B, Ky, 1]
+    ap("    const scalar_t* __restrict__ grad_out,")   # [S, V, U]
+    ap("    scalar_t* __restrict__ grad_w,")           # [B, Iw, U]
+    ap("    scalar_t* __restrict__ grad_x,")           # [S, Ix, U]
+    ap("    scalar_t* __restrict__ grad_y,")           # [B, Ky, 1]
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
     ap("    const int32_t* __restrict__ b_list,")
-    ap("    int B, int Iw, int Ix, int Ky, int V)")
+    ap("    int B, int Iw, int Ix, int Ky, int V, int U)")
     ap("{")
     ap("    int b_global = (int)blockIdx.x;")
+    ap("    int ublk     = (int)blockIdx.y;")
     ap("    if (b_global >= B) return;")
-    ap("    int b = b_list ? b_list[b_global] : b_global;")
     ap("")
+    ap("    int b = b_list ? b_list[b_global] : b_global;")
     ap("    int tid  = threadIdx.x;")
     ap("    int lane = tid & 31;")
     ap("    int warp = tid >> 5;")
     ap("    if (warp >= 2) return;")
     ap("")
+    ap("    int u = (ublk << 5) + lane;")
+    ap("    if (u >= U) return;")
+    ap("")
     ap("    int src = src_idx[b];")
     ap("    int dst = dst_idx[b];")
     ap("")
-    ap("    int64_t w_base  = (int64_t)b   * Iw * 32;")
-    ap("    int64_t x_base  = (int64_t)src * Ix * 32;")
-    ap("    int64_t y_base  = (int64_t)b   * Ky;")
-    ap("    int64_t go_base = ((int64_t)dst * V) * 32 + lane;")
+    ap("    // flattened row-major offsets with true U stride")
+    ap("    int64_t y_base = (int64_t)b * Ky;")
     ap("")
 
     def emit_warp_body(warp_id: int, warp_vs: List[int]):
@@ -462,11 +461,11 @@ def emit_two_warp_vgroup_backward_kernel(
         seen_i, seen_j, seen_k = set(), set(), set()
 
         for vv in warp_vs:
-            ii = groups[vv]['i']
+            ii = groups[vv]["i"]
             if ii not in seen_i:
                 seen_i.add(ii)
                 uniq_i.append(ii)
-            for jj, kk, _ in groups[vv]['terms']:
+            for jj, kk, _ in groups[vv]["terms"]:
                 if jj not in seen_j:
                     seen_j.add(jj)
                     uniq_j.append(jj)
@@ -474,25 +473,23 @@ def emit_two_warp_vgroup_backward_kernel(
                     seen_k.add(kk)
                     uniq_k.append(kk)
 
-        # preload forward inputs used by this warp
-        ap("        // preload w(i)")
+        ap("        // preload w(i, u)")
         for ii in uniq_i:
-            ap(f"        scalar_t wi_{ii} = w[w_base + {ii}LL * 32 + lane];")
+            ap(f"        scalar_t wi_{ii} = w[((int64_t)b * Iw + {ii}) * (int64_t)U + u];")
         ap("")
-        ap("        // preload x(j)")
+        ap("        // preload x(j, u)")
         for jj in uniq_j:
-            ap(f"        scalar_t xj_{jj} = x_all[x_base + {jj}LL * 32 + lane];")
+            ap(f"        scalar_t xj_{jj} = x_all[((int64_t)src * Ix + {jj}) * (int64_t)U + u];")
         ap("")
         ap("        // preload y(k)")
         for kk in uniq_k:
             ap(f"        scalar_t yk_{kk} = y[y_base + {kk}];")
         ap("")
-        ap("        // preload grad_out(v)")
+        ap("        // preload grad_out(v, u)")
         for vv in warp_vs:
-            ap(f"        scalar_t go_v_{vv} = grad_out[go_base + ({vv}LL << 5)];")
+            ap(f"        scalar_t go_v_{vv} = grad_out[((int64_t)dst * V + {vv}) * (int64_t)U + u];")
         ap("")
 
-        # grad_w accumulation by unique i
         ap("        // grad_w accumulate by unique i")
         for ii in uniq_i:
             ap(f"        scalar_t gw_acc_i_{ii} = scalar_t(0);")
@@ -507,16 +504,16 @@ def emit_two_warp_vgroup_backward_kernel(
                     else:
                         cstr = _fmt_coeff(cc, scalar_t)
                         ap(f"        gw_acc_i_{ii} += scalar_t({cstr}) * xj_{jj} * yk_{kk} * go_v_{vv};")
-            ap(f"        atomicAdd(&grad_w[w_base + {ii}LL * 32 + lane], gw_acc_i_{ii});")
+            ap(f"        atomicAdd(&grad_w[((int64_t)b * Iw + {ii}) * (int64_t)U + u], gw_acc_i_{ii});")
             ap("")
 
-        # grad_x accumulation by unique j
         ap("        // grad_x accumulate by unique j")
         j_terms = defaultdict(list)
         for vv in warp_vs:
             ii = groups[vv]["i"]
             for jj, kk, cc in groups[vv]["terms"]:
                 j_terms[jj].append((vv, ii, kk, cc))
+
         for jj in uniq_j:
             ap(f"        scalar_t gx_acc_j_{jj} = scalar_t(0);")
             for vv, ii, kk, cc in j_terms[jj]:
@@ -527,16 +524,16 @@ def emit_two_warp_vgroup_backward_kernel(
                 else:
                     cstr = _fmt_coeff(cc, scalar_t)
                     ap(f"        gx_acc_j_{jj} += scalar_t({cstr}) * wi_{ii} * yk_{kk} * go_v_{vv};")
-            ap(f"        atomicAdd(&grad_x[x_base + {jj}LL * 32 + lane], gx_acc_j_{jj});")
+            ap(f"        atomicAdd(&grad_x[((int64_t)src * Ix + {jj}) * (int64_t)U + u], gx_acc_j_{jj});")
             ap("")
 
-        # grad_y accumulation by unique k, with warp reduction
-        ap("        // grad_y accumulate by unique k (warp-reduce across lane)")
+        ap("        // grad_y accumulate by unique k, reduced across current 32-channel tile")
         k_terms = defaultdict(list)
         for vv in warp_vs:
             ii = groups[vv]["i"]
             for jj, kk, cc in groups[vv]["terms"]:
                 k_terms[kk].append((vv, ii, jj, cc))
+
         for kk in uniq_k:
             ap(f"        scalar_t gy_lane_k_{kk} = scalar_t(0);")
             for vv, ii, jj, cc in k_terms[kk]:
@@ -571,17 +568,17 @@ def emit_two_warp_vgroup_backward_kernel(
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
     ap("    const int32_t* b_list,")
-    ap("    int B, int Iw, int Ix, int Ky, int V,")
+    ap("    int B, int Iw, int Ix, int Ky, int V, int U,")
     ap("    cudaStream_t stream)")
     ap("{")
-    ap("    dim3 block(64);  // 2 warps")
-    ap("    dim3 grid(B);")
+    ap("    dim3 block(64);")
+    ap("    dim3 grid(B, (U + 31) / 32);")
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
     ap("        w, x_all, y, grad_out, grad_w, grad_x, grad_y,")
-    ap("        src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V);")
+    ap("        src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V, U);")
     ap("}")
-    return '\n'.join(lines)
 
+    return '\n'.join(lines)
 
 def generate_code_uniform1d_bwd(
     i_list: torch.Tensor,
