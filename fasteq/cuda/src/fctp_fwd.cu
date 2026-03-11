@@ -568,7 +568,152 @@ at::Tensor launch_fused_multipath_fctp_tile(
     return out;
 }
 
+/**
+ * Forward:
+ *   x:        [B, I, U]
+ *   w:        [P, U, V, W]
+ *   vstar:    [B]
+ *   p_for_k:  [K]
+ *   i_for_k:  [K]   (-1 => empty)
+ *   val_for_k:[K]
+ *   out:      [B, K, W]
+ *
+ * Triton mapping:
+ *   pid_b = blockIdx.x
+ *   pid_k = blockIdx.y
+ *   pid_w = blockIdx.z
+ *
+ * CUDA mapping:
+ *   blockIdx.x -> b
+ *   blockIdx.y -> k-tile
+ *   blockIdx.z -> w-tile
+ *   threadIdx.y -> local k in tile
+ *   threadIdx.x -> local w in tile
+ */
+template <typename scalar_t, typename acc_t, int BK, int BW, int BU>
+__global__ void fused_onehot_wpuvw_fwd_kernel_cuda(
+    const scalar_t* __restrict__ x_ptr,         // [B, I, U]
+    const scalar_t* __restrict__ w_ptr,         // [P, U, V, W]
+    const int32_t* __restrict__ vstar_ptr,      // [B]
+    const int32_t* __restrict__ p_for_k_ptr,    // [K]
+    const int32_t* __restrict__ i_for_k_ptr,    // [K]
+    const scalar_t* __restrict__ val_for_k_ptr, // [K]
+    scalar_t* __restrict__ out_ptr,             // [B, K, W]
+    int B, int I, int K, int U,
+    int P, int V, int W,
+    acc_t alpha)
+{
+    const int b = blockIdx.x;
+    const int k0 = blockIdx.y * BK;
+    const int w0 = blockIdx.z * BW;
 
-TORCH_LIBRARY(fctp_fused_multipath_fwd, m) {
+    const int tk = threadIdx.y;   // [0, BK)
+    const int tw = threadIdx.x;   // [0, BW)
+
+    const int k = k0 + tk;
+    const int wo = w0 + tw;
+
+    if (b >= B || tk >= BK || tw >= BW) return;
+    if (k >= K || wo >= W) return;
+
+    const int v = vstar_ptr[b];
+    const int p = p_for_k_ptr[k];
+    const int i = i_for_k_ptr[k];
+
+    acc_t acc = acc_t(0);
+
+    if (i >= 0) {
+        for (int u0 = 0; u0 < U; u0 += BU) {
+#pragma unroll
+            for (int uu = 0; uu < BU; ++uu) {
+                const int u = u0 + uu;
+                if (u < U) {
+                    const int64_t x_off =
+                        ((int64_t)b * I + i) * (int64_t)U + u;
+                    const int64_t w_off =
+                        (((int64_t)p * U + u) * (int64_t)V + v) * (int64_t)W + wo;
+
+                    acc += static_cast<acc_t>(x_ptr[x_off]) *
+                           static_cast<acc_t>(w_ptr[w_off]);
+                }
+            }
+        }
+
+        acc *= static_cast<acc_t>(val_for_k_ptr[k]) * alpha;
+    }
+
+    const int64_t out_off = ((int64_t)b * K + k) * (int64_t)W + wo;
+    out_ptr[out_off] = static_cast<scalar_t>(acc);
+}
+
+torch::Tensor fused_onehot_wpuvw_fwd(
+    torch::Tensor x_biu,        // [B, I, U]
+    torch::Tensor vstar,        // [B] int32
+    torch::Tensor w_puvw,       // [P, U, V, W]
+    torch::Tensor p_for_k,      // [K] int32
+    torch::Tensor i_for_k,      // [K] int32
+    torch::Tensor val_for_k,    // [K]
+    double alpha)
+{
+
+    TORCH_CHECK(x_biu.dim() == 3, "x_biu must be [B, I, U]");
+    TORCH_CHECK(w_puvw.dim() == 4, "w_puvw must be [P, U, V, W]");
+    TORCH_CHECK(vstar.scalar_type() == torch::kInt32, "vstar must be int32");
+    TORCH_CHECK(p_for_k.scalar_type() == torch::kInt32, "p_for_k must be int32");
+    TORCH_CHECK(i_for_k.scalar_type() == torch::kInt32, "i_for_k must be int32");
+    TORCH_CHECK(x_biu.scalar_type() == w_puvw.scalar_type(), "dtype mismatch: x and w");
+    TORCH_CHECK(x_biu.scalar_type() == val_for_k.scalar_type(), "dtype mismatch: x and val_for_k");
+
+    const int B = x_biu.size(0);
+    const int I = x_biu.size(1);
+    const int U = x_biu.size(2);
+
+    const int P = w_puvw.size(0);
+    const int U2 = w_puvw.size(1);
+    const int V = w_puvw.size(2);
+    const int W = w_puvw.size(3);
+
+    TORCH_CHECK(U == U2, "U mismatch");
+
+    const int K = p_for_k.size(0);
+    TORCH_CHECK(i_for_k.size(0) == K, "i_for_k size mismatch");
+    TORCH_CHECK(val_for_k.size(0) == K, "val_for_k size mismatch");
+
+    auto out = torch::empty({B, K, W}, x_biu.options());
+
+    const int BW = 32;
+    const int BU = 32;
+    const int BK = 8;
+
+    dim3 block(BW, BK);
+    dim3 grid(B, (K + BK - 1) / BK, (W + BW - 1) / BW);
+
+    auto stream = at::cuda::getDefaultCUDAStream();
+
+    AT_DISPATCH_FLOATING_TYPES(x_biu.scalar_type(), "fused_onehot_wpuvw_fwd_cuda", [&] {
+        using acc_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
+
+        fused_onehot_wpuvw_fwd_kernel_cuda<scalar_t, acc_t, BK, BW, BU>
+            <<<grid, block, 0, stream>>>(
+                x_biu.data_ptr<scalar_t>(),
+                w_puvw.data_ptr<scalar_t>(),
+                vstar.data_ptr<int32_t>(),
+                p_for_k.data_ptr<int32_t>(),
+                i_for_k.data_ptr<int32_t>(),
+                val_for_k.data_ptr<scalar_t>(),
+                out.data_ptr<scalar_t>(),
+                B, I, K, U, P, V, W,
+                static_cast<acc_t>(alpha)
+            );
+    });
+    out = out.view({B, K * W});
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+
+
+TORCH_LIBRARY(fctp_fwd, m) {
     m.def("forward", &launch_fused_multipath_fctp_tile);
+    m.def("forward_opt", &fused_onehot_wpuvw_fwd);
 }
