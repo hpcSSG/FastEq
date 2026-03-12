@@ -11,9 +11,7 @@ class _FastEquiLinearFn(torch.autograd.Function):
         else:
             I_list = [segment[0] for segment in descriptor.operands[1]]
         I_total = sum(I_list)
-        print(f"desc:{descriptor}")
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
+
         cg_list = []
         for pid, path in enumerate(descriptor.paths):
             cg_list.append(float(path.coefficients))
@@ -37,19 +35,25 @@ class _FastEquiLinearFn(torch.autograd.Function):
         # 1:0.03857583749052298; 3,5=0.02988071523335984; 7=0.03340765523905305
         #cg_vals = [0.03857583749052298, 0.02988071523335984, 0.03340765523905305]
         #I_total = sum(I_list)
+        origin_dtype = x.dtype
 
-        # x = x.float()
-        # w = w.float()
+        if origin_dtype == torch.float64:
+            x = x.float()
+            w = w.float()
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
         out = torch.ops.equi_linear.forward(x, w, I_list, cg_list)
         out =  out.view(B, -1)
 
-        # out = out.double()
+        if origin_dtype == torch.float64:
+            out = out.double()
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #execution_time_ms = end_time - start_time
-        #print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
 
         ctx.save_for_backward(w)
         ctx.B = B
@@ -57,6 +61,7 @@ class _FastEquiLinearFn(torch.autograd.Function):
         ctx.I_total = I_total
         ctx.u = u
         ctx.cg_list = cg_list
+        ctx.origin_dtype = origin_dtype
         return out
 
     @staticmethod
@@ -68,23 +73,20 @@ class _FastEquiLinearFn(torch.autograd.Function):
         start_time = time.perf_counter() * 1000
         w, = ctx.saved_tensors
 
-        print(f"grad_out shape:{grad_out.shape}, w shape:{w.shape}")
-
-        # grad_out = grad_out.float()
-        # w = w.float()
+        if ctx.origin_dtype == torch.float64:
+            grad_out = grad_out.float()
+            w = w.float()
 
         grad_out = grad_out.view(ctx.B, 16, ctx.u).contiguous() # 只支持out固定为16
         grad_x = torch.ops.equi_linear.backward(grad_out, w, ctx.I_list, ctx.cg_list).view(ctx.B, -1)
 
-        print(f"grad_x shape after bwd:{grad_x.shape}")
-
-        # grad_x = grad_x.double()
+        if ctx.origin_dtype == torch.float64:
+            grad_x = grad_x.double()
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        #print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
-        #print(f"<< gradx shape:{grad_x.shape}")
+        print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
         return None, grad_x, None, None
 
 def fast_equi_linear(descriptor, w, x):
