@@ -88,7 +88,7 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
     if (grad.dtype() == torch::kFloat32)
     {
         mutipath_equi_linear_bwd_f32_impl(out_num_paths, static_cast<float *>(out_ptr), static_cast<float *>(grad_ptr),
-                                          static_cast<float *>(w_ptr), B, out_total_i, out_i_dims_vec, U, V, val,
+                                          static_cast<float *>(w_ptr), B, out_total_i, out_i_dims_vec, U, V, cg_val_vec,
                                           cur_stream);
     }
     else
@@ -98,7 +98,7 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
         void *wt_ptr = wt.data_ptr();
         mutipath_equi_linear_fwd_f64_impl(out_num_paths, static_cast<double *>(out_ptr),
                                           static_cast<double *>(grad_ptr), static_cast<double *>(wt_ptr), B,
-                                          out_total_i, out_i_dims_vec, V, U, val, cur_stream);
+                                          out_total_i, out_i_dims_vec, V, U, cg_val_vec, cur_stream);
     }
 
     return out;

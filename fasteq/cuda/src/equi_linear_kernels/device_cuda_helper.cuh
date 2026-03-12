@@ -21,7 +21,7 @@ template <uint32_t _N, typename DType = float> struct cg_T
 
     __host__ cg_T(const std::vector<double> &cg_vec)
     {
-        uint32_t UB = std::min(cg_vec.size(), _N);
+        uint32_t UB = std::min<uint32_t>(cg_vec.size(), _N);
         for (uint32_t _i = 0; _i < UB; ++_i)
         {
             _v[_i] = static_cast<DType>(cg_vec[_i]);

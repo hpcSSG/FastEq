@@ -397,8 +397,7 @@ __global__ void mutipath_equi_linear_bwd_f32_tf32_kernel(
     uint32_t U,                                    // U
     uint32_t V,                                    // V
     uint32_t grad_total_i,                         // input i的总数
-    uint32_t out_total_i,                          // output i的总数
-    float cg_val                                   // val
+    uint32_t out_total_i                           // output i的总数
 )
 {
     /* tensor shape:
@@ -540,7 +539,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
                                   const uint32_t &out_total_i,                 // out_total_i
                                   const uint32_t &U,                           // U
                                   const uint32_t &V,                           // V
-                                  const std::vector<double> &cg_val_vec,       // cg_val
+                                  const std::vector<double> &cg_val_vec,       // cg_vals
                                   const cudaStream_t &cur_stream               // current stream
 )
 {
@@ -660,7 +659,7 @@ void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          /
                                        const std::vector<int64_t> &out_i_dims, // out i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const std::vector<double> &cg_val_vec,  // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_vals
                                        const cudaStream_t &cur_stream          // current stream
 )
 {
