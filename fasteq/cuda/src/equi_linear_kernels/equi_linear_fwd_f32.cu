@@ -19,6 +19,7 @@ namespace cde = cuda::device::experimental;
 __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
     float *out_smem_ptr,            // out buffer ptr to store output 32*32 data
     float *tmp_smem_ptr,            // tmp buffer ptr containning input 16x32 data
+    const float &cur_cg_val,        // cur_cg_val
     const uint32_t &base_sw_x0_tag, // 0 or 1 (indicate swizzle 16B_x starts from 0 or 4)
     const uint32_t &in_wg_tid       // in warpgroup tid
 )
@@ -33,7 +34,7 @@ __device__ __forceinline__ void wg_trans_16x32f32tf32_sw128B_sync(
     for (uint32_t cnt = 0; cnt < 4; ++cnt)
     {
         uint32_t ld_row = ld_row0 + cnt;
-        float fp32_data = tmp_smem_ptr[ld_row * 32 + ld_col];
+        float fp32_data = tmp_smem_ptr[ld_row * 32 + ld_col] * cur_cg_val;
         uint32_t tf32_data;
         asm_cvt_tf32_f32(tf32_data, fp32_data);
         tmp_reg[cnt] = __uint_as_float(tf32_data);
@@ -257,6 +258,7 @@ __device__ void preloop_consumer(barrier bars_ready[],           // buffer finis
                                  barrier bars_filled[],          // buffer finish filling barrier
                                  float *B_smem,                  //
                                  float *tmp_smem,                //
+                                 const float &cur_cg_val,        //
                                  const uint32_t &U,              //
                                  const uint32_t &consumer_wg_id, //
                                  const uint32_t &in_wg_tid       //
@@ -293,6 +295,7 @@ __device__ void preloop_consumer(barrier bars_ready[],           // buffer finis
             (B_smem + k_count * B_SMEM_SIZE_PER_TILE), // out buffer ptr to store output 32*32 data
             (tmp_smem + cur_buffer_id * PRELOOP_BUFFER_SIZE_PER_STAGE +
              base_sw_x0_tag * 512), // tmp buffer ptr containning input 16x32 data
+            cur_cg_val,             // cur_cg_val
             base_sw_x0_tag,         // 0 or 1
             in_wg_tid               // in warpgroup tid
         );
@@ -467,7 +470,6 @@ __device__ void store_re_async_consumer(
     const uint32_t &b_mtile_id,                                     // b_mtile_id
     const uint32_t &b_ntile_id,                                     // b_ntile_id
     const uint32_t &b_out_i_id,                                     // b_out_i_id
-    const float &cg_val,                                            // cg_val
     const uint32_t &consumer_wg_id,                                 // consumer warpgroup id
     const uint32_t &in_wg_tid                                       // in warpgroup tid
 )
@@ -479,16 +481,6 @@ __device__ void store_re_async_consumer(
     // Target SMEM layout (Layout from SMEM to GLOBAL): row major, swizzle NONE;
     for (uint32_t _m = 0; _m < (TILE_M / CONSUMER_WG_NUM) / 64; ++_m)
     {
-        // Attach cg_val effect
-#pragma unroll
-        for (uint32_t _n = 0; _n < (TILE_N / 8); ++_n)
-        {
-#pragma unroll
-            for (uint32_t _cnt = 0; _cnt < 4; ++_cnt)
-            {
-                t_accu[_m][_n][_cnt] *= cg_val;
-            }
-        }
         wg_reg_swap_swizzle4_m64n32f32<TILE_N>(t_accu[_m], in_wg_tid);
         wg_R2S_swizzle4_m64n32f32<TILE_N>(
             (O_smem + consumer_wg_id * OUT_SMEM_SIZE_PER_CONS_WG + _m * SMEM_SIZE_PER_M_TILE), //
@@ -531,6 +523,7 @@ template <uint32_t IN_NUM_PATHS,        // in path数量
 __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
                                                          const __grid_constant__ CUtensorMap w_map,   // w tensor maps
                                                          const __grid_constant__ CUtensorMap out_map, // out tensor maps
+                                                         cg_T<IN_NUM_PATHS> cg_vals,                  // val
                                                          idim_T<IN_NUM_PATHS> in_prefex_i_sum,        // [IN_NUM_PATHS]
                                                          idim_T<OUT_NUM_PATHS> out_prefex_i_sum,      // [OUT_NUM_PATHS]
                                                          idim_T<OUT_NUM_PATHS> out_path_count,        // [OUT_NUM_PATHS]
@@ -539,8 +532,7 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
                                                          uint32_t U,                                  // U
                                                          uint32_t V,                                  // V
                                                          uint32_t in_total_i,                         // input i的总数
-                                                         uint32_t out_total_i,                        // output i的总数
-                                                         float cg_val                                 // val
+                                                         uint32_t out_total_i                         // output i的总数
 )
 {
     /* tensor shape:
@@ -565,6 +557,12 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
         b_out_path_id = b_out_i_id >= out_prefex_i_sum._i[n] ? n : b_out_path_id;
     }
     uint32_t b_out_reduce_loop_count = out_path_count._i[b_out_path_id];
+
+    uint32_t b_in_path_id0 = 0;
+    for (uint32_t p = 0; p < b_out_path_id; ++p)
+    {
+        b_in_path_id0 += out_path_count._i[p];
+    }
 
     // define SMEM-buffer
     extern __shared__ __align__(1024) float smem[];
@@ -608,11 +606,6 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
         uint32_t b_in_i_stride = (b_out_path_id < OUT_NUM_PATHS - 1)
                                      ? (out_prefex_i_sum._i[b_out_path_id + 1] - out_prefex_i_sum._i[b_out_path_id])
                                      : (out_total_i - out_prefex_i_sum._i[b_out_path_id]);
-        uint32_t b_in_path_id0 = 0;
-        for (uint32_t p = 0; p < b_out_path_id; ++p)
-        {
-            b_in_path_id0 += out_path_count._i[p];
-        }
 
         // Out reduce loop
         for (uint32_t cnt = 0; cnt < b_out_reduce_loop_count; ++cnt)
@@ -660,10 +653,13 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
         {
             /* STEP1 (prepare loop): Fetch W tile and transpose (prepare loop)*/
             // We use O_smem as a tmp buffer (buffer size: TILE_M * TILE_N)
+            uint32_t b_in_path_id = b_in_path_id0 + cnt;
+            float cur_cg_val = cg_vals._v[b_in_path_id];
             preloop_consumer<TILE_N, TILE_K, B_SMEM_SIZE_PER_TILE, CONSUMER_WG_NUM, TOTAL_STAGES>(bars_ready,     //
                                                                                                   bars_filled,    //
                                                                                                   B_smem,         //
                                                                                                   O_smem,         //
+                                                                                                  cur_cg_val,     //
                                                                                                   U,              //
                                                                                                   consumer_wg_id, //
                                                                                                   in_wg_tid       //
@@ -690,7 +686,6 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
                                                                  b_mtile_id,     // b_mtile_id
                                                                  b_ntile_id,     // b_ntile_id
                                                                  b_out_i_id,     // b_out_i_id
-                                                                 cg_val,         // cg_val
                                                                  consumer_wg_id, // consumer warpgroup id
                                                                  in_wg_tid       // in warpgroup tid
         );
@@ -713,7 +708,7 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
                                   const uint32_t &out_total_i,                // out_total_i
                                   const uint32_t &U,                          // U
                                   const uint32_t &V,                          // V
-                                  const double &val,                          // cg_val
+                                  const std::vector<double> &cg_val_vec,      // cg_val
                                   const cudaStream_t &cur_stream              // current stream
 )
 {
@@ -760,6 +755,8 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
         out_path_in_istart._i[op] = in_prefex_i_sum._i[_cur_i_path];
         _cur_i_path += out_path_count._i[op];
     }
+
+    cg_T<IN_NUM_PATHS> cg_vals(cg_val_vec);
 
     CUtensorMap x_map{};
     CUtensorMap w_map{};
@@ -810,9 +807,9 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
     auto cuda_kernel = mutipath_equi_linear_fwd_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
                                                                 PRODUCER_WG_NUM, CONSUMER_WG_NUM>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
-    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x_map, w_map, out_map, in_prefex_i_sum, out_prefex_i_sum,
-                                                        out_path_count, out_path_in_istart, B, U, V, in_total_i,
-                                                        out_total_i, val);
+    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x_map, w_map, out_map, cg_vals, in_prefex_i_sum,
+                                                        out_prefex_i_sum, out_path_count, out_path_in_istart, B, U, V,
+                                                        in_total_i, out_total_i);
 }
 
 // wrapper
@@ -825,7 +822,7 @@ void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           /
                                        const std::vector<int64_t> &i_dims_vec, // i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_val
                                        const cudaStream_t &cur_stream          // current stream
 )
 {
@@ -849,5 +846,5 @@ void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           /
         }
     };
     // 调用lambda，完美转发参数
-    call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, val, cur_stream);
+    call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, cg_val_vec, cur_stream);
 }

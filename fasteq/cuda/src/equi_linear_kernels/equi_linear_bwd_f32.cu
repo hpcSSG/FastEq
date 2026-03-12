@@ -389,6 +389,7 @@ __global__ void mutipath_equi_linear_bwd_f32_tf32_kernel(
     const __grid_constant__ CUtensorMap grad_map,  // grad tensor maps
     const __grid_constant__ CUtensorMap w_map,     // w tensor maps
     const __grid_constant__ CUtensorMap out_map,   // out tensor maps
+    cg_T<OUT_NUM_PATHS> cg_vals,                   // cg_vals
     idim_T<GRAD_NUM_PATHS> grad_prefex_i_sum,      // [GRAD_NUM_PATHS]
     idim_T<OUT_NUM_PATHS> out_prefex_i_sum,        // [OUT_NUM_PATHS]
     idim_T<GRAD_NUM_PATHS> gradpath_repeated_nums, // [GRAD_NUM_PATHS]
@@ -509,14 +510,14 @@ __global__ void mutipath_equi_linear_bwd_f32_tf32_kernel(
         // calculate b_out_i_id
         uint32_t b_out_i_id = calculate_out_i<GRAD_NUM_PATHS, OUT_NUM_PATHS>(grad_prefex_i_sum, out_prefex_i_sum,
                                                                              b_grad_i_id, b_out_path_id);
-
+        float cur_cg_val = cg_vals._v[b_out_path_id];
         store_re_async_consumer<TILE_M, TILE_N, CONSUMER_WG_NUM>(O_smem,         // output smem buffer base addr
                                                                  t_accu,         // accumulator regs
                                                                  &out_map,       // out tensor map
                                                                  b_batch_id0,    // b_batch_id0
                                                                  b_out_i_id,     // b_out_i_id
                                                                  b_u_id0,        // b_u_id0
-                                                                 cg_val,         // cg_val
+                                                                 cur_cg_val,     // cg_val
                                                                  consumer_wg_id, // consumer warpgroup id
                                                                  in_wg_tid       // in warpgroup tid
         );
@@ -539,7 +540,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
                                   const uint32_t &out_total_i,                 // out_total_i
                                   const uint32_t &U,                           // U
                                   const uint32_t &V,                           // V
-                                  const double &val,                           // cg_val
+                                  const std::vector<double> &cg_val_vec,       // cg_val
                                   const cudaStream_t &cur_stream               // current stream
 )
 {
@@ -577,6 +578,8 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
         }
         gradpath_repeated_nums._i[_cur_grad_path] = _last_same_size_path_nums;
     }
+
+    cg_T<OUT_NUM_PATHS> cg_vals(cg_val_vec);
 
     CUtensorMap grad_map{};
     CUtensorMap w_map{};
@@ -635,6 +638,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(grad_map,               // grad tensor maps
                                                         w_map,                  // w tensor maps
                                                         out_map,                // out tensor maps
+                                                        cg_vals,                // cg vals
                                                         grad_prefex_i_sum,      // [GRAD_NUM_PATHS]
                                                         out_prefex_i_sum,       // [OUT_NUM_PATHS]
                                                         gradpath_repeated_nums, // [GRAD_NUM_PATHS]
@@ -642,8 +646,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
                                                         U,                      // U
                                                         V,                      // V
                                                         grad_total_i,           // input i的总数
-                                                        out_total_i,            // output i的总数
-                                                        val                     // val
+                                                        out_total_i             // output i的总数
     );
 }
 
@@ -657,7 +660,7 @@ void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          /
                                        const std::vector<int64_t> &out_i_dims, // out i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_val
                                        const cudaStream_t &cur_stream          // current stream
 )
 {
@@ -682,5 +685,5 @@ void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          /
     };
 
     // 调用lambda，完美转发参数
-    call_impl(out, grad, w, grad_i_dims, out_i_dims, B, grad_total_i, out_total_i, U, V, val, cur_stream);
+    call_impl(out, grad, w, grad_i_dims, out_i_dims, B, grad_total_i, out_total_i, U, V, cg_val_vec, cur_stream);
 }
