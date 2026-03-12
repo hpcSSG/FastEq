@@ -171,13 +171,13 @@ template <uint32_t M_WARPS = 2,                                                 
 __global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
                                                         const double *__restrict__ w,   // [num_paths, U, V]
                                                         double *__restrict__ out,       // [B, total_i, V]
+                                                        cg_T<NUM_PATHS> cg_vals,        // vals
                                                         idim_T<NUM_PATHS> i_dims,       // [num_paths]
                                                         idim_T<NUM_PATHS> prefex_i_sum, // [num_paths]
                                                         uint32_t total_i,               // i的总数
                                                         uint32_t B,                     // batch size
                                                         uint32_t U,                     // U
-                                                        uint32_t V,                     // V
-                                                        double cg_val                   // val
+                                                        uint32_t V                      // V
 )
 {
     constexpr uint32_t TILE_M = M_WARPS * W_TILE_M;
@@ -401,6 +401,7 @@ __global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict
     }
 
     // ST to Global
+    double cur_cg_val = cg_vals._v[b_path_id];
     for (uint32_t out_m0 = 0; out_m0 < (W_TILE_M / 8); ++out_m0)
     {
         for (uint32_t out_n0 = 0; out_n0 < (W_TILE_N / 8); ++out_n0)
@@ -420,8 +421,8 @@ __global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict
             uint32_t out_v = out_n;
             uint32_t out_offset = out_batch * total_i * V + out_i * V + out_v;
             // 乘 val
-            accu[accu_m][accu_n][accu_l0] *= cg_val;
-            accu[accu_m][accu_n][accu_l0 + 1] *= cg_val;
+            accu[accu_m][accu_n][accu_l0] *= cur_cg_val;
+            accu[accu_m][accu_n][accu_l0 + 1] *= cur_cg_val;
             // store re (sync)
             if (out_batch < B)
             {
@@ -442,7 +443,7 @@ void mutipath_equi_linear_fwd_f64(double *out,                                //
                                   const uint32_t &out_total_i,                // out_total_i
                                   const uint32_t &U,                          // U
                                   const uint32_t &V,                          // V
-                                  const double &val,                          // cg_val
+                                  const std::vector<double> &cg_val_vec,      // cg_vals
                                   const cudaStream_t &cur_stream              // current stream
 )
 {
@@ -454,6 +455,8 @@ void mutipath_equi_linear_fwd_f64(double *out,                                //
     }
     idim_T<IN_NUM_PATHS> prefix_i_sum;
     cal_prefex_sum<IN_NUM_PATHS>(prefix_i_sum, in_i_dims_vec);
+
+    cg_T<IN_NUM_PATHS> cg_vals(cg_val_vec);
 
     constexpr uint32_t M_WARPS = 2;
     constexpr uint32_t N_WARPS = 2;
@@ -474,7 +477,7 @@ void mutipath_equi_linear_fwd_f64(double *out,                                //
         mutipath_equi_linear_fwd_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
 
-    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x, w, out, i_dims, prefix_i_sum, in_total_i, B, U, V, val);
+    cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x, w, out, cg_vals, i_dims, prefix_i_sum, in_total_i, B, U, V);
 }
 
 // wrapper
@@ -487,7 +490,7 @@ void mutipath_equi_linear_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           /
                                        const std::vector<int64_t> &i_dims_vec, // i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_vals
                                        const cudaStream_t &cur_stream          // current stream
 )
 {
@@ -513,5 +516,5 @@ void mutipath_equi_linear_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           /
         }
     };
     // 调用lambda，完美转发参数
-    call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, val, cur_stream);
+    call_impl(out, x, w, i_dims_vec, out_i_dims_vec, B, total_i, out_total_i, U, V, cg_val_vec, cur_stream);
 }

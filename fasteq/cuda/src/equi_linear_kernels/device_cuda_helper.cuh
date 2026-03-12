@@ -6,12 +6,27 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <iostream>
+#include <vector>
 
 #include "./ptx_inst.cuh"
 
 template <uint32_t _N> struct idim_T
 {
     uint32_t _i[_N];
+};
+
+template <uint32_t _N, typename DType = float> struct cg_T
+{
+    DType _v[_N];
+
+    __host__ cg_T(const std::vector<double> &cg_vec)
+    {
+        uint32_t UB = std::min<uint32_t>(cg_vec.size(), _N);
+        for (uint32_t _i = 0; _i < UB; ++_i)
+        {
+            _v[_i] = static_cast<DType>(cg_vec[_i]);
+        }
+    }
 };
 
 /* Device template function helper */

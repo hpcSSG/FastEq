@@ -15,7 +15,7 @@ void mutipath_equi_linear_fwd_f32_impl(const uint32_t &num_paths,              /
                                        const std::vector<int64_t> &i_dims_vec, // i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_val
                                        const cudaStream_t &cur_stream          // current stream
 );
 
@@ -28,7 +28,7 @@ void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          /
                                        const std::vector<int64_t> &out_i_dims, // out i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_val
                                        const cudaStream_t &cur_stream          // current stream
 );
 
@@ -41,6 +41,6 @@ void mutipath_equi_linear_fwd_f64_impl(const uint32_t &num_paths,              /
                                        const std::vector<int64_t> &i_dims_vec, // i dims
                                        const uint32_t &U,                      // U
                                        const uint32_t &V,                      // V
-                                       const double &val,                      // cg_val
+                                       const std::vector<double> &cg_val_vec,  // cg_val
                                        const cudaStream_t &cur_stream          // current stream
 );
