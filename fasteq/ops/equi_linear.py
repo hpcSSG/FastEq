@@ -15,7 +15,6 @@ class _FastEquiLinearFn(torch.autograd.Function):
         #torch.cuda.synchronize()
         #start_time = time.perf_counter() * 1000
         cg_list = []
-        cg_val = descriptor.paths[0].coefficients
         for pid, path in enumerate(descriptor.paths):
             cg_list.append(float(path.coefficients))
         
@@ -42,7 +41,7 @@ class _FastEquiLinearFn(torch.autograd.Function):
         x = x.float()
         w = w.float()
 
-        out = torch.ops.equi_linear.forward(x, w, I_list, cg_val)
+        out = torch.ops.equi_linear.forward(x, w, I_list, cg_list)
         out =  out.view(B, -1)
 
         out = out.double()
@@ -56,7 +55,6 @@ class _FastEquiLinearFn(torch.autograd.Function):
         ctx.B = B
         ctx.I_list = I_list
         ctx.I_total = I_total
-        ctx.cg_val = cg_val
         ctx.u = u
         ctx.cg_list = cg_list
         return out
@@ -76,7 +74,7 @@ class _FastEquiLinearFn(torch.autograd.Function):
         w = w.float()
 
         grad_out = grad_out.view(ctx.B, 16, ctx.u).contiguous() # 只支持out固定为16
-        grad_x = torch.ops.equi_linear.backward(grad_out, w, ctx.I_list, ctx.cg_val).view(ctx.B, -1)
+        grad_x = torch.ops.equi_linear.backward(grad_out, w, ctx.I_list, ctx.cg_list).view(ctx.B, -1)
 
         print(f"grad_x shape after bwd:{grad_x.shape}")
 
