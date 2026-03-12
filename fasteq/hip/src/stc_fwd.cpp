@@ -24,15 +24,12 @@ __global__ void stc_fwd_kernel(
 
     if (b >= B || j >= u) return;
 
-    // 每个 block 对应一个样本 b，每个线程处理一个 channel j
-    // 预加载 x1[b, :, :] 到 shared memory
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
         x1_shared[a] = x1[b * num_a * u + a_idx * u + u_idx];
     }
 
-    // 预加载 x0_g[b, :, :] 到 shared memory
     for (int i = threadIdx.x; i < num_i * u; i += blockDim.x) {
         int i_idx = i / u;
         int u_idx = i % u;
@@ -45,15 +42,15 @@ __global__ void stc_fwd_kernel(
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
         const int len = path_lens[p];
-        const int* path = paths + p * 5;   // paths[p, :] 起始位置
+        const int* path = paths + p * 5;
 
         // a_idx: 第一个 x1 段索引
         const int a_idx = path[0];
 
-        // d_idx: x0_g 的段索引（倒数第二个）
+        // d_idx: x0_g 的段索引
         const int d_idx = (len == 3) ? path[1] : path[len - 2];
 
-        // out_seg: 输出段索引（最后一个）
+        // out_seg: 输出段索引
         const int out_seg = (len == 3) ? path[2] : path[len - 1];
 
         if (out_seg < 0 || out_seg >= num_out_segments) {
@@ -98,7 +95,6 @@ __global__ void stc_fwd_kernel_opt(
 
     if (b >= B || j >= u) return;
 
-    // ---------------- 预加载 x1[b,:,:], x0_g[b,:,:] 到 shared ----------------
     for (int a = threadIdx.x; a < num_a * u; a += blockDim.x) {
         int a_idx = a / u;
         int u_idx = a % u;
@@ -113,8 +109,6 @@ __global__ void stc_fwd_kernel_opt(
 
     __syncthreads();
 
-    // ---------------- 为每个 out_segment 准备 accumulator ----------------
-    // 可以模板化 MAX_OUT_SEG
     scalar_t acc_local_max[10];  // small/meidum/large num_out_segments = 1/4/9;
     const int max_seg = 10;
     const int seg_lim = (num_out_segments < max_seg) ? num_out_segments : max_seg;
@@ -122,8 +116,6 @@ __global__ void stc_fwd_kernel_opt(
     for (int s = 0; s < seg_lim; ++s) {
         acc_local_max[s] = scalar_t(0);
     }
-
-    // ---------------- 遍历所有 paths，累加到对应的 out_segment ----------------
     
     for (int p = 0; p < num_paths; ++p) {
         const scalar_t coeff = coeffs[p];
@@ -133,14 +125,14 @@ __global__ void stc_fwd_kernel_opt(
         // x1 indices
         const int a_idx = path[0];
 
-        // x0_g index d_idx: 倒数第二个
+        // x0_g index d_idx
         const int d_idx = (len == 3) ? path[1] : path[len - 2];
 
-        // 输出段索引 out_seg: 最后一个
+        // 输出段索引 out_seg
         const int out_seg = (len == 3) ? path[2] : path[len - 1];
 
         if (out_seg < 0 || out_seg >= seg_lim) {
-            continue; // 越界就直接跳过（理论上不该发生）
+            continue;
         }
 
         scalar_t val = x1_shared[a_idx * u + j];
@@ -161,8 +153,7 @@ __global__ void stc_fwd_kernel_opt(
         acc_local_max[out_seg] += val;
     }
 
-    // ---------------- 循环结束后，统一写回 global out ----------------
-    // out 逻辑形状: [B, num_out_segments, u]
+    // out: [B, num_out_segments, u]
     for (int s = 0; s < seg_lim; ++s) {
         const int out_idx = ((b * num_out_segments) + s) * u + j;
         // 每个 (b, s, j) 只由该 thread 写一次，**不需要 atomicAdd**

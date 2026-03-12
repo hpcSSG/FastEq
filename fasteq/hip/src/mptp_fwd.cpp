@@ -8,8 +8,7 @@
 #include "hip_utils.hpp"
 
 // ----------------------------------------------------------------------------
-// 1) row_ptr_s 构建：sender 已排序（非降序），写 run 边界
-// row_ptr_s: [N+1]，初始化为 -1，且 row_ptr_s[0]=0,row_ptr_s[N]=E
+// row_ptr_s 构建：sender 排序）
 // ----------------------------------------------------------------------------
 __global__ void build_row_ptr_from_sorted_sender(
     const int32_t* __restrict__ sender, // [E], sorted
@@ -54,7 +53,7 @@ static void fill_row_ptr_holes_prefix_max_int32(
 }
 
 // ----------------------------------------------------------------------------
-// 2) 融合 kernel：sender-major CSR
+// 融合 kernel：sender-major CSR
 //    一个 block 处理一个 sender s；threadIdx.x 对应 u
 //    遍历该 sender 的边段 [row_ptr_s[s], row_ptr_s[s+1])
 //    对每条边在线计算 TP(group-k) 的输出并 atomicAdd 到 out_nodes[receiver]

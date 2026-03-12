@@ -16,7 +16,7 @@ sort_by_keyword = "self_cuda_time_total"
 cutoff = 4.0
 
 #_atoms = bulk("NaCl", "rocksalt", a=4.00) * (2, 2, 2)
-_atoms = bulk("NaCl", "rocksalt", a=4.00) * (16, 16,16) 
+_atoms = bulk("NaCl", "rocksalt", a=4.00) * (16, 16, 16) 
 _atoms.rattle()
 
 print(f"atoms:{_atoms}")
@@ -89,7 +89,7 @@ def bench_atoms_cuda_event(atoms, warmup=20, iters=200, label=""):
 
         torch.cuda.synchronize()
         times_ms[i] = starter.elapsed_time(ender)
-
+    '''
     print(
         f"{label:>10s} | mean {times_ms.mean():8.3f} ms  "
         f"p50 {np.percentile(times_ms,50):8.3f}  "
@@ -97,7 +97,6 @@ def bench_atoms_cuda_event(atoms, warmup=20, iters=200, label=""):
         f"min {times_ms.min():8.3f}  max {times_ms.max():8.3f}"
     )
 
-    '''
     clear_ase_cache(atoms)
     with profile(activities=activities, record_shapes=True, with_stack=True) as prof:
         singlepoint(atoms)
@@ -162,8 +161,8 @@ def main():
     # -------------------------
     # 2) performance benchmark
     # -------------------------
-    warmup = 5
-    iters = 10
+    warmup = 1
+    iters = 0
     t_cueq = bench_atoms_cuda_event(atoms_cueq, warmup=warmup, iters=iters, label="cueq")
 
     '''

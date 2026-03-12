@@ -1314,7 +1314,7 @@ torch::Tensor u1d_fused_fwd_ep_launch(
         );
         */
         
-        constexpr int WARPS = 4;
+        constexpr int WARPS = 8;
         dim3 block(32 * WARPS, 1, 1);
         dim3 grid(B, 1, 1);
 

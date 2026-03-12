@@ -271,9 +271,9 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         B = x.shape[0]
         path_num = nnz_per_path.shape[0]
 
-        print(f"i_for_k:{i_for_k}")
-        print(f"val_for_k:{val_for_k}")
-        print(f"p_for_k:{p_for_k}")
+        #print(f"i_for_k:{i_for_k}")
+        #print(f"val_for_k:{val_for_k}")
+        #print(f"p_for_k:{p_for_k}")
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000

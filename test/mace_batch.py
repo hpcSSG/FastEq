@@ -73,12 +73,11 @@ with torch.profiler.profile(
 '''
 
 
-for i in range(0, 10):
+for i in range(0, 5):
     calculator.batch_calculate(atoms_list=atoms_list)
-'''
+
 with profile(activities=activities, record_shapes=True, with_stack=True) as prof:
     calculator.batch_calculate(atoms_list=atoms_list)
 print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=10))
-prof.export_chrome_trace("mace-70-trace.json")
-'''
+prof.export_chrome_trace("cueq-mace-small-trace.json")
