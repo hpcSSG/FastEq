@@ -14,8 +14,20 @@
 #include "./uniform1d_codegen_path1490_u32_bwd.cu"
 #include "./uniform1d_codegen_path1554_u32_fwd.cu"
 #include "./uniform1d_codegen_path1554_u32_bwd.cu"
+
+#include "./uniform1d_codegen_path16_u128_fwd.cu"
+#include "./uniform1d_codegen_path16_u128_bwd.cu"
+#include "./uniform1d_codegen_path86_u128_fwd.cu"
+#include "./uniform1d_codegen_path86_u128_bwd.cu"
+#include "./uniform1d_codegen_path16_u224_fwd.cu"
+#include "./uniform1d_codegen_path16_u224_bwd.cu"
 #include "./uniform1d_codegen_path215_u224_fwd.cu"
 #include "./uniform1d_codegen_path215_u224_bwd.cu"
+
+#include "./generated_uniform1d_u128_P16_backward_kernel.cu"
+#include "./generated_uniform1d_u128_P86_backward_kernel.cu"
+#include "./generated_uniform1d_u224_P16_backward_kernel.cu"
+#include "./generated_uniform1d_u224_P215_backward_kernel.cu"
 
 
 torch::Tensor uniform1d_codegen_fwd_launch(
@@ -113,6 +125,36 @@ torch::Tensor uniform1d_codegen_fwd_launch(
                 (const int32_t*)dst_idx.data_ptr<int32_t>(),
                 (const int32_t*)b_list.data_ptr<int32_t>(),
                 B, Iw, Ix, Ky, V, U);
+        else if (P == 16 && U == 224)
+            uniform1d_codegen_two_warp_vgroup_path16_u224_fwd<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (scalar_t*)out.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
+        else if (P == 86 && U == 128)
+            uniform1d_codegen_two_warp_vgroup_path86_u128_fwd<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (scalar_t*)out.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
+        else if (P == 16 && U == 128)
+            uniform1d_codegen_two_warp_vgroup_path16_u128_fwd<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (scalar_t*)out.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
 
         else
             TORCH_CHECK(false, "Uniform1d Unsupported P: ", P);
@@ -187,10 +229,10 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
     cudaStream_t stream = at::cuda::getDefaultCUDAStream();
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_codegen_bwd_launch", [&] {
-        dim3 block(64);  // 2 warps
-        dim3 grid(B, (U + 31) / 32);
         
         if (P == 777 && U == 32) {
+            dim3 block(64);  // 2 warps
+            dim3 grid(B, (U + 31) / 32);
             uniform1d_codegen_two_warp_vgroup_path777_u32_bwd<scalar_t><<<grid, block, 0, stream>>>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
@@ -205,6 +247,8 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
                 B, Iw, Ix, Ky, V);
         }
         else if (P == 1490 && U == 32) {
+            dim3 block(64);  // 2 warps
+            dim3 grid(B, (U + 31) / 32);
             uniform1d_codegen_two_warp_vgroup_path1490_u32_bwd<scalar_t><<<grid, block, 0, stream>>>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
@@ -219,6 +263,8 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
                 B, Iw, Ix, Ky, V);
         }
         else if (P == 1554 && U == 32) {
+            dim3 block(64);  // 2 warps
+            dim3 grid(B, (U + 31) / 32);
             uniform1d_codegen_two_warp_vgroup_path1554_u32_bwd<scalar_t><<<grid, block, 0, stream>>>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
@@ -233,7 +279,57 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
                 B, Iw, Ix, Ky, V);
         }
         else if (P == 215 && U == 224) {
-            uniform1d_codegen_two_warp_vgroup_path215_u224_bwd<scalar_t><<<grid, block, 0, stream>>>(
+            dim3 block(32);
+            dim3 grid(B, 1);
+            generated_uniform1d_u224_P215_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_w.data_ptr<scalar_t>(),
+                (scalar_t*)grad_x.data_ptr<scalar_t>(),
+                (scalar_t*)grad_y.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
+        }
+        else if (P == 16 && U == 224) {
+            dim3 block(32);
+            dim3 grid(B, (U + 32 - 1) / 32);
+            generated_uniform1d_u224_P16_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_w.data_ptr<scalar_t>(),
+                (scalar_t*)grad_x.data_ptr<scalar_t>(),
+                (scalar_t*)grad_y.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
+        }
+        else if (P == 86 && U == 128) {
+            dim3 block(32);
+            dim3 grid(B, 1);
+            generated_uniform1d_u128_P86_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_w.data_ptr<scalar_t>(),
+                (scalar_t*)grad_x.data_ptr<scalar_t>(),
+                (scalar_t*)grad_y.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U);
+        }
+        else if (P == 16 && U == 128) {
+            dim3 block(32);
+            dim3 grid(B, 1);
+            generated_uniform1d_u128_P16_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
                 (const scalar_t*)y.data_ptr<scalar_t>(),

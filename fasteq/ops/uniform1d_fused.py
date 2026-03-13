@@ -5,6 +5,7 @@ from typing import List
 from collections import defaultdict, OrderedDict
 import numpy as np
 from .code_gen import generate_code_uniform1d_fwd, generate_code_uniform1d_bwd
+from .uniform1d_bwd_schedule import build_backward_schedule_from_lists, emit_backward_cuda_from_schedule
 
 def pack_paths32(i_list: torch.Tensor,
                  j_list: torch.Tensor,
@@ -72,11 +73,11 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         packed = pack_paths32(i_list, j_list, k_list, coeff_list)
         
-        #generate_code_uniform1d_fwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
-        #print(f"generate_code_uniform1d_fwd called, P={P}, u_dim={u_dim}")
+        """ generate_code_uniform1d_fwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
+        print(f"generate_code_uniform1d_fwd called, P={P}, u_dim={u_dim}") """
 
-        #generate_code_uniform1d_bwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
-        #print(f"generate_code_uniform1d_bwd called, P={P}, u_dim={u_dim}")
+        """ generate_code_uniform1d_bwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
+        print(f"generate_code_uniform1d_bwd called, P={P}, u_dim={u_dim}") """
 
         #print(f"b_list 10:{b_list[:10]}")
         #print(f"cls_offsets 10:{cls_offsets[:10]}")
@@ -106,32 +107,13 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        if u_dim == 32 or u_dim == 224:
-            if P > 100:
-                print(f"===== call uniform1d code gen ======")
-
-                out = torch.ops.u1d_fused_fwd.forward(
-                    w, x, y, 
-                    src_idx, b_list, cls_offsets, 
-                    i_list, j_list, k_list, 
-                    coeff_list, v_offsets, out_seg_num
-                )
-
-                ref = torch.ops.uniform1d_codegen.forward(
-                    w, x, y, 
-                    src_idx, dst_idx, b_list, cls_offsets,
-                    i_list, j_list, k_list, v_list, coeff_list, packed,
-                    v_offsets, out_seg_num
-                )
-                print(f"uniform1d fwd out.shape{out.shape}, {out}")
-                print(f"uniform1d fwd ref.shape{ref.shape}, {ref}")
-            else:
-                out = torch.ops.u1d_fused_fwd.forward(
-                    w, x, y, 
-                    src_idx, b_list, cls_offsets, 
-                    i_list, j_list, k_list, 
-                    coeff_list, v_offsets, out_seg_num
-                )
+        if u_dim == 32 or u_dim == 224 or u_dim == 128:
+            out = torch.ops.uniform1d_codegen.forward(
+                w, x, y, 
+                src_idx, dst_idx, b_list, cls_offsets,
+                i_list, j_list, k_list, v_list, coeff_list, packed,
+                v_offsets, out_seg_num
+            )      
 
         else:
             out = torch.ops.u1d_fused_fwd.forward(
@@ -171,19 +153,37 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
-
         w, x, y = ctx.saved_tensors
-
-        print(f"grad_out shape:{grad_out.shape}, w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
         w = w.view(-1, ctx.w_seg_num, ctx.u_dim)
         x = x.view(-1, ctx.x_seg_num, ctx.u_dim)
         y = y.view(-1, ctx.y_seg_num, 1)
 
-        if ctx.P > 100:
+        i_list_cpu = ctx.i_list.detach().cpu().tolist()
+        j_list_cpu = ctx.j_list.detach().cpu().tolist()
+        k_list_cpu = ctx.k_list.detach().cpu().tolist()
+        v_list_cpu = ctx.v_list.detach().cpu().tolist()
+        coeff_list_cpu = ctx.coeff_list.detach().cpu().tolist()
+
+        """ sched = build_backward_schedule_from_lists(
+            i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
+            U_dim=ctx.u_dim
+        )
+
+        code = emit_backward_cuda_from_schedule(
+            sched,
+            kernel_name=f"generated_uniform1d_u{ctx.u_dim}_P{ctx.P}_backward_kernel",
+            scalar_t="double",
+        )
+        
+        print(sched["strategy"])
+        print(sched["launch_style"]) """
+       
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
+        if ctx.u_dim == 32 or ctx.u_dim == 224 or ctx.u_dim == 128:
             '''
             ref_w, ref_x, ref_y = torch.ops.u1d_fused_bwd.backward(
                 grad_out, w, x, y, 
@@ -227,15 +227,17 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
                 ctx.coeff_list, ctx.v_offsets,
                 ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num, ctx.u_dim
             )
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq uniform1d backward cost: {execution_time_ms:.3f} ms >>")
 
         grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)
         grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.u_dim)
         grad_y = grad_y.view(-1, ctx.y_seg_num)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq uniform1d backward cost: {execution_time_ms:.3f} ms >>")
+        
 
         return grad_w, grad_x, grad_y, None, None, None, None, None
 

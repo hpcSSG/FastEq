@@ -53,6 +53,15 @@ __device__ __forceinline__ T warp_sum(T v) {
     return v;
 }
 
+template <typename T>
+__device__ __forceinline__ T warp_sum_xor(T v) {
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        v += __shfl_xor_sync(0xffffffff, v, mask);
+    }
+    return v;
+}
+
 __device__ __forceinline__ int shfl_i32(int v, int src_lane=0) {
     return __shfl_sync(0xffffffff, v, src_lane);
 }
