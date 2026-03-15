@@ -189,26 +189,24 @@ __device__ void preloop_producer(barrier bars_ready[],         // buffer finish 
                                  const uint32_t &in_wg_tid     //
 )
 {
-    constexpr uint32_t PRELOOP_BUFFER_SIZE_PER_STAGE = TILE_N * TILE_K;
-
-    uint32_t cur_buffer_id = 0;
-    uint32_t coord_n0 = b_ntile_id * TILE_N;
-    uint32_t coord_n2 = b_in_path_id * 1;
-
-    // prefetch loop 0 data to L2
     if (in_wg_tid == 0)
     {
+        constexpr uint32_t PRELOOP_BUFFER_SIZE_PER_STAGE = TILE_N * TILE_K;
+        constexpr size_t TX_BYTES_PER_STAGE = PRELOOP_BUFFER_SIZE_PER_STAGE * sizeof(float);
+        uint32_t cur_buffer_id = 0;
+        uint32_t coord_n0 = b_ntile_id * TILE_N;
+        uint32_t coord_n2 = b_in_path_id * 1;
+
+        // prefetch loop 0 data to L2
         asm_cp_async_bulk_prefetch_tensor_3d_l2(w_map, coord_n0, 0, coord_n2);
-    }
-    // loop
-    uint32_t k_count;
-    for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
-    {
-        // wait buffer finish consuming
-        bars_ready[cur_buffer_id].arrive_and_wait();
-        // load w tile and prefech next tile
-        if (in_wg_tid == 0)
+
+        // loop
+        uint32_t k_count;
+        for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
         {
+            // wait buffer finish consuming
+            bars_ready[cur_buffer_id].arrive_and_wait();
+            // load w tile and prefech next tile
             uint32_t coord_n1 = k_count * TILE_K;
             uint32_t next_coord_n1 = (k_count + 1) * TILE_K;
             cde::cp_async_bulk_tensor_3d_global_to_shared(
@@ -218,18 +216,15 @@ __device__ void preloop_producer(barrier bars_ready[],         // buffer finish 
                 bars_filled[cur_buffer_id]                                  // barrier
             );
             asm_cp_async_bulk_prefetch_tensor_3d_l2(w_map, coord_n0, next_coord_n1, coord_n2);
+            cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1, TX_BYTES_PER_STAGE);
+            // switch to next buffer
+            cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
         }
-        bars_filled[cur_buffer_id].arrive();
-        // switch to next buffer
-        cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
-    }
-    // loop epilogue (no prefetch)
-    {
-        // wait buffer finish consuming
-        bars_ready[cur_buffer_id].arrive_and_wait();
-        // load w tile and prefech next tile
-        if (in_wg_tid == 0)
+        // loop epilogue (no prefetch)
         {
+            // wait buffer finish consuming
+            bars_ready[cur_buffer_id].arrive_and_wait();
+            // load w tile and prefech next tile
             uint32_t coord_n1 = k_count * TILE_K;
             cde::cp_async_bulk_tensor_3d_global_to_shared(
                 (tmp_smem + cur_buffer_id * PRELOOP_BUFFER_SIZE_PER_STAGE), // smem_ptr base
@@ -237,18 +232,18 @@ __device__ void preloop_producer(barrier bars_ready[],         // buffer finish 
                 coord_n0, coord_n1, coord_n2,                               // coords
                 bars_filled[cur_buffer_id]                                  // barrier
             );
+            cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1, TX_BYTES_PER_STAGE);
+            // switch to next buffer
+            cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
         }
-        bars_filled[cur_buffer_id].arrive();
-        // switch to next buffer
-        cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
-    }
 
-    // 循环结束时，bars_ready由于缺少producer wg的arrive，而没有被重置；
-    // 需要等待所有buffer的tag闲置之后才能进行下一步操作。
+        // 循环结束时，bars_ready由于缺少producer wg的arrive，而没有被重置；
+        // 需要等待所有buffer的tag闲置之后才能进行下一步操作。
 #pragma unroll
-    for (uint32_t i = 0; i < TOTAL_STAGES; ++i)
-    {
-        bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
+        for (uint32_t i = 0; i < TOTAL_STAGES; ++i)
+        {
+            bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
+        }
     }
 }
 
@@ -277,18 +272,8 @@ __device__ void preloop_consumer(barrier bars_ready[],           // buffer finis
     // loop
     for (uint32_t k_count = 0; k_count < CEIL_DIV(U, TILE_K); ++k_count)
     {
-        barrier::arrival_token token;
-        if (in_wg_tid == 0)
-        { // 每个consumer WG的t0更新transaction count
-            token = cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1,
-                                                    (B_SMEM_SIZE_PER_TILE * sizeof(float)) / CONSUMER_WG_NUM);
-        }
-        else
-        {
-            token = bars_filled[cur_buffer_id].arrive();
-        }
         // Wait for the data to have arrived.
-        bars_filled[cur_buffer_id].wait(std::move(token));
+        bars_filled[cur_buffer_id].arrive_and_wait();
         // consume (TILE_N = 32)
         uint32_t base_sw_x0_tag = consumer_wg_id;
         wg_trans_16x32f32tf32_sw128B_sync(
@@ -319,23 +304,21 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
                                   const uint32_t &in_wg_tid   //
 )
 {
-    uint32_t cur_buffer_id = 0;
-    uint32_t coord_n1 = b_in_i_id * 1;
-    uint32_t coord_n2 = b_mtile_id * TILE_M;
-    // prefetch
     if (in_wg_tid == 0)
     {
+        constexpr size_t TX_BYTES_PER_STAGE = A_SMEM_SIZE_PER_STAGE * sizeof(float);
+        uint32_t cur_buffer_id = 0;
+        uint32_t coord_n1 = b_in_i_id * 1;
+        uint32_t coord_n2 = b_mtile_id * TILE_M;
+        // prefetch
         asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, 0, coord_n1, coord_n2);
-    }
-    // loop
-    uint32_t k_count;
-    for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
-    {
-        // wait buffer finish consuming
-        bars_ready[cur_buffer_id].arrive_and_wait();
-        // load x tile
-        if (in_wg_tid == 0)
+        // loop
+        uint32_t k_count;
+        for (k_count = 0; k_count < (CEIL_DIV(U, TILE_K) - 1); ++k_count)
         {
+            // wait buffer finish consuming
+            bars_ready[cur_buffer_id].arrive_and_wait();
+            // load x tile
             uint32_t coord_n0 = k_count * TILE_K;
             uint32_t next_coord_n0 = (k_count + 1) * TILE_K;
             cde::cp_async_bulk_tensor_3d_global_to_shared(
@@ -345,18 +328,15 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
                 bars_filled[cur_buffer_id]                        // barrier
             );
             asm_cp_async_bulk_prefetch_tensor_3d_l2(x_map, next_coord_n0, coord_n1, coord_n2);
+            cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1, TX_BYTES_PER_STAGE);
+            // switch to next buffer
+            cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
         }
-        bars_filled[cur_buffer_id].arrive();
-        // switch to next buffer
-        cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
-    }
-    // loop epilogue (no prefetch)
-    {
-        // wait buffer finish consuming
-        bars_ready[cur_buffer_id].arrive_and_wait();
-        // load x tile
-        if (in_wg_tid == 0)
+        // loop epilogue (no prefetch)
         {
+            // wait buffer finish consuming
+            bars_ready[cur_buffer_id].arrive_and_wait();
+            // load x tile
             uint32_t coord_n0 = k_count * TILE_K;
             cde::cp_async_bulk_tensor_3d_global_to_shared(
                 (A_smem + cur_buffer_id * A_SMEM_SIZE_PER_STAGE), // smem_ptr base
@@ -364,17 +344,17 @@ __device__ void mainloop_producer(barrier bars_ready[],       // buffer finish c
                 coord_n0, coord_n1, coord_n2,                     // coords
                 bars_filled[cur_buffer_id]                        // barrier
             );
+            cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1, TX_BYTES_PER_STAGE);
+            // switch to next buffer
+            cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
         }
-        bars_filled[cur_buffer_id].arrive();
-        // switch to next buffer
-        cur_buffer_id = (cur_buffer_id + 1) % TOTAL_STAGES;
-    }
-    // 循环结束时，bars_ready由于缺少producer wg的arrive，而没有被重置；
-    // 需要等待所有buffer的tag闲置之后才能进行下一步操作。
+        // 循环结束时，bars_ready由于缺少producer wg的arrive，而没有被重置；
+        // 需要等待所有buffer的tag闲置之后才能进行下一步操作。
 #pragma unroll
-    for (uint32_t i = 0; i < TOTAL_STAGES; ++i)
-    {
-        bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
+        for (uint32_t i = 0; i < TOTAL_STAGES; ++i)
+        {
+            bars_ready[(cur_buffer_id + i) % TOTAL_STAGES].arrive_and_wait();
+        }
     }
 }
 
@@ -405,18 +385,8 @@ __device__ void mainloop_consumer(barrier bars_ready[],  // buffer finish consum
     // loop
     for (uint32_t k_count = 0; k_count < CEIL_DIV(U, TILE_K); ++k_count)
     {
-        barrier::arrival_token token;
-        if (in_wg_tid == 0)
-        { // 每个consumer WG的t0更新transaction count
-            token = cuda::device::barrier_arrive_tx(bars_filled[cur_buffer_id], 1,
-                                                    (A_SMEM_SIZE_PER_STAGE * sizeof(float)) / CONSUMER_WG_NUM);
-        }
-        else
-        {
-            token = bars_filled[cur_buffer_id].arrive();
-        }
         // Wait for the data to have arrived.
-        bars_filled[cur_buffer_id].wait(std::move(token));
+        bars_filled[cur_buffer_id].arrive_and_wait();
 
         // load A data from SMEM
         float a_reg[(TILE_M / CONSUMER_WG_NUM) / 64][16];
@@ -589,8 +559,8 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
     static_assert(TOTAL_BARRIER_NUMS <= 128); // 不同thread并行初始化barriers
     if (in_wg_tid < TOTAL_BARRIER_NUMS && wg_id == 0)
     {
-        // Initialize barrier. All `blockDim.x` threads in block participate.
-        init(&bars[in_wg_tid], WARPGROUP_NUM * 128);
+        // Initialize barrier.
+        init(&bars[in_wg_tid], (CONSUMER_WG_NUM * 128 + 1));
         // Make initialized barrier visible in async proxy.
         cde::fence_proxy_async_shared_cta();
     }
