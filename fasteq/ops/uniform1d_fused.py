@@ -5,7 +5,7 @@ from typing import List
 from collections import defaultdict, OrderedDict
 import numpy as np
 from .code_gen import generate_code_uniform1d_fwd, generate_code_uniform1d_bwd
-from .uniform1d_bwd_schedule import build_backward_schedule_from_lists, emit_backward_cuda_from_schedule
+from .uniform1d_bwd_schedule import build_backward_schedule_from_lists, emit_backward_cuda_from_schedule, generate_full_uniform1d_bwd_split_cuda
 
 def pack_paths32(i_list: torch.Tensor,
                  j_list: torch.Tensor,
@@ -107,7 +107,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        if u_dim == 32 or u_dim == 224 or u_dim == 128:
+        if (u_dim == 32 or u_dim == 224 or u_dim == 128) and P > 256:
             out = torch.ops.uniform1d_codegen.forward(
                 w, x, y, 
                 src_idx, dst_idx, b_list, cls_offsets,
@@ -179,11 +179,16 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         
         print(sched["strategy"])
         print(sched["launch_style"]) """
-       
+
+        """ generate_full_uniform1d_bwd_split_cuda(
+            i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
+            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_P{ctx.P}"
+        )
+        """
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        if ctx.u_dim == 32 or ctx.u_dim == 224 or ctx.u_dim == 128:
+        if (ctx.u_dim == 32 or ctx.u_dim == 224) and ctx.P > 256:
             '''
             ref_w, ref_x, ref_y = torch.ops.u1d_fused_bwd.backward(
                 grad_out, w, x, y, 
@@ -194,12 +199,33 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
             )
             '''
 
-            grad_w, grad_x, grad_y = torch.ops.uniform1d_codegen.backward(
+            """ grad_w, grad_x, grad_y = torch.ops.uniform1d_codegen.backward(
                 grad_out, w, x, y, 
                 ctx.src_idx, ctx.dst_idx, ctx.b_list, ctx.cls_offsets, 
                 ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
                 ctx.path_packed, ctx.v_offsets, ctx.out_seg_num
-            )
+            ) """
+
+            if ctx.P == 22:
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490.run(
+                    grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
+                    ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
+                )
+            elif ctx.P == 777:
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p777.run(
+                    grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
+                    ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
+                )
+            elif ctx.P == 1490:
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490.run(
+                    grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
+                    ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
+                )
+            elif ctx.P == 1554:
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1554.run(
+                    grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
+                    ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
+                ) 
 
             '''
             grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)

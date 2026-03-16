@@ -211,6 +211,25 @@ __device__ __forceinline__ double fma_acc<double>(double a, double b, double c) 
     return fma(a, b, c);
 }
 
+struct PathMeta {
+  int i;
+  int j;
+  int k;
+  int v;
+  float coeff;
+};
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t load_vec_u(const char* base, int byte_off, int lane) {
+    return *(reinterpret_cast<const scalar_t*>(base + byte_off) + lane);
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t load_scalar(const char* base, int byte_off) {
+    return *reinterpret_cast<const scalar_t*>(base + byte_off);
+}
+
+
 /*
 // forward declare multiple types...
 template float *shared_array<float>(unsigned int n_elements, void *&ptr,
