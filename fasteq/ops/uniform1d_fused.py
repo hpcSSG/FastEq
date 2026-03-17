@@ -173,31 +173,28 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         code = emit_backward_cuda_from_schedule(
             sched,
-            kernel_name=f"generated_uniform1d_u{ctx.u_dim}_P{ctx.P}_backward_kernel",
+            kernel_name=f"generated_uniform1d_u{ctx.u_dim}_p{ctx.P}_backward_kernel",
             scalar_t="double",
         )
         
         print(sched["strategy"])
         print(sched["launch_style"]) """
 
-        """ generate_full_uniform1d_bwd_split_cuda(
+        generate_full_uniform1d_bwd_split_cuda(
             i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
-            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_P{ctx.P}"
+            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_p{ctx.P}"
         )
-        """
+       
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
 
-        if (ctx.u_dim == 32 or ctx.u_dim == 224) and ctx.P > 256:
-            '''
-            ref_w, ref_x, ref_y = torch.ops.u1d_fused_bwd.backward(
+        if (ctx.u_dim == 32 or ctx.u_dim == 224) and ctx.P > 16:
+            """ grad_w, grad_x, grad_y = torch.ops.u1d_fused_bwd.backward_ep(
                 grad_out, w, x, y, 
-                ctx.src_idx, ctx.b_list, ctx.cls_offsets, 
-                ctx.i_list, ctx.j_list, ctx.k_list, 
-                ctx.coeff_list, ctx.v_offsets,
-                ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num, ctx.u_dim
+                ctx.src_idx, ctx.dst_idx, ctx.b_list,
+                ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
             )
-            '''
+ """
 
             """ grad_w, grad_x, grad_y = torch.ops.uniform1d_codegen.backward(
                 grad_out, w, x, y, 
@@ -207,28 +204,27 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
             ) """
 
             if ctx.P == 22:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p22_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 777:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p777.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p777_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 1490:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 1554:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1554.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1554_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 ) 
-
-            '''
-            grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)
+                
+            """ grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)
             grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.u_dim)
             grad_y = grad_y.view(-1, ctx.y_seg_num)
 
@@ -242,8 +238,8 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
             print(f"grad_w:{grad_w}, ref_w:{ref_w}")
             print(f"grad_x:{grad_x}, ref_x:{ref_x}")
-            print(f"grad_y:{grad_y}, ref_y:{ref_y}")
-            '''
+            print(f"grad_y:{grad_y}, ref_y:{ref_y}") """
+            
 
         else:
             grad_w, grad_x, grad_y = torch.ops.u1d_fused_bwd.backward(
@@ -257,7 +253,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq uniform1d backward cost: {execution_time_ms:.3f} ms >>")
+        print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {execution_time_ms:.3f} ms >>")
 
         grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.u_dim)
         grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.u_dim)

@@ -960,7 +960,7 @@ def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
             ap('')
 
         for j, _plist in chunk:
-            ap(f'    grad_x[gx_base + ((int64_t){j} << 5)] += acc_j_{j};')
+            ap(f'    atomicAdd(&grad_x[gx_base + ((int64_t){j} << 5)], acc_j_{j});')
         ap('')
 
     ap('}')
@@ -1106,8 +1106,8 @@ std::vector<torch::Tensor> {bundle_name}(
     return {{grad_w, grad_x, grad_y}};
 }}
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
-    m.def("{bundle_name}", &{bundle_name}, "Generated STP backward bundle");
+TORCH_LIBRARY({bundle_name}_codegen, m) {{
+    m.def("run", &{bundle_name});
 }}
 '''
 

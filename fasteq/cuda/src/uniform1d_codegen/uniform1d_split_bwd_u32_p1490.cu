@@ -8,7 +8,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradw(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p1490_gradw(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -8900,7 +8900,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradw(
 
 }
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p1490_gradx(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ y,
@@ -9192,7 +9192,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_10 = fma((scalar_t)(-0.70710676908493042) * w_i_85, y_k_4 * go_v_371, acc_j_10);
     }
 
-    grad_x[gx_base + ((int64_t)10 << 5)] += acc_j_10;
+    atomicAdd(&grad_x[gx_base + ((int64_t)10 << 5)], acc_j_10);
 
     // ---- grad_x chunk 1 ----
     scalar_t acc_j_12 = scalar_t(0);
@@ -9379,7 +9379,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_12 = fma((scalar_t)(0.57735025882720947) * w_i_85, y_k_8 * go_v_369, acc_j_12);
     }
 
-    grad_x[gx_base + ((int64_t)12 << 5)] += acc_j_12;
+    atomicAdd(&grad_x[gx_base + ((int64_t)12 << 5)], acc_j_12);
 
     // ---- grad_x chunk 2 ----
     scalar_t acc_j_14 = scalar_t(0);
@@ -9650,7 +9650,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_14 = fma((scalar_t)(0.70710676908493042) * w_i_85, y_k_8 * go_v_371, acc_j_14);
     }
 
-    grad_x[gx_base + ((int64_t)14 << 5)] += acc_j_14;
+    atomicAdd(&grad_x[gx_base + ((int64_t)14 << 5)], acc_j_14);
 
     // ---- grad_x chunk 3 ----
     scalar_t acc_j_11 = scalar_t(0);
@@ -9921,7 +9921,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_11 = fma((scalar_t)(-0.70710676908493042) * w_i_86, y_k_4 * go_v_372, acc_j_11);
     }
 
-    grad_x[gx_base + ((int64_t)11 << 5)] += acc_j_11;
+    atomicAdd(&grad_x[gx_base + ((int64_t)11 << 5)], acc_j_11);
 
     // ---- grad_x chunk 4 ----
     scalar_t acc_j_13 = scalar_t(0);
@@ -10108,7 +10108,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_13 = fma((scalar_t)(0.57735025882720947) * w_i_86, y_k_8 * go_v_370, acc_j_13);
     }
 
-    grad_x[gx_base + ((int64_t)13 << 5)] += acc_j_13;
+    atomicAdd(&grad_x[gx_base + ((int64_t)13 << 5)], acc_j_13);
 
     // ---- grad_x chunk 5 ----
     scalar_t acc_j_15 = scalar_t(0);
@@ -10379,7 +10379,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_15 = fma((scalar_t)(0.70710676908493042) * w_i_86, y_k_8 * go_v_372, acc_j_15);
     }
 
-    grad_x[gx_base + ((int64_t)15 << 5)] += acc_j_15;
+    atomicAdd(&grad_x[gx_base + ((int64_t)15 << 5)], acc_j_15);
 
     // ---- grad_x chunk 6 ----
     scalar_t acc_j_16 = scalar_t(0);
@@ -10650,7 +10650,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_16 = fma((scalar_t)(0.28867512941360474) * w_i_88, y_k_11 * go_v_386, acc_j_16);
     }
 
-    grad_x[gx_base + ((int64_t)16 << 5)] += acc_j_16;
+    atomicAdd(&grad_x[gx_base + ((int64_t)16 << 5)], acc_j_16);
 
     // ---- grad_x chunk 7 ----
     scalar_t acc_j_17 = scalar_t(0);
@@ -10945,7 +10945,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_17 = fma((scalar_t)(-0.45643547177314758) * w_i_88, y_k_10 * go_v_386, acc_j_17);
     }
 
-    grad_x[gx_base + ((int64_t)17 << 5)] += acc_j_17;
+    atomicAdd(&grad_x[gx_base + ((int64_t)17 << 5)], acc_j_17);
 
     // ---- grad_x chunk 8 ----
     scalar_t acc_j_18 = scalar_t(0);
@@ -11150,7 +11150,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_18 = fma((scalar_t)(-0.64549720287322998) * w_i_88, y_k_15 * go_v_386, acc_j_18);
     }
 
-    grad_x[gx_base + ((int64_t)18 << 5)] += acc_j_18;
+    atomicAdd(&grad_x[gx_base + ((int64_t)18 << 5)], acc_j_18);
 
     // ---- grad_x chunk 9 ----
     scalar_t acc_j_19 = scalar_t(0);
@@ -11445,7 +11445,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_19 = fma((scalar_t)(0.45643547177314758) * w_i_88, y_k_14 * go_v_386, acc_j_19);
     }
 
-    grad_x[gx_base + ((int64_t)19 << 5)] += acc_j_19;
+    atomicAdd(&grad_x[gx_base + ((int64_t)19 << 5)], acc_j_19);
 
     // ---- grad_x chunk 10 ----
     scalar_t acc_j_20 = scalar_t(0);
@@ -11716,7 +11716,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_20 = fma((scalar_t)(-0.28867512941360474) * w_i_88, y_k_13 * go_v_386, acc_j_20);
     }
 
-    grad_x[gx_base + ((int64_t)20 << 5)] += acc_j_20;
+    atomicAdd(&grad_x[gx_base + ((int64_t)20 << 5)], acc_j_20);
 
     // ---- grad_x chunk 11 ----
     scalar_t acc_j_33 = scalar_t(0);
@@ -11915,7 +11915,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_33 = fma((scalar_t)(0.45643547177314758) * w_i_93, y_k_5 * go_v_420, acc_j_33);
     }
 
-    grad_x[gx_base + ((int64_t)33 << 5)] += acc_j_33;
+    atomicAdd(&grad_x[gx_base + ((int64_t)33 << 5)], acc_j_33);
 
     // ---- grad_x chunk 12 ----
     scalar_t acc_j_34 = scalar_t(0);
@@ -12138,7 +12138,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_34 = fma((scalar_t)(-0.45643547177314758) * w_i_93, y_k_5 * go_v_421, acc_j_34);
     }
 
-    grad_x[gx_base + ((int64_t)34 << 5)] += acc_j_34;
+    atomicAdd(&grad_x[gx_base + ((int64_t)34 << 5)], acc_j_34);
 
     // ---- grad_x chunk 13 ----
     scalar_t acc_j_35 = scalar_t(0);
@@ -12421,7 +12421,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_35 = fma((scalar_t)(0.28867512941360474) * w_i_93, y_k_4 * go_v_421, acc_j_35);
     }
 
-    grad_x[gx_base + ((int64_t)35 << 5)] += acc_j_35;
+    atomicAdd(&grad_x[gx_base + ((int64_t)35 << 5)], acc_j_35);
 
     // ---- grad_x chunk 14 ----
     scalar_t acc_j_36 = scalar_t(0);
@@ -12620,7 +12620,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_36 = fma((scalar_t)(-0.57735025882720947) * w_i_93, y_k_8 * go_v_420, acc_j_36);
     }
 
-    grad_x[gx_base + ((int64_t)36 << 5)] += acc_j_36;
+    atomicAdd(&grad_x[gx_base + ((int64_t)36 << 5)], acc_j_36);
 
     // ---- grad_x chunk 15 ----
     scalar_t acc_j_37 = scalar_t(0);
@@ -12903,7 +12903,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_37 = fma((scalar_t)(-0.28867512941360474) * w_i_93, y_k_8 * go_v_421, acc_j_37);
     }
 
-    grad_x[gx_base + ((int64_t)37 << 5)] += acc_j_37;
+    atomicAdd(&grad_x[gx_base + ((int64_t)37 << 5)], acc_j_37);
 
     // ---- grad_x chunk 16 ----
     scalar_t acc_j_38 = scalar_t(0);
@@ -13126,7 +13126,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_38 = fma((scalar_t)(0.45643547177314758) * w_i_93, y_k_7 * go_v_421, acc_j_38);
     }
 
-    grad_x[gx_base + ((int64_t)38 << 5)] += acc_j_38;
+    atomicAdd(&grad_x[gx_base + ((int64_t)38 << 5)], acc_j_38);
 
     // ---- grad_x chunk 17 ----
     scalar_t acc_j_39 = scalar_t(0);
@@ -13325,7 +13325,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_39 = fma((scalar_t)(-0.64549720287322998) * w_i_93, y_k_6 * go_v_421, acc_j_39);
     }
 
-    grad_x[gx_base + ((int64_t)39 << 5)] += acc_j_39;
+    atomicAdd(&grad_x[gx_base + ((int64_t)39 << 5)], acc_j_39);
 
     // ---- grad_x chunk 18 ----
     scalar_t acc_j_0 = scalar_t(0);
@@ -13428,7 +13428,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_0 = fma((scalar_t)(1.0) * w_i_68, y_k_15 * go_v_264, acc_j_0);
     }
 
-    grad_x[gx_base + ((int64_t)0 << 5)] += acc_j_0;
+    atomicAdd(&grad_x[gx_base + ((int64_t)0 << 5)], acc_j_0);
 
     // ---- grad_x chunk 19 ----
     scalar_t acc_j_1 = scalar_t(0);
@@ -13531,7 +13531,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_1 = fma((scalar_t)(1.0) * w_i_69, y_k_15 * go_v_265, acc_j_1);
     }
 
-    grad_x[gx_base + ((int64_t)1 << 5)] += acc_j_1;
+    atomicAdd(&grad_x[gx_base + ((int64_t)1 << 5)], acc_j_1);
 
     // ---- grad_x chunk 20 ----
     scalar_t acc_j_2 = scalar_t(0);
@@ -13634,7 +13634,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_2 = fma((scalar_t)(1.0) * w_i_70, y_k_15 * go_v_266, acc_j_2);
     }
 
-    grad_x[gx_base + ((int64_t)2 << 5)] += acc_j_2;
+    atomicAdd(&grad_x[gx_base + ((int64_t)2 << 5)], acc_j_2);
 
     // ---- grad_x chunk 21 ----
     scalar_t acc_j_3 = scalar_t(0);
@@ -13737,7 +13737,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_3 = fma((scalar_t)(1.0) * w_i_71, y_k_15 * go_v_267, acc_j_3);
     }
 
-    grad_x[gx_base + ((int64_t)3 << 5)] += acc_j_3;
+    atomicAdd(&grad_x[gx_base + ((int64_t)3 << 5)], acc_j_3);
 
     // ---- grad_x chunk 22 ----
     scalar_t acc_j_4 = scalar_t(0);
@@ -14008,7 +14008,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_4 = fma((scalar_t)(0.35355338454246521) * w_i_83, y_k_14 * go_v_357, acc_j_4);
     }
 
-    grad_x[gx_base + ((int64_t)4 << 5)] += acc_j_4;
+    atomicAdd(&grad_x[gx_base + ((int64_t)4 << 5)], acc_j_4);
 
     // ---- grad_x chunk 23 ----
     scalar_t acc_j_6 = scalar_t(0);
@@ -14195,7 +14195,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_6 = fma((scalar_t)(-0.86602538824081421) * w_i_83, y_k_9 * go_v_357, acc_j_6);
     }
 
-    grad_x[gx_base + ((int64_t)6 << 5)] += acc_j_6;
+    atomicAdd(&grad_x[gx_base + ((int64_t)6 << 5)], acc_j_6);
 
     // ---- grad_x chunk 24 ----
     scalar_t acc_j_8 = scalar_t(0);
@@ -14466,7 +14466,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_8 = fma((scalar_t)(0.35355338454246521) * w_i_83, y_k_10 * go_v_357, acc_j_8);
     }
 
-    grad_x[gx_base + ((int64_t)8 << 5)] += acc_j_8;
+    atomicAdd(&grad_x[gx_base + ((int64_t)8 << 5)], acc_j_8);
 
     // ---- grad_x chunk 25 ----
     scalar_t acc_j_5 = scalar_t(0);
@@ -14737,7 +14737,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_5 = fma((scalar_t)(0.35355338454246521) * w_i_84, y_k_14 * go_v_358, acc_j_5);
     }
 
-    grad_x[gx_base + ((int64_t)5 << 5)] += acc_j_5;
+    atomicAdd(&grad_x[gx_base + ((int64_t)5 << 5)], acc_j_5);
 
     // ---- grad_x chunk 26 ----
     scalar_t acc_j_7 = scalar_t(0);
@@ -14924,7 +14924,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_7 = fma((scalar_t)(-0.86602538824081421) * w_i_84, y_k_9 * go_v_358, acc_j_7);
     }
 
-    grad_x[gx_base + ((int64_t)7 << 5)] += acc_j_7;
+    atomicAdd(&grad_x[gx_base + ((int64_t)7 << 5)], acc_j_7);
 
     // ---- grad_x chunk 27 ----
     scalar_t acc_j_9 = scalar_t(0);
@@ -15195,7 +15195,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_9 = fma((scalar_t)(0.35355338454246521) * w_i_84, y_k_10 * go_v_358, acc_j_9);
     }
 
-    grad_x[gx_base + ((int64_t)9 << 5)] += acc_j_9;
+    atomicAdd(&grad_x[gx_base + ((int64_t)9 << 5)], acc_j_9);
 
     // ---- grad_x chunk 28 ----
     scalar_t acc_j_21 = scalar_t(0);
@@ -15466,7 +15466,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_21 = fma((scalar_t)(0.5) * w_i_89, y_k_7 * go_v_393, acc_j_21);
     }
 
-    grad_x[gx_base + ((int64_t)21 << 5)] += acc_j_21;
+    atomicAdd(&grad_x[gx_base + ((int64_t)21 << 5)], acc_j_21);
 
     // ---- grad_x chunk 29 ----
     scalar_t acc_j_22 = scalar_t(0);
@@ -15761,7 +15761,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_22 = fma((scalar_t)(-0.5) * w_i_89, y_k_8 * go_v_393, acc_j_22);
     }
 
-    grad_x[gx_base + ((int64_t)22 << 5)] += acc_j_22;
+    atomicAdd(&grad_x[gx_base + ((int64_t)22 << 5)], acc_j_22);
 
     // ---- grad_x chunk 30 ----
     scalar_t acc_j_23 = scalar_t(0);
@@ -15966,7 +15966,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_23 = fma((scalar_t)(-0.70710676908493042) * w_i_89, y_k_4 * go_v_392, acc_j_23);
     }
 
-    grad_x[gx_base + ((int64_t)23 << 5)] += acc_j_23;
+    atomicAdd(&grad_x[gx_base + ((int64_t)23 << 5)], acc_j_23);
 
     // ---- grad_x chunk 31 ----
     scalar_t acc_j_24 = scalar_t(0);
@@ -16261,7 +16261,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_24 = fma((scalar_t)(-0.5) * w_i_89, y_k_4 * go_v_393, acc_j_24);
     }
 
-    grad_x[gx_base + ((int64_t)24 << 5)] += acc_j_24;
+    atomicAdd(&grad_x[gx_base + ((int64_t)24 << 5)], acc_j_24);
 
     // ---- grad_x chunk 32 ----
     scalar_t acc_j_25 = scalar_t(0);
@@ -16532,7 +16532,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_25 = fma((scalar_t)(0.5) * w_i_89, y_k_5 * go_v_393, acc_j_25);
     }
 
-    grad_x[gx_base + ((int64_t)25 << 5)] += acc_j_25;
+    atomicAdd(&grad_x[gx_base + ((int64_t)25 << 5)], acc_j_25);
 
     // ---- grad_x chunk 33 ----
     scalar_t acc_j_26 = scalar_t(0);
@@ -16731,7 +16731,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_26 = fma((scalar_t)(-0.40824830532073975) * w_i_91, y_k_12 * go_v_407, acc_j_26);
     }
 
-    grad_x[gx_base + ((int64_t)26 << 5)] += acc_j_26;
+    atomicAdd(&grad_x[gx_base + ((int64_t)26 << 5)], acc_j_26);
 
     // ---- grad_x chunk 34 ----
     scalar_t acc_j_27 = scalar_t(0);
@@ -16954,7 +16954,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_27 = fma((scalar_t)(0.40824830532073975) * w_i_91, y_k_13 * go_v_407, acc_j_27);
     }
 
-    grad_x[gx_base + ((int64_t)27 << 5)] += acc_j_27;
+    atomicAdd(&grad_x[gx_base + ((int64_t)27 << 5)], acc_j_27);
 
     // ---- grad_x chunk 35 ----
     scalar_t acc_j_28 = scalar_t(0);
@@ -17237,7 +17237,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_28 = fma((scalar_t)(-0.40824830532073975) * w_i_91, y_k_14 * go_v_407, acc_j_28);
     }
 
-    grad_x[gx_base + ((int64_t)28 << 5)] += acc_j_28;
+    atomicAdd(&grad_x[gx_base + ((int64_t)28 << 5)], acc_j_28);
 
     // ---- grad_x chunk 36 ----
     scalar_t acc_j_29 = scalar_t(0);
@@ -17436,7 +17436,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_29 = fma((scalar_t)(0.40824830532073975) * w_i_91, y_k_9 * go_v_407, acc_j_29);
     }
 
-    grad_x[gx_base + ((int64_t)29 << 5)] += acc_j_29;
+    atomicAdd(&grad_x[gx_base + ((int64_t)29 << 5)], acc_j_29);
 
     // ---- grad_x chunk 37 ----
     scalar_t acc_j_30 = scalar_t(0);
@@ -17719,7 +17719,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_30 = fma((scalar_t)(-0.40824830532073975) * w_i_91, y_k_10 * go_v_407, acc_j_30);
     }
 
-    grad_x[gx_base + ((int64_t)30 << 5)] += acc_j_30;
+    atomicAdd(&grad_x[gx_base + ((int64_t)30 << 5)], acc_j_30);
 
     // ---- grad_x chunk 38 ----
     scalar_t acc_j_31 = scalar_t(0);
@@ -17942,7 +17942,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_31 = fma((scalar_t)(0.40824830532073975) * w_i_91, y_k_11 * go_v_407, acc_j_31);
     }
 
-    grad_x[gx_base + ((int64_t)31 << 5)] += acc_j_31;
+    atomicAdd(&grad_x[gx_base + ((int64_t)31 << 5)], acc_j_31);
 
     // ---- grad_x chunk 39 ----
     scalar_t acc_j_32 = scalar_t(0);
@@ -18141,11 +18141,11 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_gradx(
         acc_j_32 = fma((scalar_t)(-0.40824830532073975) * w_i_91, y_k_11 * go_v_406, acc_j_32);
     }
 
-    grad_x[gx_base + ((int64_t)32 << 5)] += acc_j_32;
+    atomicAdd(&grad_x[gx_base + ((int64_t)32 << 5)], acc_j_32);
 
 }
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_grady(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p1490_grady(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
@@ -27190,7 +27190,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P1490_grady(
 
 }
 
-std::vector<torch::Tensor> uniform1d_split_bwd_u32_P1490(
+std::vector<torch::Tensor> uniform1d_split_bwd_u32_p1490(
     torch::Tensor grad_out,
     torch::Tensor w,
     torch::Tensor x_all,
@@ -27218,8 +27218,8 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P1490(
     dim3 block(32);
     dim3 grid(B);
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_bwd_u32_P1490", [&] {
-        uniform1d_split_bwd_u32_P1490_gradw<scalar_t><<<grid, block, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_bwd_u32_p1490", [&] {
+        uniform1d_split_bwd_u32_p1490_gradw<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -27229,7 +27229,7 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P1490(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_bwd_u32_P1490_gradx<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_bwd_u32_p1490_gradx<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -27239,7 +27239,7 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P1490(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_bwd_u32_P1490_grady<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_bwd_u32_p1490_grady<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
@@ -27253,7 +27253,6 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P1490(
     return {grad_w, grad_x, grad_y};
 }
 
-TORCH_LIBRARY(uniform1d_split_bwd_u32_p1490, m)
-{
-    m.def("run", &uniform1d_split_bwd_u32_P1490);
+TORCH_LIBRARY(uniform1d_split_bwd_u32_p1490_codegen, m) {
+    m.def("run", &uniform1d_split_bwd_u32_p1490);
 }

@@ -8,7 +8,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradw(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p22_gradw(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -203,7 +203,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradw(
 
 }
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradx(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p22_gradx(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ y,
@@ -300,14 +300,14 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradx(
         acc_j_5 = fma((scalar_t)(0.57735025882720947) * w_i_5, y_k_1 * go_v_5, acc_j_5);
     }
 
-    grad_x[gx_base + ((int64_t)0 << 5)] += acc_j_0;
-    grad_x[gx_base + ((int64_t)1 << 5)] += acc_j_1;
-    grad_x[gx_base + ((int64_t)2 << 5)] += acc_j_2;
-    grad_x[gx_base + ((int64_t)3 << 5)] += acc_j_3;
-    grad_x[gx_base + ((int64_t)4 << 5)] += acc_j_4;
-    grad_x[gx_base + ((int64_t)6 << 5)] += acc_j_6;
-    grad_x[gx_base + ((int64_t)8 << 5)] += acc_j_8;
-    grad_x[gx_base + ((int64_t)5 << 5)] += acc_j_5;
+    atomicAdd(&grad_x[gx_base + ((int64_t)0 << 5)], acc_j_0);
+    atomicAdd(&grad_x[gx_base + ((int64_t)1 << 5)], acc_j_1);
+    atomicAdd(&grad_x[gx_base + ((int64_t)2 << 5)], acc_j_2);
+    atomicAdd(&grad_x[gx_base + ((int64_t)3 << 5)], acc_j_3);
+    atomicAdd(&grad_x[gx_base + ((int64_t)4 << 5)], acc_j_4);
+    atomicAdd(&grad_x[gx_base + ((int64_t)6 << 5)], acc_j_6);
+    atomicAdd(&grad_x[gx_base + ((int64_t)8 << 5)], acc_j_8);
+    atomicAdd(&grad_x[gx_base + ((int64_t)5 << 5)], acc_j_5);
 
     // ---- grad_x chunk 1 ----
     scalar_t acc_j_7 = scalar_t(0);
@@ -383,14 +383,14 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradx(
         acc_j_15 = fma((scalar_t)(0.37796446681022644) * w_i_7, y_k_9 * go_v_7, acc_j_15);
     }
 
-    grad_x[gx_base + ((int64_t)7 << 5)] += acc_j_7;
-    grad_x[gx_base + ((int64_t)9 << 5)] += acc_j_9;
-    grad_x[gx_base + ((int64_t)10 << 5)] += acc_j_10;
-    grad_x[gx_base + ((int64_t)11 << 5)] += acc_j_11;
-    grad_x[gx_base + ((int64_t)12 << 5)] += acc_j_12;
-    grad_x[gx_base + ((int64_t)13 << 5)] += acc_j_13;
-    grad_x[gx_base + ((int64_t)14 << 5)] += acc_j_14;
-    grad_x[gx_base + ((int64_t)15 << 5)] += acc_j_15;
+    atomicAdd(&grad_x[gx_base + ((int64_t)7 << 5)], acc_j_7);
+    atomicAdd(&grad_x[gx_base + ((int64_t)9 << 5)], acc_j_9);
+    atomicAdd(&grad_x[gx_base + ((int64_t)10 << 5)], acc_j_10);
+    atomicAdd(&grad_x[gx_base + ((int64_t)11 << 5)], acc_j_11);
+    atomicAdd(&grad_x[gx_base + ((int64_t)12 << 5)], acc_j_12);
+    atomicAdd(&grad_x[gx_base + ((int64_t)13 << 5)], acc_j_13);
+    atomicAdd(&grad_x[gx_base + ((int64_t)14 << 5)], acc_j_14);
+    atomicAdd(&grad_x[gx_base + ((int64_t)15 << 5)], acc_j_15);
 
     // ---- grad_x chunk 2 ----
     scalar_t acc_j_16 = scalar_t(0);
@@ -448,16 +448,16 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_gradx(
         acc_j_21 = fma((scalar_t)(0.37796446681022644) * w_i_7, y_k_15 * go_v_7, acc_j_21);
     }
 
-    grad_x[gx_base + ((int64_t)16 << 5)] += acc_j_16;
-    grad_x[gx_base + ((int64_t)17 << 5)] += acc_j_17;
-    grad_x[gx_base + ((int64_t)18 << 5)] += acc_j_18;
-    grad_x[gx_base + ((int64_t)19 << 5)] += acc_j_19;
-    grad_x[gx_base + ((int64_t)20 << 5)] += acc_j_20;
-    grad_x[gx_base + ((int64_t)21 << 5)] += acc_j_21;
+    atomicAdd(&grad_x[gx_base + ((int64_t)16 << 5)], acc_j_16);
+    atomicAdd(&grad_x[gx_base + ((int64_t)17 << 5)], acc_j_17);
+    atomicAdd(&grad_x[gx_base + ((int64_t)18 << 5)], acc_j_18);
+    atomicAdd(&grad_x[gx_base + ((int64_t)19 << 5)], acc_j_19);
+    atomicAdd(&grad_x[gx_base + ((int64_t)20 << 5)], acc_j_20);
+    atomicAdd(&grad_x[gx_base + ((int64_t)21 << 5)], acc_j_21);
 
 }
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_grady(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p22_grady(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
@@ -681,7 +681,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_P22_grady(
 
 }
 
-std::vector<torch::Tensor> uniform1d_split_bwd_u32_P22(
+std::vector<torch::Tensor> uniform1d_split_bwd_u32_p22(
     torch::Tensor grad_out,
     torch::Tensor w,
     torch::Tensor x_all,
@@ -709,8 +709,8 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P22(
     dim3 block(32);
     dim3 grid(B);
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_bwd_u32_P22", [&] {
-        uniform1d_split_bwd_u32_P22_gradw<scalar_t><<<grid, block, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_bwd_u32_p22", [&] {
+        uniform1d_split_bwd_u32_p22_gradw<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -720,7 +720,7 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P22(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_bwd_u32_P22_gradx<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_bwd_u32_p22_gradx<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -730,7 +730,7 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P22(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_bwd_u32_P22_grady<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_bwd_u32_p22_grady<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
@@ -744,7 +744,6 @@ std::vector<torch::Tensor> uniform1d_split_bwd_u32_P22(
     return {grad_w, grad_x, grad_y};
 }
 
-TORCH_LIBRARY(uniform1d_split_bwd_u32_p22, m)
-{
-    m.def("run", &uniform1d_split_bwd_u32_P22);
+TORCH_LIBRARY(uniform1d_split_bwd_u32_p22_codegen, m) {
+    m.def("run", &uniform1d_split_bwd_u32_p22);
 }

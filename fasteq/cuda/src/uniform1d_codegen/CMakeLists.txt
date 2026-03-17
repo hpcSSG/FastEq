@@ -4,10 +4,10 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 
 add_library(uniform1d_codegen_obj OBJECT
     uniform1d_launcher.cu
-    uniform1d_split_bwd_u32_P22.cu
-    uniform1d_split_bwd_u32_P777.cu
-    uniform1d_split_bwd_u32_P1490.cu
-    uniform1d_split_bwd_u32_P1554.cu
+    uniform1d_split_bwd_u32_p22.cu
+    uniform1d_split_bwd_u32_p777.cu
+    uniform1d_split_bwd_u32_p1490.cu
+    uniform1d_split_bwd_u32_p1554.cu
 )
 
 target_link_libraries(uniform1d_codegen_obj PUBLIC fasteq_deps)
