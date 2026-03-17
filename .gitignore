@@ -1,4 +1,44 @@
-**/__pycache__/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+*.egg-info/
+
+# pytest
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+
+# IDE
+.idea/
+.vscode/
+*.txt
+*.log
+
+# Distribution
+dist/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# DS_Store
+.DS_Store
+*.models
+*.pt
+/wandb
+*.xyz
+/checkpoints
+*.model
+/results
+*.db
+*.so
+
+.benchmarks
+*.png**/__pycache__/
 *.pyc
 build/
 */build/
