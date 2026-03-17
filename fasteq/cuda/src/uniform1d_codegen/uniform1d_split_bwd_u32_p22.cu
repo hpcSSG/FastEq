@@ -111,12 +111,12 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p22_gradw(
         acc_i_5 = fma((scalar_t)(0.57735025882720947) * x_j_9, y_k_3 * go_v_5, acc_i_5);
     }
 
-    grad_w[gw_base + ((int64_t)0 << 5)] += acc_i_0;
-    grad_w[gw_base + ((int64_t)1 << 5)] += acc_i_1;
-    grad_w[gw_base + ((int64_t)2 << 5)] += acc_i_2;
-    grad_w[gw_base + ((int64_t)3 << 5)] += acc_i_3;
-    grad_w[gw_base + ((int64_t)4 << 5)] += acc_i_4;
-    grad_w[gw_base + ((int64_t)5 << 5)] += acc_i_5;
+    grad_w[gw_base + ((int64_t)0 << 5)] = acc_i_0;
+    grad_w[gw_base + ((int64_t)1 << 5)] = acc_i_1;
+    grad_w[gw_base + ((int64_t)2 << 5)] = acc_i_2;
+    grad_w[gw_base + ((int64_t)3 << 5)] = acc_i_3;
+    grad_w[gw_base + ((int64_t)4 << 5)] = acc_i_4;
+    grad_w[gw_base + ((int64_t)5 << 5)] = acc_i_5;
 
     // ---- grad_w chunk 1 ----
     scalar_t acc_i_6 = scalar_t(0);
@@ -198,8 +198,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p22_gradw(
         acc_i_7 = fma((scalar_t)(0.37796446681022644) * x_j_21, y_k_15 * go_v_7, acc_i_7);
     }
 
-    grad_w[gw_base + ((int64_t)6 << 5)] += acc_i_6;
-    grad_w[gw_base + ((int64_t)7 << 5)] += acc_i_7;
+    grad_w[gw_base + ((int64_t)6 << 5)] = acc_i_6;
+    grad_w[gw_base + ((int64_t)7 << 5)] = acc_i_7;
 
 }
 template <typename scalar_t>

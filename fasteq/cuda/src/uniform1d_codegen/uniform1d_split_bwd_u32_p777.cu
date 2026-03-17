@@ -111,12 +111,12 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_5 = fma((scalar_t)(0.57735025882720947) * x_j_9, y_k_3 * go_v_5, acc_i_5);
     }
 
-    grad_w[gw_base + ((int64_t)0 << 5)] += acc_i_0;
-    grad_w[gw_base + ((int64_t)1 << 5)] += acc_i_1;
-    grad_w[gw_base + ((int64_t)2 << 5)] += acc_i_2;
-    grad_w[gw_base + ((int64_t)3 << 5)] += acc_i_3;
-    grad_w[gw_base + ((int64_t)4 << 5)] += acc_i_4;
-    grad_w[gw_base + ((int64_t)5 << 5)] += acc_i_5;
+    grad_w[gw_base + ((int64_t)0 << 5)] = acc_i_0;
+    grad_w[gw_base + ((int64_t)1 << 5)] = acc_i_1;
+    grad_w[gw_base + ((int64_t)2 << 5)] = acc_i_2;
+    grad_w[gw_base + ((int64_t)3 << 5)] = acc_i_3;
+    grad_w[gw_base + ((int64_t)4 << 5)] = acc_i_4;
+    grad_w[gw_base + ((int64_t)5 << 5)] = acc_i_5;
 
     // ---- grad_w chunk 1 ----
     scalar_t acc_i_6 = scalar_t(0);
@@ -219,9 +219,9 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_8 = fma((scalar_t)(1.0) * x_j_0, y_k_3 * go_v_16, acc_i_8);
     }
 
-    grad_w[gw_base + ((int64_t)6 << 5)] += acc_i_6;
-    grad_w[gw_base + ((int64_t)7 << 5)] += acc_i_7;
-    grad_w[gw_base + ((int64_t)8 << 5)] += acc_i_8;
+    grad_w[gw_base + ((int64_t)6 << 5)] = acc_i_6;
+    grad_w[gw_base + ((int64_t)7 << 5)] = acc_i_7;
+    grad_w[gw_base + ((int64_t)8 << 5)] = acc_i_8;
 
     // ---- grad_w chunk 2 ----
     scalar_t acc_i_9 = scalar_t(0);
@@ -330,11 +330,11 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_13 = fma((scalar_t)(1.0) * x_j_9, y_k_0 * go_v_25, acc_i_13);
     }
 
-    grad_w[gw_base + ((int64_t)9 << 5)] += acc_i_9;
-    grad_w[gw_base + ((int64_t)10 << 5)] += acc_i_10;
-    grad_w[gw_base + ((int64_t)11 << 5)] += acc_i_11;
-    grad_w[gw_base + ((int64_t)12 << 5)] += acc_i_12;
-    grad_w[gw_base + ((int64_t)13 << 5)] += acc_i_13;
+    grad_w[gw_base + ((int64_t)9 << 5)] = acc_i_9;
+    grad_w[gw_base + ((int64_t)10 << 5)] = acc_i_10;
+    grad_w[gw_base + ((int64_t)11 << 5)] = acc_i_11;
+    grad_w[gw_base + ((int64_t)12 << 5)] = acc_i_12;
+    grad_w[gw_base + ((int64_t)13 << 5)] = acc_i_13;
 
     // ---- grad_w chunk 3 ----
     scalar_t acc_i_14 = scalar_t(0);
@@ -537,9 +537,9 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_16 = fma((scalar_t)(0.54772257804870605) * x_j_13, y_k_2 * go_v_34, acc_i_16);
     }
 
-    grad_w[gw_base + ((int64_t)14 << 5)] += acc_i_14;
-    grad_w[gw_base + ((int64_t)15 << 5)] += acc_i_15;
-    grad_w[gw_base + ((int64_t)16 << 5)] += acc_i_16;
+    grad_w[gw_base + ((int64_t)14 << 5)] = acc_i_14;
+    grad_w[gw_base + ((int64_t)15 << 5)] = acc_i_15;
+    grad_w[gw_base + ((int64_t)16 << 5)] = acc_i_16;
 
     // ---- grad_w chunk 4 ----
     scalar_t acc_i_17 = scalar_t(0);
@@ -769,8 +769,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_18 = fma((scalar_t)(0.46291005611419678) * x_j_21, y_k_8 * go_v_40, acc_i_18);
     }
 
-    grad_w[gw_base + ((int64_t)17 << 5)] += acc_i_17;
-    grad_w[gw_base + ((int64_t)18 << 5)] += acc_i_18;
+    grad_w[gw_base + ((int64_t)17 << 5)] = acc_i_17;
+    grad_w[gw_base + ((int64_t)18 << 5)] = acc_i_18;
 
     // ---- grad_w chunk 5 ----
     scalar_t acc_i_19 = scalar_t(0);
@@ -943,9 +943,9 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_21 = fma((scalar_t)(-0.31622776389122009) * x_j_13, y_k_4 * go_v_49, acc_i_21);
     }
 
-    grad_w[gw_base + ((int64_t)19 << 5)] += acc_i_19;
-    grad_w[gw_base + ((int64_t)20 << 5)] += acc_i_20;
-    grad_w[gw_base + ((int64_t)21 << 5)] += acc_i_21;
+    grad_w[gw_base + ((int64_t)19 << 5)] = acc_i_19;
+    grad_w[gw_base + ((int64_t)20 << 5)] = acc_i_20;
+    grad_w[gw_base + ((int64_t)21 << 5)] = acc_i_21;
 
     // ---- grad_w chunk 6 ----
     scalar_t acc_i_22 = scalar_t(0);
@@ -1183,8 +1183,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_23 = fma((scalar_t)(0.40824827551841736) * x_j_8, y_k_5 * go_v_61, acc_i_23);
     }
 
-    grad_w[gw_base + ((int64_t)22 << 5)] += acc_i_22;
-    grad_w[gw_base + ((int64_t)23 << 5)] += acc_i_23;
+    grad_w[gw_base + ((int64_t)22 << 5)] = acc_i_22;
+    grad_w[gw_base + ((int64_t)23 << 5)] = acc_i_23;
 
     // ---- grad_w chunk 7 ----
     scalar_t acc_i_24 = scalar_t(0);
@@ -1378,8 +1378,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_25 = fma((scalar_t)(-0.40824827551841736) * x_j_13, y_k_1 * go_v_67, acc_i_25);
     }
 
-    grad_w[gw_base + ((int64_t)24 << 5)] += acc_i_24;
-    grad_w[gw_base + ((int64_t)25 << 5)] += acc_i_25;
+    grad_w[gw_base + ((int64_t)24 << 5)] = acc_i_24;
+    grad_w[gw_base + ((int64_t)25 << 5)] = acc_i_25;
 
     // ---- grad_w chunk 8 ----
     scalar_t acc_i_26 = scalar_t(0);
@@ -1685,8 +1685,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_27 = fma((scalar_t)(-0.42257711291313171) * x_j_21, y_k_5 * go_v_77, acc_i_27);
     }
 
-    grad_w[gw_base + ((int64_t)26 << 5)] += acc_i_26;
-    grad_w[gw_base + ((int64_t)27 << 5)] += acc_i_27;
+    grad_w[gw_base + ((int64_t)26 << 5)] = acc_i_26;
+    grad_w[gw_base + ((int64_t)27 << 5)] = acc_i_27;
 
     // ---- grad_w chunk 9 ----
     scalar_t acc_i_28 = scalar_t(0);
@@ -1822,10 +1822,10 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_31 = fma((scalar_t)(1.0) * x_j_3, y_k_8 * go_v_97, acc_i_31);
     }
 
-    grad_w[gw_base + ((int64_t)28 << 5)] += acc_i_28;
-    grad_w[gw_base + ((int64_t)29 << 5)] += acc_i_29;
-    grad_w[gw_base + ((int64_t)30 << 5)] += acc_i_30;
-    grad_w[gw_base + ((int64_t)31 << 5)] += acc_i_31;
+    grad_w[gw_base + ((int64_t)28 << 5)] = acc_i_28;
+    grad_w[gw_base + ((int64_t)29 << 5)] = acc_i_29;
+    grad_w[gw_base + ((int64_t)30 << 5)] = acc_i_30;
+    grad_w[gw_base + ((int64_t)31 << 5)] = acc_i_31;
 
     // ---- grad_w chunk 10 ----
     scalar_t acc_i_32 = scalar_t(0);
@@ -2096,9 +2096,9 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_34 = fma((scalar_t)(0.59761428833007812) * x_j_8, y_k_15 * go_v_116, acc_i_34);
     }
 
-    grad_w[gw_base + ((int64_t)32 << 5)] += acc_i_32;
-    grad_w[gw_base + ((int64_t)33 << 5)] += acc_i_33;
-    grad_w[gw_base + ((int64_t)34 << 5)] += acc_i_34;
+    grad_w[gw_base + ((int64_t)32 << 5)] = acc_i_32;
+    grad_w[gw_base + ((int64_t)33 << 5)] = acc_i_33;
+    grad_w[gw_base + ((int64_t)34 << 5)] = acc_i_34;
 
     // ---- grad_w chunk 11 ----
     scalar_t acc_i_35 = scalar_t(0);
@@ -2264,8 +2264,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_36 = fma((scalar_t)(1.0) * x_j_14, y_k_0 * go_v_122, acc_i_36);
     }
 
-    grad_w[gw_base + ((int64_t)35 << 5)] += acc_i_35;
-    grad_w[gw_base + ((int64_t)36 << 5)] += acc_i_36;
+    grad_w[gw_base + ((int64_t)35 << 5)] = acc_i_35;
+    grad_w[gw_base + ((int64_t)36 << 5)] = acc_i_36;
 
     // ---- grad_w chunk 12 ----
     scalar_t acc_i_37 = scalar_t(0);
@@ -2519,8 +2519,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_38 = fma((scalar_t)(0.48795005679130554) * x_j_20, y_k_2 * go_v_132, acc_i_38);
     }
 
-    grad_w[gw_base + ((int64_t)37 << 5)] += acc_i_37;
-    grad_w[gw_base + ((int64_t)38 << 5)] += acc_i_38;
+    grad_w[gw_base + ((int64_t)37 << 5)] = acc_i_37;
+    grad_w[gw_base + ((int64_t)38 << 5)] = acc_i_38;
 
     // ---- grad_w chunk 13 ----
     scalar_t acc_i_39 = scalar_t(0);
@@ -2778,8 +2778,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_40 = fma((scalar_t)(1.0) * x_j_0, y_k_15 * go_v_162, acc_i_40);
     }
 
-    grad_w[gw_base + ((int64_t)39 << 5)] += acc_i_39;
-    grad_w[gw_base + ((int64_t)40 << 5)] += acc_i_40;
+    grad_w[gw_base + ((int64_t)39 << 5)] = acc_i_39;
+    grad_w[gw_base + ((int64_t)40 << 5)] = acc_i_40;
 
     // ---- grad_w chunk 14 ----
     scalar_t acc_i_41 = scalar_t(0);
@@ -2918,9 +2918,9 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_43 = fma((scalar_t)(1.0) * x_j_3, y_k_15 * go_v_165, acc_i_43);
     }
 
-    grad_w[gw_base + ((int64_t)41 << 5)] += acc_i_41;
-    grad_w[gw_base + ((int64_t)42 << 5)] += acc_i_42;
-    grad_w[gw_base + ((int64_t)43 << 5)] += acc_i_43;
+    grad_w[gw_base + ((int64_t)41 << 5)] = acc_i_41;
+    grad_w[gw_base + ((int64_t)42 << 5)] = acc_i_42;
+    grad_w[gw_base + ((int64_t)43 << 5)] = acc_i_43;
 
     // ---- grad_w chunk 15 ----
     scalar_t acc_i_44 = scalar_t(0);
@@ -3182,8 +3182,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_45 = fma((scalar_t)(0.70710676908493042) * x_j_9, y_k_8 * go_v_179, acc_i_45);
     }
 
-    grad_w[gw_base + ((int64_t)44 << 5)] += acc_i_44;
-    grad_w[gw_base + ((int64_t)45 << 5)] += acc_i_45;
+    grad_w[gw_base + ((int64_t)44 << 5)] = acc_i_44;
+    grad_w[gw_base + ((int64_t)45 << 5)] = acc_i_45;
 
     // ---- grad_w chunk 16 ----
     scalar_t acc_i_46 = scalar_t(0);
@@ -3549,8 +3549,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_47 = fma((scalar_t)(-0.28867512941360474) * x_j_14, y_k_13 * go_v_193, acc_i_47);
     }
 
-    grad_w[gw_base + ((int64_t)46 << 5)] += acc_i_46;
-    grad_w[gw_base + ((int64_t)47 << 5)] += acc_i_47;
+    grad_w[gw_base + ((int64_t)46 << 5)] = acc_i_46;
+    grad_w[gw_base + ((int64_t)47 << 5)] = acc_i_47;
 
     // ---- grad_w chunk 17 ----
     scalar_t acc_i_48 = scalar_t(0);
@@ -3808,8 +3808,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_49 = fma((scalar_t)(-0.64549720287322998) * x_j_21, y_k_6 * go_v_207, acc_i_49);
     }
 
-    grad_w[gw_base + ((int64_t)48 << 5)] += acc_i_48;
-    grad_w[gw_base + ((int64_t)49 << 5)] += acc_i_49;
+    grad_w[gw_base + ((int64_t)48 << 5)] = acc_i_48;
+    grad_w[gw_base + ((int64_t)49 << 5)] = acc_i_49;
 
     // ---- grad_w chunk 18 ----
     scalar_t acc_i_50 = scalar_t(0);
@@ -4131,8 +4131,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_51 = fma((scalar_t)(0.35355338454246521) * x_j_9, y_k_10 * go_v_221, acc_i_51);
     }
 
-    grad_w[gw_base + ((int64_t)50 << 5)] += acc_i_50;
-    grad_w[gw_base + ((int64_t)51 << 5)] += acc_i_51;
+    grad_w[gw_base + ((int64_t)50 << 5)] = acc_i_50;
+    grad_w[gw_base + ((int64_t)51 << 5)] = acc_i_51;
 
     // ---- grad_w chunk 19 ----
     scalar_t acc_i_52 = scalar_t(0);
@@ -4434,8 +4434,8 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_53 = fma((scalar_t)(-0.35355338454246521) * x_j_20, y_k_1 * go_v_235, acc_i_53);
     }
 
-    grad_w[gw_base + ((int64_t)52 << 5)] += acc_i_52;
-    grad_w[gw_base + ((int64_t)53 << 5)] += acc_i_53;
+    grad_w[gw_base + ((int64_t)52 << 5)] = acc_i_52;
+    grad_w[gw_base + ((int64_t)53 << 5)] = acc_i_53;
 
     // ---- grad_w chunk 20 ----
     scalar_t acc_i_54 = scalar_t(0);
@@ -4694,7 +4694,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_bwd_u32_p777_gradw(
         acc_i_54 = fma((scalar_t)(0.40824830532073975) * x_j_20, y_k_11 * go_v_242, acc_i_54);
     }
 
-    grad_w[gw_base + ((int64_t)54 << 5)] += acc_i_54;
+    grad_w[gw_base + ((int64_t)54 << 5)] = acc_i_54;
 
 }
 template <typename scalar_t>

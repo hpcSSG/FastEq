@@ -815,7 +815,7 @@ def emit_preamble() -> str:
 '''
 
 
-def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64) -> str:
+def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64, max_chunk=2) -> str:
     """
     grad_w: 按 i 分组
     对每个 chunk 内若干个 i 做寄存器累加 acc_i
@@ -828,14 +828,14 @@ def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
         acc_cost=1,
         cache_cost_per_symbol=1,
         reg_budget=reg_budget,
-        max_targets_per_chunk=8,
+        max_targets_per_chunk=max_chunk,
     )
 
     lines = []
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}_chunk{max_chunk}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ x_all,')
     ap('    const scalar_t* __restrict__ y,')
@@ -887,14 +887,14 @@ def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
 
         # single write per i
         for i, _plist in chunk:
-            ap(f'    grad_w[gw_base + ((int64_t){i} << 5)] += acc_i_{i};')
+            ap(f'    grad_w[gw_base + ((int64_t){i} << 5)] = acc_i_{i};')
         ap('')
 
     ap('}')
     return "\n".join(lines)
 
 
-def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64) -> str:
+def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64, max_chunk=2) -> str:
     """
     grad_x: 按 j 分组
     """
@@ -905,14 +905,14 @@ def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
         acc_cost=1,
         cache_cost_per_symbol=1,
         reg_budget=reg_budget,
-        max_targets_per_chunk=8,
+        max_targets_per_chunk=max_chunk,
     )
 
     lines = []
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}_chunk{max_chunk}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ w,')
     ap('    const scalar_t* __restrict__ y,')
@@ -967,7 +967,7 @@ def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     return "\n".join(lines)
 
 
-def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64) -> str:
+def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 64, max_chunk=2) -> str:
     """
     grad_y: 按 k 分组
     每个 k 只做一次 warp_sum 和一次 lane0 写回
@@ -981,14 +981,14 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
         acc_cost=1,   # local_k
         cache_cost_per_symbol=1,
         reg_budget=reg_budget,
-        max_targets_per_chunk=6,
+        max_targets_per_chunk=max_chunk,
     )
 
     lines = []
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}_chunk{max_chunk}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ w,')
     ap('    const scalar_t* __restrict__ x_all,')
@@ -1041,7 +1041,8 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
 def emit_launcher(bundle_name: str,
                   gradw_kernel: str,
                   gradx_kernel: str,
-                  grady_kernel: str) -> str:
+                  grady_kernel: str,
+                  max_chunk=2) -> str:
     return rf'''
 std::vector<torch::Tensor> {bundle_name}(
     torch::Tensor grad_out,
@@ -1072,7 +1073,7 @@ std::vector<torch::Tensor> {bundle_name}(
     dim3 grid(B);
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
-        {gradw_kernel}<scalar_t><<<grid, block, 0, stream>>>(
+        {gradw_kernel}_chunk{max_chunk}<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -1082,7 +1083,7 @@ std::vector<torch::Tensor> {bundle_name}(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        {gradx_kernel}<scalar_t><<<grid, block, 0, stream>>>(
+        {gradx_kernel}_chunk{max_chunk}<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -1092,7 +1093,7 @@ std::vector<torch::Tensor> {bundle_name}(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        {grady_kernel}<scalar_t><<<grid, block, 0, stream>>>(
+        {grady_kernel}_chunk{max_chunk}<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
@@ -1121,6 +1122,7 @@ def generate_full_uniform1d_bwd_split_cuda(
     *,
     bundle_name: str = "stp_edge_parallel_bwd_codegen",
     reg_budget: int = 64,
+    max_chunk: int=2,
 ) -> str:
     assert len(i_list) == len(j_list) == len(k_list) == len(v_list) == len(coeff_list)
     paths = [CGPath(i, j, k, v, c) for i, j, k, v, c in zip(i_list, j_list, k_list, v_list, coeff_list)]
@@ -1131,12 +1133,12 @@ def generate_full_uniform1d_bwd_split_cuda(
 
     parts = [
         emit_preamble(),
-        emit_gradw_kernel(paths, gradw_kernel, reg_budget=reg_budget),
-        emit_gradx_kernel(paths, gradx_kernel, reg_budget=reg_budget),
-        emit_grady_kernel(paths, grady_kernel, reg_budget=reg_budget),
-        emit_launcher(bundle_name, gradw_kernel, gradx_kernel, grady_kernel),
+        emit_gradw_kernel(paths, gradw_kernel, reg_budget=reg_budget, max_chunk),
+        emit_gradx_kernel(paths, gradx_kernel, reg_budget=reg_budget, max_chunk),
+        emit_grady_kernel(paths, grady_kernel, reg_budget=reg_budget, max_chunk),
+        emit_launcher(bundle_name, gradw_kernel, gradx_kernel, grady_kernel, max_chunk),
     ]
     #return "\n".join(parts)
     code = '\n'.join(parts)
-    file_name = f"{bundle_name}.cu"
+    file_name = f"{bundle_name}_chunk{max_chunk}.cu"
     Path(file_name).write_text(code, encoding="utf-8")

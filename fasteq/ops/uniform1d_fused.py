@@ -182,7 +182,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         generate_full_uniform1d_bwd_split_cuda(
             i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
-            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_p{ctx.P}"
+            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_p{ctx.P}", max_chunk=2
         )
        
         torch.cuda.synchronize()
