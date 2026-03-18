@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 #set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 
 add_library(uniform1d_codegen_obj OBJECT
-    uniform1d_launcher.cu
+    #uniform1d_launcher.cu
     uniform1d_split_bwd_u32_p22.cu
     uniform1d_split_bwd_u32_p777.cu
     uniform1d_split_bwd_u32_p1490.cu
@@ -16,6 +16,14 @@ add_library(uniform1d_codegen_obj OBJECT
     uniform1d_split_regalloc_bwd_u32_p1554.cu
 
     uniform1d_combine_u32_p22_bwd.cu
+    uniform1d_combine_u128_p16_bwd.cu
+
+    uniform1d_codegen_path16_u128_fwd.cu
+    uniform1d_codegen_path22_u32_fwd.cu
+    uniform1d_codegen_path777_u32_fwd.cu
+    uniform1d_codegen_path1490_u32_fwd.cu
+    uniform1d_codegen_path1554_u32_fwd.cu
+
 )
 
 target_link_libraries(uniform1d_codegen_obj PUBLIC fasteq_deps)

@@ -1,8 +1,15 @@
 #include <stdint.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <vector>
+#include <cstdint>
+#include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
+__global__ void uniform1d_codegen_path1554_u32_fwd(
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -10,9 +17,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
     const int32_t* __restrict__ src_idx,
     const int32_t* __restrict__ dst_idx,
     const int32_t* __restrict__ b_list,
-    int B, int Iw, int Ix, int Ky, int V)
+    int B, int Iw, int Ix, int Ky, int V, int U)
 {
     int b_global = (int)blockIdx.x;
+    int ublk     = (int)blockIdx.y;
     if (b_global >= B) return;
     int b = b_list ? b_list[b_global] : b_global;
 
@@ -20,6 +28,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
     int lane = tid & 31;
     int warp = tid >> 5;
     if (warp >= 2) return;
+
+    int u = (ublk << 5) + lane;
+    if (u >= U) return;
 
     int src = src_idx[b];
     int dst = dst_idx[b];
@@ -231,9 +242,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_187 += scalar_t(0.38575837f) * wi_62 * xj_37 * yk_14;
         sum_v_187 += scalar_t(0.298807144f) * wi_62 * xj_38 * yk_13;
         sum_v_187 += scalar_t(-0.38575837f) * wi_62 * xj_38 * yk_15;
-        sum_v_187 += scalar_t(0.154303342f) * wi_62 * xj_39 * yk_12;
+        sum_v_187 += scalar_t(0.154303357f) * wi_62 * xj_39 * yk_12;
         sum_v_187 += scalar_t(-0.298807144f) * wi_62 * xj_39 * yk_14;
-        sum_v_187 += scalar_t(0.154303342f) * wi_62 * xj_40 * yk_11;
+        sum_v_187 += scalar_t(0.154303357f) * wi_62 * xj_40 * yk_11;
         sum_v_187 += scalar_t(0.298807144f) * wi_62 * xj_41 * yk_10;
         sum_v_187 += scalar_t(0.38575837f) * wi_62 * xj_42 * yk_9;
         sum_v_187 += scalar_t(-0.298807144f) * wi_62 * xj_42 * yk_11;
@@ -284,25 +295,25 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_481 += scalar_t(-0.288675129f) * wi_109 * xj_37 * yk_8;
         sum_v_481 += scalar_t(0.353553385f) * wi_109 * xj_38 * yk_7;
         sum_v_481 += scalar_t(0.387298346f) * wi_109 * xj_39 * yk_6;
-        sum_v_481 += scalar_t(-0.44721359f) * wi_109 * xj_39 * yk_8;
+        sum_v_481 += scalar_t(-0.44721356f) * wi_109 * xj_39 * yk_8;
         sum_v_481 += scalar_t(0.182574183f) * wi_109 * xj_40 * yk_5;
-        sum_v_481 += scalar_t(0.44721359f) * wi_109 * xj_41 * yk_4;
+        sum_v_481 += scalar_t(0.44721356f) * wi_109 * xj_41 * yk_4;
         sum_v_481 += scalar_t(-0.353553385f) * wi_109 * xj_42 * yk_5;
         sum_v_481 += scalar_t(0.288675129f) * wi_109 * xj_43 * yk_4;
 
         scalar_t sum_v_479 = scalar_t(0);
         sum_v_479 += scalar_t(-0.645497203f) * wi_109 * xj_37 * yk_6;
-        sum_v_479 += scalar_t(0.456435472f) * wi_109 * xj_38 * yk_7;
+        sum_v_479 += scalar_t(0.456435442f) * wi_109 * xj_38 * yk_7;
         sum_v_479 += scalar_t(-0.288675129f) * wi_109 * xj_39 * yk_8;
         sum_v_479 += scalar_t(-0.288675129f) * wi_109 * xj_41 * yk_4;
-        sum_v_479 += scalar_t(0.456435472f) * wi_109 * xj_42 * yk_5;
+        sum_v_479 += scalar_t(0.456435442f) * wi_109 * xj_42 * yk_5;
 
         scalar_t sum_v_484 = scalar_t(0);
-        sum_v_484 += scalar_t(0.456435472f) * wi_109 * xj_37 * yk_5;
+        sum_v_484 += scalar_t(0.456435442f) * wi_109 * xj_37 * yk_5;
         sum_v_484 += scalar_t(-0.353553385f) * wi_109 * xj_39 * yk_5;
         sum_v_484 += scalar_t(-0.577350259f) * wi_109 * xj_40 * yk_8;
         sum_v_484 += scalar_t(0.353553385f) * wi_109 * xj_41 * yk_7;
-        sum_v_484 += scalar_t(0.456435472f) * wi_109 * xj_43 * yk_7;
+        sum_v_484 += scalar_t(0.456435442f) * wi_109 * xj_43 * yk_7;
 
         scalar_t sum_v_275 = scalar_t(0);
         sum_v_275 += scalar_t(0.422577113f) * wi_79 * xj_37 * yk_7;
@@ -339,29 +350,29 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_182 = scalar_t(0);
         sum_v_182 += scalar_t(0.487950057f) * wi_61 * xj_38 * yk_3;
-        sum_v_182 += scalar_t(0.617213368f) * wi_61 * xj_39 * yk_2;
+        sum_v_182 += scalar_t(0.617213428f) * wi_61 * xj_39 * yk_2;
         sum_v_182 += scalar_t(-0.377964467f) * wi_61 * xj_40 * yk_1;
         sum_v_182 += scalar_t(-0.487950057f) * wi_61 * xj_42 * yk_1;
 
         scalar_t sum_v_181 = scalar_t(0);
         sum_v_181 += scalar_t(0.597614288f) * wi_61 * xj_37 * yk_3;
         sum_v_181 += scalar_t(0.487950057f) * wi_61 * xj_38 * yk_2;
-        sum_v_181 += scalar_t(-0.154303342f) * wi_61 * xj_39 * yk_3;
-        sum_v_181 += scalar_t(-0.154303342f) * wi_61 * xj_41 * yk_1;
+        sum_v_181 += scalar_t(-0.154303357f) * wi_61 * xj_39 * yk_3;
+        sum_v_181 += scalar_t(-0.154303357f) * wi_61 * xj_41 * yk_1;
         sum_v_181 += scalar_t(-0.597614288f) * wi_61 * xj_43 * yk_1;
 
         scalar_t sum_v_368 = scalar_t(0);
         sum_v_368 += scalar_t(0.353553385f) * wi_93 * xj_37 * yk_1;
-        sum_v_368 += scalar_t(-0.456435472f) * wi_93 * xj_39 * yk_1;
-        sum_v_368 += scalar_t(0.456435472f) * wi_93 * xj_41 * yk_3;
+        sum_v_368 += scalar_t(-0.456435442f) * wi_93 * xj_39 * yk_1;
+        sum_v_368 += scalar_t(0.456435442f) * wi_93 * xj_41 * yk_3;
         sum_v_368 += scalar_t(-0.577350259f) * wi_93 * xj_42 * yk_2;
         sum_v_368 += scalar_t(0.353553385f) * wi_93 * xj_43 * yk_3;
 
         scalar_t sum_v_369 = scalar_t(0);
-        sum_v_369 += scalar_t(0.456435472f) * wi_93 * xj_38 * yk_1;
+        sum_v_369 += scalar_t(0.456435442f) * wi_93 * xj_38 * yk_1;
         sum_v_369 += scalar_t(0.707106769f) * wi_93 * xj_40 * yk_3;
         sum_v_369 += scalar_t(-0.288675129f) * wi_93 * xj_41 * yk_2;
-        sum_v_369 += scalar_t(0.456435472f) * wi_93 * xj_42 * yk_3;
+        sum_v_369 += scalar_t(0.456435442f) * wi_93 * xj_42 * yk_3;
 
         scalar_t sum_v_373 = scalar_t(0);
         sum_v_373 += scalar_t(0.866025388f) * wi_93 * xj_37 * yk_2;
@@ -415,8 +426,8 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_97 = scalar_t(0);
         sum_v_97 += scalar_t(-0.316227764f) * wi_43 * xj_25 * yk_5;
         sum_v_97 += scalar_t(0.316227764f) * wi_43 * xj_26 * yk_4;
-        sum_v_97 += scalar_t(0.547722578f) * wi_43 * xj_27 * yk_7;
-        sum_v_97 += scalar_t(-0.547722578f) * wi_43 * xj_28 * yk_6;
+        sum_v_97 += scalar_t(0.547722518f) * wi_43 * xj_27 * yk_7;
+        sum_v_97 += scalar_t(-0.547722518f) * wi_43 * xj_28 * yk_6;
         sum_v_97 += scalar_t(0.316227764f) * wi_43 * xj_28 * yk_8;
         sum_v_97 += scalar_t(-0.316227764f) * wi_43 * xj_29 * yk_7;
 
@@ -442,26 +453,26 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_346 = scalar_t(0);
         sum_v_346 += scalar_t(-0.288675129f) * wi_90 * xj_25 * yk_13;
-        sum_v_346 += scalar_t(0.456435472f) * wi_90 * xj_26 * yk_14;
+        sum_v_346 += scalar_t(0.456435442f) * wi_90 * xj_26 * yk_14;
         sum_v_346 += scalar_t(-0.645497203f) * wi_90 * xj_27 * yk_9;
-        sum_v_346 += scalar_t(0.456435472f) * wi_90 * xj_28 * yk_10;
+        sum_v_346 += scalar_t(0.456435442f) * wi_90 * xj_28 * yk_10;
         sum_v_346 += scalar_t(-0.288675129f) * wi_90 * xj_29 * yk_11;
 
         scalar_t sum_v_348 = scalar_t(0);
-        sum_v_348 += scalar_t(0.44721359f) * wi_90 * xj_25 * yk_13;
+        sum_v_348 += scalar_t(0.44721356f) * wi_90 * xj_25 * yk_13;
         sum_v_348 += scalar_t(0.288675129f) * wi_90 * xj_25 * yk_15;
         sum_v_348 += scalar_t(0.182574183f) * wi_90 * xj_26 * yk_12;
         sum_v_348 += scalar_t(-0.353553385f) * wi_90 * xj_26 * yk_14;
         sum_v_348 += scalar_t(0.387298346f) * wi_90 * xj_27 * yk_11;
         sum_v_348 += scalar_t(0.353553385f) * wi_90 * xj_28 * yk_10;
         sum_v_348 += scalar_t(-0.288675129f) * wi_90 * xj_29 * yk_9;
-        sum_v_348 += scalar_t(-0.44721359f) * wi_90 * xj_29 * yk_11;
+        sum_v_348 += scalar_t(-0.44721356f) * wi_90 * xj_29 * yk_11;
 
         scalar_t sum_v_352 = scalar_t(0);
         sum_v_352 += scalar_t(0.288675129f) * wi_90 * xj_25 * yk_11;
-        sum_v_352 += scalar_t(-0.456435472f) * wi_90 * xj_26 * yk_10;
+        sum_v_352 += scalar_t(-0.456435442f) * wi_90 * xj_26 * yk_10;
         sum_v_352 += scalar_t(-0.645497203f) * wi_90 * xj_27 * yk_15;
-        sum_v_352 += scalar_t(0.456435472f) * wi_90 * xj_28 * yk_14;
+        sum_v_352 += scalar_t(0.456435442f) * wi_90 * xj_28 * yk_14;
         sum_v_352 += scalar_t(-0.288675129f) * wi_90 * xj_29 * yk_13;
 
         scalar_t sum_v_341 = scalar_t(0);
@@ -476,30 +487,30 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_340 += scalar_t(0.577350259f) * wi_89 * xj_28 * yk_1;
 
         scalar_t sum_v_351 = scalar_t(0);
-        sum_v_351 += scalar_t(0.456435472f) * wi_90 * xj_26 * yk_9;
+        sum_v_351 += scalar_t(0.456435442f) * wi_90 * xj_26 * yk_9;
         sum_v_351 += scalar_t(-0.353553385f) * wi_90 * xj_26 * yk_11;
         sum_v_351 += scalar_t(0.353553385f) * wi_90 * xj_28 * yk_13;
-        sum_v_351 += scalar_t(0.456435472f) * wi_90 * xj_28 * yk_15;
+        sum_v_351 += scalar_t(0.456435442f) * wi_90 * xj_28 * yk_15;
         sum_v_351 += scalar_t(-0.577350259f) * wi_90 * xj_29 * yk_12;
 
         scalar_t sum_v_342 = scalar_t(0);
-        sum_v_342 += scalar_t(-0.44721359f) * wi_89 * xj_26 * yk_1;
+        sum_v_342 += scalar_t(-0.44721356f) * wi_89 * xj_26 * yk_1;
         sum_v_342 += scalar_t(0.774596691f) * wi_89 * xj_27 * yk_2;
-        sum_v_342 += scalar_t(-0.44721359f) * wi_89 * xj_28 * yk_3;
+        sum_v_342 += scalar_t(-0.44721356f) * wi_89 * xj_28 * yk_3;
 
         scalar_t sum_v_453 = scalar_t(0);
         sum_v_453 += scalar_t(0.387298346f) * wi_105 * xj_25 * yk_5;
         sum_v_453 += scalar_t(-0.387298346f) * wi_105 * xj_26 * yk_4;
-        sum_v_453 += scalar_t(0.44721359f) * wi_105 * xj_27 * yk_7;
-        sum_v_453 += scalar_t(-0.44721359f) * wi_105 * xj_28 * yk_6;
+        sum_v_453 += scalar_t(0.44721356f) * wi_105 * xj_27 * yk_7;
+        sum_v_453 += scalar_t(-0.44721356f) * wi_105 * xj_28 * yk_6;
         sum_v_453 += scalar_t(-0.387298346f) * wi_105 * xj_28 * yk_8;
         sum_v_453 += scalar_t(0.387298346f) * wi_105 * xj_29 * yk_7;
 
         scalar_t sum_v_451 = scalar_t(0);
-        sum_v_451 += scalar_t(0.5f) * wi_105 * xj_25 * yk_5;
-        sum_v_451 += scalar_t(-0.5f) * wi_105 * xj_26 * yk_4;
-        sum_v_451 += scalar_t(0.5f) * wi_105 * xj_28 * yk_8;
-        sum_v_451 += scalar_t(-0.5f) * wi_105 * xj_29 * yk_7;
+        sum_v_451 += scalar_t(0.49999997f) * wi_105 * xj_25 * yk_5;
+        sum_v_451 += scalar_t(-0.49999997f) * wi_105 * xj_26 * yk_4;
+        sum_v_451 += scalar_t(0.49999997f) * wi_105 * xj_28 * yk_8;
+        sum_v_451 += scalar_t(-0.49999997f) * wi_105 * xj_29 * yk_7;
 
         scalar_t sum_v_456 = scalar_t(0);
         sum_v_456 += scalar_t(0.707106769f) * wi_105 * xj_25 * yk_6;
@@ -512,9 +523,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_432 += scalar_t(-0.182574183f) * wi_102 * xj_19 * yk_8;
 
         scalar_t sum_v_430 = scalar_t(0);
-        sum_v_430 += scalar_t(-0.44721359f) * wi_102 * xj_15 * yk_5;
+        sum_v_430 += scalar_t(-0.44721356f) * wi_102 * xj_15 * yk_5;
         sum_v_430 += scalar_t(0.774596691f) * wi_102 * xj_17 * yk_6;
-        sum_v_430 += scalar_t(-0.44721359f) * wi_102 * xj_19 * yk_7;
+        sum_v_430 += scalar_t(-0.44721356f) * wi_102 * xj_19 * yk_7;
 
         scalar_t sum_v_436 = scalar_t(0);
         sum_v_436 += scalar_t(-0.707106769f) * wi_102 * xj_15 * yk_4;
@@ -527,16 +538,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_321 = scalar_t(0);
         sum_v_321 += scalar_t(-0.353553385f) * wi_87 * xj_15 * yk_9;
-        sum_v_321 += scalar_t(0.456435472f) * wi_87 * xj_15 * yk_11;
+        sum_v_321 += scalar_t(0.456435442f) * wi_87 * xj_15 * yk_11;
         sum_v_321 += scalar_t(0.577350259f) * wi_87 * xj_17 * yk_14;
-        sum_v_321 += scalar_t(-0.456435472f) * wi_87 * xj_19 * yk_13;
+        sum_v_321 += scalar_t(-0.456435442f) * wi_87 * xj_19 * yk_13;
         sum_v_321 += scalar_t(-0.353553385f) * wi_87 * xj_19 * yk_15;
 
         scalar_t sum_v_323 = scalar_t(0);
-        sum_v_323 += scalar_t(-0.456435472f) * wi_87 * xj_15 * yk_10;
+        sum_v_323 += scalar_t(-0.456435442f) * wi_87 * xj_15 * yk_10;
         sum_v_323 += scalar_t(0.288675129f) * wi_87 * xj_17 * yk_13;
         sum_v_323 += scalar_t(-0.707106769f) * wi_87 * xj_19 * yk_12;
-        sum_v_323 += scalar_t(-0.456435472f) * wi_87 * xj_19 * yk_14;
+        sum_v_323 += scalar_t(-0.456435442f) * wi_87 * xj_19 * yk_14;
 
         scalar_t sum_v_240 = scalar_t(0);
         sum_v_240 += scalar_t(0.408248276f) * wi_72 * xj_15 * yk_7;
@@ -554,16 +565,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_236 += scalar_t(0.707106769f) * wi_72 * xj_19 * yk_5;
 
         scalar_t sum_v_147 = scalar_t(0);
-        sum_v_147 += scalar_t(-0.154303342f) * wi_55 * xj_15 * yk_13;
+        sum_v_147 += scalar_t(-0.154303357f) * wi_55 * xj_15 * yk_13;
         sum_v_147 += scalar_t(-0.597614288f) * wi_55 * xj_15 * yk_15;
         sum_v_147 += scalar_t(0.487950057f) * wi_55 * xj_17 * yk_10;
         sum_v_147 += scalar_t(0.597614288f) * wi_55 * xj_19 * yk_9;
-        sum_v_147 += scalar_t(-0.154303342f) * wi_55 * xj_19 * yk_11;
+        sum_v_147 += scalar_t(-0.154303357f) * wi_55 * xj_19 * yk_11;
 
         scalar_t sum_v_149 = scalar_t(0);
         sum_v_149 += scalar_t(-0.377964467f) * wi_55 * xj_15 * yk_12;
         sum_v_149 += scalar_t(-0.487950057f) * wi_55 * xj_15 * yk_14;
-        sum_v_149 += scalar_t(0.617213368f) * wi_55 * xj_17 * yk_11;
+        sum_v_149 += scalar_t(0.617213428f) * wi_55 * xj_17 * yk_11;
         sum_v_149 += scalar_t(0.487950057f) * wi_55 * xj_19 * yk_10;
 
         scalar_t sum_v_151 = scalar_t(0);
@@ -574,12 +585,12 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_90 = scalar_t(0);
         sum_v_90 += scalar_t(0.547722578f) * wi_40 * xj_15 * yk_4;
         sum_v_90 += scalar_t(0.547722578f) * wi_40 * xj_17 * yk_7;
-        sum_v_90 += scalar_t(-0.316227764f) * wi_40 * xj_19 * yk_6;
+        sum_v_90 += scalar_t(-0.316227794f) * wi_40 * xj_19 * yk_6;
         sum_v_90 += scalar_t(0.547722578f) * wi_40 * xj_19 * yk_8;
 
         scalar_t sum_v_88 = scalar_t(0);
         sum_v_88 += scalar_t(0.547722578f) * wi_40 * xj_15 * yk_5;
-        sum_v_88 += scalar_t(0.632455528f) * wi_40 * xj_17 * yk_6;
+        sum_v_88 += scalar_t(0.632455587f) * wi_40 * xj_17 * yk_6;
         sum_v_88 += scalar_t(0.547722578f) * wi_40 * xj_19 * yk_7;
 
         scalar_t sum_v_41 = scalar_t(0);
@@ -601,26 +612,26 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_154 = scalar_t(0);
         sum_v_154 += scalar_t(0.597614288f) * wi_54 * xj_14 * yk_9;
-        sum_v_154 += scalar_t(0.154303342f) * wi_54 * xj_14 * yk_11;
+        sum_v_154 += scalar_t(0.154303357f) * wi_54 * xj_14 * yk_11;
         sum_v_154 += scalar_t(0.487950057f) * wi_54 * xj_16 * yk_14;
-        sum_v_154 += scalar_t(-0.154303342f) * wi_54 * xj_18 * yk_13;
+        sum_v_154 += scalar_t(-0.154303357f) * wi_54 * xj_18 * yk_13;
         sum_v_154 += scalar_t(0.597614288f) * wi_54 * xj_18 * yk_15;
 
         scalar_t sum_v_152 = scalar_t(0);
         sum_v_152 += scalar_t(0.487950057f) * wi_54 * xj_14 * yk_10;
-        sum_v_152 += scalar_t(0.617213368f) * wi_54 * xj_16 * yk_13;
+        sum_v_152 += scalar_t(0.617213428f) * wi_54 * xj_16 * yk_13;
         sum_v_152 += scalar_t(-0.377964467f) * wi_54 * xj_18 * yk_12;
         sum_v_152 += scalar_t(0.487950057f) * wi_54 * xj_18 * yk_14;
 
         scalar_t sum_v_89 = scalar_t(0);
         sum_v_89 += scalar_t(0.547722578f) * wi_39 * xj_14 * yk_4;
         sum_v_89 += scalar_t(0.547722578f) * wi_39 * xj_16 * yk_7;
-        sum_v_89 += scalar_t(-0.316227764f) * wi_39 * xj_18 * yk_6;
+        sum_v_89 += scalar_t(-0.316227794f) * wi_39 * xj_18 * yk_6;
         sum_v_89 += scalar_t(0.547722578f) * wi_39 * xj_18 * yk_8;
 
         scalar_t sum_v_87 = scalar_t(0);
         sum_v_87 += scalar_t(0.547722578f) * wi_39 * xj_14 * yk_5;
-        sum_v_87 += scalar_t(0.632455528f) * wi_39 * xj_16 * yk_6;
+        sum_v_87 += scalar_t(0.632455587f) * wi_39 * xj_16 * yk_6;
         sum_v_87 += scalar_t(0.547722578f) * wi_39 * xj_18 * yk_7;
 
         scalar_t sum_v_40 = scalar_t(0);
@@ -654,7 +665,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_13 += scalar_t(0.577350259f) * wi_13 * xj_13 * yk_3;
 
         scalar_t sum_v_35 = scalar_t(0);
-        sum_v_35 += scalar_t(-0.316227764f) * wi_23 * xj_9 * yk_6;
+        sum_v_35 += scalar_t(-0.316227794f) * wi_23 * xj_9 * yk_6;
         sum_v_35 += scalar_t(-0.547722578f) * wi_23 * xj_9 * yk_8;
         sum_v_35 += scalar_t(0.547722578f) * wi_23 * xj_11 * yk_5;
         sum_v_35 += scalar_t(0.547722578f) * wi_23 * xj_13 * yk_4;
@@ -685,14 +696,14 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_230 = scalar_t(0);
         sum_v_230 += scalar_t(0.597614288f) * wi_70 * xj_9 * yk_9;
-        sum_v_230 += scalar_t(0.154303342f) * wi_70 * xj_9 * yk_11;
+        sum_v_230 += scalar_t(0.154303357f) * wi_70 * xj_9 * yk_11;
         sum_v_230 += scalar_t(0.487950057f) * wi_70 * xj_11 * yk_14;
-        sum_v_230 += scalar_t(-0.154303342f) * wi_70 * xj_13 * yk_13;
+        sum_v_230 += scalar_t(-0.154303357f) * wi_70 * xj_13 * yk_13;
         sum_v_230 += scalar_t(0.597614288f) * wi_70 * xj_13 * yk_15;
 
         scalar_t sum_v_228 = scalar_t(0);
         sum_v_228 += scalar_t(0.487950057f) * wi_70 * xj_9 * yk_10;
-        sum_v_228 += scalar_t(0.617213368f) * wi_70 * xj_11 * yk_13;
+        sum_v_228 += scalar_t(0.617213428f) * wi_70 * xj_11 * yk_13;
         sum_v_228 += scalar_t(-0.377964467f) * wi_70 * xj_13 * yk_12;
         sum_v_228 += scalar_t(0.487950057f) * wi_70 * xj_13 * yk_14;
 
@@ -726,14 +737,14 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_229 = scalar_t(0);
         sum_v_229 += scalar_t(0.597614288f) * wi_69 * xj_8 * yk_9;
-        sum_v_229 += scalar_t(0.154303342f) * wi_69 * xj_8 * yk_11;
+        sum_v_229 += scalar_t(0.154303357f) * wi_69 * xj_8 * yk_11;
         sum_v_229 += scalar_t(0.487950057f) * wi_69 * xj_10 * yk_14;
-        sum_v_229 += scalar_t(-0.154303342f) * wi_69 * xj_12 * yk_13;
+        sum_v_229 += scalar_t(-0.154303357f) * wi_69 * xj_12 * yk_13;
         sum_v_229 += scalar_t(0.597614288f) * wi_69 * xj_12 * yk_15;
 
         scalar_t sum_v_227 = scalar_t(0);
         sum_v_227 += scalar_t(0.487950057f) * wi_69 * xj_8 * yk_10;
-        sum_v_227 += scalar_t(0.617213368f) * wi_69 * xj_10 * yk_13;
+        sum_v_227 += scalar_t(0.617213428f) * wi_69 * xj_10 * yk_13;
         sum_v_227 += scalar_t(-0.377964467f) * wi_69 * xj_12 * yk_12;
         sum_v_227 += scalar_t(0.487950057f) * wi_69 * xj_12 * yk_14;
 
@@ -749,9 +760,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_308 += scalar_t(-0.182574183f) * wi_84 * xj_12 * yk_4;
 
         scalar_t sum_v_310 = scalar_t(0);
-        sum_v_310 += scalar_t(-0.44721359f) * wi_84 * xj_8 * yk_5;
+        sum_v_310 += scalar_t(-0.44721356f) * wi_84 * xj_8 * yk_5;
         sum_v_310 += scalar_t(0.774596691f) * wi_84 * xj_10 * yk_6;
-        sum_v_310 += scalar_t(-0.44721359f) * wi_84 * xj_12 * yk_7;
+        sum_v_310 += scalar_t(-0.44721356f) * wi_84 * xj_12 * yk_7;
 
         scalar_t sum_v_316 = scalar_t(0);
         sum_v_316 += scalar_t(-0.707106769f) * wi_84 * xj_8 * yk_4;
@@ -778,11 +789,11 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_36 = scalar_t(0);
         sum_v_36 += scalar_t(0.547722578f) * wi_22 * xj_8 * yk_5;
-        sum_v_36 += scalar_t(0.632455528f) * wi_22 * xj_10 * yk_6;
+        sum_v_36 += scalar_t(0.632455587f) * wi_22 * xj_10 * yk_6;
         sum_v_36 += scalar_t(0.547722578f) * wi_22 * xj_12 * yk_7;
 
         scalar_t sum_v_34 = scalar_t(0);
-        sum_v_34 += scalar_t(-0.316227764f) * wi_22 * xj_8 * yk_6;
+        sum_v_34 += scalar_t(-0.316227794f) * wi_22 * xj_8 * yk_6;
         sum_v_34 += scalar_t(-0.547722578f) * wi_22 * xj_8 * yk_8;
         sum_v_34 += scalar_t(0.547722578f) * wi_22 * xj_10 * yk_5;
         sum_v_34 += scalar_t(0.547722578f) * wi_22 * xj_12 * yk_4;
@@ -884,7 +895,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_51 = scalar_t(0);
         sum_v_51 += scalar_t(0.547722578f) * wi_27 * xj_25 * yk_1;
-        sum_v_51 += scalar_t(-0.316227764f) * wi_27 * xj_27 * yk_3;
+        sum_v_51 += scalar_t(-0.316227794f) * wi_27 * xj_27 * yk_3;
         sum_v_51 += scalar_t(0.547722578f) * wi_27 * xj_28 * yk_2;
         sum_v_51 += scalar_t(0.547722578f) * wi_27 * xj_29 * yk_3;
 
@@ -902,7 +913,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_91 = scalar_t(0);
         sum_v_91 += scalar_t(0.547722578f) * wi_41 * xj_20 * yk_3;
         sum_v_91 += scalar_t(0.547722578f) * wi_41 * xj_21 * yk_2;
-        sum_v_91 += scalar_t(-0.316227764f) * wi_41 * xj_22 * yk_1;
+        sum_v_91 += scalar_t(-0.316227794f) * wi_41 * xj_22 * yk_1;
         sum_v_91 += scalar_t(-0.547722578f) * wi_41 * xj_24 * yk_1;
 
         scalar_t sum_v_94 = scalar_t(0);
@@ -917,9 +928,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_48 = scalar_t(0);
         sum_v_48 += scalar_t(0.316227764f) * wi_26 * xj_20 * yk_7;
-        sum_v_48 += scalar_t(0.547722578f) * wi_26 * xj_21 * yk_6;
+        sum_v_48 += scalar_t(0.547722518f) * wi_26 * xj_21 * yk_6;
         sum_v_48 += scalar_t(0.316227764f) * wi_26 * xj_21 * yk_8;
-        sum_v_48 += scalar_t(-0.547722578f) * wi_26 * xj_22 * yk_5;
+        sum_v_48 += scalar_t(-0.547722518f) * wi_26 * xj_22 * yk_5;
         sum_v_48 += scalar_t(-0.316227764f) * wi_26 * xj_23 * yk_4;
         sum_v_48 += scalar_t(-0.316227764f) * wi_26 * xj_24 * yk_5;
 
@@ -987,47 +998,47 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_243 += scalar_t(0.707106769f) * wi_73 * xj_23 * yk_1;
 
         scalar_t sum_v_332 = scalar_t(0);
-        sum_v_332 += scalar_t(0.5f) * wi_88 * xj_20 * yk_5;
-        sum_v_332 += scalar_t(-0.5f) * wi_88 * xj_21 * yk_4;
-        sum_v_332 += scalar_t(0.5f) * wi_88 * xj_23 * yk_8;
-        sum_v_332 += scalar_t(-0.5f) * wi_88 * xj_24 * yk_7;
+        sum_v_332 += scalar_t(0.49999997f) * wi_88 * xj_20 * yk_5;
+        sum_v_332 += scalar_t(-0.49999997f) * wi_88 * xj_21 * yk_4;
+        sum_v_332 += scalar_t(0.49999997f) * wi_88 * xj_23 * yk_8;
+        sum_v_332 += scalar_t(-0.49999997f) * wi_88 * xj_24 * yk_7;
 
         scalar_t sum_v_334 = scalar_t(0);
         sum_v_334 += scalar_t(0.387298346f) * wi_88 * xj_20 * yk_5;
         sum_v_334 += scalar_t(-0.387298346f) * wi_88 * xj_21 * yk_4;
-        sum_v_334 += scalar_t(0.44721359f) * wi_88 * xj_22 * yk_7;
-        sum_v_334 += scalar_t(-0.44721359f) * wi_88 * xj_23 * yk_6;
+        sum_v_334 += scalar_t(0.44721356f) * wi_88 * xj_22 * yk_7;
+        sum_v_334 += scalar_t(-0.44721356f) * wi_88 * xj_23 * yk_6;
         sum_v_334 += scalar_t(-0.387298346f) * wi_88 * xj_23 * yk_8;
         sum_v_334 += scalar_t(0.387298346f) * wi_88 * xj_24 * yk_7;
 
         scalar_t sum_v_338 = scalar_t(0);
-        sum_v_338 += scalar_t(0.5f) * wi_88 * xj_20 * yk_7;
-        sum_v_338 += scalar_t(-0.5f) * wi_88 * xj_21 * yk_8;
-        sum_v_338 += scalar_t(-0.5f) * wi_88 * xj_23 * yk_4;
-        sum_v_338 += scalar_t(0.5f) * wi_88 * xj_24 * yk_5;
+        sum_v_338 += scalar_t(0.49999997f) * wi_88 * xj_20 * yk_7;
+        sum_v_338 += scalar_t(-0.49999997f) * wi_88 * xj_21 * yk_8;
+        sum_v_338 += scalar_t(-0.49999997f) * wi_88 * xj_23 * yk_4;
+        sum_v_338 += scalar_t(0.49999997f) * wi_88 * xj_24 * yk_5;
 
         scalar_t sum_v_444 = scalar_t(0);
         sum_v_444 += scalar_t(-0.288675129f) * wi_104 * xj_20 * yk_13;
-        sum_v_444 += scalar_t(0.456435472f) * wi_104 * xj_21 * yk_14;
+        sum_v_444 += scalar_t(0.456435442f) * wi_104 * xj_21 * yk_14;
         sum_v_444 += scalar_t(-0.645497203f) * wi_104 * xj_22 * yk_9;
-        sum_v_444 += scalar_t(0.456435472f) * wi_104 * xj_23 * yk_10;
+        sum_v_444 += scalar_t(0.456435442f) * wi_104 * xj_23 * yk_10;
         sum_v_444 += scalar_t(-0.288675129f) * wi_104 * xj_24 * yk_11;
 
         scalar_t sum_v_446 = scalar_t(0);
-        sum_v_446 += scalar_t(0.44721359f) * wi_104 * xj_20 * yk_13;
+        sum_v_446 += scalar_t(0.44721356f) * wi_104 * xj_20 * yk_13;
         sum_v_446 += scalar_t(0.288675129f) * wi_104 * xj_20 * yk_15;
         sum_v_446 += scalar_t(0.182574183f) * wi_104 * xj_21 * yk_12;
         sum_v_446 += scalar_t(-0.353553385f) * wi_104 * xj_21 * yk_14;
         sum_v_446 += scalar_t(0.387298346f) * wi_104 * xj_22 * yk_11;
         sum_v_446 += scalar_t(0.353553385f) * wi_104 * xj_23 * yk_10;
         sum_v_446 += scalar_t(-0.288675129f) * wi_104 * xj_24 * yk_9;
-        sum_v_446 += scalar_t(-0.44721359f) * wi_104 * xj_24 * yk_11;
+        sum_v_446 += scalar_t(-0.44721356f) * wi_104 * xj_24 * yk_11;
 
         scalar_t sum_v_450 = scalar_t(0);
         sum_v_450 += scalar_t(0.288675129f) * wi_104 * xj_20 * yk_11;
-        sum_v_450 += scalar_t(-0.456435472f) * wi_104 * xj_21 * yk_10;
+        sum_v_450 += scalar_t(-0.456435442f) * wi_104 * xj_21 * yk_10;
         sum_v_450 += scalar_t(-0.645497203f) * wi_104 * xj_22 * yk_15;
-        sum_v_450 += scalar_t(0.456435472f) * wi_104 * xj_23 * yk_14;
+        sum_v_450 += scalar_t(0.456435442f) * wi_104 * xj_23 * yk_14;
         sum_v_450 += scalar_t(-0.288675129f) * wi_104 * xj_24 * yk_13;
 
         scalar_t sum_v_439 = scalar_t(0);
@@ -1037,10 +1048,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_439 += scalar_t(0.182574183f) * wi_103 * xj_24 * yk_1;
 
         scalar_t sum_v_449 = scalar_t(0);
-        sum_v_449 += scalar_t(0.456435472f) * wi_104 * xj_21 * yk_9;
+        sum_v_449 += scalar_t(0.456435442f) * wi_104 * xj_21 * yk_9;
         sum_v_449 += scalar_t(-0.353553385f) * wi_104 * xj_21 * yk_11;
         sum_v_449 += scalar_t(0.353553385f) * wi_104 * xj_23 * yk_13;
-        sum_v_449 += scalar_t(0.456435472f) * wi_104 * xj_23 * yk_15;
+        sum_v_449 += scalar_t(0.456435442f) * wi_104 * xj_23 * yk_15;
         sum_v_449 += scalar_t(-0.577350259f) * wi_104 * xj_24 * yk_12;
 
         scalar_t sum_v_442 = scalar_t(0);
@@ -1090,8 +1101,8 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_269 += scalar_t(0.38575837f) * wi_78 * xj_31 * yk_9;
         sum_v_269 += scalar_t(0.298807144f) * wi_78 * xj_31 * yk_11;
         sum_v_269 += scalar_t(0.298807144f) * wi_78 * xj_32 * yk_10;
-        sum_v_269 += scalar_t(0.154303342f) * wi_78 * xj_33 * yk_13;
-        sum_v_269 += scalar_t(0.154303342f) * wi_78 * xj_34 * yk_12;
+        sum_v_269 += scalar_t(0.154303357f) * wi_78 * xj_33 * yk_13;
+        sum_v_269 += scalar_t(0.154303357f) * wi_78 * xj_34 * yk_12;
         sum_v_269 += scalar_t(0.298807144f) * wi_78 * xj_34 * yk_14;
         sum_v_269 += scalar_t(0.298807144f) * wi_78 * xj_35 * yk_13;
         sum_v_269 += scalar_t(0.38575837f) * wi_78 * xj_35 * yk_15;
@@ -1156,45 +1167,45 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_362 += scalar_t(-0.288675129f) * wi_92 * xj_30 * yk_8;
         sum_v_362 += scalar_t(0.353553385f) * wi_92 * xj_31 * yk_7;
         sum_v_362 += scalar_t(0.387298346f) * wi_92 * xj_32 * yk_6;
-        sum_v_362 += scalar_t(-0.44721359f) * wi_92 * xj_32 * yk_8;
+        sum_v_362 += scalar_t(-0.44721356f) * wi_92 * xj_32 * yk_8;
         sum_v_362 += scalar_t(0.182574183f) * wi_92 * xj_33 * yk_5;
-        sum_v_362 += scalar_t(0.44721359f) * wi_92 * xj_34 * yk_4;
+        sum_v_362 += scalar_t(0.44721356f) * wi_92 * xj_34 * yk_4;
         sum_v_362 += scalar_t(-0.353553385f) * wi_92 * xj_35 * yk_5;
         sum_v_362 += scalar_t(0.288675129f) * wi_92 * xj_36 * yk_4;
 
         scalar_t sum_v_360 = scalar_t(0);
         sum_v_360 += scalar_t(-0.645497203f) * wi_92 * xj_30 * yk_6;
-        sum_v_360 += scalar_t(0.456435472f) * wi_92 * xj_31 * yk_7;
+        sum_v_360 += scalar_t(0.456435442f) * wi_92 * xj_31 * yk_7;
         sum_v_360 += scalar_t(-0.288675129f) * wi_92 * xj_32 * yk_8;
         sum_v_360 += scalar_t(-0.288675129f) * wi_92 * xj_34 * yk_4;
-        sum_v_360 += scalar_t(0.456435472f) * wi_92 * xj_35 * yk_5;
+        sum_v_360 += scalar_t(0.456435442f) * wi_92 * xj_35 * yk_5;
 
         scalar_t sum_v_365 = scalar_t(0);
-        sum_v_365 += scalar_t(0.456435472f) * wi_92 * xj_30 * yk_5;
+        sum_v_365 += scalar_t(0.456435442f) * wi_92 * xj_30 * yk_5;
         sum_v_365 += scalar_t(-0.353553385f) * wi_92 * xj_32 * yk_5;
         sum_v_365 += scalar_t(-0.577350259f) * wi_92 * xj_33 * yk_8;
         sum_v_365 += scalar_t(0.353553385f) * wi_92 * xj_34 * yk_7;
-        sum_v_365 += scalar_t(0.456435472f) * wi_92 * xj_36 * yk_7;
+        sum_v_365 += scalar_t(0.456435442f) * wi_92 * xj_36 * yk_7;
 
         scalar_t sum_v_265 = scalar_t(0);
         sum_v_265 += scalar_t(0.597614288f) * wi_77 * xj_30 * yk_1;
-        sum_v_265 += scalar_t(0.154303342f) * wi_77 * xj_32 * yk_1;
-        sum_v_265 += scalar_t(-0.154303342f) * wi_77 * xj_34 * yk_3;
+        sum_v_265 += scalar_t(0.154303357f) * wi_77 * xj_32 * yk_1;
+        sum_v_265 += scalar_t(-0.154303357f) * wi_77 * xj_34 * yk_3;
         sum_v_265 += scalar_t(0.487950057f) * wi_77 * xj_35 * yk_2;
         sum_v_265 += scalar_t(0.597614288f) * wi_77 * xj_36 * yk_3;
 
         scalar_t sum_v_463 = scalar_t(0);
         sum_v_463 += scalar_t(-0.353553385f) * wi_106 * xj_30 * yk_3;
         sum_v_463 += scalar_t(0.577350259f) * wi_106 * xj_31 * yk_2;
-        sum_v_463 += scalar_t(-0.456435472f) * wi_106 * xj_32 * yk_3;
-        sum_v_463 += scalar_t(-0.456435472f) * wi_106 * xj_34 * yk_1;
+        sum_v_463 += scalar_t(-0.456435442f) * wi_106 * xj_32 * yk_3;
+        sum_v_463 += scalar_t(-0.456435442f) * wi_106 * xj_34 * yk_1;
         sum_v_463 += scalar_t(0.353553385f) * wi_106 * xj_36 * yk_1;
 
         scalar_t sum_v_462 = scalar_t(0);
-        sum_v_462 += scalar_t(-0.456435472f) * wi_106 * xj_31 * yk_3;
+        sum_v_462 += scalar_t(-0.456435442f) * wi_106 * xj_31 * yk_3;
         sum_v_462 += scalar_t(0.288675129f) * wi_106 * xj_32 * yk_2;
         sum_v_462 += scalar_t(-0.707106769f) * wi_106 * xj_33 * yk_1;
-        sum_v_462 += scalar_t(0.456435472f) * wi_106 * xj_35 * yk_1;
+        sum_v_462 += scalar_t(0.456435442f) * wi_106 * xj_35 * yk_1;
 
         scalar_t sum_v_443 = scalar_t(0);
         sum_v_443 += scalar_t(-0.707106769f) * wi_103 * xj_20 * yk_1;
@@ -1221,17 +1232,17 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_433 += scalar_t(0.577350259f) * wi_101 * xj_18 * yk_7;
 
         scalar_t sum_v_328 = scalar_t(0);
-        sum_v_328 += scalar_t(0.456435472f) * wi_86 * xj_14 * yk_13;
+        sum_v_328 += scalar_t(0.456435442f) * wi_86 * xj_14 * yk_13;
         sum_v_328 += scalar_t(-0.353553385f) * wi_86 * xj_14 * yk_15;
         sum_v_328 += scalar_t(-0.577350259f) * wi_86 * xj_16 * yk_10;
         sum_v_328 += scalar_t(0.353553385f) * wi_86 * xj_18 * yk_9;
-        sum_v_328 += scalar_t(0.456435472f) * wi_86 * xj_18 * yk_11;
+        sum_v_328 += scalar_t(0.456435442f) * wi_86 * xj_18 * yk_11;
 
         scalar_t sum_v_326 = scalar_t(0);
         sum_v_326 += scalar_t(0.707106769f) * wi_86 * xj_14 * yk_12;
-        sum_v_326 += scalar_t(-0.456435472f) * wi_86 * xj_14 * yk_14;
+        sum_v_326 += scalar_t(-0.456435442f) * wi_86 * xj_14 * yk_14;
         sum_v_326 += scalar_t(-0.288675129f) * wi_86 * xj_16 * yk_11;
-        sum_v_326 += scalar_t(0.456435472f) * wi_86 * xj_18 * yk_10;
+        sum_v_326 += scalar_t(0.456435442f) * wi_86 * xj_18 * yk_10;
 
         scalar_t sum_v_318 = scalar_t(0);
         sum_v_318 += scalar_t(0.353553385f) * wi_86 * xj_14 * yk_10;
@@ -1321,16 +1332,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_411 = scalar_t(0);
         sum_v_411 += scalar_t(-0.353553385f) * wi_99 * xj_8 * yk_9;
-        sum_v_411 += scalar_t(0.456435472f) * wi_99 * xj_8 * yk_11;
+        sum_v_411 += scalar_t(0.456435442f) * wi_99 * xj_8 * yk_11;
         sum_v_411 += scalar_t(0.577350259f) * wi_99 * xj_10 * yk_14;
-        sum_v_411 += scalar_t(-0.456435472f) * wi_99 * xj_12 * yk_13;
+        sum_v_411 += scalar_t(-0.456435442f) * wi_99 * xj_12 * yk_13;
         sum_v_411 += scalar_t(-0.353553385f) * wi_99 * xj_12 * yk_15;
 
         scalar_t sum_v_413 = scalar_t(0);
-        sum_v_413 += scalar_t(-0.456435472f) * wi_99 * xj_8 * yk_10;
+        sum_v_413 += scalar_t(-0.456435442f) * wi_99 * xj_8 * yk_10;
         sum_v_413 += scalar_t(0.288675129f) * wi_99 * xj_10 * yk_13;
         sum_v_413 += scalar_t(-0.707106769f) * wi_99 * xj_12 * yk_12;
-        sum_v_413 += scalar_t(-0.456435472f) * wi_99 * xj_12 * yk_14;
+        sum_v_413 += scalar_t(-0.456435442f) * wi_99 * xj_12 * yk_14;
 
         scalar_t sum_v_421 = scalar_t(0);
         sum_v_421 += scalar_t(0.353553385f) * wi_99 * xj_8 * yk_14;
@@ -1343,16 +1354,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_412 = scalar_t(0);
         sum_v_412 += scalar_t(-0.353553385f) * wi_100 * xj_9 * yk_9;
-        sum_v_412 += scalar_t(0.456435472f) * wi_100 * xj_9 * yk_11;
+        sum_v_412 += scalar_t(0.456435442f) * wi_100 * xj_9 * yk_11;
         sum_v_412 += scalar_t(0.577350259f) * wi_100 * xj_11 * yk_14;
-        sum_v_412 += scalar_t(-0.456435472f) * wi_100 * xj_13 * yk_13;
+        sum_v_412 += scalar_t(-0.456435442f) * wi_100 * xj_13 * yk_13;
         sum_v_412 += scalar_t(-0.353553385f) * wi_100 * xj_13 * yk_15;
 
         scalar_t sum_v_414 = scalar_t(0);
-        sum_v_414 += scalar_t(-0.456435472f) * wi_100 * xj_9 * yk_10;
+        sum_v_414 += scalar_t(-0.456435442f) * wi_100 * xj_9 * yk_10;
         sum_v_414 += scalar_t(0.288675129f) * wi_100 * xj_11 * yk_13;
         sum_v_414 += scalar_t(-0.707106769f) * wi_100 * xj_13 * yk_12;
-        sum_v_414 += scalar_t(-0.456435472f) * wi_100 * xj_13 * yk_14;
+        sum_v_414 += scalar_t(-0.456435442f) * wi_100 * xj_13 * yk_14;
 
         scalar_t sum_v_422 = scalar_t(0);
         sum_v_422 += scalar_t(0.353553385f) * wi_100 * xj_9 * yk_14;
@@ -1442,7 +1453,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_262 = scalar_t(0);
         sum_v_262 += scalar_t(0.487950057f) * wi_77 * xj_31 * yk_3;
-        sum_v_262 += scalar_t(0.617213368f) * wi_77 * xj_32 * yk_2;
+        sum_v_262 += scalar_t(0.617213428f) * wi_77 * xj_32 * yk_2;
         sum_v_262 += scalar_t(-0.377964467f) * wi_77 * xj_33 * yk_1;
         sum_v_262 += scalar_t(-0.487950057f) * wi_77 * xj_35 * yk_1;
 
@@ -1893,8 +1904,8 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_189 += scalar_t(0.38575837f) * wi_62 * xj_38 * yk_9;
         sum_v_189 += scalar_t(0.298807144f) * wi_62 * xj_38 * yk_11;
         sum_v_189 += scalar_t(0.298807144f) * wi_62 * xj_39 * yk_10;
-        sum_v_189 += scalar_t(0.154303342f) * wi_62 * xj_40 * yk_13;
-        sum_v_189 += scalar_t(0.154303342f) * wi_62 * xj_41 * yk_12;
+        sum_v_189 += scalar_t(0.154303357f) * wi_62 * xj_40 * yk_13;
+        sum_v_189 += scalar_t(0.154303357f) * wi_62 * xj_41 * yk_12;
         sum_v_189 += scalar_t(0.298807144f) * wi_62 * xj_41 * yk_14;
         sum_v_189 += scalar_t(0.298807144f) * wi_62 * xj_42 * yk_13;
         sum_v_189 += scalar_t(0.38575837f) * wi_62 * xj_42 * yk_15;
@@ -1945,10 +1956,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_483 = scalar_t(0);
         sum_v_483 += scalar_t(-0.288675129f) * wi_109 * xj_37 * yk_4;
         sum_v_483 += scalar_t(0.353553385f) * wi_109 * xj_38 * yk_5;
-        sum_v_483 += scalar_t(0.44721359f) * wi_109 * xj_39 * yk_4;
+        sum_v_483 += scalar_t(0.44721356f) * wi_109 * xj_39 * yk_4;
         sum_v_483 += scalar_t(0.182574183f) * wi_109 * xj_40 * yk_7;
         sum_v_483 += scalar_t(0.387298346f) * wi_109 * xj_41 * yk_6;
-        sum_v_483 += scalar_t(0.44721359f) * wi_109 * xj_41 * yk_8;
+        sum_v_483 += scalar_t(0.44721356f) * wi_109 * xj_41 * yk_8;
         sum_v_483 += scalar_t(0.353553385f) * wi_109 * xj_42 * yk_7;
         sum_v_483 += scalar_t(-0.288675129f) * wi_109 * xj_43 * yk_8;
 
@@ -1960,18 +1971,18 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_482 += scalar_t(-0.577350259f) * wi_109 * xj_42 * yk_8;
 
         scalar_t sum_v_485 = scalar_t(0);
-        sum_v_485 += scalar_t(-0.456435472f) * wi_109 * xj_38 * yk_5;
+        sum_v_485 += scalar_t(-0.456435442f) * wi_109 * xj_38 * yk_5;
         sum_v_485 += scalar_t(0.288675129f) * wi_109 * xj_39 * yk_4;
         sum_v_485 += scalar_t(-0.288675129f) * wi_109 * xj_41 * yk_8;
-        sum_v_485 += scalar_t(0.456435472f) * wi_109 * xj_42 * yk_7;
+        sum_v_485 += scalar_t(0.456435442f) * wi_109 * xj_42 * yk_7;
         sum_v_485 += scalar_t(-0.645497203f) * wi_109 * xj_43 * yk_6;
 
         scalar_t sum_v_480 = scalar_t(0);
-        sum_v_480 += scalar_t(0.456435472f) * wi_109 * xj_37 * yk_7;
+        sum_v_480 += scalar_t(0.456435442f) * wi_109 * xj_37 * yk_7;
         sum_v_480 += scalar_t(0.353553385f) * wi_109 * xj_39 * yk_7;
         sum_v_480 += scalar_t(-0.577350259f) * wi_109 * xj_40 * yk_4;
         sum_v_480 += scalar_t(0.353553385f) * wi_109 * xj_41 * yk_5;
-        sum_v_480 += scalar_t(-0.456435472f) * wi_109 * xj_43 * yk_5;
+        sum_v_480 += scalar_t(-0.456435442f) * wi_109 * xj_43 * yk_5;
 
         scalar_t sum_v_274 = scalar_t(0);
         sum_v_274 += scalar_t(-0.422577113f) * wi_79 * xj_37 * yk_8;
@@ -2002,28 +2013,28 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_184 = scalar_t(0);
         sum_v_184 += scalar_t(0.487950057f) * wi_61 * xj_38 * yk_1;
         sum_v_184 += scalar_t(-0.377964467f) * wi_61 * xj_40 * yk_3;
-        sum_v_184 += scalar_t(0.617213368f) * wi_61 * xj_41 * yk_2;
+        sum_v_184 += scalar_t(0.617213428f) * wi_61 * xj_41 * yk_2;
         sum_v_184 += scalar_t(0.487950057f) * wi_61 * xj_42 * yk_3;
 
         scalar_t sum_v_185 = scalar_t(0);
         sum_v_185 += scalar_t(0.597614288f) * wi_61 * xj_37 * yk_1;
-        sum_v_185 += scalar_t(0.154303342f) * wi_61 * xj_39 * yk_1;
-        sum_v_185 += scalar_t(-0.154303342f) * wi_61 * xj_41 * yk_3;
+        sum_v_185 += scalar_t(0.154303357f) * wi_61 * xj_39 * yk_1;
+        sum_v_185 += scalar_t(-0.154303357f) * wi_61 * xj_41 * yk_3;
         sum_v_185 += scalar_t(0.487950057f) * wi_61 * xj_42 * yk_2;
         sum_v_185 += scalar_t(0.597614288f) * wi_61 * xj_43 * yk_3;
 
         scalar_t sum_v_372 = scalar_t(0);
         sum_v_372 += scalar_t(-0.353553385f) * wi_93 * xj_37 * yk_3;
         sum_v_372 += scalar_t(0.577350259f) * wi_93 * xj_38 * yk_2;
-        sum_v_372 += scalar_t(-0.456435472f) * wi_93 * xj_39 * yk_3;
-        sum_v_372 += scalar_t(-0.456435472f) * wi_93 * xj_41 * yk_1;
+        sum_v_372 += scalar_t(-0.456435442f) * wi_93 * xj_39 * yk_3;
+        sum_v_372 += scalar_t(-0.456435442f) * wi_93 * xj_41 * yk_1;
         sum_v_372 += scalar_t(0.353553385f) * wi_93 * xj_43 * yk_1;
 
         scalar_t sum_v_371 = scalar_t(0);
-        sum_v_371 += scalar_t(-0.456435472f) * wi_93 * xj_38 * yk_3;
+        sum_v_371 += scalar_t(-0.456435442f) * wi_93 * xj_38 * yk_3;
         sum_v_371 += scalar_t(0.288675129f) * wi_93 * xj_39 * yk_2;
         sum_v_371 += scalar_t(-0.707106769f) * wi_93 * xj_40 * yk_1;
-        sum_v_371 += scalar_t(0.456435472f) * wi_93 * xj_42 * yk_1;
+        sum_v_371 += scalar_t(0.456435442f) * wi_93 * xj_42 * yk_1;
 
         scalar_t sum_v_367 = scalar_t(0);
         sum_v_367 += scalar_t(-0.353553385f) * wi_93 * xj_38 * yk_1;
@@ -2076,9 +2087,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_99 = scalar_t(0);
         sum_v_99 += scalar_t(0.316227764f) * wi_43 * xj_25 * yk_7;
-        sum_v_99 += scalar_t(0.547722578f) * wi_43 * xj_26 * yk_6;
+        sum_v_99 += scalar_t(0.547722518f) * wi_43 * xj_26 * yk_6;
         sum_v_99 += scalar_t(0.316227764f) * wi_43 * xj_26 * yk_8;
-        sum_v_99 += scalar_t(-0.547722578f) * wi_43 * xj_27 * yk_5;
+        sum_v_99 += scalar_t(-0.547722518f) * wi_43 * xj_27 * yk_5;
         sum_v_99 += scalar_t(-0.316227764f) * wi_43 * xj_28 * yk_4;
         sum_v_99 += scalar_t(-0.316227764f) * wi_43 * xj_29 * yk_5;
 
@@ -2105,12 +2116,12 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_350 = scalar_t(0);
         sum_v_350 += scalar_t(-0.288675129f) * wi_90 * xj_25 * yk_9;
-        sum_v_350 += scalar_t(0.44721359f) * wi_90 * xj_25 * yk_11;
+        sum_v_350 += scalar_t(0.44721356f) * wi_90 * xj_25 * yk_11;
         sum_v_350 += scalar_t(0.353553385f) * wi_90 * xj_26 * yk_10;
         sum_v_350 += scalar_t(0.387298346f) * wi_90 * xj_27 * yk_13;
         sum_v_350 += scalar_t(0.182574183f) * wi_90 * xj_28 * yk_12;
         sum_v_350 += scalar_t(0.353553385f) * wi_90 * xj_28 * yk_14;
-        sum_v_350 += scalar_t(0.44721359f) * wi_90 * xj_29 * yk_13;
+        sum_v_350 += scalar_t(0.44721356f) * wi_90 * xj_29 * yk_13;
         sum_v_350 += scalar_t(-0.288675129f) * wi_90 * xj_29 * yk_15;
 
         scalar_t sum_v_349 = scalar_t(0);
@@ -2129,8 +2140,8 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_347 = scalar_t(0);
         sum_v_347 += scalar_t(-0.577350259f) * wi_90 * xj_25 * yk_12;
         sum_v_347 += scalar_t(0.353553385f) * wi_90 * xj_26 * yk_13;
-        sum_v_347 += scalar_t(-0.456435472f) * wi_90 * xj_26 * yk_15;
-        sum_v_347 += scalar_t(0.456435472f) * wi_90 * xj_28 * yk_9;
+        sum_v_347 += scalar_t(-0.456435442f) * wi_90 * xj_26 * yk_15;
+        sum_v_347 += scalar_t(0.456435442f) * wi_90 * xj_28 * yk_9;
         sum_v_347 += scalar_t(0.353553385f) * wi_90 * xj_28 * yk_11;
 
         scalar_t sum_v_344 = scalar_t(0);
@@ -2140,9 +2151,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_455 = scalar_t(0);
         sum_v_455 += scalar_t(-0.387298346f) * wi_105 * xj_25 * yk_7;
-        sum_v_455 += scalar_t(0.44721359f) * wi_105 * xj_26 * yk_6;
+        sum_v_455 += scalar_t(0.44721356f) * wi_105 * xj_26 * yk_6;
         sum_v_455 += scalar_t(-0.387298346f) * wi_105 * xj_26 * yk_8;
-        sum_v_455 += scalar_t(-0.44721359f) * wi_105 * xj_27 * yk_5;
+        sum_v_455 += scalar_t(-0.44721356f) * wi_105 * xj_27 * yk_5;
         sum_v_455 += scalar_t(0.387298346f) * wi_105 * xj_28 * yk_4;
         sum_v_455 += scalar_t(0.387298346f) * wi_105 * xj_29 * yk_5;
 
@@ -2153,10 +2164,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_454 += scalar_t(-0.316227764f) * wi_105 * xj_29 * yk_4;
 
         scalar_t sum_v_457 = scalar_t(0);
-        sum_v_457 += scalar_t(0.5f) * wi_105 * xj_25 * yk_7;
-        sum_v_457 += scalar_t(-0.5f) * wi_105 * xj_26 * yk_8;
-        sum_v_457 += scalar_t(-0.5f) * wi_105 * xj_28 * yk_4;
-        sum_v_457 += scalar_t(0.5f) * wi_105 * xj_29 * yk_5;
+        sum_v_457 += scalar_t(0.49999997f) * wi_105 * xj_25 * yk_7;
+        sum_v_457 += scalar_t(-0.49999997f) * wi_105 * xj_26 * yk_8;
+        sum_v_457 += scalar_t(-0.49999997f) * wi_105 * xj_28 * yk_4;
+        sum_v_457 += scalar_t(0.49999997f) * wi_105 * xj_29 * yk_5;
 
         scalar_t sum_v_452 = scalar_t(0);
         sum_v_452 += scalar_t(0.707106769f) * wi_105 * xj_27 * yk_8;
@@ -2183,17 +2194,17 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_424 += scalar_t(0.707106769f) * wi_102 * xj_19 * yk_4;
 
         scalar_t sum_v_329 = scalar_t(0);
-        sum_v_329 += scalar_t(0.456435472f) * wi_87 * xj_15 * yk_13;
+        sum_v_329 += scalar_t(0.456435442f) * wi_87 * xj_15 * yk_13;
         sum_v_329 += scalar_t(-0.353553385f) * wi_87 * xj_15 * yk_15;
         sum_v_329 += scalar_t(-0.577350259f) * wi_87 * xj_17 * yk_10;
         sum_v_329 += scalar_t(0.353553385f) * wi_87 * xj_19 * yk_9;
-        sum_v_329 += scalar_t(0.456435472f) * wi_87 * xj_19 * yk_11;
+        sum_v_329 += scalar_t(0.456435442f) * wi_87 * xj_19 * yk_11;
 
         scalar_t sum_v_327 = scalar_t(0);
         sum_v_327 += scalar_t(0.707106769f) * wi_87 * xj_15 * yk_12;
-        sum_v_327 += scalar_t(-0.456435472f) * wi_87 * xj_15 * yk_14;
+        sum_v_327 += scalar_t(-0.456435442f) * wi_87 * xj_15 * yk_14;
         sum_v_327 += scalar_t(-0.288675129f) * wi_87 * xj_17 * yk_11;
-        sum_v_327 += scalar_t(0.456435472f) * wi_87 * xj_19 * yk_10;
+        sum_v_327 += scalar_t(0.456435442f) * wi_87 * xj_19 * yk_10;
 
         scalar_t sum_v_319 = scalar_t(0);
         sum_v_319 += scalar_t(0.353553385f) * wi_87 * xj_15 * yk_10;
@@ -2213,14 +2224,14 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_155 = scalar_t(0);
         sum_v_155 += scalar_t(0.597614288f) * wi_55 * xj_15 * yk_9;
-        sum_v_155 += scalar_t(0.154303342f) * wi_55 * xj_15 * yk_11;
+        sum_v_155 += scalar_t(0.154303357f) * wi_55 * xj_15 * yk_11;
         sum_v_155 += scalar_t(0.487950057f) * wi_55 * xj_17 * yk_14;
-        sum_v_155 += scalar_t(-0.154303342f) * wi_55 * xj_19 * yk_13;
+        sum_v_155 += scalar_t(-0.154303357f) * wi_55 * xj_19 * yk_13;
         sum_v_155 += scalar_t(0.597614288f) * wi_55 * xj_19 * yk_15;
 
         scalar_t sum_v_153 = scalar_t(0);
         sum_v_153 += scalar_t(0.487950057f) * wi_55 * xj_15 * yk_10;
-        sum_v_153 += scalar_t(0.617213368f) * wi_55 * xj_17 * yk_13;
+        sum_v_153 += scalar_t(0.617213428f) * wi_55 * xj_17 * yk_13;
         sum_v_153 += scalar_t(-0.377964467f) * wi_55 * xj_19 * yk_12;
         sum_v_153 += scalar_t(0.487950057f) * wi_55 * xj_19 * yk_14;
 
@@ -2234,7 +2245,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_139 += scalar_t(0.707106769f) * wi_53 * xj_17 * yk_1;
 
         scalar_t sum_v_86 = scalar_t(0);
-        sum_v_86 += scalar_t(-0.316227764f) * wi_40 * xj_15 * yk_6;
+        sum_v_86 += scalar_t(-0.316227794f) * wi_40 * xj_15 * yk_6;
         sum_v_86 += scalar_t(-0.547722578f) * wi_40 * xj_15 * yk_8;
         sum_v_86 += scalar_t(0.547722578f) * wi_40 * xj_17 * yk_5;
         sum_v_86 += scalar_t(0.547722578f) * wi_40 * xj_19 * yk_4;
@@ -2257,16 +2268,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_142 += scalar_t(0.707106769f) * wi_52 * xj_18 * yk_2;
 
         scalar_t sum_v_146 = scalar_t(0);
-        sum_v_146 += scalar_t(-0.154303342f) * wi_54 * xj_14 * yk_13;
+        sum_v_146 += scalar_t(-0.154303357f) * wi_54 * xj_14 * yk_13;
         sum_v_146 += scalar_t(-0.597614288f) * wi_54 * xj_14 * yk_15;
         sum_v_146 += scalar_t(0.487950057f) * wi_54 * xj_16 * yk_10;
         sum_v_146 += scalar_t(0.597614288f) * wi_54 * xj_18 * yk_9;
-        sum_v_146 += scalar_t(-0.154303342f) * wi_54 * xj_18 * yk_11;
+        sum_v_146 += scalar_t(-0.154303357f) * wi_54 * xj_18 * yk_11;
 
         scalar_t sum_v_148 = scalar_t(0);
         sum_v_148 += scalar_t(-0.377964467f) * wi_54 * xj_14 * yk_12;
         sum_v_148 += scalar_t(-0.487950057f) * wi_54 * xj_14 * yk_14;
-        sum_v_148 += scalar_t(0.617213368f) * wi_54 * xj_16 * yk_11;
+        sum_v_148 += scalar_t(0.617213428f) * wi_54 * xj_16 * yk_11;
         sum_v_148 += scalar_t(0.487950057f) * wi_54 * xj_18 * yk_10;
 
         scalar_t sum_v_150 = scalar_t(0);
@@ -2275,7 +2286,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_150 += scalar_t(0.534522474f) * wi_54 * xj_18 * yk_13;
 
         scalar_t sum_v_85 = scalar_t(0);
-        sum_v_85 += scalar_t(-0.316227764f) * wi_39 * xj_14 * yk_6;
+        sum_v_85 += scalar_t(-0.316227794f) * wi_39 * xj_14 * yk_6;
         sum_v_85 += scalar_t(-0.547722578f) * wi_39 * xj_14 * yk_8;
         sum_v_85 += scalar_t(0.547722578f) * wi_39 * xj_16 * yk_5;
         sum_v_85 += scalar_t(0.547722578f) * wi_39 * xj_18 * yk_4;
@@ -2313,12 +2324,12 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_39 = scalar_t(0);
         sum_v_39 += scalar_t(0.547722578f) * wi_23 * xj_9 * yk_4;
         sum_v_39 += scalar_t(0.547722578f) * wi_23 * xj_11 * yk_7;
-        sum_v_39 += scalar_t(-0.316227764f) * wi_23 * xj_13 * yk_6;
+        sum_v_39 += scalar_t(-0.316227794f) * wi_23 * xj_13 * yk_6;
         sum_v_39 += scalar_t(0.547722578f) * wi_23 * xj_13 * yk_8;
 
         scalar_t sum_v_37 = scalar_t(0);
         sum_v_37 += scalar_t(0.547722578f) * wi_23 * xj_9 * yk_5;
-        sum_v_37 += scalar_t(0.632455528f) * wi_23 * xj_11 * yk_6;
+        sum_v_37 += scalar_t(0.632455587f) * wi_23 * xj_11 * yk_6;
         sum_v_37 += scalar_t(0.547722578f) * wi_23 * xj_13 * yk_7;
 
         scalar_t sum_v_133 = scalar_t(0);
@@ -2337,16 +2348,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_76 += scalar_t(0.707106769f) * wi_36 * xj_13 * yk_1;
 
         scalar_t sum_v_222 = scalar_t(0);
-        sum_v_222 += scalar_t(-0.154303342f) * wi_70 * xj_9 * yk_13;
+        sum_v_222 += scalar_t(-0.154303357f) * wi_70 * xj_9 * yk_13;
         sum_v_222 += scalar_t(-0.597614288f) * wi_70 * xj_9 * yk_15;
         sum_v_222 += scalar_t(0.487950057f) * wi_70 * xj_11 * yk_10;
         sum_v_222 += scalar_t(0.597614288f) * wi_70 * xj_13 * yk_9;
-        sum_v_222 += scalar_t(-0.154303342f) * wi_70 * xj_13 * yk_11;
+        sum_v_222 += scalar_t(-0.154303357f) * wi_70 * xj_13 * yk_11;
 
         scalar_t sum_v_224 = scalar_t(0);
         sum_v_224 += scalar_t(-0.377964467f) * wi_70 * xj_9 * yk_12;
         sum_v_224 += scalar_t(-0.487950057f) * wi_70 * xj_9 * yk_14;
-        sum_v_224 += scalar_t(0.617213368f) * wi_70 * xj_11 * yk_11;
+        sum_v_224 += scalar_t(0.617213428f) * wi_70 * xj_11 * yk_11;
         sum_v_224 += scalar_t(0.487950057f) * wi_70 * xj_13 * yk_10;
 
         scalar_t sum_v_226 = scalar_t(0);
@@ -2361,9 +2372,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_313 += scalar_t(-0.182574183f) * wi_85 * xj_13 * yk_8;
 
         scalar_t sum_v_311 = scalar_t(0);
-        sum_v_311 += scalar_t(-0.44721359f) * wi_85 * xj_9 * yk_5;
+        sum_v_311 += scalar_t(-0.44721356f) * wi_85 * xj_9 * yk_5;
         sum_v_311 += scalar_t(0.774596691f) * wi_85 * xj_11 * yk_6;
-        sum_v_311 += scalar_t(-0.44721359f) * wi_85 * xj_13 * yk_7;
+        sum_v_311 += scalar_t(-0.44721356f) * wi_85 * xj_13 * yk_7;
 
         scalar_t sum_v_317 = scalar_t(0);
         sum_v_317 += scalar_t(-0.707106769f) * wi_85 * xj_9 * yk_4;
@@ -2387,16 +2398,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_215 += scalar_t(-0.408248276f) * wi_67 * xj_12 * yk_3;
 
         scalar_t sum_v_221 = scalar_t(0);
-        sum_v_221 += scalar_t(-0.154303342f) * wi_69 * xj_8 * yk_13;
+        sum_v_221 += scalar_t(-0.154303357f) * wi_69 * xj_8 * yk_13;
         sum_v_221 += scalar_t(-0.597614288f) * wi_69 * xj_8 * yk_15;
         sum_v_221 += scalar_t(0.487950057f) * wi_69 * xj_10 * yk_10;
         sum_v_221 += scalar_t(0.597614288f) * wi_69 * xj_12 * yk_9;
-        sum_v_221 += scalar_t(-0.154303342f) * wi_69 * xj_12 * yk_11;
+        sum_v_221 += scalar_t(-0.154303357f) * wi_69 * xj_12 * yk_11;
 
         scalar_t sum_v_223 = scalar_t(0);
         sum_v_223 += scalar_t(-0.377964467f) * wi_69 * xj_8 * yk_12;
         sum_v_223 += scalar_t(-0.487950057f) * wi_69 * xj_8 * yk_14;
-        sum_v_223 += scalar_t(0.617213368f) * wi_69 * xj_10 * yk_11;
+        sum_v_223 += scalar_t(0.617213428f) * wi_69 * xj_10 * yk_11;
         sum_v_223 += scalar_t(0.487950057f) * wi_69 * xj_12 * yk_10;
 
         scalar_t sum_v_306 = scalar_t(0);
@@ -2441,7 +2452,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_38 = scalar_t(0);
         sum_v_38 += scalar_t(0.547722578f) * wi_22 * xj_8 * yk_4;
         sum_v_38 += scalar_t(0.547722578f) * wi_22 * xj_10 * yk_7;
-        sum_v_38 += scalar_t(-0.316227764f) * wi_22 * xj_12 * yk_6;
+        sum_v_38 += scalar_t(-0.316227794f) * wi_22 * xj_12 * yk_6;
         sum_v_38 += scalar_t(0.547722578f) * wi_22 * xj_12 * yk_8;
 
         scalar_t sum_v_12 = scalar_t(0);
@@ -2543,7 +2554,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_49 = scalar_t(0);
         sum_v_49 += scalar_t(0.547722578f) * wi_27 * xj_25 * yk_3;
         sum_v_49 += scalar_t(0.547722578f) * wi_27 * xj_26 * yk_2;
-        sum_v_49 += scalar_t(-0.316227764f) * wi_27 * xj_27 * yk_1;
+        sum_v_49 += scalar_t(-0.316227794f) * wi_27 * xj_27 * yk_1;
         sum_v_49 += scalar_t(-0.547722578f) * wi_27 * xj_29 * yk_1;
 
         scalar_t sum_v_167 = scalar_t(0);
@@ -2558,7 +2569,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_50 = scalar_t(0);
         sum_v_50 += scalar_t(0.547722578f) * wi_27 * xj_26 * yk_1;
-        sum_v_50 += scalar_t(0.632455528f) * wi_27 * xj_27 * yk_2;
+        sum_v_50 += scalar_t(0.632455587f) * wi_27 * xj_27 * yk_2;
         sum_v_50 += scalar_t(0.547722578f) * wi_27 * xj_28 * yk_3;
 
         scalar_t sum_v_96 = scalar_t(0);
@@ -2581,8 +2592,8 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_46 = scalar_t(0);
         sum_v_46 += scalar_t(-0.316227764f) * wi_26 * xj_20 * yk_5;
         sum_v_46 += scalar_t(0.316227764f) * wi_26 * xj_21 * yk_4;
-        sum_v_46 += scalar_t(0.547722578f) * wi_26 * xj_22 * yk_7;
-        sum_v_46 += scalar_t(-0.547722578f) * wi_26 * xj_23 * yk_6;
+        sum_v_46 += scalar_t(0.547722518f) * wi_26 * xj_22 * yk_7;
+        sum_v_46 += scalar_t(-0.547722518f) * wi_26 * xj_23 * yk_6;
         sum_v_46 += scalar_t(0.316227764f) * wi_26 * xj_23 * yk_8;
         sum_v_46 += scalar_t(-0.316227764f) * wi_26 * xj_24 * yk_7;
 
@@ -2637,20 +2648,20 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_93 = scalar_t(0);
         sum_v_93 += scalar_t(0.547722578f) * wi_41 * xj_20 * yk_1;
-        sum_v_93 += scalar_t(-0.316227764f) * wi_41 * xj_22 * yk_3;
+        sum_v_93 += scalar_t(-0.316227794f) * wi_41 * xj_22 * yk_3;
         sum_v_93 += scalar_t(0.547722578f) * wi_41 * xj_23 * yk_2;
         sum_v_93 += scalar_t(0.547722578f) * wi_41 * xj_24 * yk_3;
 
         scalar_t sum_v_92 = scalar_t(0);
         sum_v_92 += scalar_t(0.547722578f) * wi_41 * xj_21 * yk_1;
-        sum_v_92 += scalar_t(0.632455528f) * wi_41 * xj_22 * yk_2;
+        sum_v_92 += scalar_t(0.632455587f) * wi_41 * xj_22 * yk_2;
         sum_v_92 += scalar_t(0.547722578f) * wi_41 * xj_23 * yk_3;
 
         scalar_t sum_v_336 = scalar_t(0);
         sum_v_336 += scalar_t(-0.387298346f) * wi_88 * xj_20 * yk_7;
-        sum_v_336 += scalar_t(0.44721359f) * wi_88 * xj_21 * yk_6;
+        sum_v_336 += scalar_t(0.44721356f) * wi_88 * xj_21 * yk_6;
         sum_v_336 += scalar_t(-0.387298346f) * wi_88 * xj_21 * yk_8;
-        sum_v_336 += scalar_t(-0.44721359f) * wi_88 * xj_22 * yk_5;
+        sum_v_336 += scalar_t(-0.44721356f) * wi_88 * xj_22 * yk_5;
         sum_v_336 += scalar_t(0.387298346f) * wi_88 * xj_23 * yk_4;
         sum_v_336 += scalar_t(0.387298346f) * wi_88 * xj_24 * yk_5;
 
@@ -2662,12 +2673,12 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_448 = scalar_t(0);
         sum_v_448 += scalar_t(-0.288675129f) * wi_104 * xj_20 * yk_9;
-        sum_v_448 += scalar_t(0.44721359f) * wi_104 * xj_20 * yk_11;
+        sum_v_448 += scalar_t(0.44721356f) * wi_104 * xj_20 * yk_11;
         sum_v_448 += scalar_t(0.353553385f) * wi_104 * xj_21 * yk_10;
         sum_v_448 += scalar_t(0.387298346f) * wi_104 * xj_22 * yk_13;
         sum_v_448 += scalar_t(0.182574183f) * wi_104 * xj_23 * yk_12;
         sum_v_448 += scalar_t(0.353553385f) * wi_104 * xj_23 * yk_14;
-        sum_v_448 += scalar_t(0.44721359f) * wi_104 * xj_24 * yk_13;
+        sum_v_448 += scalar_t(0.44721356f) * wi_104 * xj_24 * yk_13;
         sum_v_448 += scalar_t(-0.288675129f) * wi_104 * xj_24 * yk_15;
 
         scalar_t sum_v_447 = scalar_t(0);
@@ -2691,14 +2702,14 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_445 = scalar_t(0);
         sum_v_445 += scalar_t(-0.577350259f) * wi_104 * xj_20 * yk_12;
         sum_v_445 += scalar_t(0.353553385f) * wi_104 * xj_21 * yk_13;
-        sum_v_445 += scalar_t(-0.456435472f) * wi_104 * xj_21 * yk_15;
-        sum_v_445 += scalar_t(0.456435472f) * wi_104 * xj_23 * yk_9;
+        sum_v_445 += scalar_t(-0.456435442f) * wi_104 * xj_21 * yk_15;
+        sum_v_445 += scalar_t(0.456435442f) * wi_104 * xj_23 * yk_9;
         sum_v_445 += scalar_t(0.353553385f) * wi_104 * xj_23 * yk_11;
 
         scalar_t sum_v_440 = scalar_t(0);
-        sum_v_440 += scalar_t(-0.44721359f) * wi_103 * xj_21 * yk_1;
+        sum_v_440 += scalar_t(-0.44721356f) * wi_103 * xj_21 * yk_1;
         sum_v_440 += scalar_t(0.774596691f) * wi_103 * xj_22 * yk_2;
-        sum_v_440 += scalar_t(-0.44721359f) * wi_103 * xj_23 * yk_3;
+        sum_v_440 += scalar_t(-0.44721356f) * wi_103 * xj_23 * yk_3;
 
         scalar_t sum_v_466 = scalar_t(0);
         sum_v_466 += scalar_t(-0.408248305f) * wi_107 * xj_30 * yk_11;
@@ -2728,9 +2739,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_267 += scalar_t(0.38575837f) * wi_78 * xj_30 * yk_14;
         sum_v_267 += scalar_t(0.298807144f) * wi_78 * xj_31 * yk_13;
         sum_v_267 += scalar_t(-0.38575837f) * wi_78 * xj_31 * yk_15;
-        sum_v_267 += scalar_t(0.154303342f) * wi_78 * xj_32 * yk_12;
+        sum_v_267 += scalar_t(0.154303357f) * wi_78 * xj_32 * yk_12;
         sum_v_267 += scalar_t(-0.298807144f) * wi_78 * xj_32 * yk_14;
-        sum_v_267 += scalar_t(0.154303342f) * wi_78 * xj_33 * yk_11;
+        sum_v_267 += scalar_t(0.154303357f) * wi_78 * xj_33 * yk_11;
         sum_v_267 += scalar_t(0.298807144f) * wi_78 * xj_34 * yk_10;
         sum_v_267 += scalar_t(0.38575837f) * wi_78 * xj_35 * yk_9;
         sum_v_267 += scalar_t(-0.298807144f) * wi_78 * xj_35 * yk_11;
@@ -2803,10 +2814,10 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_364 = scalar_t(0);
         sum_v_364 += scalar_t(-0.288675129f) * wi_92 * xj_30 * yk_4;
         sum_v_364 += scalar_t(0.353553385f) * wi_92 * xj_31 * yk_5;
-        sum_v_364 += scalar_t(0.44721359f) * wi_92 * xj_32 * yk_4;
+        sum_v_364 += scalar_t(0.44721356f) * wi_92 * xj_32 * yk_4;
         sum_v_364 += scalar_t(0.182574183f) * wi_92 * xj_33 * yk_7;
         sum_v_364 += scalar_t(0.387298346f) * wi_92 * xj_34 * yk_6;
-        sum_v_364 += scalar_t(0.44721359f) * wi_92 * xj_34 * yk_8;
+        sum_v_364 += scalar_t(0.44721356f) * wi_92 * xj_34 * yk_8;
         sum_v_364 += scalar_t(0.353553385f) * wi_92 * xj_35 * yk_7;
         sum_v_364 += scalar_t(-0.288675129f) * wi_92 * xj_36 * yk_8;
 
@@ -2818,38 +2829,38 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_363 += scalar_t(-0.577350259f) * wi_92 * xj_35 * yk_8;
 
         scalar_t sum_v_366 = scalar_t(0);
-        sum_v_366 += scalar_t(-0.456435472f) * wi_92 * xj_31 * yk_5;
+        sum_v_366 += scalar_t(-0.456435442f) * wi_92 * xj_31 * yk_5;
         sum_v_366 += scalar_t(0.288675129f) * wi_92 * xj_32 * yk_4;
         sum_v_366 += scalar_t(-0.288675129f) * wi_92 * xj_34 * yk_8;
-        sum_v_366 += scalar_t(0.456435472f) * wi_92 * xj_35 * yk_7;
+        sum_v_366 += scalar_t(0.456435442f) * wi_92 * xj_35 * yk_7;
         sum_v_366 += scalar_t(-0.645497203f) * wi_92 * xj_36 * yk_6;
 
         scalar_t sum_v_361 = scalar_t(0);
-        sum_v_361 += scalar_t(0.456435472f) * wi_92 * xj_30 * yk_7;
+        sum_v_361 += scalar_t(0.456435442f) * wi_92 * xj_30 * yk_7;
         sum_v_361 += scalar_t(0.353553385f) * wi_92 * xj_32 * yk_7;
         sum_v_361 += scalar_t(-0.577350259f) * wi_92 * xj_33 * yk_4;
         sum_v_361 += scalar_t(0.353553385f) * wi_92 * xj_34 * yk_5;
-        sum_v_361 += scalar_t(-0.456435472f) * wi_92 * xj_36 * yk_5;
+        sum_v_361 += scalar_t(-0.456435442f) * wi_92 * xj_36 * yk_5;
 
         scalar_t sum_v_261 = scalar_t(0);
         sum_v_261 += scalar_t(0.597614288f) * wi_77 * xj_30 * yk_3;
         sum_v_261 += scalar_t(0.487950057f) * wi_77 * xj_31 * yk_2;
-        sum_v_261 += scalar_t(-0.154303342f) * wi_77 * xj_32 * yk_3;
-        sum_v_261 += scalar_t(-0.154303342f) * wi_77 * xj_34 * yk_1;
+        sum_v_261 += scalar_t(-0.154303357f) * wi_77 * xj_32 * yk_3;
+        sum_v_261 += scalar_t(-0.154303357f) * wi_77 * xj_34 * yk_1;
         sum_v_261 += scalar_t(-0.597614288f) * wi_77 * xj_36 * yk_1;
 
         scalar_t sum_v_459 = scalar_t(0);
         sum_v_459 += scalar_t(0.353553385f) * wi_106 * xj_30 * yk_1;
-        sum_v_459 += scalar_t(-0.456435472f) * wi_106 * xj_32 * yk_1;
-        sum_v_459 += scalar_t(0.456435472f) * wi_106 * xj_34 * yk_3;
+        sum_v_459 += scalar_t(-0.456435442f) * wi_106 * xj_32 * yk_1;
+        sum_v_459 += scalar_t(0.456435442f) * wi_106 * xj_34 * yk_3;
         sum_v_459 += scalar_t(-0.577350259f) * wi_106 * xj_35 * yk_2;
         sum_v_459 += scalar_t(0.353553385f) * wi_106 * xj_36 * yk_3;
 
         scalar_t sum_v_460 = scalar_t(0);
-        sum_v_460 += scalar_t(0.456435472f) * wi_106 * xj_31 * yk_1;
+        sum_v_460 += scalar_t(0.456435442f) * wi_106 * xj_31 * yk_1;
         sum_v_460 += scalar_t(0.707106769f) * wi_106 * xj_33 * yk_3;
         sum_v_460 += scalar_t(-0.288675129f) * wi_106 * xj_34 * yk_2;
-        sum_v_460 += scalar_t(0.456435472f) * wi_106 * xj_35 * yk_3;
+        sum_v_460 += scalar_t(0.456435442f) * wi_106 * xj_35 * yk_3;
 
         scalar_t sum_v_464 = scalar_t(0);
         sum_v_464 += scalar_t(0.866025388f) * wi_106 * xj_30 * yk_2;
@@ -2871,9 +2882,9 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_431 += scalar_t(-0.182574183f) * wi_101 * xj_18 * yk_8;
 
         scalar_t sum_v_429 = scalar_t(0);
-        sum_v_429 += scalar_t(-0.44721359f) * wi_101 * xj_14 * yk_5;
+        sum_v_429 += scalar_t(-0.44721356f) * wi_101 * xj_14 * yk_5;
         sum_v_429 += scalar_t(0.774596691f) * wi_101 * xj_16 * yk_6;
-        sum_v_429 += scalar_t(-0.44721359f) * wi_101 * xj_18 * yk_7;
+        sum_v_429 += scalar_t(-0.44721356f) * wi_101 * xj_18 * yk_7;
 
         scalar_t sum_v_423 = scalar_t(0);
         sum_v_423 += scalar_t(0.707106769f) * wi_101 * xj_14 * yk_8;
@@ -2886,16 +2897,16 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
         scalar_t sum_v_320 = scalar_t(0);
         sum_v_320 += scalar_t(-0.353553385f) * wi_86 * xj_14 * yk_9;
-        sum_v_320 += scalar_t(0.456435472f) * wi_86 * xj_14 * yk_11;
+        sum_v_320 += scalar_t(0.456435442f) * wi_86 * xj_14 * yk_11;
         sum_v_320 += scalar_t(0.577350259f) * wi_86 * xj_16 * yk_14;
-        sum_v_320 += scalar_t(-0.456435472f) * wi_86 * xj_18 * yk_13;
+        sum_v_320 += scalar_t(-0.456435442f) * wi_86 * xj_18 * yk_13;
         sum_v_320 += scalar_t(-0.353553385f) * wi_86 * xj_18 * yk_15;
 
         scalar_t sum_v_322 = scalar_t(0);
-        sum_v_322 += scalar_t(-0.456435472f) * wi_86 * xj_14 * yk_10;
+        sum_v_322 += scalar_t(-0.456435442f) * wi_86 * xj_14 * yk_10;
         sum_v_322 += scalar_t(0.288675129f) * wi_86 * xj_16 * yk_13;
         sum_v_322 += scalar_t(-0.707106769f) * wi_86 * xj_18 * yk_12;
-        sum_v_322 += scalar_t(-0.456435472f) * wi_86 * xj_18 * yk_14;
+        sum_v_322 += scalar_t(-0.456435442f) * wi_86 * xj_18 * yk_14;
 
         scalar_t sum_v_239 = scalar_t(0);
         sum_v_239 += scalar_t(0.408248276f) * wi_71 * xj_14 * yk_7;
@@ -2976,17 +2987,17 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_388 += wi_98 * xj_3 * yk_10;
 
         scalar_t sum_v_419 = scalar_t(0);
-        sum_v_419 += scalar_t(0.456435472f) * wi_99 * xj_8 * yk_13;
+        sum_v_419 += scalar_t(0.456435442f) * wi_99 * xj_8 * yk_13;
         sum_v_419 += scalar_t(-0.353553385f) * wi_99 * xj_8 * yk_15;
         sum_v_419 += scalar_t(-0.577350259f) * wi_99 * xj_10 * yk_10;
         sum_v_419 += scalar_t(0.353553385f) * wi_99 * xj_12 * yk_9;
-        sum_v_419 += scalar_t(0.456435472f) * wi_99 * xj_12 * yk_11;
+        sum_v_419 += scalar_t(0.456435442f) * wi_99 * xj_12 * yk_11;
 
         scalar_t sum_v_417 = scalar_t(0);
         sum_v_417 += scalar_t(0.707106769f) * wi_99 * xj_8 * yk_12;
-        sum_v_417 += scalar_t(-0.456435472f) * wi_99 * xj_8 * yk_14;
+        sum_v_417 += scalar_t(-0.456435442f) * wi_99 * xj_8 * yk_14;
         sum_v_417 += scalar_t(-0.288675129f) * wi_99 * xj_10 * yk_11;
-        sum_v_417 += scalar_t(0.456435472f) * wi_99 * xj_12 * yk_10;
+        sum_v_417 += scalar_t(0.456435442f) * wi_99 * xj_12 * yk_10;
 
         scalar_t sum_v_409 = scalar_t(0);
         sum_v_409 += scalar_t(0.353553385f) * wi_99 * xj_8 * yk_10;
@@ -2998,17 +3009,17 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         sum_v_416 += scalar_t(0.707106769f) * wi_100 * xj_13 * yk_11;
 
         scalar_t sum_v_420 = scalar_t(0);
-        sum_v_420 += scalar_t(0.456435472f) * wi_100 * xj_9 * yk_13;
+        sum_v_420 += scalar_t(0.456435442f) * wi_100 * xj_9 * yk_13;
         sum_v_420 += scalar_t(-0.353553385f) * wi_100 * xj_9 * yk_15;
         sum_v_420 += scalar_t(-0.577350259f) * wi_100 * xj_11 * yk_10;
         sum_v_420 += scalar_t(0.353553385f) * wi_100 * xj_13 * yk_9;
-        sum_v_420 += scalar_t(0.456435472f) * wi_100 * xj_13 * yk_11;
+        sum_v_420 += scalar_t(0.456435442f) * wi_100 * xj_13 * yk_11;
 
         scalar_t sum_v_418 = scalar_t(0);
         sum_v_418 += scalar_t(0.707106769f) * wi_100 * xj_9 * yk_12;
-        sum_v_418 += scalar_t(-0.456435472f) * wi_100 * xj_9 * yk_14;
+        sum_v_418 += scalar_t(-0.456435442f) * wi_100 * xj_9 * yk_14;
         sum_v_418 += scalar_t(-0.288675129f) * wi_100 * xj_11 * yk_11;
-        sum_v_418 += scalar_t(0.456435472f) * wi_100 * xj_13 * yk_10;
+        sum_v_418 += scalar_t(0.456435442f) * wi_100 * xj_13 * yk_10;
 
         scalar_t sum_v_410 = scalar_t(0);
         sum_v_410 += scalar_t(0.353553385f) * wi_100 * xj_9 * yk_10;
@@ -3116,7 +3127,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
         scalar_t sum_v_264 = scalar_t(0);
         sum_v_264 += scalar_t(0.487950057f) * wi_77 * xj_31 * yk_1;
         sum_v_264 += scalar_t(-0.377964467f) * wi_77 * xj_33 * yk_3;
-        sum_v_264 += scalar_t(0.617213368f) * wi_77 * xj_34 * yk_2;
+        sum_v_264 += scalar_t(0.617213428f) * wi_77 * xj_34 * yk_2;
         sum_v_264 += scalar_t(0.487950057f) * wi_77 * xj_35 * yk_3;
 
         scalar_t sum_v_263 = scalar_t(0);
@@ -3389,7 +3400,7 @@ __global__ void uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
 
 // launcher helper
 template <typename scalar_t>
-void launch_uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
+void launch_uniform1d_codegen_path1554_u32_fwd(
     const scalar_t* w,
     const scalar_t* x_all,
     const scalar_t* y,
@@ -3397,12 +3408,73 @@ void launch_uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd(
     const int32_t* src_idx,
     const int32_t* dst_idx,
     const int32_t* b_list,
-    int B, int Iw, int Ix, int Ky, int V,
+    int B, int Iw, int Ix, int Ky, int V, int U,
     cudaStream_t stream)
 {
     dim3 block(64);  // 2 warps
-    dim3 grid(B);
-    uniform1d_codegen_two_warp_vgroup_path1554_u32_fwd<scalar_t><<<grid, block, 0, stream>>>(
+    dim3 grid(B, (U + 31) / 32);
+    uniform1d_codegen_path1554_u32_fwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, out, src_idx, dst_idx, b_list,
-        B, Iw, Ix, Ky, V);
+        B, Iw, Ix, Ky, V, U);
+}
+
+
+torch::Tensor launcher_uniform1d_codegen_path1554_u32_fwd(
+    torch::Tensor w,          // [B,Iw,U]
+    torch::Tensor x_all,      // [S,Ix,U]
+    torch::Tensor y,          // [B,Ky,1]
+    torch::Tensor src_idx,    // [B] int32
+    torch::Tensor dst_idx,    // [B] int32
+    torch::Tensor b_list,     // [B] int32
+    int64_t V64)
+{
+
+    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda(), "w/x_all/y must be CUDA");
+    TORCH_CHECK(src_idx.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(dst_idx.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous(), "w/x_all/y must be contiguous");
+    TORCH_CHECK(src_idx.scalar_type() == torch::kInt32, "src_idx must be int32");
+    TORCH_CHECK(dst_idx.scalar_type() == torch::kInt32, "dst_idx must be int32");
+
+    int B  = (int)w.size(0);
+    int Iw = (int)w.size(1);
+    int U  = (int)w.size(2);
+
+    int S  = (int)x_all.size(0);
+    int Ix = (int)x_all.size(1);
+
+    int Ky = (int)y.size(1);
+    int V  = (int)V64;
+
+    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)y.size(0) == B && (int)y.size(2) == 1, "y must be [B,Ky,1]");
+    TORCH_CHECK((int)src_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((int)dst_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+
+    auto out = torch::zeros({S, V, U}, w.options());
+
+    c10::cuda::CUDAGuard device_guard(w.device());
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_codegen_path1554_u32_fwd", [&] {
+
+        launch_uniform1d_codegen_path1554_u32_fwd<scalar_t>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (scalar_t*)out.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U, stream);
+    });
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}
+
+TORCH_LIBRARY(uniform1d_codegen_path1554_u32_fwd_codegen, m) {
+    m.def("run", &launcher_uniform1d_codegen_path1554_u32_fwd);
 }

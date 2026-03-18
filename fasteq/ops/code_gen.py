@@ -1,11 +1,14 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 from __future__ import annotations
-from collections import OrderedDict, defaultdict
+
+from collections import defaultdict, OrderedDict
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Tuple, Optional
+import math
 from pathlib import Path
-from typing import Dict, List, Tuple
+import struct
+import numpy as np
 import torch
+
 
 
 # ============================================================
@@ -180,6 +183,71 @@ def split_groups_into_two_warps(groups: OrderedDict):
     return warp0_vs, warp1_vs
 
 
+def emit_launcher(bundle_name: str) -> str:
+    return rf'''
+
+torch::Tensor launcher_{bundle_name}(
+    torch::Tensor w,          // [B,Iw,U]
+    torch::Tensor x_all,      // [S,Ix,U]
+    torch::Tensor y,          // [B,Ky,1]
+    torch::Tensor src_idx,    // [B] int32
+    torch::Tensor dst_idx,    // [B] int32
+    torch::Tensor b_list,     // [B] int32
+    int64_t V64)
+{{
+
+    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda(), "w/x_all/y must be CUDA");
+    TORCH_CHECK(src_idx.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(dst_idx.is_cuda(), "indices must be CUDA");
+    TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous(), "w/x_all/y must be contiguous");
+    TORCH_CHECK(src_idx.scalar_type() == torch::kInt32, "src_idx must be int32");
+    TORCH_CHECK(dst_idx.scalar_type() == torch::kInt32, "dst_idx must be int32");
+
+    int B  = (int)w.size(0);
+    int Iw = (int)w.size(1);
+    int U  = (int)w.size(2);
+
+    int S  = (int)x_all.size(0);
+    int Ix = (int)x_all.size(1);
+
+    int Ky = (int)y.size(1);
+    int V  = (int)V64;
+
+    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)y.size(0) == B && (int)y.size(2) == 1, "y must be [B,Ky,1]");
+    TORCH_CHECK((int)src_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((int)dst_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+
+    auto out = torch::zeros({{S, V, U}}, w.options());
+
+    c10::cuda::CUDAGuard device_guard(w.device());
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
+
+        launch_{bundle_name}<scalar_t>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x_all.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (scalar_t*)out.data_ptr<scalar_t>(),
+                (const int32_t*)src_idx.data_ptr<int32_t>(),
+                (const int32_t*)dst_idx.data_ptr<int32_t>(),
+                (const int32_t*)b_list.data_ptr<int32_t>(),
+                B, Iw, Ix, Ky, V, U, stream);
+    }});
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return out;
+}}
+
+TORCH_LIBRARY({bundle_name}_codegen, m) {{
+    m.def("run", &launcher_{bundle_name});
+}}
+'''
+
+
 def emit_two_warp_vgroup_forward_kernel(
     groups: OrderedDict,
     kernel_name: str = "stp_codegen_two_warp_vgroup",
@@ -199,7 +267,16 @@ def emit_two_warp_vgroup_forward_kernel(
     ap = lines.append
 
     ap("#include <stdint.h>")
+    ap("#include <cuda.h>")
     ap("#include <cuda_runtime.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <ATen/cuda/CUDAContext.h>")
+    ap("#include <c10/cuda/CUDAGuard.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap('''#include "../cuda_utils.hpp"''')
+    
+
     ap("")
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
@@ -228,7 +305,10 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("    int src = src_idx[b];")
     ap("    int dst = dst_idx[b];")
     ap("")
-    ap("    int64_t y_base = (int64_t)b * Ky;")
+    ap("    int64_t w_base = (int64_t)b   * Iw * 32;")
+    ap("    int64_t x_base = (int64_t)src * Ix * 32;")
+    ap("    int64_t y_base = (int64_t)b   * Ky;")
+    ap("    int64_t o_base = ((int64_t)dst * V) * 32 + lane;")
     ap("")
 
     def emit_warp_body(warp_id: int, warp_vs: List[int]):
@@ -239,6 +319,7 @@ def emit_two_warp_vgroup_forward_kernel(
             ap("")
             return
 
+        # preload 该 warp 用到的 unique i/j/k
         uniq_i = []
         uniq_j = []
         uniq_k = []
@@ -260,14 +341,14 @@ def emit_two_warp_vgroup_forward_kernel(
                     seen_k.add(kk)
                     uniq_k.append(kk)
 
-        ap("        // preload w(i, u)")
+        ap("        // preload w(i)")
         for ii in uniq_i:
-            ap(f"        scalar_t wi_{ii} = w[((int64_t)b * Iw + {ii}) * (int64_t)U + u];")
+            ap(f"        scalar_t wi_{ii} = w[w_base + {ii}LL * 32 + lane];")
         ap("")
 
-        ap("        // preload x(j, u)")
+        ap("        // preload x(j)")
         for jj in uniq_j:
-            ap(f"        scalar_t xj_{jj} = x_all[((int64_t)src * Ix + {jj}) * (int64_t)U + u];")
+            ap(f"        scalar_t xj_{jj} = x_all[x_base + {jj}LL * 32 + lane];")
         ap("")
 
         ap("        // preload y(k)")
@@ -292,7 +373,7 @@ def emit_two_warp_vgroup_forward_kernel(
 
         ap("        // writeback")
         for vv in warp_vs:
-            ap(f"        atomicAdd(&out[((int64_t)dst * V + {vv}) * (int64_t)U + u], sum_v_{vv});")
+            ap(f"        atomicAdd(&out[o_base + ({vv}LL << 5)], sum_v_{vv});")
         ap("    }")
         ap("")
 
@@ -345,9 +426,9 @@ def generate_code_uniform1d_fwd(
     P = i_list.numel()
     assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
 
-    out_path = f"uniform1d_codegen_path{P}_u{u_dim}_fwd.cu"
+    #out_path = f"uniform1d_codegen_path{P}_u{u_dim}_fwd.cu"
 
-    kernel_name = f"uniform1d_codegen_two_warp_vgroup_path{P}_u{u_dim}_fwd"
+    kernel_name = f"uniform1d_codegen_path{P}_u{u_dim}_fwd"
 
     if reorder_groups:
         i2, j2, k2, v2, c2, group_order = reorder_groups_for_reuse(
@@ -380,7 +461,9 @@ def generate_code_uniform1d_fwd(
 
     groups = build_v_groups(i2, j2, k2, v2, c2)
     code = emit_two_warp_vgroup_forward_kernel(groups, kernel_name=kernel_name, scalar_t=scalar_t)
-    Path(out_path).write_text(code, encoding="utf-8")
+    code = code + "\n" + emit_launcher(kernel_name)
+    file_name = f"{kernel_name}.cu"
+    Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
 
     warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
     stats = {
@@ -579,10 +662,6 @@ def emit_two_warp_vgroup_backward_kernel(
     ap("}")
 
     return '\n'.join(lines)
-
-
-from collections import defaultdict
-from typing import List, OrderedDict
 
 
 def emit_blocku_vgroup_backward_kernel(

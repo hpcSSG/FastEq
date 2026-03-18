@@ -20,7 +20,7 @@ target_compile_options(equi_kernels_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     #$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
     $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wno-unused-parameter>
-    $<$<BOOL:${DEBUG}>:$<$<COMPILE_LANGUAGE:CUDA>:-G;-g>>
+    #$<$<BOOL:${DEBUG}>:$<$<COMPILE_LANGUAGE:CUDA>:-G;-g>>
 )
 
 # Timer
