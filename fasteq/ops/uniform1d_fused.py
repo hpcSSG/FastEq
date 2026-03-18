@@ -182,7 +182,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         generate_full_uniform1d_bwd_split_cuda(
             i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
-            bundle_name=f"uniform1d_split_bwd_u{ctx.u_dim}_p{ctx.P}", max_chunk=2
+            bundle_name=f"uniform1d_split_regalloc_bwd_u{ctx.u_dim}_p{ctx.P}"
         )
        
         torch.cuda.synchronize()
@@ -204,22 +204,22 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
             ) """
 
             if ctx.P == 22:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p22_codegen.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p22_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 777:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p777_codegen.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p777_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 1490:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1490_codegen.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p1490_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 )
             elif ctx.P == 1554:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_bwd_u32_p1554_codegen.run(
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p1554_codegen.run(
                     grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
                     ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
                 ) 
