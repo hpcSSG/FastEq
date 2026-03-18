@@ -345,7 +345,6 @@ std::vector<torch::Tensor> uniform1d_codegen_bwd_launch(
         else {
             TORCH_CHECK(false, "Uniform1d backward unsupported P: ", P, ", U: ", U);
         }
-        
 
     });
 

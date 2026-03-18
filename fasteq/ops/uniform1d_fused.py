@@ -76,15 +76,6 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         """ generate_code_uniform1d_fwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
         print(f"generate_code_uniform1d_fwd called, P={P}, u_dim={u_dim}") """
 
-        """ generate_code_uniform1d_bwd(i_list, j_list, k_list, v_list, coeff_list, u_dim)
-        print(f"generate_code_uniform1d_bwd called, P={P}, u_dim={u_dim}") """
-
-        #print(f"b_list 10:{b_list[:10]}")
-        #print(f"cls_offsets 10:{cls_offsets[:10]}")
-
-
-        #print(f"max i:{torch.max(i_list)}, max j:{torch.max(j_list)}, max k:{torch.max(k_list)}, max v:{torch.max(v_list)}")
-        #print(f"w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
         '''
         out = torch.ops.u1d_fused_fwd.forward_np(
@@ -166,24 +157,22 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         v_list_cpu = ctx.v_list.detach().cpu().tolist()
         coeff_list_cpu = ctx.coeff_list.detach().cpu().tolist()
 
-        """ sched = build_backward_schedule_from_lists(
-            i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
-            U_dim=ctx.u_dim
-        )
+        if ctx.P > 512:
+            generate_full_uniform1d_bwd_split_cuda(
+                i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
+                bundle_name=f"uniform1d_split_regalloc_bwd_u{ctx.u_dim}_p{ctx.P}"
+            )
+        else:
+            sched = build_backward_schedule_from_lists(
+                i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
+                U_dim=ctx.u_dim
+            )
 
-        code = emit_backward_cuda_from_schedule(
-            sched,
-            kernel_name=f"generated_uniform1d_u{ctx.u_dim}_p{ctx.P}_backward_kernel",
-            scalar_t="double",
-        )
-        
-        print(sched["strategy"])
-        print(sched["launch_style"]) """
-
-        generate_full_uniform1d_bwd_split_cuda(
-            i_list=i_list_cpu, j_list=j_list_cpu, k_list=k_list_cpu, v_list=v_list_cpu, coeff_list=coeff_list_cpu,
-            bundle_name=f"uniform1d_split_regalloc_bwd_u{ctx.u_dim}_p{ctx.P}"
-        )
+            code = emit_backward_cuda_from_schedule(
+                sched,
+                kernel_name=f"uniform1d_combine_u{ctx.u_dim}_p{ctx.P}_bwd",
+                scalar_t="double",
+            )
        
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
@@ -204,9 +193,9 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
             ) """
 
             if ctx.P == 22:
-                grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p22_codegen.run(
-                    grad_out, w, x, y, ctx.src_idx, ctx.dst_idx, ctx.b_list,
-                    ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num
+                grad_w, grad_x, grad_y = torch.ops.uniform1d_combine_u32_p22_bwd_codegen.run(
+                    grad_out, w, x, y, 
+                    ctx.src_idx, ctx.dst_idx, ctx.b_list, ctx.out_seg_num
                 )
             elif ctx.P == 777:
                 grad_w, grad_x, grad_y = torch.ops.uniform1d_split_regalloc_bwd_u32_p777_codegen.run(

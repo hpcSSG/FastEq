@@ -14,6 +14,8 @@ add_library(uniform1d_codegen_obj OBJECT
     uniform1d_split_regalloc_bwd_u32_p777.cu
     uniform1d_split_regalloc_bwd_u32_p1490.cu
     uniform1d_split_regalloc_bwd_u32_p1554.cu
+
+    uniform1d_combine_u32_p22_bwd.cu
 )
 
 target_link_libraries(uniform1d_codegen_obj PUBLIC fasteq_deps)

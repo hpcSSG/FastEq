@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Tuple, Optional
 import math
@@ -404,17 +404,97 @@ def _fmt_coeff(cc: float, scalar_t: str) -> str:
         return f"{cc:.17g}"
     return f"{cc:.9g}f"
 
-from typing import Dict, Any, List
 
 
-def _fmt_coeff(cc: float, scalar_t: str) -> str:
-    if abs(cc - 1.0) < 1e-12:
-        return "1"
-    if abs(cc + 1.0) < 1e-12:
-        return "-1"
-    if scalar_t == "double":
-        return f"{cc:.17g}"
-    return f"{cc:.9g}f"
+def emit_combine_launcher(bundle_name: str) -> str:
+    kernel_name = f"{bundle_name}"
+
+    return rf'''
+
+std::vector<torch::Tensor> launcher_{bundle_name}(
+    torch::Tensor grad_out,     // [S,V,U]
+    torch::Tensor w,            // [B,Iw,U]
+    torch::Tensor x_all,        // [S,Ix,U]
+    torch::Tensor y,            // [B,Ky,1]
+    torch::Tensor src_idx,      // [B] int32
+    torch::Tensor dst_idx,      // [B] int32
+    torch::Tensor b_list,       // [B] int32
+    int64_t V64)
+{{
+
+    TORCH_CHECK(w.scalar_type() == grad_out.scalar_type(),
+                "w and grad_out must have the same dtype");
+    TORCH_CHECK(x_all.scalar_type() == w.scalar_type(),
+                "x_all dtype must match w");
+    TORCH_CHECK(y.scalar_type() == w.scalar_type(),
+                "y dtype must match w");
+
+    TORCH_CHECK(w.dim() == 3, "w must be [B,Iw,U]");
+    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(y.dim() == 3, "y must be [B,Ky,1]");
+    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [S,V,U]");
+
+    const int B  = (int)w.size(0);
+    const int Iw = (int)w.size(1);
+    const int U  = (int)w.size(2);
+
+    const int S  = (int)x_all.size(0);
+    const int Ix = (int)x_all.size(1);
+
+    const int Ky = (int)y.size(1);
+    const int V  = (int)V64;
+
+    TORCH_CHECK((int)x_all.size(0) == S, "internal shape error for x_all");
+    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)y.size(0) == B, "y B mismatch");
+    TORCH_CHECK((int)y.size(2) == 1, "y must be [B,Ky,1]");
+    TORCH_CHECK((int)grad_out.size(0) == S, "grad_out S mismatch");
+    TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
+    TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
+
+    TORCH_CHECK((int)src_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((int)dst_idx.numel() == B, "dst_idx must be [B]");
+    TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
+
+    TORCH_CHECK(U > 0, "U must be > 0");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+    TORCH_CHECK(B >= 0 && S >= 0 && Iw >= 0 && Ix >= 0 && Ky >= 0 && V >= 0,
+                "invalid negative shape");
+
+    c10::cuda::CUDAGuard device_guard(w.device());
+
+    auto grad_w = torch::zeros_like(w);      // [B,Iw,U]
+    auto grad_x = torch::zeros_like(x_all);  // [S,Ix,U]
+    auto grad_y = torch::zeros_like(y);      // [B,Ky,1]
+
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
+
+        launch_{kernel_name}<scalar_t>(
+            (const scalar_t*)w.data_ptr<scalar_t>(),
+            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)y.data_ptr<scalar_t>(),
+            (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+            (scalar_t*)grad_w.data_ptr<scalar_t>(),
+            (scalar_t*)grad_x.data_ptr<scalar_t>(),
+            (scalar_t*)grad_y.data_ptr<scalar_t>(),
+            (const int32_t*)src_idx.data_ptr<int32_t>(),
+            (const int32_t*)dst_idx.data_ptr<int32_t>(),
+            (const int32_t*)b_list.data_ptr<int32_t>(),
+            B, Iw, Ix, Ky, V, U, stream);
+    }});
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {{grad_w, grad_x, grad_y}};
+}}
+
+TORCH_LIBRARY({bundle_name}_codegen, m) {{
+    m.def("run", &launcher_{bundle_name});
+}}
+'''
+
 
 
 def emit_backward_cuda_from_schedule(
@@ -470,16 +550,11 @@ def emit_backward_cuda_from_schedule(
 
     ap("#include <stdint.h>")
     ap("#include <cuda_runtime.h>")
-    ap("")
-
-    ap("template <typename T>")
-    ap("__device__ __forceinline__ T warp_sum_xor(T v) {")
-    ap("    #pragma unroll")
-    ap("    for (int mask = 16; mask > 0; mask >>= 1) {")
-    ap("        v += __shfl_xor_sync(0xffffffff, v, mask);")
-    ap("    }")
-    ap("    return v;")
-    ap("}")
+    ap("#include <torch/extension.h>")
+    ap("#include <ATen/cuda/CUDAContext.h>")
+    ap("#include <c10/cuda/CUDAGuard.h>")
+    ap("#include <vector>")
+    ap('''#include "../cuda_utils.hpp"''')
     ap("")
 
     ap("template <typename scalar_t>")
@@ -706,16 +781,12 @@ def emit_backward_cuda_from_schedule(
        
     #return '\n'.join(lines)
     code = '\n'.join(lines)
+    code = code + "\n" + emit_combine_launcher(kernel_name)
     file_name = f"{kernel_name}.cu"
-    Path(file_name).write_text(code, encoding="utf-8")
+    Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
     return code
 
 # ================== GradX, GradW, GradY, Split Code Gen ==========================
-
-from collections import defaultdict, OrderedDict
-from dataclasses import dataclass
-from typing import List, Tuple, Dict
-
 
 @dataclass
 class CGPath:
@@ -1463,7 +1534,7 @@ def emit_gradw_kernel_segmented_unrolled(
 
 
 
-def emit_launcher(bundle_name: str,
+def emit_split_launcher(bundle_name: str,
                   gradw_kernel: str,
                   gradx_kernel: str,
                   grady_kernel: str,
@@ -1560,7 +1631,7 @@ def generate_full_uniform1d_bwd_split_cuda(
         emit_gradw_kernel_segmented_unrolled(paths, gradw_kernel),
         emit_gradx_kernel_segmented_unrolled(paths, gradx_kernel),
         emit_grady_kernel(paths, grady_kernel, reg_budget=reg_budget),
-        emit_launcher(bundle_name, gradw_kernel, gradx_kernel, grady_kernel),
+        emit_split_launcher(bundle_name, gradw_kernel, gradx_kernel, grady_kernel),
     ]
     #return "\n".join(parts)
     code = '\n'.join(parts)

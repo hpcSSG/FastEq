@@ -1,6 +1,9 @@
-torch==2.4.1
+torch==2.7.0
 #cuequivariance==0.8.0
 #cuequivariance-torch==0.8.0
 #cuequivariance-ops-torch-cu12==0.8.0
 setuptools
 ninja
+torch-scatter
+torch_geometric
+torch-sparse
