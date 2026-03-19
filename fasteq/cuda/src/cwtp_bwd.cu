@@ -984,5 +984,4 @@ std::vector<torch::Tensor> tp_channel_wise_bwd_dense_launch(
 TORCH_LIBRARY(cwtp_bwd, m)
 {
     m.def("backward", &tp_channel_wise_bwd_dense_launch);
-    //m.def("backward_opt", &tp_channel_wise_bwd_ell_launch);
 }
