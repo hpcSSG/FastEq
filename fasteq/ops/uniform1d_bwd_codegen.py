@@ -905,7 +905,7 @@ def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ x_all,')
     ap('    const scalar_t* __restrict__ y,')
@@ -981,7 +981,7 @@ def emit_gradx_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ w,')
     ap('    const scalar_t* __restrict__ y,')
@@ -1047,7 +1047,7 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     chunks = chunk_keys_by_budget(
         groups,
         base_regs=26,
-        acc_cost=1,   # local_k
+        acc_cost=4,   # local_k
         cache_cost_per_symbol=1,
         reg_budget=reg_budget,
         max_targets_per_chunk=4,
@@ -1057,7 +1057,7 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     ap = lines.append
 
     ap('template <typename scalar_t>')
-    ap(f'__launch_bounds__(32, 8) __global__ void {kernel_name}(')
+    ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ w,')
     ap('    const scalar_t* __restrict__ x_all,')
