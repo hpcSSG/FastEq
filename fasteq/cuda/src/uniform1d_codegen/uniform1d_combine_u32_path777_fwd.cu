@@ -9,7 +9,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void uniform1d_codegen_path777_u32_fwd(
+__global__ void uniform1d_combine_u32_path777_fwd(
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -1750,7 +1750,7 @@ __global__ void uniform1d_codegen_path777_u32_fwd(
 
 // launcher helper
 template <typename scalar_t>
-void launch_uniform1d_codegen_path777_u32_fwd(
+void launch_uniform1d_combine_u32_path777_fwd(
     const scalar_t* w,
     const scalar_t* x_all,
     const scalar_t* y,
@@ -1763,13 +1763,13 @@ void launch_uniform1d_codegen_path777_u32_fwd(
 {
     dim3 block(64);  // 2 warps
     dim3 grid(B, (U + 31) / 32);
-    uniform1d_codegen_path777_u32_fwd<scalar_t><<<grid, block, 0, stream>>>(
+    uniform1d_combine_u32_path777_fwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, out, src_idx, dst_idx, b_list,
         B, Iw, Ix, Ky, V, U);
 }
 
 
-torch::Tensor launcher_uniform1d_codegen_path777_u32_fwd(
+torch::Tensor launcher_uniform1d_combine_u32_path777_fwd(
     torch::Tensor w,          // [B,Iw,U]
     torch::Tensor x_all,      // [S,Ix,U]
     torch::Tensor y,          // [B,Ky,1]
@@ -1807,9 +1807,9 @@ torch::Tensor launcher_uniform1d_codegen_path777_u32_fwd(
     c10::cuda::CUDAGuard device_guard(w.device());
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_codegen_path777_u32_fwd", [&] {
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_combine_u32_path777_fwd", [&] {
 
-        launch_uniform1d_codegen_path777_u32_fwd<scalar_t>(
+        launch_uniform1d_combine_u32_path777_fwd<scalar_t>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
                 (const scalar_t*)y.data_ptr<scalar_t>(),
@@ -1825,6 +1825,6 @@ torch::Tensor launcher_uniform1d_codegen_path777_u32_fwd(
     return out;
 }
 
-TORCH_LIBRARY(uniform1d_codegen_path777_u32_fwd_codegen, m) {
-    m.def("run", &launcher_uniform1d_codegen_path777_u32_fwd);
+TORCH_LIBRARY(uniform1d_combine_u32_path777_fwd_codegen, m) {
+    m.def("run", &launcher_uniform1d_combine_u32_path777_fwd);
 }

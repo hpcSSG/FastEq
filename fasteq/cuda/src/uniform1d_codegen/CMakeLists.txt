@@ -3,26 +3,24 @@ cmake_minimum_required(VERSION 3.18 FATAL_ERROR)
 #set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 
 add_library(uniform1d_codegen_obj OBJECT
-    #uniform1d_launcher.cu
-    uniform1d_split_bwd_u32_p22.cu
-    uniform1d_split_bwd_u32_p777.cu
-    uniform1d_split_bwd_u32_p1490.cu
-    uniform1d_split_bwd_u32_p1554.cu
-    uniform1d_split_bwd_u128_p16.cu
 
-    uniform1d_split_regalloc_bwd_u32_p22.cu
-    uniform1d_split_regalloc_bwd_u32_p777.cu
-    uniform1d_split_regalloc_bwd_u32_p1490.cu
-    uniform1d_split_regalloc_bwd_u32_p1554.cu
+    # SevenNet
+    uniform1d_combine_u32_path22_fwd.cu
+    uniform1d_combine_u32_path22_bwd.cu
+    uniform1d_combine_u128_path16_fwd.cu
+    uniform1d_combine_u128_path16_bwd.cu
+    uniform1d_combine_u32_path777_fwd.cu
+    uniform1d_split_regalloc_u32_path777_bwd.cu
+    uniform1d_combine_u32_path1490_fwd.cu
+    uniform1d_split_regalloc_u32_path1490_bwd.cu
+    uniform1d_combine_u32_path1554_fwd.cu
+    uniform1d_split_regalloc_u32_path1554_bwd.cu
 
-    uniform1d_combine_u32_p22_bwd.cu
-    uniform1d_combine_u128_p16_bwd.cu
-
-    uniform1d_codegen_path16_u128_fwd.cu
-    uniform1d_codegen_path22_u32_fwd.cu
-    uniform1d_codegen_path777_u32_fwd.cu
-    uniform1d_codegen_path1490_u32_fwd.cu
-    uniform1d_codegen_path1554_u32_fwd.cu
+    # MACE Large
+    uniform1d_combine_u224_path16_bwd.cu
+    uniform1d_combine_u224_path16_fwd.cu
+    uniform1d_combine_u224_path215_bwd.cu
+    uniform1d_combine_u224_path215_fwd.cu
 
 )
 

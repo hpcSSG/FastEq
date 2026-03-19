@@ -1,9 +1,13 @@
 #include <stdint.h>
 #include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <vector>
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void generated_uniform1d_u128_P16_backward_kernel(
+__global__ void uniform1d_combine_u224_p16_bwd(
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -291,7 +295,7 @@ __global__ void generated_uniform1d_u128_P16_backward_kernel(
 }
 
 template <typename scalar_t>
-void launch_generated_uniform1d_u128_P16_backward_kernel(
+void launch_uniform1d_combine_u224_p16_bwd(
     const scalar_t* w,
     const scalar_t* x_all,
     const scalar_t* y,
@@ -307,7 +311,92 @@ void launch_generated_uniform1d_u128_P16_backward_kernel(
 {
     dim3 block(32);
     dim3 grid(B, 1);
-    generated_uniform1d_u128_P16_backward_kernel<scalar_t><<<grid, block, 0, stream>>>(
+    uniform1d_combine_u224_p16_bwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, grad_out, grad_w, grad_x, grad_y,
         src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V, U);
+}
+
+
+
+std::vector<torch::Tensor> launcher_uniform1d_combine_u224_p16_bwd(
+    torch::Tensor grad_out,     // [S,V,U]
+    torch::Tensor w,            // [B,Iw,U]
+    torch::Tensor x_all,        // [S,Ix,U]
+    torch::Tensor y,            // [B,Ky,1]
+    torch::Tensor src_idx,      // [B] int32
+    torch::Tensor dst_idx,      // [B] int32
+    torch::Tensor b_list,       // [B] int32
+    int64_t V64)
+{
+
+    TORCH_CHECK(w.scalar_type() == grad_out.scalar_type(),
+                "w and grad_out must have the same dtype");
+    TORCH_CHECK(x_all.scalar_type() == w.scalar_type(),
+                "x_all dtype must match w");
+    TORCH_CHECK(y.scalar_type() == w.scalar_type(),
+                "y dtype must match w");
+
+    TORCH_CHECK(w.dim() == 3, "w must be [B,Iw,U]");
+    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(y.dim() == 3, "y must be [B,Ky,1]");
+    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [S,V,U]");
+
+    const int B  = (int)w.size(0);
+    const int Iw = (int)w.size(1);
+    const int U  = (int)w.size(2);
+
+    const int S  = (int)x_all.size(0);
+    const int Ix = (int)x_all.size(1);
+
+    const int Ky = (int)y.size(1);
+    const int V  = (int)V64;
+
+    TORCH_CHECK((int)x_all.size(0) == S, "internal shape error for x_all");
+    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)y.size(0) == B, "y B mismatch");
+    TORCH_CHECK((int)y.size(2) == 1, "y must be [B,Ky,1]");
+    TORCH_CHECK((int)grad_out.size(0) == S, "grad_out S mismatch");
+    TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
+    TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
+
+    TORCH_CHECK((int)src_idx.numel() == B, "src_idx must be [B]");
+    TORCH_CHECK((int)dst_idx.numel() == B, "dst_idx must be [B]");
+    TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
+
+    TORCH_CHECK(U > 0, "U must be > 0");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+    TORCH_CHECK(B >= 0 && S >= 0 && Iw >= 0 && Ix >= 0 && Ky >= 0 && V >= 0,
+                "invalid negative shape");
+
+    c10::cuda::CUDAGuard device_guard(w.device());
+
+    auto grad_w = torch::zeros_like(w);      // [B,Iw,U]
+    auto grad_x = torch::zeros_like(x_all);  // [S,Ix,U]
+    auto grad_y = torch::zeros_like(y);      // [B,Ky,1]
+
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_combine_u224_p16_bwd", [&] {
+
+        launch_uniform1d_combine_u224_p16_bwd<scalar_t>(
+            (const scalar_t*)w.data_ptr<scalar_t>(),
+            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)y.data_ptr<scalar_t>(),
+            (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+            (scalar_t*)grad_w.data_ptr<scalar_t>(),
+            (scalar_t*)grad_x.data_ptr<scalar_t>(),
+            (scalar_t*)grad_y.data_ptr<scalar_t>(),
+            (const int32_t*)src_idx.data_ptr<int32_t>(),
+            (const int32_t*)dst_idx.data_ptr<int32_t>(),
+            (const int32_t*)b_list.data_ptr<int32_t>(),
+            B, Iw, Ix, Ky, V, U, stream);
+    });
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
+    return {grad_w, grad_x, grad_y};
+}
+
+TORCH_LIBRARY(uniform1d_combine_u224_p16_bwd_codegen, m) {
+    m.def("run", &launcher_uniform1d_combine_u224_p16_bwd);
 }

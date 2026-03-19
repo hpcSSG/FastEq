@@ -8,7 +8,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void uniform1d_split_regalloc_bwd_u32_p777_gradw(
+__global__ void uniform1d_split_regalloc_u32_path777_bwd_gradw(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -5634,7 +5634,7 @@ __global__ void uniform1d_split_regalloc_bwd_u32_p777_gradw(
 #include <cuda_runtime.h>
 
 template <typename scalar_t>
-__global__ void uniform1d_split_regalloc_bwd_u32_p777_gradx(
+__global__ void uniform1d_split_regalloc_u32_path777_bwd_gradx(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ y,
@@ -11219,7 +11219,7 @@ __global__ void uniform1d_split_regalloc_bwd_u32_p777_gradx(
 
 }
 template <typename scalar_t>
-__launch_bounds__(32, 8) __global__ void uniform1d_split_regalloc_bwd_u32_p777_grady(
+__launch_bounds__(32, 8) __global__ void uniform1d_split_regalloc_u32_path777_bwd_grady(
     const scalar_t* __restrict__ grad_out,
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
@@ -15986,7 +15986,7 @@ __launch_bounds__(32, 8) __global__ void uniform1d_split_regalloc_bwd_u32_p777_g
 
 }
 
-std::vector<torch::Tensor> uniform1d_split_regalloc_bwd_u32_p777(
+std::vector<torch::Tensor> uniform1d_split_regalloc_u32_path777_bwd(
     torch::Tensor grad_out,
     torch::Tensor w,
     torch::Tensor x_all,
@@ -16014,8 +16014,8 @@ std::vector<torch::Tensor> uniform1d_split_regalloc_bwd_u32_p777(
     dim3 block(32);
     dim3 grid(B);
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_regalloc_bwd_u32_p777", [&] {
-        uniform1d_split_regalloc_bwd_u32_p777_gradw<scalar_t><<<grid, block, 0, stream>>>(
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_split_regalloc_u32_path777_bwd", [&] {
+        uniform1d_split_regalloc_u32_path777_bwd_gradw<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -16025,7 +16025,7 @@ std::vector<torch::Tensor> uniform1d_split_regalloc_bwd_u32_p777(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_regalloc_bwd_u32_p777_gradx<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_regalloc_u32_path777_bwd_gradx<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
@@ -16035,7 +16035,7 @@ std::vector<torch::Tensor> uniform1d_split_regalloc_bwd_u32_p777(
             b_list.numel() ? b_list.data_ptr<int32_t>() : nullptr,
             B, (int)Iw, (int)Ix, (int)Ky, (int)V);
 
-        uniform1d_split_regalloc_bwd_u32_p777_grady<scalar_t><<<grid, block, 0, stream>>>(
+        uniform1d_split_regalloc_u32_path777_bwd_grady<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
             x_all.data_ptr<scalar_t>(),
@@ -16049,6 +16049,6 @@ std::vector<torch::Tensor> uniform1d_split_regalloc_bwd_u32_p777(
     return {grad_w, grad_x, grad_y};
 }
 
-TORCH_LIBRARY(uniform1d_split_regalloc_bwd_u32_p777_codegen, m) {
-    m.def("run", &uniform1d_split_regalloc_bwd_u32_p777);
+TORCH_LIBRARY(uniform1d_split_regalloc_u32_path777_bwd_codegen, m) {
+    m.def("run", &uniform1d_split_regalloc_u32_path777_bwd);
 }

@@ -7,7 +7,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void uniform1d_combine_u32_p22_bwd(
+__global__ void uniform1d_combine_u32_path22_bwd(
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -380,7 +380,7 @@ __global__ void uniform1d_combine_u32_p22_bwd(
 }
 
 template <typename scalar_t>
-void launch_uniform1d_combine_u32_p22_bwd(
+void launch_uniform1d_combine_u32_path22_bwd(
     const scalar_t* w,
     const scalar_t* x_all,
     const scalar_t* y,
@@ -396,14 +396,14 @@ void launch_uniform1d_combine_u32_p22_bwd(
 {
     dim3 block(32);
     dim3 grid(B, 1);
-    uniform1d_combine_u32_p22_bwd<scalar_t><<<grid, block, 0, stream>>>(
+    uniform1d_combine_u32_path22_bwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, grad_out, grad_w, grad_x, grad_y,
         src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V, U);
 }
 
 
 
-std::vector<torch::Tensor> launcher_uniform1d_combine_u32_p22_bwd(
+std::vector<torch::Tensor> launcher_uniform1d_combine_u32_path22_bwd(
     torch::Tensor grad_out,     // [S,V,U]
     torch::Tensor w,            // [B,Iw,U]
     torch::Tensor x_all,        // [S,Ix,U]
@@ -461,9 +461,9 @@ std::vector<torch::Tensor> launcher_uniform1d_combine_u32_p22_bwd(
 
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_combine_u32_p22_bwd", [&] {
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_combine_u32_path22_bwd", [&] {
 
-        launch_uniform1d_combine_u32_p22_bwd<scalar_t>(
+        launch_uniform1d_combine_u32_path22_bwd<scalar_t>(
             (const scalar_t*)w.data_ptr<scalar_t>(),
             (const scalar_t*)x_all.data_ptr<scalar_t>(),
             (const scalar_t*)y.data_ptr<scalar_t>(),
@@ -482,6 +482,6 @@ std::vector<torch::Tensor> launcher_uniform1d_combine_u32_p22_bwd(
     return {grad_w, grad_x, grad_y};
 }
 
-TORCH_LIBRARY(uniform1d_combine_u32_p22_bwd_codegen, m) {
-    m.def("run", &launcher_uniform1d_combine_u32_p22_bwd);
+TORCH_LIBRARY(uniform1d_combine_u32_path22_bwd_codegen, m) {
+    m.def("run", &launcher_uniform1d_combine_u32_path22_bwd);
 }

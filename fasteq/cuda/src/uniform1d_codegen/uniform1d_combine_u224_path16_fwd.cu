@@ -9,7 +9,7 @@
 #include "../cuda_utils.hpp"
 
 template <typename scalar_t>
-__global__ void uniform1d_codegen_path16_u128_fwd(
+__global__ void uniform1d_combine_u224_path16_fwd(
     const scalar_t* __restrict__ w,
     const scalar_t* __restrict__ x_all,
     const scalar_t* __restrict__ y,
@@ -22,9 +22,10 @@ __global__ void uniform1d_codegen_path16_u128_fwd(
     int b_global = (int)blockIdx.x;
     int ublk     = (int)blockIdx.y;
     if (b_global >= B) return;
+
     int b = b_list ? b_list[b_global] : b_global;
 
-    int tid  = threadIdx.x;
+    int tid  = (int)threadIdx.x;
     int lane = tid & 31;
     int warp = tid >> 5;
     if (warp >= 2) return;
@@ -35,20 +36,19 @@ __global__ void uniform1d_codegen_path16_u128_fwd(
     int src = src_idx[b];
     int dst = dst_idx[b];
 
-    int64_t w_base = (int64_t)b   * Iw * 32;
-    int64_t x_base = (int64_t)src * Ix * 32;
-    int64_t y_base = (int64_t)b   * Ky;
-    int64_t o_base = ((int64_t)dst * V) * 32 + lane;
+    int64_t w_base = (int64_t)b   * (int64_t)Iw * (int64_t)U;
+    int64_t x_base = (int64_t)src * (int64_t)Ix * (int64_t)U;
+    int64_t y_base = (int64_t)b   * (int64_t)Ky;
 
     if (warp == 0) {
         // preload w(i)
-        scalar_t wi_0 = w[w_base + 0LL * 32 + lane];
-        scalar_t wi_1 = w[w_base + 1LL * 32 + lane];
-        scalar_t wi_2 = w[w_base + 2LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
+        scalar_t wi_0 = w[w_base + (int64_t)0 * (int64_t)U + u];
+        scalar_t wi_1 = w[w_base + (int64_t)1 * (int64_t)U + u];
+        scalar_t wi_2 = w[w_base + (int64_t)2 * (int64_t)U + u];
+        scalar_t wi_3 = w[w_base + (int64_t)3 * (int64_t)U + u];
 
         // preload x(j)
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        scalar_t xj_0 = x_all[x_base + (int64_t)0 * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_0 = y[y_base + 0];
@@ -86,24 +86,24 @@ __global__ void uniform1d_codegen_path16_u128_fwd(
         sum_v_14 += wi_3 * xj_0 * yk_14;
 
         // writeback
-        atomicAdd(&out[o_base + (0LL << 5)], sum_v_0);
-        atomicAdd(&out[o_base + (2LL << 5)], sum_v_2);
-        atomicAdd(&out[o_base + (4LL << 5)], sum_v_4);
-        atomicAdd(&out[o_base + (6LL << 5)], sum_v_6);
-        atomicAdd(&out[o_base + (8LL << 5)], sum_v_8);
-        atomicAdd(&out[o_base + (10LL << 5)], sum_v_10);
-        atomicAdd(&out[o_base + (12LL << 5)], sum_v_12);
-        atomicAdd(&out[o_base + (14LL << 5)], sum_v_14);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)0) * (int64_t)U + u], sum_v_0);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)2) * (int64_t)U + u], sum_v_2);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)4) * (int64_t)U + u], sum_v_4);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)6) * (int64_t)U + u], sum_v_6);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)8) * (int64_t)U + u], sum_v_8);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)10) * (int64_t)U + u], sum_v_10);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)12) * (int64_t)U + u], sum_v_12);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)14) * (int64_t)U + u], sum_v_14);
     }
 
     if (warp == 1) {
         // preload w(i)
-        scalar_t wi_1 = w[w_base + 1LL * 32 + lane];
-        scalar_t wi_2 = w[w_base + 2LL * 32 + lane];
-        scalar_t wi_3 = w[w_base + 3LL * 32 + lane];
+        scalar_t wi_1 = w[w_base + (int64_t)1 * (int64_t)U + u];
+        scalar_t wi_2 = w[w_base + (int64_t)2 * (int64_t)U + u];
+        scalar_t wi_3 = w[w_base + (int64_t)3 * (int64_t)U + u];
 
         // preload x(j)
-        scalar_t xj_0 = x_all[x_base + 0LL * 32 + lane];
+        scalar_t xj_0 = x_all[x_base + (int64_t)0 * (int64_t)U + u];
 
         // preload y(k)
         scalar_t yk_1 = y[y_base + 1];
@@ -141,21 +141,21 @@ __global__ void uniform1d_codegen_path16_u128_fwd(
         sum_v_15 += wi_3 * xj_0 * yk_15;
 
         // writeback
-        atomicAdd(&out[o_base + (1LL << 5)], sum_v_1);
-        atomicAdd(&out[o_base + (3LL << 5)], sum_v_3);
-        atomicAdd(&out[o_base + (5LL << 5)], sum_v_5);
-        atomicAdd(&out[o_base + (7LL << 5)], sum_v_7);
-        atomicAdd(&out[o_base + (9LL << 5)], sum_v_9);
-        atomicAdd(&out[o_base + (11LL << 5)], sum_v_11);
-        atomicAdd(&out[o_base + (13LL << 5)], sum_v_13);
-        atomicAdd(&out[o_base + (15LL << 5)], sum_v_15);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)1) * (int64_t)U + u], sum_v_1);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)3) * (int64_t)U + u], sum_v_3);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)5) * (int64_t)U + u], sum_v_5);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)7) * (int64_t)U + u], sum_v_7);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)9) * (int64_t)U + u], sum_v_9);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)11) * (int64_t)U + u], sum_v_11);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)13) * (int64_t)U + u], sum_v_13);
+        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t)15) * (int64_t)U + u], sum_v_15);
     }
 
 }
 
 // launcher helper
 template <typename scalar_t>
-void launch_uniform1d_codegen_path16_u128_fwd(
+void launch_uniform1d_combine_u224_path16_fwd(
     const scalar_t* w,
     const scalar_t* x_all,
     const scalar_t* y,
@@ -166,15 +166,15 @@ void launch_uniform1d_codegen_path16_u128_fwd(
     int B, int Iw, int Ix, int Ky, int V, int U,
     cudaStream_t stream)
 {
-    dim3 block(64);  // 2 warps
+    dim3 block(64);
     dim3 grid(B, (U + 31) / 32);
-    uniform1d_codegen_path16_u128_fwd<scalar_t><<<grid, block, 0, stream>>>(
+    uniform1d_combine_u224_path16_fwd<scalar_t><<<grid, block, 0, stream>>>(
         w, x_all, y, out, src_idx, dst_idx, b_list,
         B, Iw, Ix, Ky, V, U);
 }
 
 
-torch::Tensor launcher_uniform1d_codegen_path16_u128_fwd(
+torch::Tensor launcher_uniform1d_combine_u224_path16_fwd(
     torch::Tensor w,          // [B,Iw,U]
     torch::Tensor x_all,      // [S,Ix,U]
     torch::Tensor y,          // [B,Ky,1]
@@ -212,9 +212,9 @@ torch::Tensor launcher_uniform1d_codegen_path16_u128_fwd(
     c10::cuda::CUDAGuard device_guard(w.device());
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
 
-    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_codegen_path16_u128_fwd", [&] {
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "uniform1d_combine_u224_path16_fwd", [&] {
 
-        launch_uniform1d_codegen_path16_u128_fwd<scalar_t>(
+        launch_uniform1d_combine_u224_path16_fwd<scalar_t>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
                 (const scalar_t*)x_all.data_ptr<scalar_t>(),
                 (const scalar_t*)y.data_ptr<scalar_t>(),
@@ -230,6 +230,6 @@ torch::Tensor launcher_uniform1d_codegen_path16_u128_fwd(
     return out;
 }
 
-TORCH_LIBRARY(uniform1d_codegen_path16_u128_fwd_codegen, m) {
-    m.def("run", &launcher_uniform1d_codegen_path16_u128_fwd);
+TORCH_LIBRARY(uniform1d_combine_u224_path16_fwd_codegen, m) {
+    m.def("run", &launcher_uniform1d_combine_u224_path16_fwd);
 }

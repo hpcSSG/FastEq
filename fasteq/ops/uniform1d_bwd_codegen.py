@@ -10,6 +10,17 @@ import numpy as np
 import torch
 
 
+def find_fasteq_root(start: Path) -> Path:
+    start = start.resolve()
+    for p in [start, *start.parents]:
+        if p.name == "fasteq":
+            return p
+    raise RuntimeError("Cannot find fasteq project root from __file__")
+
+fasteq_root = find_fasteq_root(Path(__file__).parent)
+out_dir = fasteq_root / "cuda" / "src" / "uniform1d_codegen"
+out_dir.mkdir(parents=True, exist_ok=True)
+
 
 def stable_unique(xs: List[int]) -> List[int]:
     out = []
@@ -783,7 +794,8 @@ def emit_backward_cuda_from_schedule(
     code = '\n'.join(lines)
     code = code + "\n" + emit_combine_launcher(kernel_name)
     file_name = f"{kernel_name}.cu"
-    Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
+    #Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
+    (out_dir / file_name).write_text(code, encoding="utf-8")
     return code
 
 # ================== GradX, GradW, GradY, Split Code Gen ==========================
@@ -1636,4 +1648,5 @@ def generate_full_uniform1d_bwd_split_cuda(
     #return "\n".join(parts)
     code = '\n'.join(parts)
     file_name = f"{bundle_name}.cu"
-    Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
+    #Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
+    (out_dir / file_name).write_text(code, encoding="utf-8")
