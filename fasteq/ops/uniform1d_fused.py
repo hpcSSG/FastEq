@@ -210,7 +210,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
 
         
 
-        """ 
+        
         i_list_cpu = ctx.i_list.detach().cpu().tolist()
         j_list_cpu = ctx.j_list.detach().cpu().tolist()
         k_list_cpu = ctx.k_list.detach().cpu().tolist()
@@ -233,7 +233,7 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
                 kernel_name=f"uniform1d_combine_u{ctx.u_dim}_p{ctx.P}_bwd",
                 scalar_t="double",
             ) 
-        """
+       
        
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
