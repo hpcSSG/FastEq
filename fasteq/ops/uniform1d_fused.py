@@ -8,38 +8,6 @@ from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_bwd_codegen import build_backward_schedule_from_lists, emit_backward_cuda_from_schedule, generate_full_uniform1d_bwd_split_cuda
 from ..tilelang.uniform1d import stp_edge_parallel_kernel_tl
 
-def pack_paths32(i_list: torch.Tensor,
-                 j_list: torch.Tensor,
-                 k_list: torch.Tensor,
-                 coeff_list: torch.Tensor) -> torch.Tensor:
-    assert i_list.dtype == torch.int32 and j_list.dtype == torch.int32 and k_list.dtype == torch.int32
-    assert coeff_list.dtype in (torch.float32, torch.float64)
-
-    P = i_list.numel()
-    device = coeff_list.device
-
-    i_list = i_list.contiguous()
-    j_list = j_list.contiguous()
-    k_list = k_list.contiguous()
-    coeff_list = coeff_list.contiguous()
-
-    packed = torch.zeros((P, 32), dtype=torch.uint8, device=device)
-
-    packed[:, 0:4]  = i_list.view(torch.uint8).reshape(P, 4)
-    packed[:, 4:8]  = j_list.view(torch.uint8).reshape(P, 4)
-    packed[:, 8:12] = k_list.view(torch.uint8).reshape(P, 4)
-    # 12:16 pad0 = 0
-
-    if coeff_list.dtype == torch.float32:
-        packed[:, 16:20] = coeff_list.view(torch.uint8).reshape(P, 4)
-        # 20:32 padding = 0
-    else:
-        packed[:, 16:24] = coeff_list.view(torch.uint8).reshape(P, 8)
-        # 24:32 padding = 0
-
-    return packed
-
-
 
 class FastUniform1dFusedFunction(torch.autograd.Function):
     @staticmethod
@@ -68,9 +36,6 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         cls_offsets = cls_offsets.to(torch.int32)
 
         P = i_list.numel()
-        #print(f"Uniform1d Path num P={P}")
-
-        packed = pack_paths32(i_list, j_list, k_list, coeff_list)
 
 
         """ # 编译 kernel
@@ -195,7 +160,6 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
         ctx.j_list = j_list
         ctx.k_list = k_list
         ctx.v_list = v_list
-        ctx.path_packed = packed
         ctx.coeff_list = coeff_list
         ctx.v_offsets = v_offsets
         ctx.out_seg_num = out_seg_num
@@ -244,19 +208,6 @@ class FastUniform1dFusedFunction(torch.autograd.Function):
        
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000
-
-        """ grad_w, grad_x, grad_y = torch.ops.u1d_fused_bwd.backward_ep(
-            grad_out, w, x, y, 
-            ctx.src_idx, ctx.dst_idx, ctx.b_list,
-            ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
-        ) """
-
-        """ grad_w, grad_x, grad_y = torch.ops.uniform1d_codegen.backward(
-            grad_out, w, x, y, 
-            ctx.src_idx, ctx.dst_idx, ctx.b_list, ctx.cls_offsets, 
-            ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
-            ctx.path_packed, ctx.v_offsets, ctx.out_seg_num
-        ) """
 
         if ctx.P == 22 and ctx.u_dim == 32:
             grad_w, grad_x, grad_y = torch.ops.uniform1d_combine_u32_path22_bwd_codegen.run(

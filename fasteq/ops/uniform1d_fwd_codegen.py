@@ -39,17 +39,6 @@ def _fmt_coeff(c: float, scalar_t: str = "float") -> str:
         return f"{c:.9g}f"
     return f"{c:.17g}"
 
-def find_fasteq_root(start: Path) -> Path:
-    start = start.resolve()
-    for p in [start, *start.parents]:
-        if p.name == "fasteq":
-            return p
-    raise RuntimeError("Cannot find fasteq project root from __file__")
-
-fasteq_root = find_fasteq_root(Path(__file__).parent)
-out_dir = fasteq_root / "cuda" / "src" / "uniform1d_codegen"
-out_dir.mkdir(parents=True, exist_ok=True)
-
 # ============================================================
 # Reorder logic
 # ============================================================
@@ -251,9 +240,14 @@ torch::Tensor launcher_{bundle_name}(
 
     return out;
 }}
-
+/*
 TORCH_LIBRARY({bundle_name}_codegen, m) {{
     m.def("run", &launcher_{bundle_name});
+}}
+*/
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{bundle_name}, "{bundle_name} forward jit impl");
 }}
 '''
 
@@ -284,7 +278,7 @@ def emit_two_warp_vgroup_forward_kernel_u32(
     ap("#include <c10/cuda/CUDAGuard.h>")
     ap("#include <vector>")
     ap("#include <cstdint>")
-    ap('''#include "../cuda_utils.hpp"''')
+    ap('''#include "cuda_utils.hpp"''')
     
 
     ap("")
@@ -439,7 +433,7 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("#include <c10/cuda/CUDAGuard.h>")
     ap("#include <vector>")
     ap("#include <cstdint>")
-    ap('#include "../cuda_utils.hpp"')
+    ap('#include "cuda_utils.hpp"')
     ap("")
 
     ap("template <typename scalar_t>")
@@ -628,9 +622,6 @@ def generate_code_uniform1d_fwd(
     else:
         code = emit_two_warp_vgroup_forward_kernel(groups, kernel_name=kernel_name, scalar_t=scalar_t)
     code = code + "\n" + emit_launcher(kernel_name)
-    file_name = f"{kernel_name}.cu"
-    #Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
-    (out_dir / file_name).write_text(code, encoding="utf-8")
 
     warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
     stats = {
@@ -641,4 +632,4 @@ def generate_code_uniform1d_fwd(
         "warp1_vs": warp1_vs,
         "out_path": str(out_path),
     }
-    return stats
+    return code

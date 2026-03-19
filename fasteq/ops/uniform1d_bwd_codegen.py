@@ -9,19 +9,6 @@ import struct
 import numpy as np
 import torch
 
-
-def find_fasteq_root(start: Path) -> Path:
-    start = start.resolve()
-    for p in [start, *start.parents]:
-        if p.name == "fasteq":
-            return p
-    raise RuntimeError("Cannot find fasteq project root from __file__")
-
-fasteq_root = find_fasteq_root(Path(__file__).parent)
-out_dir = fasteq_root / "cuda" / "src" / "uniform1d_codegen"
-out_dir.mkdir(parents=True, exist_ok=True)
-
-
 def stable_unique(xs: List[int]) -> List[int]:
     out = []
     seen = set()
@@ -430,7 +417,10 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     torch::Tensor src_idx,      // [B] int32
     torch::Tensor dst_idx,      // [B] int32
     torch::Tensor b_list,       // [B] int32
-    int64_t V64)
+    int64_t Iw,
+    int64_t Ix,
+    int64_t Ky,
+    int64_t V)
 {{
 
     TORCH_CHECK(w.scalar_type() == grad_out.scalar_type(),
@@ -446,14 +436,8 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [S,V,U]");
 
     const int B  = (int)w.size(0);
-    const int Iw = (int)w.size(1);
     const int U  = (int)w.size(2);
-
     const int S  = (int)x_all.size(0);
-    const int Ix = (int)x_all.size(1);
-
-    const int Ky = (int)y.size(1);
-    const int V  = (int)V64;
 
     TORCH_CHECK((int)x_all.size(0) == S, "internal shape error for x_all");
     TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
@@ -493,7 +477,8 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
             (const int32_t*)src_idx.data_ptr<int32_t>(),
             (const int32_t*)dst_idx.data_ptr<int32_t>(),
             (const int32_t*)b_list.data_ptr<int32_t>(),
-            B, Iw, Ix, Ky, V, U, stream);
+            B, (int)Iw, (int)Ix, (int)Ky, (int)V, U, stream);
+            
     }});
 
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -501,8 +486,14 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     return {{grad_w, grad_x, grad_y}};
 }}
 
+/*
 TORCH_LIBRARY({bundle_name}_codegen, m) {{
     m.def("run", &launcher_{bundle_name});
+}}
+*/
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{bundle_name}, "{bundle_name} backward jit impl");
 }}
 '''
 
@@ -565,7 +556,7 @@ def emit_backward_cuda_from_schedule(
     ap("#include <ATen/cuda/CUDAContext.h>")
     ap("#include <c10/cuda/CUDAGuard.h>")
     ap("#include <vector>")
-    ap('''#include "../cuda_utils.hpp"''')
+    ap('''#include "cuda_utils.hpp"''')
     ap("")
 
     ap("template <typename scalar_t>")
@@ -790,12 +781,8 @@ def emit_backward_cuda_from_schedule(
     ap("}")
     ap("")
        
-    #return '\n'.join(lines)
     code = '\n'.join(lines)
     code = code + "\n" + emit_combine_launcher(kernel_name)
-    file_name = f"{kernel_name}.cu"
-    #Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
-    (out_dir / file_name).write_text(code, encoding="utf-8")
     return code
 
 # ================== GradX, GradW, GradY, Split Code Gen ==========================
@@ -894,7 +881,7 @@ def emit_preamble() -> str:
 #include <cuda_runtime.h>
 #include <vector>
 #include <cstdint>
-#include "../cuda_utils.hpp"
+#include "cuda_utils.hpp"
 '''
 
 
@@ -1250,133 +1237,6 @@ def emit_gradx_kernel_segmented_unrolled(
     ap('}')
     return "\n".join(lines)
 
-def build_grady_segments(paths: List[CGPath], acc_slots: int = 8) -> List[Dict[str, Any]]:
-    """
-    grad_y:
-      target = k
-      term   = (slot, i, j, v, c)
-    """
-    by_k: "OrderedDict[int, List[CGPath]]" = OrderedDict()
-    for p in sorted(paths, key=lambda p: (p.k, p.i, p.j, p.v)):
-        by_k.setdefault(int(p.k), []).append(p)
-
-    unique_k = list(by_k.keys())
-    segments: List[Dict[str, Any]] = []
-
-    for seg_start in range(0, len(unique_k), acc_slots):
-        tgt_ks = unique_k[seg_start: seg_start + acc_slots]
-        slot_of_k = {k: s for s, k in enumerate(tgt_ks)}
-
-        raw_terms: List[Tuple[int, int, int, int, float]] = []
-        for k in tgt_ks:
-            slot = slot_of_k[k]
-            for p in by_k[k]:
-                raw_terms.append((slot, int(p.i), int(p.j), int(p.v), float(p.c)))
-
-        # 先按 (i,j,v)，再按 slot
-        raw_terms.sort(key=lambda t: (t[1], t[2], t[3], t[0]))
-
-        segments.append({
-            "targets": tgt_ks,
-            "terms": raw_terms,
-        })
-
-    return segments
-
-
-def emit_grady_kernel_segmented_unrolled(
-    paths: List[CGPath],
-    kernel_name: str,
-    acc_slots: int = 2,
-    ijv_group_reuse_threshold: int = 2,
-) -> str:
-    """
-    segmented-style fully-unrolled grad_y
-    """
-    segments = build_grady_segments(paths, acc_slots=acc_slots)
-
-    lines = []
-    ap = lines.append
-
-    ap('template <typename scalar_t>')
-    ap(f'__global__ void {kernel_name}(')
-    ap('    const scalar_t* __restrict__ grad_out,')
-    ap('    const scalar_t* __restrict__ w,')
-    ap('    const scalar_t* __restrict__ x_all,')
-    ap('    scalar_t* __restrict__ grad_y,')
-    ap('    const int32_t* __restrict__ src_idx,')
-    ap('    const int32_t* __restrict__ dst_idx,')
-    ap('    const int32_t* __restrict__ b_list,')
-    ap('    int B, int Iw, int Ix, int Ky, int V)')
-    ap('{')
-    ap('    int lane = (int)threadIdx.x;')
-    ap('    int bidx = (int)blockIdx.x;')
-    ap('    if (bidx >= B) return;')
-    ap('')
-    ap('    int b   = b_list ? b_list[bidx] : bidx;')
-    ap('    int src = src_idx[b];')
-    ap('    int dst = dst_idx[b];')
-    ap('')
-    ap('    int64_t w_base  = ((int64_t)b   * Iw) * 32 + lane;')
-    ap('    int64_t x_base  = ((int64_t)src * Ix) * 32 + lane;')
-    ap('    int64_t go_base = ((int64_t)dst * V) * 32 + lane;')
-    ap('    int64_t gy_base = (int64_t)b * Ky;')
-    ap('')
-
-    for seg_id, seg in enumerate(segments):
-        targets: List[int] = seg["targets"]
-        terms: List[Tuple[int, int, int, int, float]] = seg["terms"]
-
-        ap(f'    // ============================================================')
-        ap(f'    // grad_y segment {seg_id}: targets = {targets}')
-        ap(f'    // ============================================================')
-        ap('    {')
-
-        for s in range(len(targets)):
-            ap(f'        scalar_t acc{s} = scalar_t(0);')
-        ap('')
-
-        ijv_buckets: "OrderedDict[Tuple[int,int,int], List[Tuple[int,int,int,int,float]]]" = OrderedDict()
-        for term in terms:
-            slot, i, j, v, c = term
-            ijv_buckets.setdefault((i, j, v), []).append(term)
-
-        for (i, j, v), bucket in ijv_buckets.items():
-            bucket.sort(key=lambda t: t[0])
-            use_reuse = len(bucket) >= ijv_group_reuse_threshold
-
-            if use_reuse:
-                ap('        {')
-                ap(f'            scalar_t wv  = w[w_base + ((int64_t){i} << 5)];')
-                ap(f'            scalar_t xv  = x_all[x_base + ((int64_t){j} << 5)];')
-                ap(f'            scalar_t gov = grad_out[go_base + ((int64_t){v} << 5)];')
-                ap(f'            scalar_t t0  = xv * gov;')
-                for (slot, _i, _j, _v, c) in bucket:
-                    cstr = fmt_coeff(c)
-                    ap(f'            acc{slot} = fma((scalar_t)({cstr}) * wv, t0, acc{slot});')
-                ap('        }')
-                ap('')
-            else:
-                for (slot, _i, _j, _v, c) in bucket:
-                    cstr = fmt_coeff(c)
-                    ap('        {')
-                    ap(f'            scalar_t wv  = w[w_base + ((int64_t){i} << 5)];')
-                    ap(f'            scalar_t xv  = x_all[x_base + ((int64_t){j} << 5)];')
-                    ap(f'            scalar_t gov = grad_out[go_base + ((int64_t){v} << 5)];')
-                    ap(f'            acc{slot} = fma((scalar_t)({cstr}) * wv, xv * gov, acc{slot});')
-                    ap('        }')
-                ap('')
-
-        for s, k in enumerate(targets):
-            ap(f'        scalar_t sum{s} = warp_sum(acc{s});')
-            ap(f'        if (lane == 0) grad_y[gy_base + {k}] += sum{s};')
-
-        ap('    }')
-        ap('')
-
-    ap('}')
-    return "\n".join(lines)
-
 
 def build_gradw_segments(paths: List[CGPath], acc_slots: int = 8) -> List[Dict[str, Any]]:
     """
@@ -1552,7 +1412,7 @@ def emit_split_launcher(bundle_name: str,
                   grady_kernel: str,
                   ) -> str:
     return rf'''
-std::vector<torch::Tensor> {bundle_name}(
+std::vector<torch::Tensor> launcher_{bundle_name}(
     torch::Tensor grad_out,
     torch::Tensor w,
     torch::Tensor x_all,
@@ -1615,8 +1475,14 @@ std::vector<torch::Tensor> {bundle_name}(
     return {{grad_w, grad_x, grad_y}};
 }}
 
+/*
 TORCH_LIBRARY({bundle_name}_codegen, m) {{
-    m.def("run", &{bundle_name});
+    m.def("run", &&launcher_{bundle_name});
+}}
+*/
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{bundle_name}, "{bundle_name} backward jit impl");
 }}
 '''
 
@@ -1645,8 +1511,5 @@ def generate_full_uniform1d_bwd_split_cuda(
         emit_grady_kernel(paths, grady_kernel, reg_budget=reg_budget),
         emit_split_launcher(bundle_name, gradw_kernel, gradx_kernel, grady_kernel),
     ]
-    #return "\n".join(parts)
     code = '\n'.join(parts)
-    file_name = f"{bundle_name}.cu"
-    #Path(f"../../fasteq/cuda/src/uniform1d_codegen/{file_name}").write_text(code, encoding="utf-8")
-    (out_dir / file_name).write_text(code, encoding="utf-8")
+    return code
