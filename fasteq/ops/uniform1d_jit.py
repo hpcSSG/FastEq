@@ -86,7 +86,7 @@ def _load_jit_module(
         name=module_name,
         sources=[str(cu_path)],
         extra_cflags=extra_cflags or ["-O3"],
-        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo", "-Xptxas=--maxrregcount=128"],
+        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
         extra_include_paths=[str(src_dir)],
         build_directory=str(build_dir),
         verbose=True,
@@ -207,7 +207,6 @@ def _build_jit_module_common(
         cache=cache,
     )
 
-@torch._dynamo.disable
 def _build_fwd_jit_module(
     *,
     i_list: torch.Tensor,
@@ -269,7 +268,6 @@ def _build_fwd_jit_module(
         codegen_fn=codegen_fn,
     )
 
-@torch._dynamo.disable
 def _build_bwd_jit_module(
     *,
     i_list: torch.Tensor,
@@ -340,7 +338,6 @@ def _build_bwd_jit_module(
 # -----------------------------------------------------------------------------
 # runtime dispatch
 # -----------------------------------------------------------------------------
-@torch._dynamo.disable
 def _run_fwd(
     *,
     w,
@@ -385,7 +382,7 @@ def _run_fwd(
             src_idx, b_list, out_seg_num
         )
 
-@torch._dynamo.disable
+        
 def _run_bwd(
     *,
     grad_out,
@@ -419,7 +416,7 @@ def _run_bwd(
         dtype_str=dtype_str,
         mode=mode,
     )
-    
+
     return mod.run(
         grad_out, w, x, y,
         src_idx, dst_idx, b_list,
@@ -554,7 +551,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         return grad_w, grad_x, grad_y, None, None, None, None, None
 
-@torch._dynamo.disable
 def fast_uniform1d_jit(w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter):
     return FastUniform1dJITFunction.apply(
         w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter

@@ -1302,7 +1302,7 @@ def build_gradw_segments(paths: List[CGPath], acc_slots: int = 8) -> List[Dict[s
 def emit_gradw_kernel_segmented_unrolled(
     paths: List[CGPath],
     kernel_name: str,
-    acc_slots: int = 8,
+    acc_slots: int = 16,
     kv_group_reuse_threshold: int = 2,
 ) -> str:
     """
