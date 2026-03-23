@@ -6,15 +6,16 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
+import torch._dynamo
 from torch.utils.cpp_extension import load
 
-from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
-from .uniform1d_bwd_codegen import (
+from .uniform1d_scatter_fwd_codegen import generate_code_uniform1d_fwd
+from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd_no_scatter
+from .uniform1d_scatter_bwd_codegen import (
     build_backward_schedule_from_lists,
     emit_backward_cuda_from_schedule,
     generate_full_uniform1d_bwd_split_cuda,
 )
-
 
 # -----------------------------------------------------------------------------
 # JIT cache
@@ -100,13 +101,20 @@ def _load_jit_module(
 # codegen -> jit module
 # -----------------------------------------------------------------------------
 
-def _tensor_to_cpu_list(x: torch.Tensor):
-    return x.detach().cpu().tolist()
+def _tensor_to_cpu_list(x):
+    if isinstance(x, list):
+        return x
+    if isinstance(x, tuple):
+        return list(x)
+    if isinstance(x, torch.Tensor):
+        return x.detach().cpu().tolist()
+    raise TypeError(f"Unsupported type for _tensor_to_cpu_list: {type(x)}")
 
 def _make_fwd_module_name(
     *,
     P: int,
     u_dim: int,
+    mode,
     i_list,
     j_list,
     k_list,
@@ -115,18 +123,19 @@ def _make_fwd_module_name(
     dtype_str: str,
 ) -> str:
     sig = repr((
-        P, u_dim, dtype_str,
+        P, u_dim, dtype_str, mode,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
-        tuple(float(c) for c in coeff_list),
+        #tuple(float(c) for c in coeff_list),
     ))
     h = _sha1_text(sig)
-    return f"uniform1d_fwd_u{u_dim}_path{P}_jit_{dtype_str}_{h}"
-
+    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_jit_{dtype_str}_{h}"
 
 def _make_bwd_module_name(
     *,
     P: int,
     u_dim: int,
+    mode: str,
     i_list,
     j_list,
     k_list,
@@ -136,13 +145,14 @@ def _make_bwd_module_name(
     split_mode: bool,
 ) -> str:
     sig = repr((
-        P, u_dim, dtype_str, split_mode,
+        P, u_dim, dtype_str, split_mode, mode,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
         tuple(float(c) for c in coeff_list),
     ))
     h = _sha1_text(sig)
     tag = "split" if split_mode else "combine"
-    return f"uniform1d_bwd_u{u_dim}_path{P}_{tag}_jit_{dtype_str}_{h}"
+    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    return f"uniform1d_bwd_{mode_str}_u{u_dim}_path{P}_{tag}_jit_{dtype_str}_{h}"
 
 
 def _get_scalar_t_str(t: torch.Tensor) -> str:
@@ -197,7 +207,7 @@ def _build_jit_module_common(
         cache=cache,
     )
 
-
+@torch._dynamo.disable
 def _build_fwd_jit_module(
     *,
     i_list: torch.Tensor,
@@ -206,7 +216,9 @@ def _build_fwd_jit_module(
     v_list: torch.Tensor,
     coeff_list: torch.Tensor,
     u_dim: int,
+    mode: str,
     dtype_str: str,
+    fused_scatter: bool,
 ):
     # Convert tensors to CPU-side Python lists for hashing and code generation.
     i_cpu = _tensor_to_cpu_list(i_list)
@@ -220,6 +232,7 @@ def _build_fwd_jit_module(
     module_name = _make_fwd_module_name(
         P=P,
         u_dim=u_dim,
+        mode=mode,
         i_list=i_cpu,
         j_list=j_cpu,
         k_list=k_cpu,
@@ -228,21 +241,35 @@ def _build_fwd_jit_module(
         dtype_str=dtype_str,
     )
 
-    return _build_jit_module_common(
-        module_name=module_name,
-        cache=_FWD_JIT_CACHE,
-        kind="FWD",
-        codegen_fn=lambda: generate_code_uniform1d_fwd(
+    if fused_scatter:
+        codegen_fn = lambda: generate_code_uniform1d_fwd(
             i_list=i_list,
             j_list=j_list,
             k_list=k_list,
             v_list=v_list,
             coeff_list=coeff_list,
             u_dim=u_dim,
-        ),
+            mode=mode,
+        )
+    else:
+        codegen_fn = lambda: generate_code_uniform1d_fwd_no_scatter(
+            i_list=i_list,
+            j_list=j_list,
+            k_list=k_list,
+            v_list=v_list,
+            coeff_list=coeff_list,
+            u_dim=u_dim,
+            mode=mode,
+        )
+
+    return _build_jit_module_common(
+        module_name=module_name,
+        cache=_FWD_JIT_CACHE,
+        kind="FWD",
+        codegen_fn=codegen_fn,
     )
 
-
+@torch._dynamo.disable
 def _build_bwd_jit_module(
     *,
     i_list: torch.Tensor,
@@ -251,6 +278,7 @@ def _build_bwd_jit_module(
     v_list: torch.Tensor,
     coeff_list: torch.Tensor,
     u_dim: int,
+    mode: str,
     dtype_str: str,
 ):
     # Convert tensors to CPU-side Python lists for hashing and code generation.
@@ -266,6 +294,7 @@ def _build_bwd_jit_module(
     module_name = _make_bwd_module_name(
         P=P,
         u_dim=u_dim,
+        mode=mode,
         i_list=i_cpu,
         j_list=j_cpu,
         k_list=k_cpu,
@@ -311,7 +340,7 @@ def _build_bwd_jit_module(
 # -----------------------------------------------------------------------------
 # runtime dispatch
 # -----------------------------------------------------------------------------
-
+@torch._dynamo.disable
 def _run_fwd(
     *,
     w,
@@ -327,6 +356,8 @@ def _run_fwd(
     coeff_list,
     out_seg_num,
     u_dim,
+    mode,
+    fused_scatter,
 ):
 
     dtype_str = _get_scalar_t_str(w)
@@ -338,14 +369,23 @@ def _run_fwd(
         coeff_list=coeff_list,
         u_dim=u_dim,
         dtype_str=dtype_str,
+        mode=mode,
+        fused_scatter=fused_scatter,
     )
 
-    return mod.run(
-        w, x, y,
-        src_idx, dst_idx, b_list, out_seg_num
-    )
+    if fused_scatter:
 
+        return mod.run(
+            w, x, y,
+            src_idx, dst_idx, b_list, out_seg_num
+        )
+    else:
+        return mod.run(
+            w, x, y,
+            src_idx, b_list, out_seg_num
+        )
 
+@torch._dynamo.disable
 def _run_bwd(
     *,
     grad_out,
@@ -365,6 +405,7 @@ def _run_bwd(
     y_seg_num,
     out_seg_num,
     u_dim,
+    mode,
 ):
 
     dtype_str = _get_scalar_t_str(w)
@@ -376,6 +417,7 @@ def _run_bwd(
         coeff_list=coeff_list,
         u_dim=u_dim,
         dtype_str=dtype_str,
+        mode=mode,
     )
     
     return mod.run(
@@ -392,7 +434,7 @@ def _run_bwd(
 
 class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, x, y, src_idx, dst_idx, b_list, meta):
+    def forward(ctx, w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter):
         i_list = meta["i_list"].to(torch.int32)
         j_list = meta["j_list"].to(torch.int32)
         k_list = meta["k_list"].to(torch.int32)
@@ -405,13 +447,22 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
 
+        edge_num = src_idx.shape[0]
+
         w = w.view(-1, w_seg_num, u_dim)
-        x = x.view(-1, x_seg_num, u_dim)
-        y = y.view(-1, y_seg_num, 1)
+        x = x.view(-1, x_seg_num, u_dim) # [node_num, x_seg_num, u_dim]
+
+        y = y.view(edge_num, y_seg_num, -1)
+
+        if y.shape[2] == 1:
+            mode = "u,u,,u"
+        else:
+            mode = "u,u,u,u"
 
         src_idx = src_idx.to(torch.int32)
-        dst_idx = dst_idx.to(torch.int32)
-        b_list = b_list.to(torch.int32)
+        if fused_scatter:
+            dst_idx = dst_idx.to(torch.int32)
+            b_list = b_list.to(torch.int32)
 
         P = i_list.numel()
         print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
@@ -433,6 +484,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             coeff_list=coeff_list,
             out_seg_num=out_seg_num,
             u_dim=u_dim,
+            mode=mode,
+            fused_scatter=fused_scatter,
         )
 
         torch.cuda.synchronize()
@@ -454,6 +507,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         ctx.y_seg_num = y_seg_num
         ctx.u_dim = u_dim
         ctx.P = P
+        ctx.mode = mode
 
         return out
 
@@ -487,6 +541,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             y_seg_num=ctx.y_seg_num,
             out_seg_num=ctx.out_seg_num,
             u_dim=ctx.u_dim,
+            mode=ctx.mode,
         )
 
         torch.cuda.synchronize()
@@ -499,8 +554,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         return grad_w, grad_x, grad_y, None, None, None, None, None
 
-
-def fast_uniform1d_jit(w, x, y, src_idx, dst_idx, b_list, meta):
+@torch._dynamo.disable
+def fast_uniform1d_jit(w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter):
     return FastUniform1dJITFunction.apply(
-        w, x, y, src_idx, dst_idx, b_list, meta
+        w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter
     )
