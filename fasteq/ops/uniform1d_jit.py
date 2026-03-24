@@ -3,14 +3,14 @@ import time
 import hashlib
 import tempfile
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional, Any
 
 import torch
 import torch._dynamo
 from torch.utils.cpp_extension import load
 
-from .uniform1d_scatter_fwd_codegen import generate_code_uniform1d_fwd
-from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd_no_scatter
+#from .uniform1d_scatter_fwd_codegen import generate_code_uniform1d_fwd
+from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_scatter_bwd_codegen import (
     build_backward_schedule_from_lists,
     emit_backward_cuda_from_schedule,
@@ -214,10 +214,11 @@ def _build_fwd_jit_module(
     k_list: torch.Tensor,
     v_list: torch.Tensor,
     coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int,
     mode: str,
     dtype_str: str,
-    fused_scatter: bool,
 ):
     # Convert tensors to CPU-side Python lists for hashing and code generation.
     i_cpu = _tensor_to_cpu_list(i_list)
@@ -240,26 +241,18 @@ def _build_fwd_jit_module(
         dtype_str=dtype_str,
     )
 
-    if fused_scatter:
-        codegen_fn = lambda: generate_code_uniform1d_fwd(
-            i_list=i_list,
-            j_list=j_list,
-            k_list=k_list,
-            v_list=v_list,
-            coeff_list=coeff_list,
-            u_dim=u_dim,
-            mode=mode,
-        )
-    else:
-        codegen_fn = lambda: generate_code_uniform1d_fwd_no_scatter(
-            i_list=i_list,
-            j_list=j_list,
-            k_list=k_list,
-            v_list=v_list,
-            coeff_list=coeff_list,
-            u_dim=u_dim,
-            mode=mode,
-        )
+    codegen_fn = lambda: generate_code_uniform1d_fwd(
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices,
+        output_indices=output_indices,
+        u_dim=u_dim,
+        mode=mode,
+    )
+    
 
     return _build_jit_module_common(
         module_name=module_name,
@@ -343,18 +336,17 @@ def _run_fwd(
     w,
     x,
     y,
-    src_idx,
-    dst_idx,
     b_list,
     i_list,
     j_list,
     k_list,
     v_list,
     coeff_list,
+    input_indices,
+    output_indices,
     out_seg_num,
     u_dim,
     mode,
-    fused_scatter,
 ):
 
     dtype_str = _get_scalar_t_str(w)
@@ -365,13 +357,29 @@ def _run_fwd(
         v_list=v_list,
         coeff_list=coeff_list,
         u_dim=u_dim,
+        input_indices=input_indices,
+        output_indices=output_indices,
         dtype_str=dtype_str,
         mode=mode,
-        fused_scatter=fused_scatter,
     )
 
-    if fused_scatter:
+    use_x_src = 1 in input_indices
+    use_y_src = 2 in input_indices
+    fused_scatter = 0 in output_indices
 
+
+    if use_x_src:
+        src_idx = input_indices[1].to(torch.int32)
+    elif use_y_src:
+        src_idx = input_indices[2].to(torch.int32)
+    else:
+        src_idx = None
+        raise RuntimeError("Input_indices 1 and 2 all empty")
+
+    
+    if fused_scatter:
+        b_list = b_list.to(torch.int32)
+        dst_idx = output_indices[0].to(torch.int32)
         return mod.run(
             w, x, y,
             src_idx, dst_idx, b_list, out_seg_num
@@ -379,7 +387,7 @@ def _run_fwd(
     else:
         return mod.run(
             w, x, y,
-            src_idx, b_list, out_seg_num
+            src_idx, out_seg_num
         )
 
         
@@ -389,8 +397,6 @@ def _run_bwd(
     w,
     x,
     y,
-    src_idx,
-    dst_idx,
     b_list,
     i_list,
     j_list,
@@ -431,7 +437,8 @@ def _run_bwd(
 
 class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter):
+    def forward(ctx, w, x, y, input_indices, output_indices, meta, b_list):
+
         i_list = meta["i_list"].to(torch.int32)
         j_list = meta["j_list"].to(torch.int32)
         k_list = meta["k_list"].to(torch.int32)
@@ -444,22 +451,23 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
 
-        edge_num = src_idx.shape[0]
+        
+        w_irreps =  int(meta["size_list"][0] / w_seg_num)
+        x_irreps =  int(meta["size_list"][1] / x_seg_num)
+        y_irreps =  int(meta["size_list"][2] / y_seg_num)
+        out_irreps = int(meta["size_list"][3] / out_seg_num)
 
-        w = w.view(-1, w_seg_num, u_dim)
-        x = x.view(-1, x_seg_num, u_dim) # [node_num, x_seg_num, u_dim]
+        print(f"fasteq w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
-        y = y.view(edge_num, y_seg_num, -1)
+        w = w.view(-1, w_seg_num, w_irreps)
+        x = x.view(-1, x_seg_num, x_irreps) # [node_num, x_seg_num, u_dim]
+
+        y = y.view(-1, y_seg_num, y_irreps)
 
         if y.shape[2] == 1:
             mode = "u,u,,u"
         else:
             mode = "u,u,u,u"
-
-        src_idx = src_idx.to(torch.int32)
-        if fused_scatter:
-            dst_idx = dst_idx.to(torch.int32)
-            b_list = b_list.to(torch.int32)
 
         P = i_list.numel()
         print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
@@ -471,18 +479,17 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             w=w,
             x=x,
             y=y,
-            src_idx=src_idx,
-            dst_idx=dst_idx,
-            b_list=b_list,
             i_list=i_list,
             j_list=j_list,
             k_list=k_list,
             v_list=v_list,
             coeff_list=coeff_list,
+            input_indices=input_indices,
+            output_indices=output_indices,
+            b_list=b_list,
             out_seg_num=out_seg_num,
             u_dim=u_dim,
             mode=mode,
-            fused_scatter=fused_scatter,
         )
 
         torch.cuda.synchronize()
@@ -490,8 +497,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
-        ctx.src_idx = src_idx
-        ctx.dst_idx = dst_idx
         ctx.b_list = b_list
         ctx.i_list = i_list
         ctx.j_list = j_list
@@ -549,9 +554,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.u_dim)
         grad_y = grad_y.view(-1, ctx.y_seg_num)
 
-        return grad_w, grad_x, grad_y, None, None, None, None, None
+        return grad_w, grad_x, grad_y, None, None, None, None
 
-def fast_uniform1d_jit(w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter):
+def fast_uniform1d_jit(w, x, y, input_indices, output_indices, meta, b_list):
     return FastUniform1dJITFunction.apply(
-        w, x, y, src_idx, dst_idx, b_list, meta, fused_scatter
+        w, x, y, input_indices, output_indices, meta, b_list
     )
