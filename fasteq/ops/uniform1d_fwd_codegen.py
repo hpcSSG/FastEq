@@ -167,6 +167,15 @@ def split_groups_into_two_warps(groups: OrderedDict):
     按 (v, i) group 的 term 数量尽量均衡地分给两个 warp。
     返回的是 group keys 列表，而不是 v 列表。
     """
+
+    """ v2cnt = defaultdict(int)
+    for gk, info in groups.items():
+        v2cnt[info["v"]] += 1
+
+    bad_vs = [v for v, c in v2cnt.items() if c > 1]
+    print("num duplicated v groups =", len(bad_vs))
+    print("some duplicated v =", bad_vs[:20]) """
+
     items = [(gk, len(info["terms"])) for gk, info in groups.items()]
 
     warp0_groups = []
@@ -190,6 +199,51 @@ def split_groups_into_two_warps(groups: OrderedDict):
 
     return warp0_groups, warp1_groups
 
+
+def split_groups_into_two_warps_by_v(groups: OrderedDict):
+    # v -> list[gk]
+    v_buckets = OrderedDict()
+    for gk, info in groups.items():
+        vv = info["v"]
+        if vv not in v_buckets:
+            v_buckets[vv] = []
+        v_buckets[vv].append(gk)
+
+    # 每个 v 的 cost = 该 v 下所有 groups 的 terms 总数
+    items = []
+    for vv, gks in v_buckets.items():
+        cost = sum(len(groups[gk]["terms"]) for gk in gks)
+        items.append((vv, cost))
+
+    # 贪心负载均衡，但分配单位是整个 v bucket
+    warp0_v = []
+    warp1_v = []
+    load0 = 0
+    load1 = 0
+
+    for vv, cost in sorted(items, key=lambda x: x[1], reverse=True):
+        if load0 <= load1:
+            warp0_v.append(vv)
+            load0 += cost
+        else:
+            warp1_v.append(vv)
+            load1 += cost
+
+    # 保持原始 v 顺序
+    v_order = list(v_buckets.keys())
+    pos = {vv: i for i, vv in enumerate(v_order)}
+    warp0_v.sort(key=lambda vv: pos[vv])
+    warp1_v.sort(key=lambda vv: pos[vv])
+
+    # 展开回 group 列表
+    warp0_groups = []
+    warp1_groups = []
+    for vv in warp0_v:
+        warp0_groups.extend(v_buckets[vv])
+    for vv in warp1_v:
+        warp1_groups.extend(v_buckets[vv])
+
+    return warp0_groups, warp1_groups
 
 def emit_launcher(
     bundle_name: str,
@@ -348,7 +402,8 @@ def emit_two_warp_vgroup_forward_kernel(
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
-    warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
+    #warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
+    warp0_groups, warp1_groups = split_groups_into_two_warps_by_v(groups)
 
     lines: List[str] = []
     ap = lines.append
@@ -482,12 +537,15 @@ def emit_two_warp_vgroup_forward_kernel(
             if use_scatter:
                 ap(f"        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], sum_g_{warp_id}_{idx});")
             else:
+                #ap(f"        atomicAdd(&out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], sum_g_{warp_id}_{idx});")
                 ap(f"        out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u] += sum_g_{warp_id}_{idx};")
         ap("    }")
         ap("")
 
-    emit_warp_body(0, warp0_vs)
-    emit_warp_body(1, warp1_vs)
+    #emit_warp_body(0, warp0_vs)
+    #emit_warp_body(1, warp1_vs)
+    emit_warp_body(0, warp0_groups)
+    emit_warp_body(1, warp1_groups)
 
     ap("}")
     ap("")
@@ -586,6 +644,9 @@ def generate_code_uniform1d_fwd(
 
     groups = build_vi_groups(i2, j2, k2, v2, c2)
 
+    num_v = len({info["v"] for info in groups.values()})
+    print(f"build_vi_groups lens:{len(groups)}, num_v:{num_v}")
+    
     
     code = emit_two_warp_vgroup_forward_kernel(
         groups,
