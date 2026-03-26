@@ -129,7 +129,7 @@ def _make_fwd_module_name(
         #tuple(float(c) for c in coeff_list),
     ))
     h = _sha1_text(sig)
-    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_jit_{dtype_str}_{h}"
 
 def _make_bwd_module_name(
@@ -472,7 +472,7 @@ def _run_bwd(
 
     grad_out = grad_out.view(-1, out_seg_num, u_dim)
 
-    print(f"grad_out shape:{grad_out.shape}. w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
+    #print(f"grad_out shape:{grad_out.shape}. w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
     if fused_scatter:
         b_list = b_list.to(torch.int32)
         dst_idx = output_indices[0].to(torch.int32)
@@ -521,7 +521,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         y = y.view(-1, y_seg_num, y_irreps)
 
-        print(f"fasteq w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
+        #print(f"fasteq fwd w shape:{w.shape}, x shape:{x.shape}, y shape:{y.shape}")
 
         if y.shape[2] == 1:
             mode = "u,u,,u"
@@ -529,7 +529,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode = "u,u,u,u"
 
         P = i_list.numel()
-        print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
+        #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000.0
@@ -574,8 +574,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         ctx.mode = mode
         ctx.input_indices=input_indices
         ctx.output_indices=output_indices
-
-        print(f"input_indices:{input_indices}")
 
         return out
 

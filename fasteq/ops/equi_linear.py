@@ -41,8 +41,8 @@ class _FastEquiLinearFn(torch.autograd.Function):
             x = x.float()
             w = w.float()
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000 """
 
         out = torch.ops.equi_linear.forward(x, w, I_list, cg_list)
         out =  out.view(B, -1)
@@ -50,10 +50,10 @@ class _FastEquiLinearFn(torch.autograd.Function):
         if origin_dtype == torch.float64:
             out = out.double()
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>")
+        print(f"<< fasteq equi-linear forward cost: {execution_time_ms:.3f} ms >>") """
 
         ctx.save_for_backward(w)
         ctx.B = B
@@ -69,8 +69,8 @@ class _FastEquiLinearFn(torch.autograd.Function):
 
         #print(f"eq-linear bwd grad_out:{grad_out.shape}")
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000 """
         w, = ctx.saved_tensors
 
         if ctx.origin_dtype == torch.float64:
@@ -83,10 +83,10 @@ class _FastEquiLinearFn(torch.autograd.Function):
         if ctx.origin_dtype == torch.float64:
             grad_x = grad_x.double()
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>")
+        print(f"<< fasteq equi-linear backward cost: {execution_time_ms:.3f} ms >>") """
         return None, grad_x, None, None
 
 def fast_equi_linear(descriptor, w, x):

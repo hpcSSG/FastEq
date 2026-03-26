@@ -287,7 +287,9 @@ torch::Tensor launcher_{bundle_name}(
     TORCH_CHECK((int)w.size(2) == U, "w U mismatch");
     TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
                 "w.size(0) must be 1 or B");
+    TORCH_CHECK((int)w.size(1) > 0, "Iw must be > 0");
 
+    TORCH_CHECK((int)x_all.size(1) > 0, "Ix must be > 0");
     TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
     {y_check_u}
     TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
@@ -602,16 +604,15 @@ def emit_adaptive_vgroup_forward_kernel(
     groups: OrderedDict,
     kernel_name: str = "stp_codegen_adaptive_vgroup",
     scalar_t: str = "float",
-    mode: str = "u,u,u",
+    mode: str = "u,u,,u",
     *,
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
 ) -> str:
-    if mode not in ("u,u,u", "u,u,u,u"):
+    if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
-    
     num_warps = choose_num_warps(groups)
     warp0_groups, warp1_groups = split_groups_into_one_or_two_warps_by_v(groups, num_warps)
     threads_per_block = 32 * num_warps
@@ -645,7 +646,7 @@ def emit_adaptive_vgroup_forward_kernel(
     ap("    if (e_local >= B) return;")
     ap("")
     ap("    int e_orig = b_list ? b_list[e_local] : e_local;")
-    ap("    int w_row  = (WB == 1 ? 0 : e_local);")
+    ap("    int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     ap("    int tid  = (int)threadIdx.x;")
     ap("    int lane = tid & 31;")
@@ -666,11 +667,11 @@ def emit_adaptive_vgroup_forward_kernel(
     else:
         ap("    int64_t x_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
 
-    if mode == 'u,u,u':
+    if mode == 'u,u,,u':
         if use_y_src:
             ap("    int64_t y_base = (int64_t)src * (int64_t)Ky;")
         else:
-            ap("    int64_t y_base = (int64_t)e_local * (int64_t)Ky;")
+            ap("    int64_t y_base = (int64_t)e_orig * (int64_t)Ky;")
     else:
         if use_y_src:
             ap("    int64_t y_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
@@ -748,14 +749,14 @@ def generate_code_uniform1d_fwd(
     use_y_src = 2 in input_indices
     use_scatter = 0 in output_indices
 
-    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
 
     assert i_list.ndim == j_list.ndim == k_list.ndim == v_list.ndim == coeff_list.ndim == 1
     P = i_list.numel()
     assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
 
-    kernel_name = f"uniform1d_combine_u{u_dim}_path{P}_{mode_str}_{layout_tag}_fwd"
+    kernel_name = f"uniform1d_u{u_dim}_path{P}_{mode_str}_{layout_tag}_fwd"
 
     if reorder_groups:
         i2, j2, k2, v2, c2, group_order = reorder_groups_for_reuse(

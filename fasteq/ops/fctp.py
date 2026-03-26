@@ -271,12 +271,8 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         B = x.shape[0]
         path_num = nnz_per_path.shape[0]
 
-        #print(f"i_for_k:{i_for_k}")
-        #print(f"val_for_k:{val_for_k}")
-        #print(f"p_for_k:{p_for_k}")
-
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000 """
 
         #triton_fused_fctp_fwd()
         x = x.view(B, I_total, U)
@@ -286,10 +282,10 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
                                                          BK=8, BW=64, BU=32, num_warps=4)
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq triton fctp forward cost: {execution_time_ms:.3f} ms >>")
+        print(f"<< fasteq triton fctp forward cost: {execution_time_ms:.3f} ms >>") """
 
         '''
         torch.cuda.synchronize()
@@ -340,16 +336,16 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         grad_out = grad_out.view(B, K_total, W)
         w = w.view(path_num, U, V, W)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000 """
 
         grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val,
                                                          BK=8, BW=32, BU=32, num_warps=4)
         
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq triton fctp backward cost: {execution_time_ms:.3f} ms >>")
+        print(f"<< fasteq triton fctp backward cost: {execution_time_ms:.3f} ms >>") """
         
         '''
         torch.cuda.synchronize()

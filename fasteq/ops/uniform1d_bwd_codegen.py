@@ -543,7 +543,7 @@ def emit_fused_bwd_kernel(
     ap("    if (e_local >= B) return;")
     ap("")
     ap("    int e_orig = b_list ? b_list[e_local] : e_local;")
-    ap("    int w_row  = (WB == 1 ? 0 : e_local);")
+    ap("    int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     ap("    int tid  = (int)threadIdx.x;")
     ap("    int lane = tid & 31;")
@@ -576,14 +576,14 @@ def emit_fused_bwd_kernel(
             ap("    int64_t y_base  = (int64_t)src * (int64_t)Ky;")
             ap("    int64_t gy_base = (int64_t)src * (int64_t)Ky;")
         else:
-            ap("    int64_t y_base  = (int64_t)e_local * (int64_t)Ky;")
-            ap("    int64_t gy_base = (int64_t)e_local * (int64_t)Ky;")
+            ap("    int64_t y_base  = (int64_t)e_orig * (int64_t)Ky;")
+            ap("    int64_t gy_base = (int64_t)e_orig * (int64_t)Ky;")
     elif mode == "u,u,u,u":
         if use_y_src:
             ap("    int64_t y_base  = (int64_t)src * (int64_t)Ky * (int64_t)U;")
             ap("    int64_t gy_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
         else:
-            ap("    int64_t y_base  = (int64_t)e_local * (int64_t)Ky * (int64_t)U;")
+            ap("    int64_t y_base  = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
             ap("    int64_t gy_base = (int64_t)e_local * (int64_t)Ky * (int64_t)U;")
     else:
         raise ValueError(f"Unsupported mode: {mode}")
@@ -673,9 +673,9 @@ def generate_code_uniform1d_bwd_fused(
     P = i_list.numel()
     assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
 
-    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
-    bundle_name = f"uniform1d_combine_u{u_dim}_path{P}_{mode_str}_{layout_tag}_bwd_fused"
+    bundle_name = f"uniform1d_u{u_dim}_path{P}_{mode_str}_{layout_tag}_bwd_fused"
 
     if reorder_groups:
         i2, j2, k2, v2, c2 = reorder_paths_for_fused_bwd(
