@@ -14,6 +14,7 @@ from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_bwd_codegen import generate_code_uniform1d_bwd_fused
 from .uniform1d_scatter_bwd_codegen import (
     emit_backward_cuda_from_schedule,
+    build_backward_schedule_from_lists,
     generate_full_uniform1d_bwd_split_cuda,
     #generate_code_uniform1d_bwd,
 )
@@ -298,7 +299,7 @@ def _build_bwd_jit_module(
         split_mode=split_mode,
     )
 
-    """ def _codegen_bwd():
+    def _codegen_bwd():
         if split_mode:
             return generate_full_uniform1d_bwd_split_cuda(
                 i_list=i_cpu,
@@ -308,38 +309,38 @@ def _build_bwd_jit_module(
                 coeff_list=coeff_cpu,
                 bundle_name=f"uniform1d_split_u{u_dim}_path{P}_bwd",
             )
-
-        sched = build_backward_schedule_from_lists(
-            i_list=i_cpu,
-            j_list=j_cpu,
-            k_list=k_cpu,
-            v_list=v_cpu,
-            coeff_list=coeff_cpu,
-            U_dim=u_dim,
-        )
-        return emit_backward_cuda_from_schedule(
-            sched,
-            kernel_name=f"uniform1d_combine_u{u_dim}_path{P}_bwd",
-            scalar_t=dtype_str,
-        ) """
+        else:
+            """ return generate_code_uniform1d_bwd_fused(
+                    i_list=i_list,
+                    j_list=j_list,
+                    k_list=k_list,
+                    v_list=v_list,
+                    coeff_list=coeff_list,
+                    input_indices=input_indices,
+                    output_indices=output_indices,
+                    u_dim=u_dim,
+                    mode=mode,
+                ) """
+            sched = build_backward_schedule_from_lists(
+                i_list=i_cpu,
+                j_list=j_cpu,
+                k_list=k_cpu,
+                v_list=v_cpu,
+                coeff_list=coeff_cpu,
+                U_dim=u_dim,
+            )
+            return emit_backward_cuda_from_schedule(
+                sched,
+                kernel_name=f"uniform1d_fused_u{u_dim}_path{P}_bwd",
+                scalar_t=dtype_str,
+            )
     
-    codegen_fn = lambda: generate_code_uniform1d_bwd_fused(
-        i_list=i_list,
-        j_list=j_list,
-        k_list=k_list,
-        v_list=v_list,
-        coeff_list=coeff_list,
-        input_indices=input_indices,
-        output_indices=output_indices,
-        u_dim=u_dim,
-        mode=mode,
-    )
 
     return _build_jit_module_common(
         module_name=module_name,
         cache=_BWD_JIT_CACHE,
         kind="BWD",
-        codegen_fn=codegen_fn,
+        codegen_fn=_codegen_bwd,
     )
 
 

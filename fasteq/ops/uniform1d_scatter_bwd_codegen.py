@@ -410,37 +410,38 @@ def emit_combine_launcher(bundle_name: str) -> str:
     return rf'''
 
 std::vector<torch::Tensor> launcher_{bundle_name}(
-    torch::Tensor grad_out,     // [S,V,U]
     torch::Tensor w,            // [B,Iw,U]
-    torch::Tensor x_all,        // [S,Ix,U]
+    torch::Tensor x,        // [S,Ix,U]
     torch::Tensor y,            // [B,Ky,1]
+    torch::Tensor grad_out,     // [S,V,U]
     torch::Tensor src_idx,      // [B] int32
     torch::Tensor dst_idx,      // [B] int32
     torch::Tensor b_list,       // [B] int32
-    int64_t Iw,
-    int64_t Ix,
-    int64_t Ky,
     int64_t V)
 {{
 
     TORCH_CHECK(w.scalar_type() == grad_out.scalar_type(),
                 "w and grad_out must have the same dtype");
-    TORCH_CHECK(x_all.scalar_type() == w.scalar_type(),
-                "x_all dtype must match w");
+    TORCH_CHECK(x.scalar_type() == w.scalar_type(),
+                "x dtype must match w");
     TORCH_CHECK(y.scalar_type() == w.scalar_type(),
                 "y dtype must match w");
 
     TORCH_CHECK(w.dim() == 3, "w must be [B,Iw,U]");
-    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(x.dim() == 3, "x must be [S,Ix,U]");
     TORCH_CHECK(y.dim() == 3, "y must be [B,Ky,1]");
     TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [S,V,U]");
 
     const int B  = (int)w.size(0);
     const int U  = (int)w.size(2);
-    const int S  = (int)x_all.size(0);
+    const int Iw = (int)w.size(1);
 
-    TORCH_CHECK((int)x_all.size(0) == S, "internal shape error for x_all");
-    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    const int S  = (int)x.size(0);
+    const int Ix = (int)x.size(1);
+    const int Ky = (int)y.size(1);
+
+    TORCH_CHECK((int)x.size(0) == S, "internal shape error for x");
+    TORCH_CHECK((int)x.size(2) == U, "x U mismatch");
     TORCH_CHECK((int)y.size(0) == B, "y B mismatch");
     TORCH_CHECK((int)y.size(2) == 1, "y must be [B,Ky,1]");
     TORCH_CHECK((int)grad_out.size(0) == S, "grad_out S mismatch");
@@ -459,7 +460,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     c10::cuda::CUDAGuard device_guard(w.device());
 
     auto grad_w = torch::zeros_like(w);      // [B,Iw,U]
-    auto grad_x = torch::zeros_like(x_all);  // [S,Ix,U]
+    auto grad_x = torch::zeros_like(x);  // [S,Ix,U]
     auto grad_y = torch::zeros_like(y);      // [B,Ky,1]
 
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
@@ -468,7 +469,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
 
         launch_{kernel_name}<scalar_t>(
             (const scalar_t*)w.data_ptr<scalar_t>(),
-            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)x.data_ptr<scalar_t>(),
             (const scalar_t*)y.data_ptr<scalar_t>(),
             (const scalar_t*)grad_out.data_ptr<scalar_t>(),
             (scalar_t*)grad_w.data_ptr<scalar_t>(),
@@ -562,7 +563,7 @@ def emit_backward_cuda_from_schedule(
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
-    ap("    const scalar_t* __restrict__ x_all,")
+    ap("    const scalar_t* __restrict__ x,")
     ap("    const scalar_t* __restrict__ y,")
     ap("    const scalar_t* __restrict__ grad_out,")
     ap("    scalar_t* __restrict__ grad_w,")
@@ -607,7 +608,7 @@ def emit_backward_cuda_from_schedule(
         ap(f"{indent}")
         ap(f"{indent}    // preload x(j,u)")
         for jj in ordered_j:
-            ap(f"{indent}    scalar_t xj_{jj} = x_all[((int64_t)src * Ix + {jj}) * (int64_t)U + u];")
+            ap(f"{indent}    scalar_t xj_{jj} = x[((int64_t)src * Ix + {jj}) * (int64_t)U + u];")
         ap(f"{indent}")
 
         # grad_w / grad_x accumulators are per-u, so inside loop/body
@@ -748,7 +749,7 @@ def emit_backward_cuda_from_schedule(
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* w,")
-    ap("    const scalar_t* x_all,")
+    ap("    const scalar_t* x,")
     ap("    const scalar_t* y,")
     ap("    const scalar_t* grad_out,")
     ap("    scalar_t* grad_w,")
@@ -776,7 +777,7 @@ def emit_backward_cuda_from_schedule(
         ap(f"    size_t smem_bytes = sizeof(scalar_t) * {smem_slots};")
         ap(f"    {kernel_name}<scalar_t><<<grid, block, smem_bytes, stream>>>(")
 
-    ap("        w, x_all, y, grad_out, grad_w, grad_x, grad_y,")
+    ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     ap("        src_idx, dst_idx, b_list, B, Iw, Ix, Ky, V, U);")
     ap("}")
     ap("")
@@ -907,7 +908,7 @@ def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     ap('template <typename scalar_t>')
     ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
-    ap('    const scalar_t* __restrict__ x_all,')
+    ap('    const scalar_t* __restrict__ x,')
     ap('    const scalar_t* __restrict__ y,')
     ap('    scalar_t* __restrict__ grad_w,')
     ap('    const int32_t* __restrict__ src_idx,')
@@ -950,7 +951,7 @@ def emit_gradw_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
                 ap(f'        scalar_t go_v_{v} = grad_out[go_base + ((int64_t){v} << 5)];')
                 for p in kv_plist:
                     c = fmt_coeff(p.c)
-                    ap(f'        scalar_t x_j_{p.j} = x_all[x_base + ((int64_t){p.j} << 5)];')
+                    ap(f'        scalar_t x_j_{p.j} = x[x_base + ((int64_t){p.j} << 5)];')
                     ap(f'        acc_i_{i} = fma((scalar_t)({c}) * x_j_{p.j}, y_k_{k} * go_v_{v}, acc_i_{i});')
                 ap(f'    }}')
             ap('')
@@ -1060,7 +1061,7 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
     ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
     ap('    const scalar_t* __restrict__ w,')
-    ap('    const scalar_t* __restrict__ x_all,')
+    ap('    const scalar_t* __restrict__ x,')
     ap('    scalar_t* __restrict__ grad_y,')
     ap('    const int32_t* __restrict__ src_idx,')
     ap('    const int32_t* __restrict__ dst_idx,')
@@ -1093,7 +1094,7 @@ def emit_grady_kernel(paths: List[CGPath], kernel_name: str, reg_budget: int = 6
             for (i, j, v), sub in ijv_groups.items():
                 ap('    {')
                 ap(f'        scalar_t w_i_{i}  = w[w_base + ((int64_t){i} << 5)];')
-                ap(f'        scalar_t x_j_{j}  = x_all[x_base + ((int64_t){j} << 5)];')
+                ap(f'        scalar_t x_j_{j}  = x[x_base + ((int64_t){j} << 5)];')
                 ap(f'        scalar_t go_v_{v} = grad_out[go_base + ((int64_t){v} << 5)];')
                 for p in sub:
                     c = fmt_coeff(p.c)
@@ -1323,7 +1324,7 @@ def emit_gradw_kernel_segmented_unrolled(
     ap('template <typename scalar_t>')
     ap(f'__global__ void {kernel_name}(')
     ap('    const scalar_t* __restrict__ grad_out,')
-    ap('    const scalar_t* __restrict__ x_all,')
+    ap('    const scalar_t* __restrict__ x,')
     ap('    const scalar_t* __restrict__ y,')
     ap('    scalar_t* __restrict__ grad_w,')
     ap('    const int32_t* __restrict__ src_idx,')
@@ -1377,7 +1378,7 @@ def emit_gradw_kernel_segmented_unrolled(
                 for (slot, j, _k, _v, c) in bucket:
                     cstr = fmt_coeff(c)
                     ap('            {')
-                    ap(f'                scalar_t xv = x_all[x_base + ((int64_t){j} << 5)];')
+                    ap(f'                scalar_t xv = x[x_base + ((int64_t){j} << 5)];')
                     ap(f'                acc{slot} = fma((scalar_t)({cstr}), xv * yg, acc{slot});')
                     ap('            }')
                 ap('        }')
@@ -1387,7 +1388,7 @@ def emit_gradw_kernel_segmented_unrolled(
                 for (slot, j, _k, _v, c) in bucket:
                     cstr = fmt_coeff(c)
                     ap('        {')
-                    ap(f'            scalar_t xv  = x_all[x_base + ((int64_t){j} << 5)];')
+                    ap(f'            scalar_t xv  = x[x_base + ((int64_t){j} << 5)];')
                     ap(f'            scalar_t yv  = y[y_base + {k}];')
                     ap(f'            scalar_t gov = grad_out[go_base + ((int64_t){v} << 5)];')
                     ap(f'            acc{slot} = fma((scalar_t)({cstr}), xv * (yv * gov), acc{slot});')
@@ -1413,28 +1414,29 @@ def emit_split_launcher(bundle_name: str,
                   ) -> str:
     return rf'''
 std::vector<torch::Tensor> launcher_{bundle_name}(
-    torch::Tensor grad_out,
     torch::Tensor w,
-    torch::Tensor x_all,
+    torch::Tensor x,
     torch::Tensor y,
+    torch::Tensor grad_out,
     torch::Tensor src_idx,
     torch::Tensor dst_idx,
     torch::Tensor b_list,
-    int64_t Iw,
-    int64_t Ix,
-    int64_t Ky,
     int64_t V)
 {{
     TORCH_CHECK(grad_out.is_cuda(), "grad_out must be CUDA");
     TORCH_CHECK(w.is_cuda(), "w must be CUDA");
-    TORCH_CHECK(x_all.is_cuda(), "x_all must be CUDA");
+    TORCH_CHECK(x.is_cuda(), "x must be CUDA");
     TORCH_CHECK(y.is_cuda(), "y must be CUDA");
 
     auto B = b_list.numel() > 0 ? (int)b_list.numel() : (int)w.size(0);
 
     auto grad_w = torch::zeros_like(w);
-    auto grad_x = torch::zeros_like(x_all);
+    auto grad_x = torch::zeros_like(x);
     auto grad_y = torch::zeros_like(y);
+
+    const int Iw = (int)w.size(1);
+    const int Ix = (int)x.size(1);
+    const int Ky = (int)y.size(1);
 
     cudaStream_t stream = at::cuda::getDefaultCUDAStream();
     dim3 block(32);
@@ -1443,7 +1445,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
         {gradw_kernel}<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
-            x_all.data_ptr<scalar_t>(),
+            x.data_ptr<scalar_t>(),
             y.data_ptr<scalar_t>(),
             grad_w.data_ptr<scalar_t>(),
             src_idx.data_ptr<int32_t>(),
@@ -1464,7 +1466,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
         {grady_kernel}<scalar_t><<<grid, block, 0, stream>>>(
             grad_out.data_ptr<scalar_t>(),
             w.data_ptr<scalar_t>(),
-            x_all.data_ptr<scalar_t>(),
+            x.data_ptr<scalar_t>(),
             grad_y.data_ptr<scalar_t>(),
             src_idx.data_ptr<int32_t>(),
             dst_idx.data_ptr<int32_t>(),
