@@ -33,10 +33,37 @@ def _ordered_unique(xs):
 
 
 def _fmt_coeff(c: float, scalar_t: str = "float") -> str:
-    # CUDA literal formatting
-    if scalar_t == "float":
-        return f"{c:.9g}f"
-    return f"{c:.17g}"
+    c = float(c)
+
+    if scalar_t in ("float", "at::Half", "half"):
+        if c == float("inf"):
+            return "INFINITY"
+        if c == float("-inf"):
+            return "-INFINITY"
+        if c != c:  # nan
+            return "NAN"
+        s = f"{c:.9g}"
+        if ("e" not in s) and ("E" not in s) and ("." not in s):
+            s += ".0"
+        return s + "f"
+
+    elif scalar_t in ("double",):
+        if c == float("inf"):
+            return "INFINITY"
+        if c == float("-inf"):
+            return "-INFINITY"
+        if c != c:
+            return "NAN"
+        s = f"{c:.17g}"
+        if ("e" not in s) and ("E" not in s) and ("." not in s):
+            s += ".0"
+        return s
+
+    else:
+        s = f"{c:.9g}"
+        if ("e" not in s) and ("E" not in s) and ("." not in s):
+            s += ".0"
+        return s
 
 def _y_expr(kk: int, mode: str) -> str:
     if mode == "u,u,,u":
@@ -162,88 +189,6 @@ def build_vi_groups(
         groups[key]["terms"].append((jj, kk, cc))
     return groups
 
-def split_groups_into_two_warps(groups: OrderedDict):
-    """
-    按 (v, i) group 的 term 数量尽量均衡地分给两个 warp。
-    返回的是 group keys 列表，而不是 v 列表。
-    """
-
-    """ v2cnt = defaultdict(int)
-    for gk, info in groups.items():
-        v2cnt[info["v"]] += 1
-
-    bad_vs = [v for v, c in v2cnt.items() if c > 1]
-    print("num duplicated v groups =", len(bad_vs))
-    print("some duplicated v =", bad_vs[:20]) """
-
-    items = [(gk, len(info["terms"])) for gk, info in groups.items()]
-
-    warp0_groups = []
-    warp1_groups = []
-    load0 = 0
-    load1 = 0
-
-    items_sorted = sorted(items, key=lambda x: x[1], reverse=True)
-    for gk, cost in items_sorted:
-        if load0 <= load1:
-            warp0_groups.append(gk)
-            load0 += cost
-        else:
-            warp1_groups.append(gk)
-            load1 += cost
-
-    order = list(groups.keys())
-    pos = {gk: idx for idx, gk in enumerate(order)}
-    warp0_groups.sort(key=lambda gk: pos[gk])
-    warp1_groups.sort(key=lambda gk: pos[gk])
-
-    return warp0_groups, warp1_groups
-
-
-def split_groups_into_two_warps_by_v(groups: OrderedDict):
-    # v -> list[gk]
-    v_buckets = OrderedDict()
-    for gk, info in groups.items():
-        vv = info["v"]
-        if vv not in v_buckets:
-            v_buckets[vv] = []
-        v_buckets[vv].append(gk)
-
-    # 每个 v 的 cost = 该 v 下所有 groups 的 terms 总数
-    items = []
-    for vv, gks in v_buckets.items():
-        cost = sum(len(groups[gk]["terms"]) for gk in gks)
-        items.append((vv, cost))
-
-    # 贪心负载均衡，但分配单位是整个 v bucket
-    warp0_v = []
-    warp1_v = []
-    load0 = 0
-    load1 = 0
-
-    for vv, cost in sorted(items, key=lambda x: x[1], reverse=True):
-        if load0 <= load1:
-            warp0_v.append(vv)
-            load0 += cost
-        else:
-            warp1_v.append(vv)
-            load1 += cost
-
-    # 保持原始 v 顺序
-    v_order = list(v_buckets.keys())
-    pos = {vv: i for i, vv in enumerate(v_order)}
-    warp0_v.sort(key=lambda vv: pos[vv])
-    warp1_v.sort(key=lambda vv: pos[vv])
-
-    # 展开回 group 列表
-    warp0_groups = []
-    warp1_groups = []
-    for vv in warp0_v:
-        warp0_groups.extend(v_buckets[vv])
-    for vv in warp1_v:
-        warp1_groups.extend(v_buckets[vv])
-
-    return warp0_groups, warp1_groups
 
 def emit_launcher(
     bundle_name: str,
@@ -388,22 +333,288 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 '''
 
 
-
-def emit_two_warp_vgroup_forward_kernel(
+def emit_warp_body_lowreg(
+    ap,
     groups: OrderedDict,
-    kernel_name: str = "stp_codegen_two_warp_vgroup",
+    warp_id: int,
+    warp_groups: List[tuple],
+    mode: str,
+    scalar_t: str,
+    use_scatter: bool,
+    *,
+    max_i_slots: int = 1,
+    max_j_slots: int = 1,
+    max_k_slots: int = 1,
+    max_groups_per_chunk: int = 1,
+):
+    ap(f"    if (warp == {warp_id}) {{")
+    if not warp_groups:
+        ap("        return;")
+        ap("    }")
+        ap("")
+        return
+
+    v_buckets = OrderedDict()
+    for gk in warp_groups:
+        vv = groups[gk]["v"]
+        if vv not in v_buckets:
+            v_buckets[vv] = []
+        v_buckets[vv].append(gk)
+
+    def build_chunks_for_v(v_groups: List[tuple]):
+        chunks = []
+        cur = []
+        cur_i, cur_j, cur_k = set(), set(), set()
+
+        def flush():
+            nonlocal cur, cur_i, cur_j, cur_k
+            if cur:
+                chunks.append(cur)
+            cur = []
+            cur_i, cur_j, cur_k = set(), set(), set()
+
+        for gk in v_groups:
+            info = groups[gk]
+            ii = info["i"]
+            terms = info["terms"]
+
+            add_i = {ii}
+            add_j = {jj for jj, _, _ in terms}
+            add_k = {kk for _, kk, _ in terms}
+
+            new_i = cur_i | add_i
+            new_j = cur_j | add_j
+            new_k = cur_k | add_k
+
+            if max_groups_per_chunk == 1:
+                over_budget = (
+                    len(cur) >= max_groups_per_chunk
+                    or len(new_i) > max_i_slots
+                )
+            else:
+                over_budget = (
+                    len(cur) >= max_groups_per_chunk
+                    or len(new_i) > max_i_slots
+                    or len(new_j) > max_j_slots
+                    or len(new_k) > max_k_slots
+                )
+
+            if over_budget and cur:
+                flush()
+
+            cur.append(gk)
+            cur_i.add(ii)
+            for jj, kk, _ in terms:
+                cur_j.add(jj)
+                cur_k.add(kk)
+
+        flush()
+        return chunks
+
+    ap("        for (int u = lane; u < U; u += 32) {")
+
+    for vv, v_groups in v_buckets.items():
+        chunks = build_chunks_for_v(v_groups)
+
+        ap(f"            // ---- v = {vv} ----")
+        ap("            {")
+        ap("                scalar_t acc_v = scalar_t(0);")
+        ap("")
+
+        for chunk_id, chunk in enumerate(chunks):
+            uniq_i = []
+            uniq_j = []
+            uniq_k = []
+            seen_i = set()
+            seen_j = set()
+            seen_k = set()
+
+            for gk in chunk:
+                info = groups[gk]
+                ii = info["i"]
+                if ii not in seen_i:
+                    seen_i.add(ii)
+                    uniq_i.append(ii)
+
+                if max_groups_per_chunk != 1:
+                    for jj, kk, _ in info["terms"]:
+                        if jj not in seen_j:
+                            seen_j.add(jj)
+                            uniq_j.append(jj)
+                        if kk not in seen_k:
+                            seen_k.add(kk)
+                            uniq_k.append(kk)
+
+            i2slot = {ii: s for s, ii in enumerate(uniq_i)}
+            j2slot = {jj: s for s, jj in enumerate(uniq_j)}
+            k2slot = {kk: s for s, kk in enumerate(uniq_k)}
+
+            ap(f"                // chunk {chunk_id}")
+            ap("                {")
+
+            for s in range(len(uniq_i)):
+                ap(f"                    scalar_t wi_slot{s} = scalar_t(0);")
+
+            if max_groups_per_chunk != 1:
+                for s in range(len(uniq_j)):
+                    ap(f"                    scalar_t xj_slot{s} = scalar_t(0);")
+                for s in range(len(uniq_k)):
+                    ap(f"                    scalar_t yk_slot{s} = scalar_t(0);")
+
+            ap("")
+
+            for ii in uniq_i:
+                s = i2slot[ii]
+                ap(f"                    wi_slot{s} = w[w_base + (int64_t){ii} * (int64_t)U + u];")
+
+            if max_groups_per_chunk != 1:
+                for jj in uniq_j:
+                    s = j2slot[jj]
+                    ap(f"                    xj_slot{s} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
+                for kk in uniq_k:
+                    s = k2slot[kk]
+                    ap(f"                    yk_slot{s} = {_y_expr(kk, mode)};")
+
+            ap("")
+
+            for local_gid, gk in enumerate(chunk):
+                info = groups[gk]
+                ii = info["i"]
+                wi = i2slot[ii]
+                terms = info["terms"]
+
+                ap(f"                    // group {local_gid}")
+                ap("                    {")
+
+                if max_groups_per_chunk == 1:
+                    ap("                        scalar_t xj_val, yk_val;")
+                    for jj, kk, cc in terms:
+                        ap(f"                        xj_val = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
+                        ap(f"                        yk_val = {_y_expr(kk, mode)};")
+                        expr = f"wi_slot{wi} * xj_val * yk_val"
+                        if abs(cc - 1.0) < 1e-12:
+                            ap(f"                        acc_v += {expr};")
+                        elif abs(cc + 1.0) < 1e-12:
+                            ap(f"                        acc_v -= {expr};")
+                        else:
+                            cstr = _fmt_coeff(cc, scalar_t)
+                            ap(f"                        acc_v += scalar_t({cstr}) * {expr};")
+                else:
+                    for jj, kk, cc in terms:
+                        xj = j2slot[jj]
+                        yk = k2slot[kk]
+                        expr = f"wi_slot{wi} * xj_slot{xj} * yk_slot{yk}"
+                        if abs(cc - 1.0) < 1e-12:
+                            ap(f"                        acc_v += {expr};")
+                        elif abs(cc + 1.0) < 1e-12:
+                            ap(f"                        acc_v -= {expr};")
+                        else:
+                            cstr = _fmt_coeff(cc, scalar_t)
+                            ap(f"                        acc_v += scalar_t({cstr}) * {expr};")
+
+                ap("                    }")
+                ap("")
+
+            ap("                }")
+            ap("")
+
+        if use_scatter:
+            ap(f"                atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], acc_v);")
+        else:
+            ap(f"                out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u] += acc_v;")
+
+        ap("            }")
+        ap("")
+
+    ap("        }")
+    ap("        return;")
+    ap("    }")
+    ap("")
+
+def split_groups_into_one_or_two_warps_by_v(
+    groups: OrderedDict,
+    num_warps: int,
+) -> Tuple[List[tuple], List[tuple]]:
+    """
+    Keep all groups with the same v inside the same warp.
+
+    Returns:
+        warp0_groups, warp1_groups
+    If num_warps == 1, warp1_groups will be empty.
+    """
+    if num_warps == 1:
+        return list(groups.keys()), []
+
+    # bucket groups by v
+    v_buckets = OrderedDict()
+    for gk, info in groups.items():
+        vv = info["v"]
+        if vv not in v_buckets:
+            v_buckets[vv] = []
+        v_buckets[vv].append(gk)
+
+    # cost per v bucket = number of terms in that bucket
+    items = []
+    for vv, gks in v_buckets.items():
+        cost = sum(len(groups[gk]["terms"]) for gk in gks)
+        items.append((vv, cost))
+
+    # greedy load balancing, unit = whole v bucket
+    warp0_v = []
+    warp1_v = []
+    load0 = 0
+    load1 = 0
+
+    for vv, cost in sorted(items, key=lambda x: x[1], reverse=True):
+        if load0 <= load1:
+            warp0_v.append(vv)
+            load0 += cost
+        else:
+            warp1_v.append(vv)
+            load1 += cost
+
+    # restore original v order
+    v_order = list(v_buckets.keys())
+    pos = {vv: i for i, vv in enumerate(v_order)}
+    warp0_v.sort(key=lambda vv: pos[vv])
+    warp1_v.sort(key=lambda vv: pos[vv])
+
+    warp0_groups = []
+    warp1_groups = []
+    for vv in warp0_v:
+        warp0_groups.extend(v_buckets[vv])
+    for vv in warp1_v:
+        warp1_groups.extend(v_buckets[vv])
+
+    return warp0_groups, warp1_groups
+
+
+
+def choose_num_warps(groups):
+    #num_v = len({info["v"] for info in groups.values()})
+    total_terms = sum(len(info["terms"]) for info in groups.values())
+    if total_terms > 64:
+        return 1 # todo fix it 
+    return 1
+
+
+def emit_adaptive_vgroup_forward_kernel(
+    groups: OrderedDict,
+    kernel_name: str = "stp_codegen_adaptive_vgroup",
     scalar_t: str = "float",
-    mode: str = "u,u,,u",
+    mode: str = "u,u,u",
     *,
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
 ) -> str:
-    if mode not in ("u,u,,u", "u,u,u,u"):
+    if mode not in ("u,u,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
-    #warp0_vs, warp1_vs = split_groups_into_two_warps(groups)
-    warp0_groups, warp1_groups = split_groups_into_two_warps_by_v(groups)
+    
+    num_warps = choose_num_warps(groups)
+    warp0_groups, warp1_groups = split_groups_into_one_or_two_warps_by_v(groups, num_warps)
+    threads_per_block = 32 * num_warps
 
     lines: List[str] = []
     ap = lines.append
@@ -430,21 +641,16 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
-
     ap("    int e_local = (int)blockIdx.x;")
-    ap("    int ublk    = (int)blockIdx.y;")
     ap("    if (e_local >= B) return;")
-
+    ap("")
     ap("    int e_orig = b_list ? b_list[e_local] : e_local;")
     ap("    int w_row  = (WB == 1 ? 0 : e_local);")
-
+    ap("")
     ap("    int tid  = (int)threadIdx.x;")
     ap("    int lane = tid & 31;")
     ap("    int warp = tid >> 5;")
-    ap("    if (warp >= 2) return;")
-    ap("")
-    ap("    int u = (ublk << 5) + lane;")
-    ap("    if (u >= U) return;")
+    ap(f"    if (warp >= {num_warps}) return;")
     ap("")
 
     if use_x_src or use_y_src:
@@ -454,14 +660,13 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("")
 
     ap("    int64_t w_base = (int64_t)w_row * (int64_t)Iw * (int64_t)U;")
-    
 
     if use_x_src:
         ap("    int64_t x_base = (int64_t)src * (int64_t)Ix * (int64_t)U;")
     else:
         ap("    int64_t x_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
 
-    if mode == "u,u,u":
+    if mode == 'u,u,u':
         if use_y_src:
             ap("    int64_t y_base = (int64_t)src * (int64_t)Ky;")
         else:
@@ -473,82 +678,18 @@ def emit_two_warp_vgroup_forward_kernel(
             ap("    int64_t y_base = (int64_t)e_local * (int64_t)Ky * (int64_t)U;")
     ap("")
 
-    def emit_warp_body(warp_id: int, warp_groups: List[tuple]):
-        ap(f"    if (warp == {warp_id}) {{")
-        if not warp_groups:
-            ap("        return;")
-            ap("    }")
-            ap("")
-            return
-
-        uniq_i, uniq_j, uniq_k = [], [], []
-        seen_i, seen_j, seen_k = set(), set(), set()
-
-        for gk in warp_groups:
-            info = groups[gk]
-            ii = info["i"]
-            if ii not in seen_i:
-                seen_i.add(ii)
-                uniq_i.append(ii)
-            for jj, kk, _ in info["terms"]:
-                if jj not in seen_j:
-                    seen_j.add(jj)
-                    uniq_j.append(jj)
-                if kk not in seen_k:
-                    seen_k.add(kk)
-                    uniq_k.append(kk)
-
-        ap("        // preload w(i)")
-        for ii in uniq_i:
-            ap(f"        scalar_t wi_{ii} = w[w_base + (int64_t){ii} * (int64_t)U + u];")
-        ap("")
-
-        ap("        // preload x(j)")
-        for jj in uniq_j:
-            ap(f"        scalar_t xj_{jj} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
-        ap("")
-
-        ap("        // preload y(k)")
-        for kk in uniq_k:
-            ap(f"        scalar_t yk_{kk} = {_y_expr(kk, mode)};")
-        ap("")
-
-        ap("        // per-group accumulation")
-        for idx, gk in enumerate(warp_groups):
-            info = groups[gk]
-            vv = info["v"]
-            ii = info["i"]
-            terms = info["terms"]
-
-            ap(f"        scalar_t sum_g_{warp_id}_{idx} = scalar_t(0);")
-            for jj, kk, cc in terms:
-                if abs(cc - 1.0) < 1e-12:
-                    ap(f"        sum_g_{warp_id}_{idx} += wi_{ii} * xj_{jj} * yk_{kk};")
-                elif abs(cc + 1.0) < 1e-12:
-                    ap(f"        sum_g_{warp_id}_{idx} -= wi_{ii} * xj_{jj} * yk_{kk};")
-                else:
-                    cstr = _fmt_coeff(cc, scalar_t)
-                    ap(f"        sum_g_{warp_id}_{idx} += scalar_t({cstr}) * wi_{ii} * xj_{jj} * yk_{kk};")
-            ap("")
-
-        ap("        // writeback")
-        for idx, gk in enumerate(warp_groups):
-            vv = groups[gk]["v"]
-            if use_scatter:
-                ap(f"        atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], sum_g_{warp_id}_{idx});")
-            else:
-                #ap(f"        atomicAdd(&out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], sum_g_{warp_id}_{idx});")
-                ap(f"        out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u] += sum_g_{warp_id}_{idx};")
-        ap("    }")
-        ap("")
-
-    #emit_warp_body(0, warp0_vs)
-    #emit_warp_body(1, warp1_vs)
-    emit_warp_body(0, warp0_groups)
-    emit_warp_body(1, warp1_groups)
+    
+    emit_warp_body_lowreg(
+        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter,
+    )
+    if num_warps == 2:
+        emit_warp_body_lowreg(
+            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter,
+        )
 
     ap("}")
     ap("")
+
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* w,")
@@ -561,14 +702,16 @@ def emit_two_warp_vgroup_forward_kernel(
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    cudaStream_t stream)")
     ap("{")
-    ap("    dim3 block(64);")
-    ap("    dim3 grid(B, (U + 31) / 32);")
+    ap(f"    dim3 block({threads_per_block});")
+    ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
     ap("        w, x_all, y, out, src_idx, dst_idx, b_list,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
+    ap("")
 
-    return "\n".join(lines)
+    return '\n'.join(lines)
+
 
 
 def generate_code_uniform1d_fwd(
@@ -645,10 +788,10 @@ def generate_code_uniform1d_fwd(
     groups = build_vi_groups(i2, j2, k2, v2, c2)
 
     num_v = len({info["v"] for info in groups.values()})
-    print(f"build_vi_groups lens:{len(groups)}, num_v:{num_v}")
+    total_terms = sum(len(info["terms"]) for info in groups.values())
+    print(f"build_vi_groups lens:{len(groups)}, num_v:{num_v}, total_terms:{total_terms}")
     
-    
-    code = emit_two_warp_vgroup_forward_kernel(
+    code = emit_adaptive_vgroup_forward_kernel(
         groups,
         kernel_name=kernel_name,
         scalar_t=scalar_t,
@@ -665,14 +808,11 @@ def generate_code_uniform1d_fwd(
         use_y_src=use_y_src,
         use_scatter=use_scatter,
     )
-
-    warp0_groups, warp1_groups = split_groups_into_two_warps(groups)
+    
     stats = {
         "num_paths": int(P),
         "num_groups": int(len(groups)),
         "group_keys": list(groups.keys()),
-        "warp0_groups": warp0_groups,
-        "warp1_groups": warp1_groups,
         "out_path": str(out_path),
         "mode": mode,
         "use_x_src": use_x_src,
