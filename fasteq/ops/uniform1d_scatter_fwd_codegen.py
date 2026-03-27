@@ -584,7 +584,7 @@ def emit_two_warp_vgroup_forward_kernel(
 
     return "\n".join(lines)
 
-def generate_code_uniform1d_fwd(
+def generate_code_scatter_uniform1d_fwd(
     i_list: torch.Tensor,
     j_list: torch.Tensor,
     k_list: torch.Tensor,

@@ -9,12 +9,12 @@ import torch
 import torch._dynamo
 from torch.utils.cpp_extension import load
 
-#from .uniform1d_scatter_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_bwd_codegen import generate_code_uniform1d_bwd_fused
 from .uniform1d_scatter_bwd_codegen import (
     emit_backward_cuda_from_schedule,
     build_backward_schedule_from_lists,
+    summarize_backward_schedule,
     generate_full_uniform1d_bwd_split_cuda,
     #generate_code_uniform1d_bwd,
 )
@@ -243,6 +243,8 @@ def _build_fwd_jit_module(
         dtype_str=dtype_str,
     )
 
+    # enable tileU for Sevennet
+    # disable tileU for Allegro
     codegen_fn = lambda: generate_code_uniform1d_fwd(
         i_list=i_list,
         j_list=j_list,
@@ -253,6 +255,7 @@ def _build_fwd_jit_module(
         output_indices=output_indices,
         u_dim=u_dim,
         mode=mode,
+        tileU=False,
     )
     
 
@@ -310,7 +313,7 @@ def _build_bwd_jit_module(
                 bundle_name=f"uniform1d_split_u{u_dim}_path{P}_bwd",
             )
         else:
-            """ return generate_code_uniform1d_bwd_fused(
+            return generate_code_uniform1d_bwd_fused(
                     i_list=i_list,
                     j_list=j_list,
                     k_list=k_list,
@@ -320,8 +323,9 @@ def _build_bwd_jit_module(
                     output_indices=output_indices,
                     u_dim=u_dim,
                     mode=mode,
-                ) """
-            sched = build_backward_schedule_from_lists(
+                )
+                
+            """ sched = build_backward_schedule_from_lists(
                 i_list=i_cpu,
                 j_list=j_cpu,
                 k_list=k_cpu,
@@ -329,11 +333,12 @@ def _build_bwd_jit_module(
                 coeff_list=coeff_cpu,
                 U_dim=u_dim,
             )
+            print(summarize_backward_schedule(sched))
             return emit_backward_cuda_from_schedule(
                 sched,
                 kernel_name=f"uniform1d_fused_u{u_dim}_path{P}_bwd",
                 scalar_t=dtype_str,
-            )
+            ) """
     
 
     return _build_jit_module_common(

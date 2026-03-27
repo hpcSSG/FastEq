@@ -189,6 +189,32 @@ def build_vi_groups(
         groups[key]["terms"].append((jj, kk, cc))
     return groups
 
+def build_v_groups(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+):
+    """
+    输入已排序的 tensor，按 v 分组。
+    """
+    i_py = _to_int_list(i_list)
+    j_py = _to_int_list(j_list)
+    k_py = _to_int_list(k_list)
+    v_py = _to_int_list(v_list)
+    c_py = _to_float_list(coeff_list)
+
+    groups = OrderedDict()
+    for ii, jj, kk, vv, cc in zip(i_py, j_py, k_py, v_py, c_py):
+        if vv not in groups:
+            groups[vv] = {"i": ii, "terms": []}
+        else:
+            if groups[vv]["i"] != ii:
+                raise ValueError(f"same v={vv} maps to different i: {groups[vv]['i']} vs {ii}")
+        groups[vv]["terms"].append((jj, kk, cc))
+    return groups
+
 
 def emit_launcher(
     bundle_name: str,
@@ -533,7 +559,276 @@ def emit_warp_body_lowreg(
     ap("    }")
     ap("")
 
-def split_groups_into_one_or_two_warps_by_v(
+
+from collections import OrderedDict
+from typing import List
+
+
+def emit_warp_body_lowreg_unroll_u(
+    ap,
+    groups: OrderedDict,
+    warp_id: int,
+    warp_groups: List[tuple],
+    mode: str,
+    scalar_t: str,
+    use_scatter: bool,
+    u_dim: int, 
+    *,
+    max_i_slots: int = 1,
+    max_j_slots: int = 1,
+    max_k_slots: int = 1,
+    max_groups_per_chunk: int = 1,
+):
+    """
+    Fully unroll:
+        for (int u = lane; u < U; u += 32)
+    into:
+        { const int u = lane;      ... }
+        { const int u = lane + 32; ... }
+        { const int u = lane + 64; ... }
+        ...
+    Requires U (= u_dim) to be known at codegen time.
+    """
+
+    if u_dim <= 0:
+        raise ValueError(f"u_dim must be positive, got {u_dim}")
+
+    ap(f"    if (warp == {warp_id}) {{")
+    if not warp_groups:
+        ap("        return;")
+        ap("    }")
+        ap("")
+        return
+
+    # ------------------------------------------------------------------
+    # bucket groups by v
+    # ------------------------------------------------------------------
+    v_buckets = OrderedDict()
+    for gk in warp_groups:
+        vv = groups[gk]["v"]
+        if vv not in v_buckets:
+            v_buckets[vv] = []
+        v_buckets[vv].append(gk)
+
+    # ------------------------------------------------------------------
+    # chunk builder
+    # ------------------------------------------------------------------
+    def build_chunks_for_v(v_groups: List[tuple]):
+        chunks = []
+        cur = []
+        cur_i, cur_j, cur_k = set(), set(), set()
+
+        def flush():
+            nonlocal cur, cur_i, cur_j, cur_k
+            if cur:
+                chunks.append(cur)
+            cur = []
+            cur_i, cur_j, cur_k = set(), set(), set()
+
+        for gk in v_groups:
+            info = groups[gk]
+            ii = info["i"]
+            terms = info["terms"]
+
+            add_i = {ii}
+            add_j = {jj for jj, _, _ in terms}
+            add_k = {kk for _, kk, _ in terms}
+
+            new_i = cur_i | add_i
+            new_j = cur_j | add_j
+            new_k = cur_k | add_k
+
+            if max_groups_per_chunk == 1:
+                over_budget = (
+                    len(cur) >= max_groups_per_chunk
+                    or len(new_i) > max_i_slots
+                )
+            else:
+                over_budget = (
+                    len(cur) >= max_groups_per_chunk
+                    or len(new_i) > max_i_slots
+                    or len(new_j) > max_j_slots
+                    or len(new_k) > max_k_slots
+                )
+
+            if over_budget and cur:
+                flush()
+
+            cur.append(gk)
+            cur_i.add(ii)
+            for jj, kk, _ in terms:
+                cur_j.add(jj)
+                cur_k.add(kk)
+
+        flush()
+        return chunks
+
+    # ------------------------------------------------------------------
+    # emit one fixed-u body
+    # ------------------------------------------------------------------
+    def emit_one_u_body(u_expr: str, u_guard: bool):
+        ap("        {")
+        ap(f"            const int u = {u_expr};")
+        if u_guard:
+            ap("            if (u < U) {")
+            inner = "                "
+        else:
+            inner = "            "
+
+        for vv, v_groups in v_buckets.items():
+            chunks = build_chunks_for_v(v_groups)
+
+            ap(f"{inner}// ---- v = {vv} ----")
+            ap(f"{inner}{{")
+            ap(f"{inner}    scalar_t acc_v = scalar_t(0);")
+            ap("")
+
+            for chunk_id, chunk in enumerate(chunks):
+                uniq_i = []
+                uniq_j = []
+                uniq_k = []
+                seen_i = set()
+                seen_j = set()
+                seen_k = set()
+
+                for gk in chunk:
+                    info = groups[gk]
+                    ii = info["i"]
+                    if ii not in seen_i:
+                        seen_i.add(ii)
+                        uniq_i.append(ii)
+
+                    if max_groups_per_chunk != 1:
+                        for jj, kk, _ in info["terms"]:
+                            if jj not in seen_j:
+                                seen_j.add(jj)
+                                uniq_j.append(jj)
+                            if kk not in seen_k:
+                                seen_k.add(kk)
+                                uniq_k.append(kk)
+
+                i2slot = {ii: s for s, ii in enumerate(uniq_i)}
+                j2slot = {jj: s for s, jj in enumerate(uniq_j)}
+                k2slot = {kk: s for s, kk in enumerate(uniq_k)}
+
+                ap(f"{inner}    // chunk {chunk_id}")
+                ap(f"{inner}    {{")
+
+                for s in range(len(uniq_i)):
+                    ap(f"{inner}        scalar_t wi_slot{s} = scalar_t(0);")
+
+                if max_groups_per_chunk != 1:
+                    for s in range(len(uniq_j)):
+                        ap(f"{inner}        scalar_t xj_slot{s} = scalar_t(0);")
+                    for s in range(len(uniq_k)):
+                        ap(f"{inner}        scalar_t yk_slot{s} = scalar_t(0);")
+
+                ap("")
+
+                for ii in uniq_i:
+                    s = i2slot[ii]
+                    ap(
+                        f"{inner}        wi_slot{s} = "
+                        f"w[w_base + (int64_t){ii} * (int64_t)U + u];"
+                    )
+
+                if max_groups_per_chunk != 1:
+                    for jj in uniq_j:
+                        s = j2slot[jj]
+                        ap(
+                            f"{inner}        xj_slot{s} = "
+                            f"x_all[x_base + (int64_t){jj} * (int64_t)U + u];"
+                        )
+                    for kk in uniq_k:
+                        s = k2slot[kk]
+                        ap(f"{inner}        yk_slot{s} = {_y_expr(kk, mode)};")
+
+                ap("")
+
+                for local_gid, gk in enumerate(chunk):
+                    info = groups[gk]
+                    ii = info["i"]
+                    wi = i2slot[ii]
+                    terms = info["terms"]
+
+                    ap(f"{inner}        // group {local_gid}")
+                    ap(f"{inner}        {{")
+
+                    if max_groups_per_chunk == 1:
+                        ap(f"{inner}            scalar_t xj_val, yk_val;")
+                        for jj, kk, cc in terms:
+                            ap(
+                                f"{inner}            xj_val = "
+                                f"x_all[x_base + (int64_t){jj} * (int64_t)U + u];"
+                            )
+                            ap(f"{inner}            yk_val = {_y_expr(kk, mode)};")
+
+                            expr = f"wi_slot{wi} * xj_val * yk_val"
+                            if abs(cc - 1.0) < 1e-12:
+                                ap(f"{inner}            acc_v += {expr};")
+                            elif abs(cc + 1.0) < 1e-12:
+                                ap(f"{inner}            acc_v -= {expr};")
+                            else:
+                                cstr = _fmt_coeff(cc, scalar_t)
+                                ap(f"{inner}            acc_v += scalar_t({cstr}) * {expr};")
+                    else:
+                        for jj, kk, cc in terms:
+                            xj = j2slot[jj]
+                            yk = k2slot[kk]
+                            expr = f"wi_slot{wi} * xj_slot{xj} * yk_slot{yk}"
+                            if abs(cc - 1.0) < 1e-12:
+                                ap(f"{inner}            acc_v += {expr};")
+                            elif abs(cc + 1.0) < 1e-12:
+                                ap(f"{inner}            acc_v -= {expr};")
+                            else:
+                                cstr = _fmt_coeff(cc, scalar_t)
+                                ap(f"{inner}            acc_v += scalar_t({cstr}) * {expr};")
+
+                    ap(f"{inner}        }}")
+                    ap("")
+
+                ap(f"{inner}    }}")
+                ap("")
+
+            if use_scatter:
+                ap(
+                    f"{inner}    atomicAdd("
+                    f"&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], "
+                    f"acc_v);"
+                )
+            else:
+                ap(
+                    f"{inner}    out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * "
+                    f"(int64_t)U + u] += acc_v;"
+                )
+
+            ap(f"{inner}}}")
+            ap("")
+
+        if u_guard:
+            ap("            }")
+        ap("        }")
+        ap("")
+
+    # ------------------------------------------------------------------
+    # fully unroll u-loop at codegen time
+    # ------------------------------------------------------------------
+    num_tiles = (u_dim + 31) // 32
+    for t in range(num_tiles):
+        u0 = 32 * t
+        if u0 + 31 < u_dim:
+            # full tile: no guard needed
+            emit_one_u_body(f"lane + {u0}" if u0 != 0 else "lane", u_guard=False)
+        else:
+            # tail tile
+            emit_one_u_body(f"lane + {u0}" if u0 != 0 else "lane", u_guard=True)
+
+    ap("        return;")
+    ap("    }")
+    ap("")
+
+
+def split_groups_into_one_or_two_warps_by_vi(
     groups: OrderedDict,
     num_warps: int,
 ) -> Tuple[List[tuple], List[tuple]]:
@@ -591,12 +886,11 @@ def split_groups_into_one_or_two_warps_by_v(
     return warp0_groups, warp1_groups
 
 
-
 def choose_num_warps(groups):
     #num_v = len({info["v"] for info in groups.values()})
     total_terms = sum(len(info["terms"]) for info in groups.values())
-    if total_terms > 64:
-        return 1 # todo fix it 
+    if total_terms > 128: # total_times == path number
+        return 2
     return 1
 
 
@@ -605,6 +899,7 @@ def emit_adaptive_vgroup_forward_kernel(
     kernel_name: str = "stp_codegen_adaptive_vgroup",
     scalar_t: str = "float",
     mode: str = "u,u,,u",
+    u_dim: int = 32,
     *,
     use_x_src: bool,
     use_y_src: bool,
@@ -613,8 +908,9 @@ def emit_adaptive_vgroup_forward_kernel(
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
-    num_warps = choose_num_warps(groups)
-    warp0_groups, warp1_groups = split_groups_into_one_or_two_warps_by_v(groups, num_warps)
+    #num_warps = choose_num_warps(groups)
+    num_warps = 1
+    warp0_groups, warp1_groups = split_groups_into_one_or_two_warps_by_vi(groups, num_warps)
     threads_per_block = 32 * num_warps
 
     lines: List[str] = []
@@ -680,12 +976,12 @@ def emit_adaptive_vgroup_forward_kernel(
     ap("")
 
     
-    emit_warp_body_lowreg(
-        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter,
+    emit_warp_body_lowreg_unroll_u(
+        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter, u_dim
     )
     if num_warps == 2:
-        emit_warp_body_lowreg(
-            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter,
+        emit_warp_body_lowreg_unroll_u(
+            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter, u_dim
         )
 
     ap("}")
@@ -713,8 +1009,6 @@ def emit_adaptive_vgroup_forward_kernel(
 
     return '\n'.join(lines)
 
-
-
 def generate_code_uniform1d_fwd(
     i_list: torch.Tensor,
     j_list: torch.Tensor,
@@ -729,6 +1023,7 @@ def generate_code_uniform1d_fwd(
     kernel_name: str = "stp_codegen_two_warp_vgroup",
     scalar_t: str = "float",
     reorder_groups: bool = True,
+    tileU: bool = False,
 ):
     """
     input_indices:
@@ -787,16 +1082,14 @@ def generate_code_uniform1d_fwd(
         c2 = torch.tensor([x[4] for x in reordered], device=device, dtype=coeff_list.dtype)
 
     groups = build_vi_groups(i2, j2, k2, v2, c2)
-
-    num_v = len({info["v"] for info in groups.values()})
-    total_terms = sum(len(info["terms"]) for info in groups.values())
-    print(f"build_vi_groups lens:{len(groups)}, num_v:{num_v}, total_terms:{total_terms}")
+    
     
     code = emit_adaptive_vgroup_forward_kernel(
         groups,
         kernel_name=kernel_name,
         scalar_t=scalar_t,
         mode=mode,
+        u_dim=u_dim,
         use_x_src=use_x_src,
         use_y_src=use_y_src,
         use_scatter=use_scatter,
