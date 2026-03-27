@@ -976,12 +976,19 @@ def emit_adaptive_vgroup_forward_kernel(
     ap("")
 
     
-    emit_warp_body_lowreg_unroll_u(
+    """ emit_warp_body_lowreg_unroll_u(
         ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter, u_dim
     )
     if num_warps == 2:
         emit_warp_body_lowreg_unroll_u(
             ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter, u_dim
+        ) """
+    emit_warp_body_lowreg(
+        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter
+    )
+    if num_warps == 2:
+        emit_warp_body_lowreg(
+            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter
         )
 
     ap("}")

@@ -12,11 +12,10 @@ from torch.utils.cpp_extension import load
 from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_bwd_codegen import generate_code_uniform1d_bwd_fused
 from .uniform1d_scatter_bwd_codegen import (
-    emit_backward_cuda_from_schedule,
-    build_backward_schedule_from_lists,
-    summarize_backward_schedule,
+    #emit_backward_cuda_from_schedule,
+    #build_backward_schedule_from_lists,
+    #summarize_backward_schedule,
     generate_full_uniform1d_bwd_split_cuda,
-    #generate_code_uniform1d_bwd,
 )
 
 # -----------------------------------------------------------------------------
@@ -278,6 +277,7 @@ def _build_bwd_jit_module(
     u_dim: int,
     mode: str,
     dtype_str: str,
+    grad_w: bool,
 ):
     # Convert tensors to CPU-side Python lists for hashing and code generation.
     i_cpu = _tensor_to_cpu_list(i_list)
@@ -323,6 +323,7 @@ def _build_bwd_jit_module(
                     output_indices=output_indices,
                     u_dim=u_dim,
                     mode=mode,
+                    grad_w=grad_w,
                 )
                 
             """ sched = build_backward_schedule_from_lists(
@@ -429,6 +430,7 @@ def _run_bwd(
     out_seg_num,
     u_dim,
     mode,
+    grad_w,
 ):
 
     """ dtype_str = _get_scalar_t_str(w)
@@ -461,6 +463,7 @@ def _run_bwd(
         output_indices=output_indices,
         dtype_str=dtype_str,
         mode=mode,
+        grad_w=grad_w,
     )
 
     use_x_src = 1 in input_indices
@@ -592,27 +595,52 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000.0
 
-        grad_w, grad_x, grad_y = _run_bwd(
-            grad_out=grad_out,
-            w=w,
-            x=x,
-            y=y,
-            i_list=ctx.i_list,
-            j_list=ctx.j_list,
-            k_list=ctx.k_list,
-            v_list=ctx.v_list,
-            coeff_list=ctx.coeff_list,
-            input_indices=ctx.input_indices,
-            output_indices=ctx.output_indices,
-            b_list=ctx.b_list,
-            out_seg_num=ctx.out_seg_num,
-            u_dim=ctx.u_dim,
-            mode=ctx.mode,
-        )
+        if w.requires_grad:
+            grad_w, grad_x, grad_y = _run_bwd(
+                grad_out=grad_out,
+                w=w,
+                x=x,
+                y=y,
+                i_list=ctx.i_list,
+                j_list=ctx.j_list,
+                k_list=ctx.k_list,
+                v_list=ctx.v_list,
+                coeff_list=ctx.coeff_list,
+                input_indices=ctx.input_indices,
+                output_indices=ctx.output_indices,
+                b_list=ctx.b_list,
+                out_seg_num=ctx.out_seg_num,
+                u_dim=ctx.u_dim,
+                mode=ctx.mode,
+                grad_w=w.requires_grad,
+            )
 
-        grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.w_irreps)
-        grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
-        grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
+            grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.w_irreps)
+            grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
+            grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
+        else:
+            grad_x, grad_y = _run_bwd(
+                grad_out=grad_out,
+                w=w,
+                x=x,
+                y=y,
+                i_list=ctx.i_list,
+                j_list=ctx.j_list,
+                k_list=ctx.k_list,
+                v_list=ctx.v_list,
+                coeff_list=ctx.coeff_list,
+                input_indices=ctx.input_indices,
+                output_indices=ctx.output_indices,
+                b_list=ctx.b_list,
+                out_seg_num=ctx.out_seg_num,
+                u_dim=ctx.u_dim,
+                mode=ctx.mode,
+                grad_w=w.requires_grad,
+            )
+
+            grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
+            grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
+            grad_w = None
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0

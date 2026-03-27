@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from collections import defaultdict, OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 import math
@@ -459,8 +460,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
 {dst_numel_check}
 
 {blist_logic}
-
-    auto grad_w = torch::zeros_like(w);
     auto grad_x = torch::zeros_like(x_all);
 {gy_alloc}
 
@@ -494,6 +493,146 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &launcher_{bundle_name}, "{bundle_name} backward fused jit impl");
 }}
 '''
+
+def emit_fused_bwd_launcher_no_gradw(
+    bundle_name: str,
+    mode: str,
+    *,
+    use_x_src: bool,
+    use_y_src: bool,
+    use_scatter: bool,
+) -> str:
+    if mode == "u,u,,u":
+        y_comment = "[B,Ky,1] or [S,Ky,1]"
+        gy_alloc = '    auto grad_y = torch::zeros({y.size(0), Ky, 1}, y.options());'
+        y_check_u = 'TORCH_CHECK((int)y.size(2) == 1, "y.size(2) must be 1 for mode u,u,,u");'
+    elif mode == "u,u,u,u":
+        y_comment = "[B,Ky,U] or [S,Ky,U]"
+        gy_alloc = '    auto grad_y = torch::zeros_like(y);'
+        y_check_u = 'TORCH_CHECK((int)y.size(2) == U, "y.size(2) must equal U for mode u,u,u,u");'
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    src_decl = '    torch::Tensor src_idx,    // [?] int32\n' if (use_x_src or use_y_src) else ""
+    dst_decl = '    torch::Tensor dst_idx,    // [?] int32\n' if use_scatter else ""
+    blist_decl = '    torch::Tensor b_list,    // [B] int32 optional\n' if use_scatter else ""
+
+    src_check = ""
+    if use_x_src or use_y_src:
+        src_check = r'''
+    TORCH_CHECK(src_idx.is_cuda(), "src_idx must be CUDA");
+    TORCH_CHECK(src_idx.scalar_type() == torch::kInt32, "src_idx must be int32");
+'''
+
+    dst_check = ""
+    if use_scatter:
+        dst_check = r'''
+    TORCH_CHECK(dst_idx.is_cuda(), "dst_idx must be CUDA");
+    TORCH_CHECK(dst_idx.scalar_type() == torch::kInt32, "dst_idx must be int32");
+'''
+
+    if use_x_src or use_y_src:
+        B_expr = "(int)src_idx.size(0)"
+        src_numel_check = '    TORCH_CHECK(src_idx.numel() >= B, "src_idx numel must be >= B");'
+    elif use_scatter:
+        B_expr = "(int)dst_idx.size(0)"
+        src_numel_check = ""
+    else:
+        B_expr = "(int)grad_out.size(0)"
+        src_numel_check = ""
+
+    dst_numel_check = '    TORCH_CHECK(dst_idx.numel() >= B, "dst_idx numel must be >= B");' if use_scatter else ""
+
+    blist_logic = ""
+    if use_scatter:
+        blist_logic = r'''
+    const int32_t* b_list_ptr = nullptr;
+    if (b_list.defined() && b_list.numel() > 0) {
+        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA");
+        TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
+        TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
+        b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
+    }
+'''
+    else:
+        blist_logic = '    const int32_t* b_list_ptr = nullptr;\n'
+
+    launch_src_arg = '(const int32_t*)src_idx.data_ptr<int32_t>(),' if (use_x_src or use_y_src) else 'nullptr,'
+    launch_dst_arg = '(const int32_t*)dst_idx.data_ptr<int32_t>(),' if use_scatter else 'nullptr,'
+
+    return rf'''
+
+std::vector<torch::Tensor> launcher_{bundle_name}(
+    torch::Tensor w,           // [WB,Iw,U]
+    torch::Tensor x_all,       // [S,Ix,U]
+    torch::Tensor y,           // {y_comment}
+    torch::Tensor grad_out,    // [B,V,U] or [S,V,U]
+{src_decl}{dst_decl}{blist_decl}    int64_t V64)
+{{
+    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
+                "w/x_all/y/grad_out must be CUDA");
+    TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
+                "w/x_all/y/grad_out must be contiguous");
+{src_check}{dst_check}
+    TORCH_CHECK(w.dim() == 3, "w must be [WB,Iw,U]");
+    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(y.dim() == 3, "y must be 3D");
+    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be 3D");
+
+    int B  = {B_expr};
+    int WB = (int)w.size(0);
+    int Iw = (int)w.size(1);
+    int U  = (int)w.size(2);
+
+    int S  = (int)x_all.size(0);
+    int Ix = (int)x_all.size(1);
+    int Ky = (int)y.size(1);
+    int V  = (int)V64;
+
+    TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
+                "w.size(0) must be 1 or B");
+    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    {y_check_u}
+    TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
+    TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+{src_numel_check}
+{dst_numel_check}
+
+{blist_logic}
+    auto grad_x = torch::zeros_like(x_all);
+{gy_alloc}
+
+    c10::cuda::CUDAGuard device_guard(w.device());
+    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
+        TORCH_CHECK(x_all.scalar_type() == w.scalar_type(), "x_all dtype must match w");
+        TORCH_CHECK(y.scalar_type() == w.scalar_type(), "y dtype must match w");
+        TORCH_CHECK(grad_out.scalar_type() == w.scalar_type(), "grad_out dtype must match w");
+
+        launch_{bundle_name}<scalar_t>(
+            (const scalar_t*)w.data_ptr<scalar_t>(),
+            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)y.data_ptr<scalar_t>(),
+            (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+            (scalar_t*)grad_x.data_ptr<scalar_t>(),
+            (scalar_t*)grad_y.data_ptr<scalar_t>(),
+            {launch_src_arg}
+            {launch_dst_arg}
+            b_list_ptr,
+            B, WB, Iw, Ix, Ky, V, U, S, stream);
+    }});
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {{grad_x, grad_y}};
+}}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{bundle_name}, "{bundle_name} backward fused jit impl (no grad_w)");
+}}
+'''
+
 
 
 # ============================================================
@@ -1310,6 +1449,278 @@ def emit_fused_bwd_kernel_from_schedule(
     return '\n'.join(lines)
 
 
+def emit_fused_bwd_kernel_from_schedule_no_gradw(
+    schedule: Dict[str, Any],
+    *,
+    kernel_name: str,
+    scalar_t: str,
+    mode: str,
+    use_x_src: bool,
+    use_y_src: bool,
+    use_scatter: bool,
+) -> str:
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    write_modes = schedule["write_modes"]
+    launch_style = schedule["launch_style"]
+    u_traversal = schedule["u_traversal"]
+    u_loop_step = schedule["u_loop_step"]
+    block_size = int(schedule["block_size"])
+    u_tile = int(schedule.get("u_tile", 32))
+
+    if block_size != 32:
+        raise ValueError(f"Only block_size=32 is supported here, got {block_size}")
+    if launch_style not in ("persistent_u_inner_loop", "grid_y_tiled_u"):
+        raise ValueError(f"Unsupported launch_style: {launch_style}")
+    if u_traversal not in ("inner_loop", "grid_y"):
+        raise ValueError(f"Unsupported u_traversal: {u_traversal}")
+    if write_modes["grad_y"] not in ("warp_reduce_then_atomic", "warp_reduce_then_block_merge_then_atomic"):
+        raise NotImplementedError(f"Unsupported grad_y mode: {write_modes['grad_y']}")
+
+    ordered_i = [int(x) for x in schedule["ordered_symbols"]["i"]]
+    ordered_j = [int(x) for x in schedule["ordered_symbols"]["j"]]
+    ordered_k = [int(x) for x in schedule["ordered_symbols"]["k"]]
+
+    v_tiles = schedule["tiling"]["v_tiles"]
+    j_tiles = schedule["tiling"]["j_tiles"]
+    k_tiles = schedule["tiling"]["k_tiles"]
+
+    grad_x_groups = schedule["groups"]["grad_x"]
+    grad_y_groups = schedule["groups"]["grad_y"]
+
+    key_is_str_gx = len(grad_x_groups) > 0 and isinstance(next(iter(grad_x_groups.keys())), str)
+    key_is_str_gy = len(grad_y_groups) > 0 and isinstance(next(iter(grad_y_groups.keys())), str)
+
+    def _gx_entries(jj: int):
+        return grad_x_groups[str(jj)] if key_is_str_gx else grad_x_groups[jj]
+
+    def _gy_entries(kk: int):
+        return grad_y_groups[str(kk)] if key_is_str_gy else grad_y_groups[kk]
+
+    lines: List[str] = []
+    ap = lines.append
+
+    ap("#include <stdint.h>")
+    ap("#include <cuda.h>")
+    ap("#include <cuda_runtime.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <ATen/cuda/CUDAContext.h>")
+    ap("#include <c10/cuda/CUDAGuard.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap('#include "cuda_utils.hpp"')
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x_all,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    const scalar_t* __restrict__ grad_out,")
+    ap("    scalar_t* __restrict__ grad_x,")
+    ap("    scalar_t* __restrict__ grad_y,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("")
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+
+    if use_x_src or use_y_src:
+        ap("    const int src = src_idx[e_orig];")
+    if use_scatter:
+        ap("    const int dst = dst_idx[e_orig];")
+
+    ap("    const int64_t w_base  = (int64_t)w_row * (int64_t)Iw * (int64_t)U;")
+
+    if use_x_src:
+        ap("    const int64_t x_base  = (int64_t)src * (int64_t)Ix * (int64_t)U;")
+        ap("    const int64_t gx_base = (int64_t)src * (int64_t)Ix * (int64_t)U;")
+    else:
+        ap("    const int64_t x_base  = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
+        ap("    const int64_t gx_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
+
+    if mode == "u,u,,u":
+        if use_y_src:
+            ap("    const int64_t y_base  = (int64_t)src * (int64_t)Ky;")
+            ap("    const int64_t gy_base = (int64_t)src * (int64_t)Ky;")
+        else:
+            ap("    const int64_t y_base  = (int64_t)e_orig * (int64_t)Ky;")
+            ap("    const int64_t gy_base = (int64_t)e_orig * (int64_t)Ky;")
+    else:
+        if use_y_src:
+            ap("    const int64_t y_base  = (int64_t)src * (int64_t)Ky * (int64_t)U;")
+            ap("    const int64_t gy_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
+        else:
+            ap("    const int64_t y_base  = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
+            ap("    const int64_t gy_base = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
+
+    if use_scatter:
+        ap("    const int64_t go_base = (int64_t)dst * (int64_t)V * (int64_t)U;")
+    else:
+        ap("    const int64_t go_base = (int64_t)e_local * (int64_t)V * (int64_t)U;")
+    ap("")
+
+    def emit_one_u_body(indent: str, u_expr: str):
+        ap(f"{indent}{{")
+        ap(f"{indent}    int u = {u_expr};")
+        ap(f"{indent}    if (u < U) {{")
+
+        ap(f"{indent}        // preload wi(i,u) for grad_y")
+        for ii in ordered_i:
+            ap(f"{indent}        scalar_t wi_{ii} = w[w_base + (int64_t){ii} * (int64_t)U + u];")
+        ap("")
+
+        ap(f"{indent}        // preload xj(j,u)")
+        for jj in ordered_j:
+            ap(f"{indent}        scalar_t xj_{jj} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
+        ap("")
+
+        if mode == "u,u,,u":
+            ap(f"{indent}        // preload scalar yk(k)")
+            for kk in ordered_k:
+                ap(f"{indent}        scalar_t yk_{kk} = y[y_base + (int64_t){kk}];")
+            ap("")
+
+        ap(f"{indent}        // init accumulators")
+        for jj in ordered_j:
+            ap(f"{indent}        scalar_t gx_acc_j_{jj} = scalar_t(0);")
+        for kk in ordered_k:
+            ap(f"{indent}        scalar_t gy_acc_k_{kk} = scalar_t(0);")
+        ap("")
+
+        for tile_id, vtile in enumerate(v_tiles):
+            ap(f"{indent}        // ---- v tile {tile_id}: {vtile} ----")
+            for vv in vtile:
+                ap(f"{indent}        scalar_t go_v_{vv} = grad_out[go_base + (int64_t){vv} * (int64_t)U + u];")
+            ap("")
+
+            for j_tile_id, jtile in enumerate(j_tiles):
+                ap(f"{indent}        // grad_x j-tile {j_tile_id}")
+                for jj in jtile:
+                    for entry in _gx_entries(jj):
+                        vv = int(entry['v'])
+                        if vv not in vtile:
+                            continue
+                        ii = int(entry['i'])
+                        kk = int(entry['k'])
+                        cc = float(entry['c'])
+                        yexpr = (
+                            f"(y[y_base + (int64_t){kk} * (int64_t)U + u])"
+                            if mode == "u,u,u,u"
+                            else f"yk_{kk}"
+                        )
+                        if abs(cc - 1.0) < 1e-12:
+                            ap(f"{indent}        gx_acc_j_{jj} += wi_{ii} * {yexpr} * go_v_{vv};")
+                        elif abs(cc + 1.0) < 1e-12:
+                            ap(f"{indent}        gx_acc_j_{jj} -= wi_{ii} * {yexpr} * go_v_{vv};")
+                        else:
+                            ap(f"{indent}        gx_acc_j_{jj} += scalar_t({cc}) * wi_{ii} * {yexpr} * go_v_{vv};")
+                ap("")
+
+            for k_tile_id, ktile in enumerate(k_tiles):
+                ap(f"{indent}        // grad_y k-tile {k_tile_id}")
+                for kk in ktile:
+                    for entry in _gy_entries(kk):
+                        vv = int(entry['v'])
+                        if vv not in vtile:
+                            continue
+                        ii = int(entry['i'])
+                        jj = int(entry['j'])
+                        cc = float(entry['c'])
+                        if abs(cc - 1.0) < 1e-12:
+                            ap(f"{indent}        gy_acc_k_{kk} += wi_{ii} * xj_{jj} * go_v_{vv};")
+                        elif abs(cc + 1.0) < 1e-12:
+                            ap(f"{indent}        gy_acc_k_{kk} -= wi_{ii} * xj_{jj} * go_v_{vv};")
+                        else:
+                            ap(f"{indent}        gy_acc_k_{kk} += scalar_t({cc}) * wi_{ii} * xj_{jj} * go_v_{vv};")
+                ap("")
+
+        ap(f"{indent}        // write grad_x")
+        for jj in ordered_j:
+            if write_modes["grad_x"] == "atomic":
+                ap(f"{indent}        atomicAdd(&grad_x[gx_base + (int64_t){jj} * (int64_t)U + u], gx_acc_j_{jj});")
+            else:
+                ap(f"{indent}        grad_x[gx_base + (int64_t){jj} * (int64_t)U + u] += gx_acc_j_{jj};")
+        ap("")
+
+        if mode == "u,u,,u":
+            ap(f"{indent}        // warp-reduce scalar grad_y over u lanes")
+            for kk in ordered_k:
+                ap(f"{indent}        scalar_t gy_sum_{kk} = warp_sum_xor(gy_acc_k_{kk});")
+                ap(f"{indent}        if (lane == 0) {{")
+                if use_y_src:
+                    ap(f"{indent}            atomicAdd(&grad_y[gy_base + (int64_t){kk}], gy_sum_{kk});")
+                else:
+                    ap(f"{indent}            grad_y[gy_base + (int64_t){kk}] += gy_sum_{kk};")
+                ap(f"{indent}        }}")
+        else:
+            ap(f"{indent}        // write vector grad_y[k,u]")
+            for kk in ordered_k:
+                if use_y_src:
+                    ap(f"{indent}        atomicAdd(&grad_y[gy_base + (int64_t){kk} * (int64_t)U + u], gy_acc_k_{kk});")
+                else:
+                    ap(f"{indent}        grad_y[gy_base + (int64_t){kk} * (int64_t)U + u] += gy_acc_k_{kk};")
+
+        ap(f"{indent}    }}")
+        ap(f"{indent}}}")
+        ap("")
+
+    if u_traversal == "grid_y":
+        ap("    // u traversal: grid_y tiled-u")
+        ap("    int ublk = (int)blockIdx.y;")
+        emit_one_u_body("    ", f"ublk * {u_tile} + lane")
+    else:
+        if u_loop_step is None:
+            raise ValueError("schedule has u_traversal=inner_loop but u_loop_step is None")
+        ap("    // u traversal: persistent inner loop over U")
+        ap(f"    for (int u_base = 0; u_base < U; u_base += {int(u_loop_step)}) {{")
+        emit_one_u_body("        ", "u_base + lane")
+        ap("    }")
+        ap("")
+
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x_all,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    ap("    scalar_t* grad_x,")
+    ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+
+    if u_traversal == "inner_loop":
+        ap("    dim3 grid((unsigned int)B, 1, 1);")
+    else:
+        ap(f"    dim3 grid((unsigned int)B, (unsigned int)((U + {u_tile} - 1) / {u_tile}), 1);")
+
+    ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
+    ap("        w, x_all, y, grad_out, grad_x, grad_y,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+    return '\n'.join(lines)
+
 # ============================================================
 # Public API
 # ============================================================
@@ -1324,6 +1735,7 @@ def generate_code_uniform1d_bwd_fused(
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int = 1,
     mode: str = "u,u,,u",
+    grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_fused.cu",
     kernel_name: str = "uniform1d_bwd_fused",
     scalar_t: str = "float",
@@ -1398,23 +1810,45 @@ def generate_code_uniform1d_bwd_fused(
         U_dim=u_dim,
     )
 
-    code = emit_fused_bwd_kernel_from_schedule(
-        sched,
-        kernel_name=bundle_name,
-        scalar_t=scalar_t,
-        mode=mode,
-        use_x_src=use_x_src,
-        use_y_src=use_y_src,
-        use_scatter=use_scatter,
-    )
+    print(sched)
 
-    code += "\n"
-    code += emit_fused_bwd_launcher(
-        bundle_name,
-        mode=mode,
-        use_x_src=use_x_src,
-        use_y_src=use_y_src,
-        use_scatter=use_scatter,
-    )
+    if grad_w:
+        code = emit_fused_bwd_kernel_from_schedule(
+            sched,
+            kernel_name=bundle_name,
+            scalar_t=scalar_t,
+            mode=mode,
+            use_x_src=use_x_src,
+            use_y_src=use_y_src,
+            use_scatter=use_scatter,
+        )
+
+        code += "\n"
+        code += emit_fused_bwd_launcher(
+            bundle_name,
+            mode=mode,
+            use_x_src=use_x_src,
+            use_y_src=use_y_src,
+            use_scatter=use_scatter,
+        )
+    else:
+        code = emit_fused_bwd_kernel_from_schedule_no_gradw(
+            sched,
+            kernel_name=bundle_name,
+            scalar_t=scalar_t,
+            mode=mode,
+            use_x_src=use_x_src,
+            use_y_src=use_y_src,
+            use_scatter=use_scatter,
+        )
+
+        code += "\n"
+        code += emit_fused_bwd_launcher_no_gradw(
+            bundle_name,
+            mode=mode,
+            use_x_src=use_x_src,
+            use_y_src=use_y_src,
+            use_scatter=use_scatter,
+        )
 
     return code
