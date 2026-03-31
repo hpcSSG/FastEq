@@ -205,7 +205,7 @@ def emit_gradw_body_fused(
         ap("            scalar_t acc = scalar_t(0);")
         for jj, kk, vv, cc in terms:
             expr = (
-                f"x_all[x_base + (int64_t){jj} * (int64_t)U + u] * "
+                f"x[x_base + (int64_t){jj} * (int64_t)U + u] * "
                 f"{_y_expr(kk, mode)} * "
                 f"{_gradout_expr(vv)}"
             )
@@ -289,7 +289,7 @@ def emit_grady_body_fused(
             for ii, jj, vv, cc in terms:
                 expr = (
                     f"w[w_base + (int64_t){ii} * (int64_t)U + u] * "
-                    f"x_all[x_base + (int64_t){jj} * (int64_t)U + u] * "
+                    f"x[x_base + (int64_t){jj} * (int64_t)U + u] * "
                     f"{_gradout_expr(vv)}"
                 )
                 if abs(cc - 1.0) < 1e-12:
@@ -322,7 +322,7 @@ def emit_grady_body_fused(
             for ii, jj, vv, cc in terms:
                 expr = (
                     f"w[w_base + (int64_t){ii} * (int64_t)U + u] * "
-                    f"x_all[x_base + (int64_t){jj} * (int64_t)U + u] * "
+                    f"x[x_base + (int64_t){jj} * (int64_t)U + u] * "
                     f"{_gradout_expr(vv)}"
                 )
                 if abs(cc - 1.0) < 1e-12:
@@ -424,18 +424,18 @@ def emit_fused_bwd_launcher(
 
 std::vector<torch::Tensor> launcher_{bundle_name}(
     torch::Tensor w,           // [WB,Iw,U]
-    torch::Tensor x_all,       // [S,Ix,U]
+    torch::Tensor x,       // [S,Ix,U]
     torch::Tensor y,           // {y_comment}
     torch::Tensor grad_out,    // [B,V,U] or [S,V,U]
 {src_decl}{dst_decl}{blist_decl}    int64_t V64)
 {{
-    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
-                "w/x_all/y/grad_out must be CUDA");
-    TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
-                "w/x_all/y/grad_out must be contiguous");
+    TORCH_CHECK(w.is_cuda() && x.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
+                "w/x/y/grad_out must be CUDA");
+    TORCH_CHECK(w.is_contiguous() && x.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
+                "w/x/y/grad_out must be contiguous");
 {src_check}{dst_check}
     TORCH_CHECK(w.dim() == 3, "w must be [WB,Iw,U]");
-    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(x.dim() == 3, "x must be [S,Ix,U]");
     TORCH_CHECK(y.dim() == 3, "y must be 3D");
     TORCH_CHECK(grad_out.dim() == 3, "grad_out must be 3D");
 
@@ -444,14 +444,14 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     int Iw = (int)w.size(1);
     int U  = (int)w.size(2);
 
-    int S  = (int)x_all.size(0);
-    int Ix = (int)x_all.size(1);
+    int S  = (int)x.size(0);
+    int Ix = (int)x.size(1);
     int Ky = (int)y.size(1);
     int V  = (int)V64;
 
     TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
                 "w.size(0) must be 1 or B");
-    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)x.size(2) == U, "x U mismatch");
     {y_check_u}
     TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
     TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
@@ -460,20 +460,21 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
 {dst_numel_check}
 
 {blist_logic}
-    auto grad_x = torch::zeros_like(x_all);
+    auto grad_x = torch::zeros_like(x);
+    auto grad_w = torch::zeros_like(w);
 {gy_alloc}
 
     c10::cuda::CUDAGuard device_guard(w.device());
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
-        TORCH_CHECK(x_all.scalar_type() == w.scalar_type(), "x_all dtype must match w");
+        TORCH_CHECK(x.scalar_type() == w.scalar_type(), "x dtype must match w");
         TORCH_CHECK(y.scalar_type() == w.scalar_type(), "y dtype must match w");
         TORCH_CHECK(grad_out.scalar_type() == w.scalar_type(), "grad_out dtype must match w");
 
         launch_{bundle_name}<scalar_t>(
             (const scalar_t*)w.data_ptr<scalar_t>(),
-            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)x.data_ptr<scalar_t>(),
             (const scalar_t*)y.data_ptr<scalar_t>(),
             (const scalar_t*)grad_out.data_ptr<scalar_t>(),
             (scalar_t*)grad_w.data_ptr<scalar_t>(),
@@ -564,18 +565,18 @@ def emit_fused_bwd_launcher_no_gradw(
 
 std::vector<torch::Tensor> launcher_{bundle_name}(
     torch::Tensor w,           // [WB,Iw,U]
-    torch::Tensor x_all,       // [S,Ix,U]
+    torch::Tensor x,       // [S,Ix,U]
     torch::Tensor y,           // {y_comment}
     torch::Tensor grad_out,    // [B,V,U] or [S,V,U]
 {src_decl}{dst_decl}{blist_decl}    int64_t V64)
 {{
-    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
-                "w/x_all/y/grad_out must be CUDA");
-    TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
-                "w/x_all/y/grad_out must be contiguous");
+    TORCH_CHECK(w.is_cuda() && x.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
+                "w/x/y/grad_out must be CUDA");
+    TORCH_CHECK(w.is_contiguous() && x.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
+                "w/x/y/grad_out must be contiguous");
 {src_check}{dst_check}
     TORCH_CHECK(w.dim() == 3, "w must be [WB,Iw,U]");
-    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+    TORCH_CHECK(x.dim() == 3, "x must be [S,Ix,U]");
     TORCH_CHECK(y.dim() == 3, "y must be 3D");
     TORCH_CHECK(grad_out.dim() == 3, "grad_out must be 3D");
 
@@ -584,14 +585,14 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     int Iw = (int)w.size(1);
     int U  = (int)w.size(2);
 
-    int S  = (int)x_all.size(0);
-    int Ix = (int)x_all.size(1);
+    int S  = (int)x.size(0);
+    int Ix = (int)x.size(1);
     int Ky = (int)y.size(1);
     int V  = (int)V64;
 
     TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
                 "w.size(0) must be 1 or B");
-    TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+    TORCH_CHECK((int)x.size(2) == U, "x U mismatch");
     {y_check_u}
     TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
     TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
@@ -600,20 +601,20 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
 {dst_numel_check}
 
 {blist_logic}
-    auto grad_x = torch::zeros_like(x_all);
+    auto grad_x = torch::zeros_like(x);
 {gy_alloc}
 
     c10::cuda::CUDAGuard device_guard(w.device());
     cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
-        TORCH_CHECK(x_all.scalar_type() == w.scalar_type(), "x_all dtype must match w");
+        TORCH_CHECK(x.scalar_type() == w.scalar_type(), "x dtype must match w");
         TORCH_CHECK(y.scalar_type() == w.scalar_type(), "y dtype must match w");
         TORCH_CHECK(grad_out.scalar_type() == w.scalar_type(), "grad_out dtype must match w");
 
         launch_{bundle_name}<scalar_t>(
             (const scalar_t*)w.data_ptr<scalar_t>(),
-            (const scalar_t*)x_all.data_ptr<scalar_t>(),
+            (const scalar_t*)x.data_ptr<scalar_t>(),
             (const scalar_t*)y.data_ptr<scalar_t>(),
             (const scalar_t*)grad_out.data_ptr<scalar_t>(),
             (scalar_t*)grad_x.data_ptr<scalar_t>(),
@@ -669,7 +670,7 @@ def emit_fused_bwd_kernel(
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
-    ap("    const scalar_t* __restrict__ x_all,")
+    ap("    const scalar_t* __restrict__ x,")
     ap("    const scalar_t* __restrict__ y,")
     ap("    const scalar_t* __restrict__ grad_out,")
     ap("    scalar_t* __restrict__ grad_w,")
@@ -745,7 +746,7 @@ def emit_fused_bwd_kernel(
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* w,")
-    ap("    const scalar_t* x_all,")
+    ap("    const scalar_t* x,")
     ap("    const scalar_t* y,")
     ap("    const scalar_t* grad_out,")
     ap("    scalar_t* grad_w,")
@@ -760,7 +761,7 @@ def emit_fused_bwd_kernel(
     ap("    dim3 block(32);")
     ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
-    ap("        w, x_all, y, grad_out, grad_w, grad_x, grad_y,")
+    ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     ap("        src_idx, dst_idx, b_list,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
@@ -1196,7 +1197,7 @@ def emit_fused_bwd_kernel_from_schedule(
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
-    ap("    const scalar_t* __restrict__ x_all,")
+    ap("    const scalar_t* __restrict__ x,")
     ap("    const scalar_t* __restrict__ y,")
     ap("    const scalar_t* __restrict__ grad_out,")
     ap("    scalar_t* __restrict__ grad_w,")
@@ -1267,7 +1268,7 @@ def emit_fused_bwd_kernel_from_schedule(
 
         ap(f"{indent}        // preload all xj(j,u)")
         for jj in ordered_j:
-            ap(f"{indent}        scalar_t xj_{jj} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
+            ap(f"{indent}        scalar_t xj_{jj} = x[x_base + (int64_t){jj} * (int64_t)U + u];")
         ap("")
 
         if mode == "u,u,,u":
@@ -1421,7 +1422,7 @@ def emit_fused_bwd_kernel_from_schedule(
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* w,")
-    ap("    const scalar_t* x_all,")
+    ap("    const scalar_t* x,")
     ap("    const scalar_t* y,")
     ap("    const scalar_t* grad_out,")
     ap("    scalar_t* grad_w,")
@@ -1441,13 +1442,12 @@ def emit_fused_bwd_kernel_from_schedule(
         ap(f"    dim3 grid((unsigned int)B, (unsigned int)((U + {u_tile} - 1) / {u_tile}), 1);")
 
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
-    ap("        w, x_all, y, grad_out, grad_w, grad_x, grad_y,")
+    ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     ap("        src_idx, dst_idx, b_list,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
     return '\n'.join(lines)
-
 
 def emit_fused_bwd_kernel_from_schedule_no_gradw(
     schedule: Dict[str, Any],
@@ -1458,9 +1458,16 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
+    u_dim: int,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
 ) -> str:
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
+    if not isinstance(u_dim, int) or u_dim <= 0:
+        raise ValueError(f"u_dim must be positive int, got {u_dim}")
 
     write_modes = schedule["write_modes"]
     launch_style = schedule["launch_style"]
@@ -1498,6 +1505,29 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
     def _gy_entries(kk: int):
         return grad_y_groups[str(kk)] if key_is_str_gy else grad_y_groups[kk]
 
+    # ---- compile-time constant offsets: segment offsets inside one row ----
+    wi_offsets = {ii: ii * u_dim for ii in ordered_i}
+    xj_offsets = {jj: jj * u_dim for jj in ordered_j}
+    yk_u_offsets = {kk: kk * u_dim for kk in ordered_k}
+    gy_u_offsets = {kk: kk * u_dim for kk in ordered_k}
+    gx_u_offsets = {jj: jj * u_dim for jj in ordered_j}
+
+    all_vs = []
+    seen_v = set()
+    for tile in v_tiles:
+        for vv in tile:
+            vv = int(vv)
+            if vv not in seen_v:
+                seen_v.add(vv)
+                all_vs.append(vv)
+    go_u_offsets = {vv: vv * u_dim for vv in all_vs}
+
+    # ---- optional compile-time constant row strides ----
+    w_row_stride_const = None if iw_dim is None else int(iw_dim) * u_dim
+    x_row_stride_const = None if ix_dim is None else int(ix_dim) * u_dim
+    y_row_stride_const = None if (mode == "u,u,,u" or ky_dim is None) else int(ky_dim) * u_dim
+    go_row_stride_const = None if v_dim is None else int(v_dim) * u_dim
+
     lines: List[str] = []
     ap = lines.append
 
@@ -1515,7 +1545,7 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
     ap("template <typename scalar_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
-    ap("    const scalar_t* __restrict__ x_all,")
+    ap("    const scalar_t* __restrict__ x,")
     ap("    const scalar_t* __restrict__ y,")
     ap("    const scalar_t* __restrict__ grad_out,")
     ap("    scalar_t* __restrict__ grad_x,")
@@ -1532,6 +1562,8 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
     ap("    const int lane = tid & 31;")
     ap("    if (tid >= 32) return;")
     ap("")
+    ap(f"    constexpr int U_CONST = {u_dim};")
+    ap("    (void)U_CONST;")
     ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
@@ -1540,16 +1572,36 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
         ap("    const int src = src_idx[e_orig];")
     if use_scatter:
         ap("    const int dst = dst_idx[e_orig];")
+    ap("")
 
-    ap("    const int64_t w_base  = (int64_t)w_row * (int64_t)Iw * (int64_t)U;")
+    # consistency check comment
+    ap("    // Note: this generated kernel assumes compile-time specialized U.")
+    ap("    // Caller should guarantee runtime U matches U_CONST.")
+    ap("")
 
-    if use_x_src:
-        ap("    const int64_t x_base  = (int64_t)src * (int64_t)Ix * (int64_t)U;")
-        ap("    const int64_t gx_base = (int64_t)src * (int64_t)Ix * (int64_t)U;")
+    # w_base
+    if w_row_stride_const is not None:
+        ap(f"    const int64_t w_base = (int64_t)w_row * {w_row_stride_const};")
     else:
-        ap("    const int64_t x_base  = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
-        ap("    const int64_t gx_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
+        ap("    const int64_t w_base = (int64_t)w_row * (int64_t)Iw * (int64_t)U;")
 
+    # x_base / gx_base
+    if x_row_stride_const is not None:
+        if use_x_src:
+            ap(f"    const int64_t x_base  = (int64_t)src * {x_row_stride_const};")
+            ap(f"    const int64_t gx_base = (int64_t)src * {x_row_stride_const};")
+        else:
+            ap(f"    const int64_t x_base  = (int64_t)e_local * {x_row_stride_const};")
+            ap(f"    const int64_t gx_base = (int64_t)e_local * {x_row_stride_const};")
+    else:
+        if use_x_src:
+            ap("    const int64_t x_base  = (int64_t)src * (int64_t)Ix * (int64_t)U;")
+            ap("    const int64_t gx_base = (int64_t)src * (int64_t)Ix * (int64_t)U;")
+        else:
+            ap("    const int64_t x_base  = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
+            ap("    const int64_t gx_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
+
+    # y_base / gy_base
     if mode == "u,u,,u":
         if use_y_src:
             ap("    const int64_t y_base  = (int64_t)src * (int64_t)Ky;")
@@ -1558,17 +1610,32 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
             ap("    const int64_t y_base  = (int64_t)e_orig * (int64_t)Ky;")
             ap("    const int64_t gy_base = (int64_t)e_orig * (int64_t)Ky;")
     else:
-        if use_y_src:
-            ap("    const int64_t y_base  = (int64_t)src * (int64_t)Ky * (int64_t)U;")
-            ap("    const int64_t gy_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
+        if y_row_stride_const is not None:
+            if use_y_src:
+                ap(f"    const int64_t y_base  = (int64_t)src * {y_row_stride_const};")
+                ap(f"    const int64_t gy_base = (int64_t)src * {y_row_stride_const};")
+            else:
+                ap(f"    const int64_t y_base  = (int64_t)e_orig * {y_row_stride_const};")
+                ap(f"    const int64_t gy_base = (int64_t)e_orig * {y_row_stride_const};")
         else:
-            ap("    const int64_t y_base  = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
-            ap("    const int64_t gy_base = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
+            if use_y_src:
+                ap("    const int64_t y_base  = (int64_t)src * (int64_t)Ky * (int64_t)U;")
+                ap("    const int64_t gy_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
+            else:
+                ap("    const int64_t y_base  = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
+                ap("    const int64_t gy_base = (int64_t)e_orig * (int64_t)Ky * (int64_t)U;")
 
-    if use_scatter:
-        ap("    const int64_t go_base = (int64_t)dst * (int64_t)V * (int64_t)U;")
+    # go_base
+    if go_row_stride_const is not None:
+        if use_scatter:
+            ap(f"    const int64_t go_base = (int64_t)dst * {go_row_stride_const};")
+        else:
+            ap(f"    const int64_t go_base = (int64_t)e_local * {go_row_stride_const};")
     else:
-        ap("    const int64_t go_base = (int64_t)e_local * (int64_t)V * (int64_t)U;")
+        if use_scatter:
+            ap("    const int64_t go_base = (int64_t)dst * (int64_t)V * (int64_t)U;")
+        else:
+            ap("    const int64_t go_base = (int64_t)e_local * (int64_t)V * (int64_t)U;")
     ap("")
 
     def emit_one_u_body(indent: str, u_expr: str):
@@ -1578,18 +1645,20 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
 
         ap(f"{indent}        // preload wi(i,u) for grad_y")
         for ii in ordered_i:
-            ap(f"{indent}        scalar_t wi_{ii} = w[w_base + (int64_t){ii} * (int64_t)U + u];")
+            wi_off = wi_offsets[ii]
+            ap(f"{indent}        scalar_t wi_{ii} = w[w_base + {wi_off} + u];")
         ap("")
 
         ap(f"{indent}        // preload xj(j,u)")
         for jj in ordered_j:
-            ap(f"{indent}        scalar_t xj_{jj} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
+            xj_off = xj_offsets[jj]
+            ap(f"{indent}        scalar_t xj_{jj} = x[x_base + {xj_off} + u];")
         ap("")
 
         if mode == "u,u,,u":
             ap(f"{indent}        // preload scalar yk(k)")
             for kk in ordered_k:
-                ap(f"{indent}        scalar_t yk_{kk} = y[y_base + (int64_t){kk}];")
+                ap(f"{indent}        scalar_t yk_{kk} = y[y_base + {kk}];")
             ap("")
 
         ap(f"{indent}        // init accumulators")
@@ -1602,42 +1671,45 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
         for tile_id, vtile in enumerate(v_tiles):
             ap(f"{indent}        // ---- v tile {tile_id}: {vtile} ----")
             for vv in vtile:
-                ap(f"{indent}        scalar_t go_v_{vv} = grad_out[go_base + (int64_t){vv} * (int64_t)U + u];")
+                go_off = go_u_offsets[int(vv)]
+                ap(f"{indent}        scalar_t go_v_{vv} = grad_out[go_base + {go_off} + u];")
             ap("")
 
             for j_tile_id, jtile in enumerate(j_tiles):
                 ap(f"{indent}        // grad_x j-tile {j_tile_id}")
                 for jj in jtile:
                     for entry in _gx_entries(jj):
-                        vv = int(entry['v'])
+                        vv = int(entry["v"])
                         if vv not in vtile:
                             continue
-                        ii = int(entry['i'])
-                        kk = int(entry['k'])
-                        cc = float(entry['c'])
-                        yexpr = (
-                            f"(y[y_base + (int64_t){kk} * (int64_t)U + u])"
-                            if mode == "u,u,u,u"
-                            else f"yk_{kk}"
-                        )
-                        if abs(cc - 1.0) < 1e-12:
-                            ap(f"{indent}        gx_acc_j_{jj} += wi_{ii} * {yexpr} * go_v_{vv};")
-                        elif abs(cc + 1.0) < 1e-12:
-                            ap(f"{indent}        gx_acc_j_{jj} -= wi_{ii} * {yexpr} * go_v_{vv};")
+                        ii = int(entry["i"])
+                        kk = int(entry["k"])
+                        cc = float(entry["c"])
+
+                        if mode == "u,u,u,u":
+                            y_off = yk_u_offsets[kk]
+                            yexpr = f"y[y_base + {y_off} + u]"
                         else:
-                            ap(f"{indent}        gx_acc_j_{jj} += scalar_t({cc}) * wi_{ii} * {yexpr} * go_v_{vv};")
+                            yexpr = f"yk_{kk}"
+
+                        if abs(cc - 1.0) < 1e-12:
+                            ap(f"{indent}        gx_acc_j_{jj} += wi_{ii} * ({yexpr}) * go_v_{vv};")
+                        elif abs(cc + 1.0) < 1e-12:
+                            ap(f"{indent}        gx_acc_j_{jj} -= wi_{ii} * ({yexpr}) * go_v_{vv};")
+                        else:
+                            ap(f"{indent}        gx_acc_j_{jj} += scalar_t({cc}) * wi_{ii} * ({yexpr}) * go_v_{vv};")
                 ap("")
 
             for k_tile_id, ktile in enumerate(k_tiles):
                 ap(f"{indent}        // grad_y k-tile {k_tile_id}")
                 for kk in ktile:
                     for entry in _gy_entries(kk):
-                        vv = int(entry['v'])
+                        vv = int(entry["v"])
                         if vv not in vtile:
                             continue
-                        ii = int(entry['i'])
-                        jj = int(entry['j'])
-                        cc = float(entry['c'])
+                        ii = int(entry["i"])
+                        jj = int(entry["j"])
+                        cc = float(entry["c"])
                         if abs(cc - 1.0) < 1e-12:
                             ap(f"{indent}        gy_acc_k_{kk} += wi_{ii} * xj_{jj} * go_v_{vv};")
                         elif abs(cc + 1.0) < 1e-12:
@@ -1648,10 +1720,11 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
 
         ap(f"{indent}        // write grad_x")
         for jj in ordered_j:
+            gx_off = gx_u_offsets[jj]
             if write_modes["grad_x"] == "atomic":
-                ap(f"{indent}        atomicAdd(&grad_x[gx_base + (int64_t){jj} * (int64_t)U + u], gx_acc_j_{jj});")
+                ap(f"{indent}        atomicAdd(&grad_x[gx_base + {gx_off} + u], gx_acc_j_{jj});")
             else:
-                ap(f"{indent}        grad_x[gx_base + (int64_t){jj} * (int64_t)U + u] += gx_acc_j_{jj};")
+                ap(f"{indent}        grad_x[gx_base + {gx_off} + u] += gx_acc_j_{jj};")
         ap("")
 
         if mode == "u,u,,u":
@@ -1660,17 +1733,18 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
                 ap(f"{indent}        scalar_t gy_sum_{kk} = warp_sum_xor(gy_acc_k_{kk});")
                 ap(f"{indent}        if (lane == 0) {{")
                 if use_y_src:
-                    ap(f"{indent}            atomicAdd(&grad_y[gy_base + (int64_t){kk}], gy_sum_{kk});")
+                    ap(f"{indent}            atomicAdd(&grad_y[gy_base + {kk}], gy_sum_{kk});")
                 else:
-                    ap(f"{indent}            grad_y[gy_base + (int64_t){kk}] += gy_sum_{kk};")
+                    ap(f"{indent}            grad_y[gy_base + {kk}] += gy_sum_{kk};")
                 ap(f"{indent}        }}")
         else:
             ap(f"{indent}        // write vector grad_y[k,u]")
             for kk in ordered_k:
+                gy_off = gy_u_offsets[kk]
                 if use_y_src:
-                    ap(f"{indent}        atomicAdd(&grad_y[gy_base + (int64_t){kk} * (int64_t)U + u], gy_acc_k_{kk});")
+                    ap(f"{indent}        atomicAdd(&grad_y[gy_base + {gy_off} + u], gy_acc_k_{kk});")
                 else:
-                    ap(f"{indent}        grad_y[gy_base + (int64_t){kk} * (int64_t)U + u] += gy_acc_k_{kk};")
+                    ap(f"{indent}        grad_y[gy_base + {gy_off} + u] += gy_acc_k_{kk};")
 
         ap(f"{indent}    }}")
         ap(f"{indent}}}")
@@ -1695,7 +1769,7 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* w,")
-    ap("    const scalar_t* x_all,")
+    ap("    const scalar_t* x,")
     ap("    const scalar_t* y,")
     ap("    const scalar_t* grad_out,")
     ap("    scalar_t* grad_x,")
@@ -1714,11 +1788,12 @@ def emit_fused_bwd_kernel_from_schedule_no_gradw(
         ap(f"    dim3 grid((unsigned int)B, (unsigned int)((U + {u_tile} - 1) / {u_tile}), 1);")
 
     ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
-    ap("        w, x_all, y, grad_out, grad_x, grad_y,")
+    ap("        w, x, y, grad_out, grad_x, grad_y,")
     ap("        src_idx, dst_idx, b_list,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
+
     return '\n'.join(lines)
 
 # ============================================================
@@ -1734,6 +1809,10 @@ def generate_code_uniform1d_bwd_fused(
     input_indices: Optional[Dict[int, Any]] = None,
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int = 1,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
     mode: str = "u,u,,u",
     grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_fused.cu",
@@ -1808,6 +1887,10 @@ def generate_code_uniform1d_bwd_fused(
         v_list=v_cpu,
         coeff_list=coeff_cpu,
         U_dim=u_dim,
+        v_tile_size=1,
+        i_tile_size=1,
+        j_tile_size=1,
+        k_tile_size=1,
     )
 
     print(sched)
@@ -1840,6 +1923,11 @@ def generate_code_uniform1d_bwd_fused(
             use_x_src=use_x_src,
             use_y_src=use_y_src,
             use_scatter=use_scatter,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
         )
 
         code += "\n"

@@ -144,9 +144,10 @@ def _make_bwd_module_name(
     coeff_list,
     dtype_str: str,
     split_mode: bool,
+    grad_w: bool,
 ) -> str:
     sig = repr((
-        P, u_dim, dtype_str, split_mode, mode,
+        P, u_dim, dtype_str, split_mode, mode, grad_w,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
         tuple(float(c) for c in coeff_list),
     ))
@@ -275,6 +276,10 @@ def _build_bwd_jit_module(
     input_indices: Optional[Dict[int, Any]] = None,
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
     mode: str,
     dtype_str: str,
     grad_w: bool,
@@ -300,6 +305,7 @@ def _build_bwd_jit_module(
         coeff_list=coeff_cpu,
         dtype_str=dtype_str,
         split_mode=split_mode,
+        grad_w=grad_w,
     )
 
     def _codegen_bwd():
@@ -322,6 +328,10 @@ def _build_bwd_jit_module(
                     input_indices=input_indices,
                     output_indices=output_indices,
                     u_dim=u_dim,
+                    iw_dim=iw_dim,
+                    ix_dim=ix_dim,
+                    ky_dim=ky_dim,
+                    v_dim=v_dim,
                     mode=mode,
                     grad_w=grad_w,
                 )
@@ -429,6 +439,10 @@ def _run_bwd(
     output_indices,
     out_seg_num,
     u_dim,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
     mode,
     grad_w,
 ):
@@ -459,6 +473,10 @@ def _run_bwd(
         v_list=v_list,
         coeff_list=coeff_list,
         u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
         input_indices=input_indices,
         output_indices=output_indices,
         dtype_str=dtype_str,
@@ -540,8 +558,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         P = i_list.numel()
         #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000.0
 
         out = _run_fwd(
             w=w,
@@ -560,9 +578,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode=mode,
         )
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000.0
+        #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.b_list = b_list
@@ -592,8 +610,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000.0
 
         if w.requires_grad:
             grad_w, grad_x, grad_y = _run_bwd(
@@ -634,6 +652,10 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 b_list=ctx.b_list,
                 out_seg_num=ctx.out_seg_num,
                 u_dim=ctx.u_dim,
+                iw_dim=ctx.w_seg_num,
+                ix_dim=ctx.x_seg_num,
+                ky_dim=ctx.y_seg_num,
+                v_dim=ctx.out_seg_num,
                 mode=ctx.mode,
                 grad_w=w.requires_grad,
             )
@@ -642,9 +664,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
             grad_w = None
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000.0
+        #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
 
         return grad_w, grad_x, grad_y, None, None, None, None
 
