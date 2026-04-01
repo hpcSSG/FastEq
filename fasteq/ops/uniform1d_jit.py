@@ -11,7 +11,7 @@ from torch.utils.cpp_extension import load
 
 from .uniform1d_fwd_codegen import generate_code_uniform1d_fwd
 from .uniform1d_bwd_codegen import generate_code_uniform1d_bwd_fused
-from .uniform1d_scatter_bwd_codegen import (
+from .uniform1d_split_bwd_codegen import (
     #emit_backward_cuda_from_schedule,
     #build_backward_schedule_from_lists,
     #summarize_backward_schedule,
@@ -153,7 +153,7 @@ def _make_bwd_module_name(
     ))
     h = _sha1_text(sig)
     tag = "split" if split_mode else "combine"
-    mode_str = "u_u__u" if mode == "u,u,,u" else "u_u_u_u"
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     return f"uniform1d_bwd_{mode_str}_u{u_dim}_path{P}_{tag}_jit_{dtype_str}_{h}"
 
 
@@ -610,8 +610,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000.0
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
 
         if w.requires_grad:
             grad_w, grad_x, grad_y = _run_bwd(
@@ -664,9 +664,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
             grad_w = None
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000.0
-        #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
 
         return grad_w, grad_x, grad_y, None, None, None, None
 
