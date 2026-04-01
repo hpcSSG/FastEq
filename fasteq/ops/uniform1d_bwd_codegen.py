@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, OrderedDict, Counter
 from typing import Any, Dict, List, Optional, Tuple
 import math
 import torch
@@ -1812,13 +1812,27 @@ class GroupPlanGXGY:
     uniq_j: List[int]
     uniq_k: List[int]
     uniq_v: List[int]
+
     i_slot_map: Dict[int, int]
+
+    # 这里只给“值得 preload”的 x/y 分配 slot
     x_slot_map: Dict[int, int]
     y_slot_map: Dict[int, int]
+
     v_slot_map: Dict[int, int]
+
+    # 真正参与 preload 的 j/k
+    uniq_j_preload: List[int]
+    uniq_k_preload: List[int]
+
+    # 原始展开 term（保留 sanity/debug）
     terms: List[Dict[str, Any]]
+
+    # 聚合后的小组：wg = c * wi_slot * go_slot
+    mul_groups: List[Dict[str, Any]]
+
     num_paths: int
-    reg_usage_inputs: int  # = |uniq_i| + |uniq_j| + |uniq_k| + |uniq_v|
+    reg_usage_inputs: int  # = |uniq_i| + |uniq_j_preload| + |uniq_k_preload| + |uniq_v|
 
 
 @dataclass
@@ -1862,7 +1876,6 @@ def _lookup_key(p: CGPath, name: str) -> int:
 
 
 def _path_sort_key_global(p: CGPath, iv_order: Tuple[str, str], jk_order: Tuple[str, str]):
-    # 全局排序：先 iv 再 jk，利于 group 装满
     return (
         _lookup_key(p, iv_order[0]),
         _lookup_key(p, iv_order[1]),
@@ -1872,7 +1885,6 @@ def _path_sort_key_global(p: CGPath, iv_order: Tuple[str, str], jk_order: Tuple[
 
 
 def _path_sort_key_in_group(p: CGPath, iv_order: Tuple[str, str], jk_order: Tuple[str, str]):
-    # 组内排序：先 jk 再 iv，利于 x/y 地址相邻、最大化 xj/yk 寄存器复用
     return (
         _lookup_key(p, jk_order[0]),
         _lookup_key(p, jk_order[1]),
@@ -1881,13 +1893,104 @@ def _path_sort_key_in_group(p: CGPath, iv_order: Tuple[str, str], jk_order: Tupl
     )
 
 
+def _build_xy_preload_slot_maps(paths: List[CGPath]):
+    """
+    只对组内复用 >= 2 的 j/k 分配 preload slot。
+    """
+    j_cnt = Counter(p.j for p in paths)
+    k_cnt = Counter(p.k for p in paths)
+
+    uniq_j_preload = sorted(j for j, cnt in j_cnt.items() if cnt >= 2)
+    uniq_k_preload = sorted(k for k, cnt in k_cnt.items() if cnt >= 2)
+
+    x_slot_map = _stable_slot_map(uniq_j_preload)
+    y_slot_map = _stable_slot_map(uniq_k_preload)
+    return uniq_j_preload, uniq_k_preload, x_slot_map, y_slot_map
+
+
+def _estimate_group_input_regs_with_xy_reuse(paths: List[CGPath]) -> int:
+    """
+    group cut 预算估计：
+      wi -> uniq_i
+      go -> uniq_v
+      x  -> 仅统计组内复用 >= 2 的 j
+      y  -> 仅统计组内复用 >= 2 的 k
+    """
+    if not paths:
+        return 0
+
+    uniq_i = {p.i for p in paths}
+    uniq_v = {p.v for p in paths}
+
+    j_cnt = Counter(p.j for p in paths)
+    k_cnt = Counter(p.k for p in paths)
+
+    num_x_preload = sum(1 for _, cnt in j_cnt.items() if cnt >= 2)
+    num_y_preload = sum(1 for _, cnt in k_cnt.items() if cnt >= 2)
+
+    return len(uniq_i) + num_x_preload + num_y_preload + len(uniq_v)
+
+
+def _build_mul_groups(
+    paths: List[CGPath],
+    i_slot_map: Dict[int, int],
+    v_slot_map: Dict[int, int],
+    x_slot_map: Dict[int, int],
+    y_slot_map: Dict[int, int],
+):
+    """
+    把 term 按 (coeff, wi_slot, go_slot) 聚合：
+        wg = coeff * wi_slot * go_slot
+    """
+    buckets = defaultdict(list)
+    for p in paths:
+        wi_slot = i_slot_map[p.i]
+        go_slot = v_slot_map[p.v]
+        key = (float(p.c), wi_slot, go_slot)
+        buckets[key].append(p)
+
+    mul_groups: List[Dict[str, Any]] = []
+    for (c, wi_slot, go_slot), plist in buckets.items():
+        gx_terms = []
+        gy_terms = []
+        for p in plist:
+            gx_terms.append(
+                {
+                    "j": int(p.j),
+                    "k": int(p.k),
+                    "use_y_slot": (p.k in y_slot_map),
+                    "y_slot": int(y_slot_map[p.k]) if p.k in y_slot_map else -1,
+                }
+            )
+            gy_terms.append(
+                {
+                    "k": int(p.k),
+                    "j": int(p.j),
+                    "use_x_slot": (p.j in x_slot_map),
+                    "x_slot": int(x_slot_map[p.j]) if p.j in x_slot_map else -1,
+                }
+            )
+
+        mul_groups.append(
+            {
+                "c": float(c),
+                "wi_slot": int(wi_slot),
+                "go_slot": int(go_slot),
+                "gx_terms": gx_terms,
+                "gy_terms": gy_terms,
+            }
+        )
+
+    mul_groups.sort(key=lambda g: (g["wi_slot"], g["go_slot"], g["c"]))
+    return mul_groups
+
+
 def _make_group_plan(
     group_id: int,
     paths: List[CGPath],
     iv_order: Tuple[str, str],
     jk_order: Tuple[str, str],
 ) -> GroupPlanGXGY:
-    # 组内重新排序：优先把相同 xj/yk 地址放一起
     paths = sorted(paths, key=lambda p: _path_sort_key_in_group(p, iv_order, jk_order))
 
     uniq_i = sorted({p.i for p in paths})
@@ -1896,9 +1999,9 @@ def _make_group_plan(
     uniq_v = sorted({p.v for p in paths})
 
     i_slot_map = _stable_slot_map(uniq_i)
-    x_slot_map = _stable_slot_map(uniq_j)
-    y_slot_map = _stable_slot_map(uniq_k)
     v_slot_map = _stable_slot_map(uniq_v)
+
+    uniq_j_preload, uniq_k_preload, x_slot_map, y_slot_map = _build_xy_preload_slot_maps(paths)
 
     terms: List[Dict[str, Any]] = []
     for p in paths:
@@ -1910,11 +2013,21 @@ def _make_group_plan(
                 "v": p.v,
                 "c": p.c,
                 "wi_slot": i_slot_map[p.i],
-                "x_slot": x_slot_map[p.j],
-                "y_slot": y_slot_map[p.k],
+                "x_slot": x_slot_map[p.j] if p.j in x_slot_map else -1,
+                "y_slot": y_slot_map[p.k] if p.k in y_slot_map else -1,
                 "go_slot": v_slot_map[p.v],
+                "use_x_slot": p.j in x_slot_map,
+                "use_y_slot": p.k in y_slot_map,
             }
         )
+
+    mul_groups = _build_mul_groups(
+        paths=paths,
+        i_slot_map=i_slot_map,
+        v_slot_map=v_slot_map,
+        x_slot_map=x_slot_map,
+        y_slot_map=y_slot_map,
+    )
 
     return GroupPlanGXGY(
         group_id=group_id,
@@ -1926,9 +2039,12 @@ def _make_group_plan(
         x_slot_map=x_slot_map,
         y_slot_map=y_slot_map,
         v_slot_map=v_slot_map,
+        uniq_j_preload=uniq_j_preload,
+        uniq_k_preload=uniq_k_preload,
         terms=terms,
+        mul_groups=mul_groups,
         num_paths=len(paths),
-        reg_usage_inputs=len(uniq_i) + len(uniq_j) + len(uniq_k) + len(uniq_v),
+        reg_usage_inputs=len(uniq_i) + len(uniq_j_preload) + len(uniq_k_preload) + len(uniq_v),
     )
 
 
@@ -1943,7 +2059,6 @@ def _sanity_check_plan(plan: SchedulerPlanGXGY, globally_sorted_paths: List[CGPa
         for t in g.terms:
             flat_terms.append((t["i"], t["j"], t["k"], t["v"], float(t["c"])))
 
-    # 只检查多重集合一致，不强制与全局排序完全一致，因为组内会再按 jk->iv 重排
     a = sorted(flat_terms)
     b = sorted((p.i, p.j, p.k, p.v, float(p.c)) for p in globally_sorted_paths)
     if a != b:
@@ -1963,19 +2078,15 @@ def schedule_gradx_grady_full_acc(
     sanity_check: bool = True,
 ) -> SchedulerPlanGXGY:
     """
-    联合 grad_x + grad_y 的 scheduler（wi/xj/yk/go 全纳入 group 预算）：
+    联合 grad_x + grad_y 的 scheduler：
 
-      1) 全部 gx[j] / gy[k] accumulator 全 kernel 常驻
-      2) 剩余寄存器 R_rem = reg_budget - (|uniq_j| + |uniq_k|)
-      3) wi / xj / yk / go[v] 都作为 group-local preload 缓存
-      4) 全局排序键动态决定：
-            - i/v 哪个 uniq 更少，就谁排前
-            - j/k 哪个 uniq 更少，就谁排前
-         全局排序使用: (iv -> jk)
-      5) 顺序扫描分组，约束：
-            |uniq_i(group)| + |uniq_j(group)| + |uniq_k(group)| + |uniq_v(group)| <= R_rem
-         若超出则切组
-      6) 组内再按 (jk -> iv) 排序，保证相同 xj/yk 地址访问尽量挨在一起
+      1) gx[j] / gy[k] accumulator 全 kernel 常驻
+      2) 剩余寄存器 R_rem = reg_budget - (|uniq_j_all| + |uniq_k_all|)
+      3) wi/go 一定作为 group-local preload 候选
+      4) x/y 仅对“组内复用 >= 2”的 j/k 分配 preload slot
+      5) group cut 时也按上述真实 preload 预算估计
+      6) 组内再按 (jk -> iv) 排序
+      7) codegen 端再按 (c, wi_slot, go_slot) 提取公共 wg
     """
     if not (
         len(i_list) == len(j_list) == len(k_list) == len(v_list) == len(coeff_list)
@@ -2017,7 +2128,6 @@ def schedule_gradx_grady_full_acc(
     else:
         jk_order = ("j", "k")
 
-    # 全局先按 iv -> jk 排，利于切出更满的组
     paths.sort(key=lambda p: _path_sort_key_global(p, iv_order, jk_order))
 
     groups_raw: List[List[CGPath]] = []
@@ -2029,19 +2139,15 @@ def schedule_gradx_grady_full_acc(
     cur_v: set[int] = set()
 
     for p in paths:
-        next_i = cur_i | {p.i}
-        next_j = cur_j | {p.j}
-        next_k = cur_k | {p.k}
-        next_v = cur_v | {p.v}
-
-        need_regs = len(next_i) + len(next_j) + len(next_k) + len(next_v)
+        cand_group = cur_group + [p]
+        need_regs = _estimate_group_input_regs_with_xy_reuse(cand_group)
 
         if need_regs <= r_rem:
             cur_group.append(p)
-            cur_i = next_i
-            cur_j = next_j
-            cur_k = next_k
-            cur_v = next_v
+            cur_i.add(p.i)
+            cur_j.add(p.j)
+            cur_k.add(p.k)
+            cur_v.add(p.v)
         else:
             if not cur_group:
                 raise ValueError(
@@ -2110,6 +2216,8 @@ def emit_codegen_metadata(plan) -> Dict[str, Any]:
             "uniq_j": list(g.uniq_j),
             "uniq_k": list(g.uniq_k),
             "uniq_v": list(g.uniq_v),
+            "uniq_j_preload": list(g.uniq_j_preload),
+            "uniq_k_preload": list(g.uniq_k_preload),
             "i_slot_map": dict(g.i_slot_map),
             "x_slot_map": dict(g.x_slot_map),
             "y_slot_map": dict(g.y_slot_map),
@@ -2117,6 +2225,7 @@ def emit_codegen_metadata(plan) -> Dict[str, Any]:
             "num_paths": int(g.num_paths),
             "reg_usage_inputs": int(g.reg_usage_inputs),
             "terms": [dict(t) for t in g.terms],
+            "mul_groups": [dict(mg) for mg in g.mul_groups],
         }
         schedule["groups"].append(gdict)
 
@@ -2142,6 +2251,8 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
     block_size: int = 32,
     write_grad_x_atomic: bool = False,
     write_grad_y_atomic: bool = True,
+    unroll_u_outer: bool = False,
+    assume_u_multiple_of_tile: bool = False,
 ) -> str:
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
@@ -2151,6 +2262,11 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
         raise ValueError(f"Only block_size=32 is supported, got {block_size}")
     if launch_style not in ("persistent_u_inner_loop", "grid_y_tiled_u"):
         raise ValueError(f"Unsupported launch_style: {launch_style}")
+    if assume_u_multiple_of_tile and (u_dim % u_tile != 0):
+        raise ValueError(
+            f"u_dim={u_dim} must be a multiple of u_tile={u_tile} "
+            f"when assume_u_multiple_of_tile=True"
+        )
 
     uniq_j_all = [int(x) for x in schedule["uniq_j_all"]]
     uniq_k_all = [int(x) for x in schedule["uniq_k_all"]]
@@ -2168,6 +2284,8 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
     max_x_slot = -1
     max_y_slot = -1
     max_go_slot = -1
+    max_wg_slot = -1
+
     for g in groups:
         for _, s in g["i_slot_map"].items():
             max_wi_slot = max(max_wi_slot, int(s))
@@ -2177,6 +2295,7 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
             max_y_slot = max(max_y_slot, int(s))
         for _, s in g["v_slot_map"].items():
             max_go_slot = max(max_go_slot, int(s))
+        max_wg_slot = max(max_wg_slot, len(g.get("mul_groups", [])) - 1)
 
     lines: List[str] = []
     ap = lines.append
@@ -2283,7 +2402,6 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
             ap("    const int64_t go_base = (int64_t)e_local * (int64_t)V * (int64_t)U;")
     ap("")
 
-    # declarations outside u-loop
     ap("    // predeclare full-resident accumulators outside u-loop")
     for jj in uniq_j_all:
         ap(f"    scalar_t gx_acc_j_{jj};")
@@ -2300,128 +2418,160 @@ def emit_fused_bwd_kernel_from_new_schedule_no_gradw(
         ap(f"    scalar_t y_slot_{s};")
     for s in range(max_go_slot + 1):
         ap(f"    scalar_t go_slot_{s};")
+    for s in range(max_wg_slot + 1):
+        ap(f"    scalar_t wg_slot_{s};")
     ap("")
 
-    def emit_one_u_body(indent: str, u_expr: str):
+    def emit_one_u_body(indent: str, u_expr: str, *, check_u_bound: bool):
         ap(f"{indent}{{")
         ap(f"{indent}    int u = {u_expr};")
-        ap(f"{indent}    if (u < U) {{")
+        if check_u_bound:
+            ap(f"{indent}    if (u < U) {{")
+            inner = indent + "        "
+        else:
+            inner = indent + "    "
         ap("")
 
-        ap(f"{indent}        // reset full-resident accumulators")
+        ap(f"{inner}// reset full-resident accumulators")
         for jj in uniq_j_all:
-            ap(f"{indent}        gx_acc_j_{jj} = scalar_t(0);")
+            ap(f"{inner}gx_acc_j_{jj} = scalar_t(0);")
         for kk in uniq_k_all:
-            ap(f"{indent}        gy_acc_k_{kk} = scalar_t(0);")
+            ap(f"{inner}gy_acc_k_{kk} = scalar_t(0);")
         ap("")
 
         for g in groups:
             gid = int(g["group_id"])
             uniq_i = [int(x) for x in g["uniq_i"]]
-            uniq_j = [int(x) for x in g["uniq_j"]]
-            uniq_k = [int(x) for x in g["uniq_k"]]
+            uniq_j_preload = [int(x) for x in g["uniq_j_preload"]]
+            uniq_k_preload = [int(x) for x in g["uniq_k_preload"]]
             uniq_v = [int(x) for x in g["uniq_v"]]
             i_slot_map = {int(k): int(v) for k, v in g["i_slot_map"].items()}
             x_slot_map = {int(k): int(v) for k, v in g["x_slot_map"].items()}
             y_slot_map = {int(k): int(v) for k, v in g["y_slot_map"].items()}
             v_slot_map = {int(k): int(v) for k, v in g["v_slot_map"].items()}
-            terms = g["terms"]
+            mul_groups = g["mul_groups"]
 
-            ap(f"{indent}        // ---- group {gid} ----")
-            ap(f"{indent}        // preload wi slots")
+            ap(f"{inner}// ---- group {gid} ----")
+            ap(f"{inner}// preload wi slots")
             for ii in uniq_i:
                 slot = i_slot_map[ii]
                 wi_off = ii * u_dim
-                ap(f"{indent}        wi_slot_{slot} = w[w_base + {wi_off} + u];")
+                ap(f"{inner}wi_slot_{slot} = w[w_base + {wi_off} + u];")
             ap("")
 
-            ap(f"{indent}        // preload x slots")
-            for jj in uniq_j:
+            ap(f"{inner}// preload x slots (only reused j)")
+            for jj in uniq_j_preload:
                 slot = x_slot_map[jj]
                 x_off = jj * u_dim
-                ap(f"{indent}        x_slot_{slot} = x[x_base + {x_off} + u];")
+                ap(f"{inner}x_slot_{slot} = x[x_base + {x_off} + u];")
             ap("")
 
-            ap(f"{indent}        // preload y slots")
-            for kk in uniq_k:
+            ap(f"{inner}// preload y slots (only reused k)")
+            for kk in uniq_k_preload:
                 slot = y_slot_map[kk]
-                if mode == 'u,u,u,u':
+                if mode == "u,u,u,u":
                     y_off = kk * u_dim
-                    ap(f"{indent}        y_slot_{slot} = y[y_base + {y_off} + u];")
+                    ap(f"{inner}y_slot_{slot} = y[y_base + {y_off} + u];")
                 else:
-                    ap(f"{indent}        y_slot_{slot} = y[y_base + {kk}];")
+                    ap(f"{inner}y_slot_{slot} = y[y_base + {kk}];")
             ap("")
 
-            ap(f"{indent}        // preload go[v] slots")
+            ap(f"{inner}// preload go[v] slots")
             for vv in uniq_v:
                 slot = v_slot_map[vv]
                 go_off = vv * u_dim
-                ap(f"{indent}        go_slot_{slot} = grad_out[go_base + {go_off} + u];")
+                ap(f"{inner}go_slot_{slot} = grad_out[go_base + {go_off} + u];")
             ap("")
 
-            ap(f"{indent}        // fused terms")
-            for t in terms:
-                jj = int(t["j"])
-                kk = int(t["k"])
-                cc = float(t["c"])
-                wi_slot = int(t["wi_slot"])
-                x_slot = int(t["x_slot"])
-                y_slot = int(t["y_slot"])
-                go_slot = int(t["go_slot"])
-
-                if abs(cc - 1.0) < 1e-12:
-                    ap(f"{indent}        gx_acc_j_{jj} += wi_slot_{wi_slot} * go_slot_{go_slot} * y_slot_{y_slot};")
-                    ap(f"{indent}        gy_acc_k_{kk} += wi_slot_{wi_slot} * go_slot_{go_slot} * x_slot_{x_slot};")
-                elif abs(cc + 1.0) < 1e-12:
-                    ap(f"{indent}        gx_acc_j_{jj} -= wi_slot_{wi_slot} * go_slot_{go_slot} * y_slot_{y_slot};")
-                    ap(f"{indent}        gy_acc_k_{kk} -= wi_slot_{wi_slot} * go_slot_{go_slot} * x_slot_{x_slot};")
+            ap(f"{inner}// precompute wg = c * wi_slot * go_slot")
+            for mg_idx, mg in enumerate(mul_groups):
+                c = float(mg["c"])
+                wi_slot = int(mg["wi_slot"])
+                go_slot = int(mg["go_slot"])
+                if abs(c - 1.0) < 1e-12:
+                    ap(f"{inner}wg_slot_{mg_idx} = wi_slot_{wi_slot} * go_slot_{go_slot};")
+                elif abs(c + 1.0) < 1e-12:
+                    ap(f"{inner}wg_slot_{mg_idx} = -wi_slot_{wi_slot} * go_slot_{go_slot};")
                 else:
-                    ap(f"{indent}        gx_acc_j_{jj} += scalar_t({cc}) * wi_slot_{wi_slot} * go_slot_{go_slot} * y_slot_{y_slot};")
-                    ap(f"{indent}        gy_acc_k_{kk} += scalar_t({cc}) * wi_slot_{wi_slot} * go_slot_{go_slot} * x_slot_{x_slot};")
+                    ap(f"{inner}wg_slot_{mg_idx} = scalar_t({c}) * wi_slot_{wi_slot} * go_slot_{go_slot};")
             ap("")
 
-        ap(f"{indent}        // write grad_x")
+            ap(f"{inner}// fused terms")
+            for mg_idx, mg in enumerate(mul_groups):
+                for gt in mg["gx_terms"]:
+                    jj = int(gt["j"])
+                    kk = int(gt["k"])
+                    if bool(gt["use_y_slot"]):
+                        y_expr = f"y_slot_{int(gt['y_slot'])}"
+                    else:
+                        if mode == "u,u,u,u":
+                            y_expr = f"y[y_base + {kk * u_dim} + u]"
+                        else:
+                            y_expr = f"y[y_base + {kk}]"
+                    ap(f"{inner}gx_acc_j_{jj} += wg_slot_{mg_idx} * {y_expr};")
+
+                for gt in mg["gy_terms"]:
+                    kk = int(gt["k"])
+                    jj = int(gt["j"])
+                    if bool(gt["use_x_slot"]):
+                        x_expr = f"x_slot_{int(gt['x_slot'])}"
+                    else:
+                        x_expr = f"x[x_base + {jj * u_dim} + u]"
+                    ap(f"{inner}gy_acc_k_{kk} += wg_slot_{mg_idx} * {x_expr};")
+            ap("")
+
+        ap(f"{inner}// write grad_x")
         for jj in uniq_j_all:
             gx_off = gx_u_offsets[jj]
             if write_grad_x_atomic:
-                ap(f"{indent}        atomicAdd(&grad_x[gx_base + {gx_off} + u], gx_acc_j_{jj});")
+                ap(f"{inner}atomicAdd(&grad_x[gx_base + {gx_off} + u], gx_acc_j_{jj});")
             else:
-                ap(f"{indent}        grad_x[gx_base + {gx_off} + u] += gx_acc_j_{jj};")
+                ap(f"{inner}grad_x[gx_base + {gx_off} + u] += gx_acc_j_{jj};")
         ap("")
 
         if mode == "u,u,,u":
-            ap(f"{indent}        // warp-reduce scalar grad_y over u lanes")
+            ap(f"{inner}// warp-reduce scalar grad_y over u lanes")
             for kk in uniq_k_all:
-                ap(f"{indent}        scalar_t gy_sum_{kk} = warp_sum_xor(gy_acc_k_{kk});")
-                ap(f"{indent}        if (lane == 0) {{")
+                ap(f"{inner}scalar_t gy_sum_{kk} = warp_sum_xor(gy_acc_k_{kk});")
+                ap(f"{inner}if (lane == 0) {{")
                 if write_grad_y_atomic:
-                    ap(f"{indent}            atomicAdd(&grad_y[gy_base + {kk}], gy_sum_{kk});")
+                    ap(f"{inner}    atomicAdd(&grad_y[gy_base + {kk}], gy_sum_{kk});")
                 else:
-                    ap(f"{indent}            grad_y[gy_base + {kk}] += gy_sum_{kk};")
-                ap(f"{indent}        }}")
+                    ap(f"{inner}    grad_y[gy_base + {kk}] += gy_sum_{kk};")
+                ap(f"{inner}}}")
         else:
-            ap(f"{indent}        // write vector grad_y[k,u]")
+            ap(f"{inner}// write vector grad_y[k,u] (keep atomic, no warp-reduce)")
             for kk in uniq_k_all:
                 gy_off = gy_u_offsets[kk]
                 if write_grad_y_atomic:
-                    ap(f"{indent}        atomicAdd(&grad_y[gy_base + {gy_off} + u], gy_acc_k_{kk});")
+                    ap(f"{inner}atomicAdd(&grad_y[gy_base + {gy_off} + u], gy_acc_k_{kk});")
                 else:
-                    ap(f"{indent}        grad_y[gy_base + {gy_off} + u] += gy_acc_k_{kk};")
+                    ap(f"{inner}grad_y[gy_base + {gy_off} + u] += gy_acc_k_{kk};")
 
-        ap(f"{indent}    }}")
+        if check_u_bound:
+            ap(f"{indent}    }}")
         ap(f"{indent}}}")
         ap("")
 
     if launch_style == "grid_y_tiled_u":
         ap("    // u traversal: grid_y tiled-u")
         ap("    int ublk = (int)blockIdx.y;")
-        emit_one_u_body("    ", f"ublk * {u_tile} + lane")
+        emit_one_u_body("    ", f"ublk * {u_tile} + lane", check_u_bound=True)
     else:
-        ap("    // u traversal: persistent inner loop over U")
-        ap(f"    for (int u_base = 0; u_base < U; u_base += {u_tile}) {{")
-        emit_one_u_body("        ", "u_base + lane")
-        ap("    }")
-        ap("")
+        if unroll_u_outer:
+            ap("    // u traversal: fully unrolled persistent inner loop over U")
+            for u_base_const in range(0, u_dim, u_tile):
+                emit_one_u_body(
+                    "    ",
+                    f"{u_base_const} + lane",
+                    check_u_bound=not assume_u_multiple_of_tile,
+                )
+        else:
+            ap("    // u traversal: persistent inner loop over U")
+            ap(f"    for (int u_base = 0; u_base < U; u_base += {u_tile}) {{")
+            emit_one_u_body("        ", "u_base + lane", check_u_bound=True)
+            ap("    }")
+            ap("")
 
     ap("}")
     ap("")
