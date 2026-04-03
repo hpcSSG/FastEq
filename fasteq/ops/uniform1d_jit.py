@@ -333,7 +333,7 @@ def _build_bwd_jit_module(
                     ky_dim=ky_dim,
                     v_dim=v_dim,
                     mode=mode,
-                    grad_w=grad_w,
+                    need_grad_w=grad_w,
                 )
                 
             """ sched = build_backward_schedule_from_lists(
