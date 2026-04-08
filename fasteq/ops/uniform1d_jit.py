@@ -255,7 +255,6 @@ def _build_fwd_jit_module(
         output_indices=output_indices,
         u_dim=u_dim,
         mode=mode,
-        tileU=False,
     )
     
 
@@ -558,8 +557,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         P = i_list.numel()
         #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000.0
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
 
         out = _run_fwd(
             w=w,
@@ -578,9 +577,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode=mode,
         )
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000.0
-        #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.b_list = b_list

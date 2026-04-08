@@ -4134,5 +4134,3 @@ def generate_code_uniform1d_bwd_fused(
         )
 
     return code
-
-    

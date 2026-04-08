@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import defaultdict, OrderedDict
+from collections import defaultdict, OrderedDict, Counter
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Tuple, Optional
 import math
@@ -21,199 +21,1801 @@ def _to_int_list(x: torch.Tensor) -> List[int]:
 def _to_float_list(x: torch.Tensor) -> List[float]:
     return [float(v) for v in x.detach().cpu().tolist()]
 
+# =============================================================================
+# Data structures
+# =============================================================================
+@dataclass(frozen=True)
+class CGPath:
+    i: int
+    j: int
+    k: int
+    v: int
+    c: float
 
-def _ordered_unique(xs):
-    out = []
+
+# =============================================================================
+# Generic helpers
+# =============================================================================
+def _stable_slot_map(vals) -> Dict[Any, int]:
+    uniq = []
     seen = set()
-    for x in xs:
+    for x in vals:
         if x not in seen:
             seen.add(x)
-            out.append(x)
-    return out
+            uniq.append(x)
+    uniq = sorted(uniq)
+    return {v: s for s, v in enumerate(uniq)}
+
+def _count_pair_reuse(paths: List[CGPath]):
+    cnt_wx = Counter()
+    cnt_wy = Counter()
+    cnt_xy = Counter()
+    cnt_x = Counter()
+    cnt_w = Counter()
+    cnt_y = Counter()
+    for p in paths:
+        cnt_wx[(p.i, p.j)] += 1
+        cnt_wy[(p.i, p.k)] += 1
+        cnt_xy[(p.j, p.k)] += 1
+        cnt_x[p.j] += 1
+        cnt_w[p.i] += 1
+        cnt_y[p.k] += 1
+    return cnt_wx, cnt_wy, cnt_xy, cnt_x, cnt_w, cnt_y
 
 
-def _fmt_coeff(c: float, scalar_t: str = "float") -> str:
-    c = float(c)
+def _phase_operand_cost(
+    wi_vals: Set[int],
+    x_vals: Set[int],
+    y_vals: Set[int],
+    pair_vals: Set[Tuple[int, int]],
+    y_weight: float,
+) -> float:
+    return (
+        float(len(wi_vals))
+        + float(len(x_vals))
+        + float(y_weight * len(y_vals))
+        + float(len(pair_vals))
+    )
 
-    if scalar_t in ("float", "at::Half", "half"):
-        if c == float("inf"):
-            return "INFINITY"
-        if c == float("-inf"):
-            return "-INFINITY"
-        if c != c:  # nan
-            return "NAN"
-        s = f"{c:.9g}"
-        if ("e" not in s) and ("E" not in s) and ("." not in s):
-            s += ".0"
-        return s + "f"
 
-    elif scalar_t in ("double",):
-        if c == float("inf"):
-            return "INFINITY"
-        if c == float("-inf"):
-            return "-INFINITY"
-        if c != c:
-            return "NAN"
-        s = f"{c:.17g}"
-        if ("e" not in s) and ("E" not in s) and ("." not in s):
-            s += ".0"
-        return s
-
-    else:
-        s = f"{c:.9g}"
-        if ("e" not in s) and ("E" not in s) and ("." not in s):
-            s += ".0"
-        return s
-
-def _y_expr(kk: int, mode: str) -> str:
-    if mode == "u,u,,u":
-        return f"y[y_base + (int64_t){kk}]"
-    elif mode == "u,u,u,u":
-        return f"y[y_base + (int64_t){kk} * (int64_t)U + u]"
-    else:
-        raise ValueError(f"Unsupported mode: {mode}")
-
-# ============================================================
-# Reorder logic
-# ============================================================
-
-def reorder_groups_for_reuse(
-    i_list: torch.Tensor,
-    j_list: torch.Tensor,
-    k_list: torch.Tensor,
-    v_list: torch.Tensor,
-    coeff_list: torch.Tensor,
-    wj: float = 4.0,
-    wk: float = 1.0,
-    penalty_vdist: float = 0.05,
+def _extract_phase_sets_from_items(
+    items: List[Tuple[int, CGPath]],
 ):
-    """
-    先按 v 分组，再对 group 重排，使相邻 group 的 j/k 集合尽量重叠。
-    最后每个 group 内按 (j, k) 排序。
-    """
-    assert i_list.ndim == j_list.ndim == k_list.ndim == v_list.ndim == coeff_list.ndim == 1
-    P = i_list.numel()
-    assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
-
-    device = i_list.device
-    dtype_i = i_list.dtype
-    dtype_c = coeff_list.dtype
-
-    i_cpu = _to_int_list(i_list)
-    j_cpu = _to_int_list(j_list)
-    k_cpu = _to_int_list(k_list)
-    v_cpu = _to_int_list(v_list)
-    c_cpu = _to_float_list(coeff_list)
-
-    # 按 v 分组
-    groups: "OrderedDict[int, List[Tuple[int,int,int,int,float]]]" = OrderedDict()
-    for ii, jj, kk, vv, cc in zip(i_cpu, j_cpu, k_cpu, v_cpu, c_cpu):
-        groups.setdefault(vv, []).append((ii, jj, kk, vv, cc))
-
-    group_keys = list(groups.keys())
-
-    # 构建每组的 j/k 集合
-    J: Dict[int, set] = {}
-    K: Dict[int, set] = {}
-    for vv, items in groups.items():
-        J[vv] = set(x[1] for x in items)
-        K[vv] = set(x[2] for x in items)
-
-    def score(v1: int, v2: int) -> float:
-        sj = len(J[v1] & J[v2])
-        sk = len(K[v1] & K[v2])
-        return wj * sj + wk * sk - penalty_vdist * abs(v1 - v2)
-
-    # 贪心组排序
-    start = max(group_keys, key=lambda vv: (len(groups[vv]), len(J[vv]), len(K[vv])))
-    unvisited = set(group_keys)
-    order = [start]
-    unvisited.remove(start)
-
-    cur = start
-    while unvisited:
-        nxt = max(
-            unvisited,
-            key=lambda vv: (score(cur, vv), len(groups[vv]), len(J[vv]), len(K[vv]))
-        )
-        order.append(nxt)
-        unvisited.remove(nxt)
-        cur = nxt
-
-    # 组内按 (j, k) 排序
-    reordered = []
-    for vv in order:
-        items = groups[vv]
-        items = sorted(items, key=lambda x: (x[1], x[2]))
-        reordered.extend(items)
-
-    i2 = torch.tensor([x[0] for x in reordered], device=device, dtype=dtype_i)
-    j2 = torch.tensor([x[1] for x in reordered], device=device, dtype=dtype_i)
-    k2 = torch.tensor([x[2] for x in reordered], device=device, dtype=dtype_i)
-    v2 = torch.tensor([x[3] for x in reordered], device=device, dtype=dtype_i)
-    c2 = torch.tensor([x[4] for x in reordered], device=device, dtype=dtype_c)
-
-    return i2, j2, k2, v2, c2, order
+    w_set = {p.i for _, p in items}
+    x_set = {p.j for _, p in items}
+    y_set = {p.k for _, p in items}
+    pair_wx_set = {(p.i, p.j) for _, p in items}
+    return w_set, x_set, y_set, pair_wx_set
 
 
-# ============================================================
-# Grouping for codegen
-# ============================================================
+def _sort_items_for_wx_pair_reuse(items: List[Tuple[int, CGPath]]):
+    items.sort(key=lambda it: (it[1].i, it[1].j, it[1].k, it[1].v, it[0]))
 
-def build_vi_groups(
-    i_list: torch.Tensor,
-    j_list: torch.Tensor,
-    k_list: torch.Tensor,
-    v_list: torch.Tensor,
-    coeff_list: torch.Tensor,
-):
-    """
-    输入已排序的 tensor，按 (v, i) 分组。
-    允许同一个 v 对应多个不同的 i。
-    """
-    i_py = _to_int_list(i_list)
-    j_py = _to_int_list(j_list)
-    k_py = _to_int_list(k_list)
-    v_py = _to_int_list(v_list)
-    c_py = _to_float_list(coeff_list)
+# =========================================================
+# merge scoring
+# =========================================================
 
-    groups = OrderedDict()
-    for ii, jj, kk, vv, cc in zip(i_py, j_py, k_py, v_py, c_py):
-        key = (vv, ii)
-        if key not in groups:
-            groups[key] = {
-                "v": vv,
-                "i": ii,
-                "terms": [],
+def _merge_score_wx_seed(
+    items_a: List[Tuple[int, CGPath]],
+    items_b: List[Tuple[int, CGPath]],
+    *,
+    y_weight: float,
+    r_rem: int,
+    x_share_weight: float,
+    w_share_weight: float,
+    y_share_weight: float,
+    pair_bonus_weight: float,
+    overflow_penalty_weight: float,
+) -> float:
+    wa, xa, ya, pa = _extract_phase_sets_from_items(items_a)
+    wb, xb, yb, pb = _extract_phase_sets_from_items(items_b)
+
+    shared_x = len(xa & xb)
+    shared_w = len(wa & wb)
+    shared_y = len(ya & yb)
+
+    # 合并前后 cost
+    cost_a = _phase_operand_cost(wa, xa, ya, pa, y_weight)
+    cost_b = _phase_operand_cost(wb, xb, yb, pb, y_weight)
+
+    w_u = wa | wb
+    x_u = xa | xb
+    y_u = ya | yb
+    p_u = pa | pb
+    cost_u = _phase_operand_cost(w_u, x_u, y_u, p_u, y_weight)
+
+    saved_cost = (cost_a + cost_b) - cost_u
+    overflow = max(0.0, cost_u - float(r_rem))
+
+    # 两个 wx seed phase 合并时，如果主 pair 数量没爆，默认给一点 bonus
+    pair_bonus = 1.0 if len(p_u) <= r_rem else 0.0
+
+    score = (
+        x_share_weight * float(shared_x)
+        + w_share_weight * float(shared_w)
+        + y_share_weight * float(shared_y)
+        + pair_bonus_weight * float(pair_bonus)
+        + 1.5 * float(saved_cost)
+        - overflow_penalty_weight * float(overflow)
+    )
+    return score
+
+
+# =========================================================
+# greedy merge on wx seeds
+# =========================================================
+
+def _build_wx_seed_clusters(
+    paths: List[CGPath],
+    cnt_wx: Counter,
+) -> List[Dict[str, Any]]:
+    buckets = defaultdict(list)
+    for pid, p in enumerate(paths):
+        buckets[(p.i, p.j)].append((pid, p))
+
+    cluster_items = list(buckets.items())
+    cluster_items.sort(key=lambda kv: (-cnt_wx[kv[0]], kv[0][0], kv[0][1]))
+
+    seeds: List[Dict[str, Any]] = []
+    for seed_id, ((i, j), items) in enumerate(cluster_items):
+        _sort_items_for_wx_pair_reuse(items)
+        seeds.append(
+            {
+                "seed_id": int(seed_id),
+                "main_pair_kind": "wx",
+                "seed_pair": (int(i), int(j)),
+                "items": list(items),
             }
-        groups[key]["terms"].append((jj, kk, cc))
-    return groups
+        )
+    return seeds
 
-def build_v_groups(
-    i_list: torch.Tensor,
-    j_list: torch.Tensor,
-    k_list: torch.Tensor,
-    v_list: torch.Tensor,
-    coeff_list: torch.Tensor,
-):
-    """
-    输入已排序的 tensor，按 v 分组。
-    """
-    i_py = _to_int_list(i_list)
-    j_py = _to_int_list(j_list)
-    k_py = _to_int_list(k_list)
-    v_py = _to_int_list(v_list)
-    c_py = _to_float_list(coeff_list)
 
-    groups = OrderedDict()
-    for ii, jj, kk, vv, cc in zip(i_py, j_py, k_py, v_py, c_py):
-        if vv not in groups:
-            groups[vv] = {"i": ii, "terms": []}
+def _greedy_merge_wx_seeds(
+    seeds: List[Dict[str, Any]],
+    *,
+    y_weight: float,
+    r_rem: int,
+    phase_pair_max_slots: int,
+    x_share_weight: float,
+    w_share_weight: float,
+    y_share_weight: float,
+    pair_bonus_weight: float,
+    overflow_penalty_weight: float,
+    min_merge_score: float,
+) -> List[Dict[str, Any]]:
+    """
+    目标：
+      - 先保住 wx seed
+      - 尽量把共享相同 x_j 的 seeds 合到同一个 phase
+      - phase 内 pair 个数不超过 phase_pair_max_slots
+      - 合并收益不足则停止
+    """
+    active = []
+    for sd in seeds:
+        active.append(
+            {
+                "main_pair_kind": "wx",
+                "seed_pairs": [sd["seed_pair"]],
+                "items": list(sd["items"]),
+            }
+        )
+
+    while True:
+        best_score = None
+        best_pair = None
+
+        n = len(active)
+        for a in range(n):
+            items_a = active[a]["items"]
+            _, _, _, pa = _extract_phase_sets_from_items(items_a)
+
+            for b in range(a + 1, n):
+                items_b = active[b]["items"]
+                _, _, _, pb = _extract_phase_sets_from_items(items_b)
+
+                # 限制 phase-local wx pair cache 大小
+                if len(pa | pb) > int(phase_pair_max_slots):
+                    continue
+
+                score = _merge_score_wx_seed(
+                    items_a,
+                    items_b,
+                    y_weight=y_weight,
+                    r_rem=r_rem,
+                    x_share_weight=x_share_weight,
+                    w_share_weight=w_share_weight,
+                    y_share_weight=y_share_weight,
+                    pair_bonus_weight=pair_bonus_weight,
+                    overflow_penalty_weight=overflow_penalty_weight,
+                )
+
+                if best_score is None or score > best_score:
+                    best_score = score
+                    best_pair = (a, b)
+
+        if best_pair is None:
+            break
+        if best_score is None or best_score < float(min_merge_score):
+            break
+
+        a, b = best_pair
+        if a > b:
+            a, b = b, a
+
+        merged_items = list(active[a]["items"]) + list(active[b]["items"])
+        _sort_items_for_wx_pair_reuse(merged_items)
+
+        merged_seed_pairs = list(active[a]["seed_pairs"]) + list(active[b]["seed_pairs"])
+
+        active[a] = {
+            "main_pair_kind": "wx",
+            "seed_pairs": merged_seed_pairs,
+            "items": merged_items,
+        }
+        del active[b]
+
+    return active
+
+
+# =========================================================
+# subphase split
+# =========================================================
+
+def _chunk_phase_items_by_budget_wx(
+    items: List[Tuple[int, CGPath]],
+    *,
+    y_weight: float,
+    r_rem: int,
+) -> List[List[Tuple[int, CGPath]]]:
+    chunks: List[List[Tuple[int, CGPath]]] = []
+    cur: List[Tuple[int, CGPath]] = []
+
+    cur_w = set()
+    cur_x = set()
+    cur_y = set()
+    cur_p = set()
+
+    def cost_of(w_set, x_set, y_set, p_set) -> float:
+        return _phase_operand_cost(w_set, x_set, y_set, p_set, y_weight)
+
+    for it in items:
+        _, p = it
+        nw = set(cur_w); nw.add(p.i)
+        nx = set(cur_x); nx.add(p.j)
+        ny = set(cur_y); ny.add(p.k)
+        np = set(cur_p); np.add((p.i, p.j))
+
+        if cur and cost_of(nw, nx, ny, np) > float(r_rem):
+            chunks.append(cur)
+            cur = [it]
+            cur_w = {p.i}
+            cur_x = {p.j}
+            cur_y = {p.k}
+            cur_p = {(p.i, p.j)}
         else:
-            if groups[vv]["i"] != ii:
-                raise ValueError(f"same v={vv} maps to different i: {groups[vv]['i']} vs {ii}")
-        groups[vv]["terms"].append((jj, kk, cc))
+            cur.append(it)
+            cur_w = nw
+            cur_x = nx
+            cur_y = ny
+            cur_p = np
+
+    if cur:
+        chunks.append(cur)
+
+    return chunks
+
+
+def _build_subphases_from_phase_items_wx(
+    items: List[Tuple[int, CGPath]],
+    *,
+    out_acc_slot_map: Dict[int, int],
+    wi_slot_map_phase: Dict[int, int],
+    x_slot_map_phase: Dict[int, int],
+    y_slot_map_phase: Dict[int, int],
+    pair_slot_map_phase: Dict[Tuple[int, int], int],
+    y_weight: float,
+    r_rem: int,
+) -> List[Dict[str, Any]]:
+    ordered = list(items)
+    _sort_items_for_wx_pair_reuse(ordered)
+
+    chunks = _chunk_phase_items_by_budget_wx(
+        ordered,
+        y_weight=y_weight,
+        r_rem=r_rem,
+    )
+
+    subphases: List[Dict[str, Any]] = []
+    for sp_id, chunk in enumerate(chunks):
+        sp_w = sorted({p.i for _, p in chunk})
+        sp_x = sorted({p.j for _, p in chunk})
+        sp_y = sorted({p.k for _, p in chunk})
+        sp_p = sorted({(p.i, p.j) for _, p in chunk})
+
+        reg_usage_inputs = _phase_operand_cost(set(sp_w), set(sp_x), set(sp_y), set(sp_p), y_weight)
+
+        ops = []
+        path_ids = []
+
+        for pid, p in chunk:
+            path_ids.append(pid)
+            ops.append(
+                {
+                    "i": int(p.i),
+                    "j": int(p.j),
+                    "k": int(p.k),
+                    "v": int(p.v),
+                    "c": float(p.c),
+
+                    "out_acc_slot": int(out_acc_slot_map[p.v]),
+                    "wi_slot": int(wi_slot_map_phase[p.i]),
+                    "x_slot": int(x_slot_map_phase[p.j]),
+                    "y_slot": int(y_slot_map_phase[p.k]),
+                    "pair_slot": int(pair_slot_map_phase[(p.i, p.j)]),
+                }
+            )
+
+        subphases.append(
+            {
+                "subphase_id": int(sp_id),
+                "wi_vals": list(sp_w),
+                "x_vals": list(sp_x),
+                "y_vals": list(sp_y),
+                "pair_vals": list(sp_p),
+                "path_ids": list(path_ids),
+                "reg_usage_inputs": float(reg_usage_inputs),
+                "reg_usage_inputs_rounded": int(round(reg_usage_inputs)),
+                "ops": ops,
+            }
+        )
+
+    return subphases
+
+
+# =========================================================
+# main scheduler: wx seed + shared-x merge
+# =========================================================
+# method1: operand-pair reuse maximization
+def schedule_fwd_reuse_first_wx_seed_merge_x(
+    i_list,
+    j_list,
+    k_list,
+    v_list,
+    coeff_list,
+    reg_budget: int,
+    *,
+    mode: str = "u,u,,u",
+    y_weight_scalar_mode: float = 0.5,
+    y_weight_vector_mode: float = 1.0,
+
+    phase_pair_max_slots: int = 8,
+
+    # merge weights
+    x_share_weight: float = 4.0,
+    w_share_weight: float = 2.0,
+    y_share_weight: float = 1.0,
+    pair_bonus_weight: float = 0.5,
+    overflow_penalty_weight: float = 3.0,
+    min_merge_score: float = 0.25,
+
+    sanity_check: bool = True,
+) -> Dict[str, Any]:
+
+    if not (len(i_list) == len(j_list) == len(k_list) == len(v_list) == len(coeff_list)):
+        raise ValueError("i/j/k/v/coeff list lengths must match")
+
+    if reg_budget <= 0:
+        raise ValueError(f"reg_budget must be positive, got {reg_budget}")
+
+    if phase_pair_max_slots <= 0:
+        raise ValueError(f"phase_pair_max_slots must be > 0, got {phase_pair_max_slots}")
+
+    paths = [
+        CGPath(
+            int(i_list[t]),
+            int(j_list[t]),
+            int(k_list[t]),
+            int(v_list[t]),
+            float(coeff_list[t]),
+        )
+        for t in range(len(i_list))
+    ]
+
+    uniq_i_all = sorted({p.i for p in paths})
+    uniq_j_all = sorted({p.j for p in paths})
+    uniq_k_all = sorted({p.k for p in paths})
+    uniq_v_all = sorted({p.v for p in paths})
+
+    out_acc_slot_map = _stable_slot_map(uniq_v_all)
+
+    n_acc_out = len(uniq_v_all)
+    n_acc_total = n_acc_out
+    r_rem = reg_budget - n_acc_total
+    if r_rem <= 0:
+        print(f"reg_budget={reg_budget} is too small: need n_acc_out={n_acc_out}")
+        r_rem = n_acc_out
+
+    y_weight = float(y_weight_scalar_mode if mode == "u,u,,u" else y_weight_vector_mode)
+    if y_weight <= 0:
+        raise ValueError(f"y_weight must be positive, got {y_weight}")
+
+    cnt_wx, cnt_wy, cnt_xy, cnt_x, cnt_w, cnt_y = _count_pair_reuse(paths)
+
+    # 1) build wx seeds
+    seeds = _build_wx_seed_clusters(paths, cnt_wx)
+
+    # 2) merge seeds by shared-x/shared-w/shared-y
+    merged_phases_raw = _greedy_merge_wx_seeds(
+        seeds,
+        y_weight=y_weight,
+        r_rem=r_rem,
+        phase_pair_max_slots=phase_pair_max_slots,
+        x_share_weight=x_share_weight,
+        w_share_weight=w_share_weight,
+        y_share_weight=y_share_weight,
+        pair_bonus_weight=pair_bonus_weight,
+        overflow_penalty_weight=overflow_penalty_weight,
+        min_merge_score=min_merge_score,
+    )
+
+    phases: List[Dict[str, Any]] = []
+    covered: List[int] = []
+    phase_id = 0
+
+    for ph in merged_phases_raw:
+        items = list(ph["items"])
+        _sort_items_for_wx_pair_reuse(items)
+
+        wi_vals_phase = sorted({p.i for _, p in items})
+        x_vals_phase  = sorted({p.j for _, p in items})
+        y_vals_phase  = sorted({p.k for _, p in items})
+        pair_vals_phase = sorted({(p.i, p.j) for _, p in items})
+
+        wi_slot_map_phase = _stable_slot_map(wi_vals_phase)
+        x_slot_map_phase  = _stable_slot_map(x_vals_phase)
+        y_slot_map_phase  = _stable_slot_map(y_vals_phase)
+        pair_slot_map_phase = {pv: s for s, pv in enumerate(pair_vals_phase)}
+
+        reg_usage_inputs_phase = _phase_operand_cost(
+            set(wi_vals_phase),
+            set(x_vals_phase),
+            set(y_vals_phase),
+            set(pair_vals_phase),
+            y_weight,
+        )
+
+        subphases = _build_subphases_from_phase_items_wx(
+            items,
+            out_acc_slot_map=out_acc_slot_map,
+            wi_slot_map_phase=wi_slot_map_phase,
+            x_slot_map_phase=x_slot_map_phase,
+            y_slot_map_phase=y_slot_map_phase,
+            pair_slot_map_phase=pair_slot_map_phase,
+            y_weight=y_weight,
+            r_rem=r_rem,
+        )
+
+        phase_path_ids = []
+        for sp in subphases:
+            phase_path_ids.extend(sp["path_ids"])
+        covered.extend(phase_path_ids)
+
+        phases.append(
+            {
+                "phase_id": int(phase_id),
+                "main_pair_kind": "wx",
+                "seed_pairs": list(ph["seed_pairs"]),
+                "seed_pair": list(ph["seed_pairs"])[0] if ph["seed_pairs"] else None,
+
+                "pair_vals_phase": list(pair_vals_phase),
+                "pair_slot_map_phase": dict(pair_slot_map_phase),
+
+                "wi_vals_phase": list(wi_vals_phase),
+                "x_vals_phase": list(x_vals_phase),
+                "y_vals_phase": list(y_vals_phase),
+
+                "wi_slot_map_phase": dict(wi_slot_map_phase),
+                "x_slot_map_phase": dict(x_slot_map_phase),
+                "y_slot_map_phase": dict(y_slot_map_phase),
+
+                "path_ids": list(phase_path_ids),
+
+                "reg_usage_inputs_phase": float(reg_usage_inputs_phase),
+                "reg_usage_inputs_phase_rounded": int(round(reg_usage_inputs_phase)),
+
+                "subphases": subphases,
+            }
+        )
+        phase_id += 1
+
+    if sanity_check:
+        seen = sorted(covered)
+        if seen != list(range(len(paths))):
+            raise AssertionError("scheduler did not cover each path exactly once")
+
+        for ph in phases:
+            if len(ph["pair_vals_phase"]) > int(phase_pair_max_slots):
+                raise AssertionError(
+                    f"phase pair count exceeds phase_pair_max_slots: "
+                    f"{len(ph['pair_vals_phase'])} > {phase_pair_max_slots}"
+                )
+
+            for sp in ph["subphases"]:
+                if sp["reg_usage_inputs"] > float(r_rem) + 1e-12:
+                    raise AssertionError(
+                        f"subphase exceeds weighted reg budget: "
+                        f"{sp['reg_usage_inputs']:.3f} > {r_rem}"
+                    )
+
+    schedule: Dict[str, Any] = {
+        "kernel_mode": "fwd_fullacc_reuse_first_wx_seed_merge_x",
+        "mode": str(mode),
+
+        "reg_budget": int(reg_budget),
+        "n_acc_out": int(n_acc_out),
+        "n_acc_total": int(n_acc_total),
+        "r_rem": int(r_rem),
+
+        "y_weight": float(y_weight),
+        "phase_pair_max_slots": int(phase_pair_max_slots),
+
+        "merge_weights": {
+            "x_share_weight": float(x_share_weight),
+            "w_share_weight": float(w_share_weight),
+            "y_share_weight": float(y_share_weight),
+            "pair_bonus_weight": float(pair_bonus_weight),
+            "overflow_penalty_weight": float(overflow_penalty_weight),
+            "min_merge_score": float(min_merge_score),
+        },
+
+        "uniq_i_all": list(uniq_i_all),
+        "uniq_j_all": list(uniq_j_all),
+        "uniq_k_all": list(uniq_k_all),
+        "uniq_v_all": list(uniq_v_all),
+
+        "out_acc_slot_map": dict(out_acc_slot_map),
+
+        "global_counts": {
+            "cnt_x": dict(cnt_x),
+            "cnt_w": dict(cnt_w),
+            "cnt_y": dict(cnt_y),
+            "cnt_wx": {str(k): int(v) for k, v in cnt_wx.items()},
+            "cnt_wy": {str(k): int(v) for k, v in cnt_wy.items()},
+            "cnt_xy": {str(k): int(v) for k, v in cnt_xy.items()},
+        },
+
+        "phases": phases,
+    }
+    return schedule
+
+def emit_fused_fwd_kernel_from_reuse_first_schedule(
+    schedule: Dict[str, Any],
+    *,
+    kernel_name: str,
+    scalar_t: str = "float",
+    mode: str = "u,u,,u",
+    use_x_src: bool = False,
+    use_y_src: bool = False,
+    use_scatter: bool = False,
+    u_dim: Optional[int] = None,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+) -> str:
+
+    """ if schedule.get("kernel_mode", "") != "fwd_fullacc_reuse_first":
+        raise ValueError(
+            f"schedule kernel_mode mismatch: got {schedule.get('kernel_mode')}"
+        ) """
+
+    if block_size != 32:
+        raise ValueError("this emitter currently assumes block_size=32")
+
+    uniq_v_all = list(schedule["uniq_v_all"])
+    out_acc_slot_map = dict(schedule["out_acc_slot_map"])
+    phases = list(schedule["phases"])
+
+    max_wi_slots = 0
+    max_x_slots = 0
+    max_y_slots = 0
+    max_pair_slots = 0
+    for ph in phases:
+        max_wi_slots = max(max_wi_slots, len(ph["wi_vals_phase"]))
+        max_x_slots = max(max_x_slots, len(ph["x_vals_phase"]))
+        max_y_slots = max(max_y_slots, len(ph["y_vals_phase"]))
+        max_pair_slots = max(max_pair_slots, len(ph["pair_vals_phase"]))
+
+    mode_scalar_y = (mode == "u,u,,u")
+
+    out_acc_by_slot = [None] * len(uniq_v_all)
+    for v, s in out_acc_slot_map.items():
+        out_acc_by_slot[s] = v
+
+    def ap(line: str = ""):
+        lines.append(line)
+
+    def fmt_float(x: float) -> str:
+        return repr(float(x))
+
+    def emit_indent(lines_list, indent, text):
+        lines_list.append(f"{indent}{text}")
+
+    lines: List[str] = []
+
+    # ---------- helpers ----------
+    ap("#include <stdint.h>")
+    ap("#include <cuda.h>")
+    ap("#include <cuda_runtime.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <ATen/cuda/CUDAContext.h>")
+    ap("#include <c10/cuda/CUDAGuard.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap('#include "cuda_utils.hpp"')
+    ap("")
+
+    # ---------- kernel ----------
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    scalar_t* __restrict__ out,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("")
+
+    if u_dim is not None:
+        ap(f"    constexpr int U_CONST = {int(u_dim)};")
+        ap("    (void)U_CONST;")
+
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+
+    if use_x_src:
+        ap("    const int x_row = src_idx[e_orig];")
+    else:
+        ap("    const int x_row = e_local;")
+
+    if use_y_src:
+        ap("    const int y_row = src_idx[e_orig];")
+    else:
+        ap("    const int y_row = e_orig;")
+
+    if use_scatter:
+        ap("    const int out_row = dst_idx[e_orig];")
+    else:
+        ap("    const int out_row = e_orig;")
+    ap("")
+
+    ap("    const index_t w_base = (index_t)w_row  * (index_t)Iw * (index_t)U;")
+    ap("    const index_t x_base = (index_t)x_row  * (index_t)Ix * (index_t)U;")
+    if mode_scalar_y:
+        ap("    const index_t y_base = (index_t)y_row  * (index_t)Ky;")
+    else:
+        ap("    const index_t y_base = (index_t)y_row  * (index_t)Ky * (index_t)U;")
+    ap("    const index_t out_base = (index_t)out_row * (index_t)V  * (index_t)U;")
+    ap("")
+
+    ap("    // full-resident output accumulators across all phases")
+    for slot_id in range(len(uniq_v_all)):
+        ap(f"    scalar_t out_acc_v_{slot_id};")
+    ap("")
+
+    ap("    // phase-local operand / pair slots")
+    for s in range(max_wi_slots):
+        ap(f"    scalar_t wi_slot_{s};")
+    for s in range(max_x_slots):
+        ap(f"    scalar_t x_slot_{s};")
+    for s in range(max_y_slots):
+        ap(f"    scalar_t y_slot_{s};")
+    for s in range(max_pair_slots):
+        ap(f"    scalar_t pair_slot_{s};")
+    ap("")
+
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        int u = u_base + lane;")
+    ap("        if (u < U) {")
+    ap("")
+
+    ap("            // reset output accumulators")
+    for slot_id in range(len(uniq_v_all)):
+        ap(f"            out_acc_v_{slot_id} = scalar_t(0);")
+    ap("")
+
+    # ---------- emit phases ----------
+    for ph in phases:
+        phase_id = ph["phase_id"]
+        main_pair_kind = ph["main_pair_kind"]
+        wi_vals_phase = list(ph["wi_vals_phase"])
+        x_vals_phase = list(ph["x_vals_phase"])
+        y_vals_phase = list(ph["y_vals_phase"])
+        pair_vals_phase = list(ph["pair_vals_phase"])
+
+        wi_slot_map_phase = dict(ph["wi_slot_map_phase"])
+        x_slot_map_phase = dict(ph["x_slot_map_phase"])
+        y_slot_map_phase = dict(ph["y_slot_map_phase"])
+        pair_slot_map_phase = dict(ph["pair_slot_map_phase"])
+
+        ap(f"            // ===== phase {phase_id}: main_pair_kind={main_pair_kind} =====")
+        ap("            {")
+
+        # preload phase operands
+        ap("                // phase-local wi preload")
+        for i_val in wi_vals_phase:
+            slot = wi_slot_map_phase[i_val]
+            if iw_dim is not None and i_val >= iw_dim:
+                raise ValueError(f"i={i_val} out of iw_dim={iw_dim}")
+            offset = int(i_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
+            if offset is not None:
+                ap(f"                wi_slot_{slot} = w[w_base + (index_t){offset} + (index_t)u];")
+            else:
+                ap(f"                wi_slot_{slot} = w[w_base + (index_t){i_val} * (index_t)U + (index_t)u];")
+        ap("")
+
+        ap("                // phase-local x preload")
+        for j_val in x_vals_phase:
+            slot = x_slot_map_phase[j_val]
+            if ix_dim is not None and j_val >= ix_dim:
+                raise ValueError(f"j={j_val} out of ix_dim={ix_dim}")
+            offset = int(j_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
+            if offset is not None:
+                ap(f"                x_slot_{slot} = x[x_base + (index_t){offset} + (index_t)u];")
+            else:
+                ap(f"                x_slot_{slot} = x[x_base + (index_t){j_val} * (index_t)U + (index_t)u];")
+        ap("")
+
+        ap("                // phase-local y preload")
+        for k_val in y_vals_phase:
+            slot = y_slot_map_phase[k_val]
+            if ky_dim is not None and k_val >= ky_dim:
+                raise ValueError(f"k={k_val} out of ky_dim={ky_dim}")
+            if mode_scalar_y:
+                ap(f"                y_slot_{slot} = y[y_base + (index_t){k_val}];")
+            else:
+                offset = int(k_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
+                if offset is not None:
+                    ap(f"                y_slot_{slot} = y[y_base + (index_t){offset} + (index_t)u];")
+                else:
+                    ap(f"                y_slot_{slot} = y[y_base + (index_t){k_val} * (index_t)U + (index_t)u];")
+        ap("")
+
+        # phase-local pair precompute
+        ap(f"                // phase-local pair cache kind={main_pair_kind}")
+        for pair_val in pair_vals_phase:
+            pair_slot = pair_slot_map_phase[tuple(pair_val) if isinstance(pair_val, list) else pair_val]
+            if main_pair_kind == "wx":
+                i_val, j_val = pair_val
+                wi_slot = wi_slot_map_phase[i_val]
+                x_slot = x_slot_map_phase[j_val]
+                ap(f"                pair_slot_{pair_slot} = wi_slot_{wi_slot} * x_slot_{x_slot};")
+            elif main_pair_kind == "wy":
+                i_val, k_val = pair_val
+                wi_slot = wi_slot_map_phase[i_val]
+                y_slot = y_slot_map_phase[k_val]
+                ap(f"                pair_slot_{pair_slot} = wi_slot_{wi_slot} * y_slot_{y_slot};")
+            elif main_pair_kind == "xy":
+                j_val, k_val = pair_val
+                x_slot = x_slot_map_phase[j_val]
+                y_slot = y_slot_map_phase[k_val]
+                ap(f"                pair_slot_{pair_slot} = x_slot_{x_slot} * y_slot_{y_slot};")
+            else:
+                raise ValueError(f"bad main_pair_kind={main_pair_kind}")
+        ap("")
+
+        # subphases consume pair cache
+        for sp in ph["subphases"]:
+            subphase_id = sp["subphase_id"]
+            ap(f"                // ---- subphase {subphase_id} ----")
+            for op in sp["ops"]:
+                out_acc_slot = int(op["out_acc_slot"])
+                pair_slot = int(op["pair_slot"])
+                wi_slot = int(op["wi_slot"])
+                x_slot = int(op["x_slot"])
+                y_slot = int(op["y_slot"])
+                coeff = fmt_float(float(op["c"]))
+
+                if main_pair_kind == "wx":
+                    # pair * y
+                    ap(
+                        f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
+                        f"pair_slot_{pair_slot} * y_slot_{y_slot};"
+                    )
+                elif main_pair_kind == "wy":
+                    # pair * x
+                    ap(
+                        f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
+                        f"pair_slot_{pair_slot} * x_slot_{x_slot};"
+                    )
+                elif main_pair_kind == "xy":
+                    # wi * pair
+                    ap(
+                        f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
+                        f"wi_slot_{wi_slot} * pair_slot_{pair_slot};"
+                    )
+                else:
+                    raise ValueError(f"bad main_pair_kind={main_pair_kind}")
+            ap("")
+
+        ap("            }")
+        ap("")
+
+    # ---------- write out ----------
+    ap("            // write out")
+    for slot_id, v_val in enumerate(out_acc_by_slot):
+        if v_val is None:
+            raise ValueError(f"missing out_acc slot {slot_id}")
+        if v_dim is not None and v_val >= v_dim:
+            raise ValueError(f"v={v_val} out of v_dim={v_dim}")
+
+        if u_dim is not None:
+            out_offset = int(v_val) * int(u_dim)
+            idx_expr = f"out_base + (index_t){out_offset} + (index_t)u"
+        else:
+            idx_expr = f"out_base + (index_t){v_val} * (index_t)U + (index_t)u"
+
+        if use_scatter:
+            ap(f"            atomicAdd(&out[{idx_expr}], out_acc_v_{slot_id});")
+        else:
+            ap(f"            out[{idx_expr}] = out_acc_v_{slot_id};")
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    # ---------- index helper ----------
+    ap("static inline bool mul_fits_int32(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("")
+    ap("static inline bool mul3_fits_int32(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32(a, b)) return false;")
+    ap("    return mul_fits_int32(a * b, c);")
+    ap("}")
+    ap("")
+    ap("static inline bool should_use_int32_index_fwd(")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    bool use_x_src, bool use_y_src, bool use_scatter, bool mode_scalar_y)")
+    ap("{")
+    ap("    bool w_ok = mul3_fits_int32((int64_t)WB, (int64_t)Iw, (int64_t)U);")
+    ap("    int64_t x_dim0 = use_x_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool x_ok = mul3_fits_int32(x_dim0, (int64_t)Ix, (int64_t)U);")
+    ap("    bool y_ok = false;")
+    ap("    if (mode_scalar_y) {")
+    ap("        int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("        y_ok = mul_fits_int32(y_dim0, (int64_t)Ky);")
+    ap("    } else {")
+    ap("        int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("        y_ok = mul3_fits_int32(y_dim0, (int64_t)Ky, (int64_t)U);")
+    ap("    }")
+    ap("    int64_t out_dim0 = use_scatter ? (int64_t)S : (int64_t)B;")
+    ap("    bool out_ok = mul3_fits_int32(out_dim0, (int64_t)V, (int64_t)U);")
+    ap("    return w_ok && x_ok && y_ok && out_ok;")
+    ap("}")
+    ap("")
+
+    # ---------- launchers ----------
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap("        w, x, y, out,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}_auto(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    constexpr bool kUseXSrc = {'true' if use_x_src else 'false'};")
+    ap(f"    constexpr bool kUseYSrc = {'true' if use_y_src else 'false'};")
+    ap(f"    constexpr bool kUseScatter = {'true' if use_scatter else 'false'};")
+    ap(f"    constexpr bool kModeScalarY = {'true' if mode_scalar_y else 'false'};")
+    ap("    if (should_use_int32_index_fwd(B, WB, Iw, Ix, Ky, V, U, S,")
+    ap("                                   kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    launch_{kernel_name}_auto<scalar_t>(")
+    ap("        w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("}")
+    ap("")
+
+    return "\n".join(lines)
+
+
+
+# Method3: output accumulator grouping may replace Method1
+
+# ============================================================
+# Data structures
+# ============================================================
+
+@dataclass
+class PathOp:
+    i: int
+    j: int
+    k: int
+    v: int
+    c: float
+
+    wi_slot: int
+    x_slot: int
+    y_slot: int
+
+    out_acc_slot: int
+
+
+@dataclass
+class PathPattern:
+    pattern_id: int
+    v: int
+
+    wi_vals: Tuple[int, ...]
+    x_vals: Tuple[int, ...]
+    y_vals: Tuple[int, ...]
+
+    wi_slot_map: Dict[int, int]
+    x_slot_map: Dict[int, int]
+    y_slot_map: Dict[int, int]
+
+    path_ids: List[int]
+    ops: List[PathOp]
+
+
+@dataclass
+class GroupPath:
+    group_id: int
+    group_type: str  # "xy" / "x" / "y" / "w" / "single"
+
+    shared_wi_vals: Optional[List[int]]
+    shared_x_vals: Optional[List[int]]
+    shared_y_vals: Optional[List[int]]
+
+    shared_wi_slot_map: Optional[Dict[int, int]]
+    shared_x_slot_map: Optional[Dict[int, int]]
+    shared_y_slot_map: Optional[Dict[int, int]]
+
+    member_pattern_ids: List[int]
+    members: List[PathPattern]
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+
+def _freeze_sorted(vals) -> Tuple[int, ...]:
+    return tuple(sorted(set(int(x) for x in vals)))
+
+
+def _bucket_by_key(items, key_fn):
+    buckets: Dict[Any, List[Any]] = {}
+    for x in items:
+        k = key_fn(x)
+        buckets.setdefault(k, []).append(x)
+    return buckets
+
+
+# ============================================================
+# Step 1: Build base path patterns
+#
+# 基础规则：
+#   pattern = same (v, i)
+#
+# 即：同一个输出 v 下，同一个 wi / i 的所有 raw path 构成一个基础 pattern。
+# ============================================================
+
+def build_base_path_patterns(
+    i_list,
+    j_list,
+    k_list,
+    v_list,
+    coeff_list,
+) -> Tuple[List[PathPattern], Dict[int, int], List[int]]:
+    if not (len(i_list) == len(j_list) == len(k_list) == len(v_list) == len(coeff_list)):
+        raise ValueError("i/j/k/v/coeff list lengths must match")
+
+    raw_paths: List[Tuple[int, CGPath]] = [
+        (
+            pid,
+            CGPath(
+                int(i_list[pid]),
+                int(j_list[pid]),
+                int(k_list[pid]),
+                int(v_list[pid]),
+                float(coeff_list[pid]),
+            ),
+        )
+        for pid in range(len(i_list))
+    ]
+
+    uniq_v_all = sorted({int(p.v) for _, p in raw_paths})
+    out_acc_slot_map = _stable_slot_map(uniq_v_all)
+
+    # 基础 pattern: group by (v, i)
+    buckets = _bucket_by_key(raw_paths, key_fn=lambda it: (int(it[1].v), int(it[1].i)))
+
+    patterns: List[PathPattern] = []
+    pattern_id = 0
+
+    for (vv, ii) in sorted(buckets.keys()):
+        items = buckets[(vv, ii)]
+        items = sorted(items, key=lambda it: (int(it[1].j), int(it[1].k), int(it[0])))
+
+        wi_vals = _freeze_sorted([p.i for _, p in items])   # 对这个 builder 来说通常只有 1 个
+        x_vals = _freeze_sorted([p.j for _, p in items])
+        y_vals = _freeze_sorted([p.k for _, p in items])
+
+        wi_slot_map = _stable_slot_map(list(wi_vals))
+        x_slot_map = _stable_slot_map(list(x_vals))
+        y_slot_map = _stable_slot_map(list(y_vals))
+
+        ops: List[PathOp] = []
+        path_ids: List[int] = []
+
+        for pid, p in items:
+            path_ids.append(int(pid))
+            ops.append(
+                PathOp(
+                    i=int(p.i),
+                    j=int(p.j),
+                    k=int(p.k),
+                    v=int(p.v),
+                    c=float(p.c),
+                    wi_slot=int(wi_slot_map[int(p.i)]),
+                    x_slot=int(x_slot_map[int(p.j)]),
+                    y_slot=int(y_slot_map[int(p.k)]),
+                    out_acc_slot=int(out_acc_slot_map[int(p.v)]),
+                )
+            )
+
+        patterns.append(
+            PathPattern(
+                pattern_id=int(pattern_id),
+                v=int(vv),
+                wi_vals=wi_vals,
+                x_vals=x_vals,
+                y_vals=y_vals,
+                wi_slot_map=dict(wi_slot_map),
+                x_slot_map=dict(x_slot_map),
+                y_slot_map=dict(y_slot_map),
+                path_ids=list(path_ids),
+                ops=list(ops),
+            )
+        )
+        pattern_id += 1
+
+    return patterns, out_acc_slot_map, uniq_v_all
+
+
+# ============================================================
+# Step 2: Layered priority merge into GroupPath
+#
+# 优先级：
+#   1) xy
+#   2) x
+#   3) y
+#   4) w
+#   5) single
+# ============================================================
+
+def build_group_paths_with_priority_merge(
+    patterns: List[PathPattern],
+) -> List[GroupPath]:
+    remaining: Dict[int, PathPattern] = {p.pattern_id: p for p in patterns}
+    groups: List[GroupPath] = []
+    group_id = 0
+
+    def emit_group(group_type: str, members: List[PathPattern]):
+        nonlocal group_id
+        if not members:
+            return
+
+        shared_wi_vals = None
+        shared_x_vals = None
+        shared_y_vals = None
+
+        shared_wi_slot_map = None
+        shared_x_slot_map = None
+        shared_y_slot_map = None
+
+        if group_type == "xy":
+            shared_x_vals = list(members[0].x_vals)
+            shared_y_vals = list(members[0].y_vals)
+            shared_x_slot_map = dict(members[0].x_slot_map)
+            shared_y_slot_map = dict(members[0].y_slot_map)
+
+        elif group_type == "x":
+            shared_x_vals = list(members[0].x_vals)
+            shared_x_slot_map = dict(members[0].x_slot_map)
+
+        elif group_type == "y":
+            shared_y_vals = list(members[0].y_vals)
+            shared_y_slot_map = dict(members[0].y_slot_map)
+
+        elif group_type == "w":
+            shared_wi_vals = list(members[0].wi_vals)
+            shared_wi_slot_map = dict(members[0].wi_slot_map)
+
+        groups.append(
+            GroupPath(
+                group_id=int(group_id),
+                group_type=str(group_type),
+                shared_wi_vals=shared_wi_vals,
+                shared_x_vals=shared_x_vals,
+                shared_y_vals=shared_y_vals,
+                shared_wi_slot_map=shared_wi_slot_map,
+                shared_x_slot_map=shared_x_slot_map,
+                shared_y_slot_map=shared_y_slot_map,
+                member_pattern_ids=[int(m.pattern_id) for m in members],
+                members=list(members),
+            )
+        )
+        group_id += 1
+
+    # Round 1: XY
+    round1 = list(remaining.values())
+    xy_buckets = _bucket_by_key(round1, key_fn=lambda p: ("xy", p.x_vals, p.y_vals))
+    for _, members in xy_buckets.items():
+        if len(members) >= 2:
+            emit_group("xy", members)
+            for m in members:
+                remaining.pop(m.pattern_id, None)
+
+    # Round 2: X
+    round2 = list(remaining.values())
+    x_buckets = _bucket_by_key(round2, key_fn=lambda p: ("x", p.x_vals))
+    for _, members in x_buckets.items():
+        if len(members) >= 2:
+            emit_group("x", members)
+            for m in members:
+                remaining.pop(m.pattern_id, None)
+
+    # Round 3: Y
+    round3 = list(remaining.values())
+    y_buckets = _bucket_by_key(round3, key_fn=lambda p: ("y", p.y_vals))
+    for _, members in y_buckets.items():
+        if len(members) >= 2:
+            emit_group("y", members)
+            for m in members:
+                remaining.pop(m.pattern_id, None)
+
+    # Round 4: W
+    round4 = list(remaining.values())
+    w_buckets = _bucket_by_key(round4, key_fn=lambda p: ("w", p.wi_vals))
+    for _, members in w_buckets.items():
+        if len(members) >= 2:
+            emit_group("w", members)
+            for m in members:
+                remaining.pop(m.pattern_id, None)
+
+    # Round 5: single
+    for p in remaining.values():
+        emit_group("single", [p])
+
     return groups
+
+
+# ============================================================
+# Top-level schedule builder
+# ============================================================
+
+def schedule_fwd_path_group_priority_merge(
+    i_list,
+    j_list,
+    k_list,
+    v_list,
+    coeff_list,
+) -> Dict[str, Any]:
+    patterns, out_acc_slot_map, uniq_v_all = build_base_path_patterns(
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+    )
+
+    groups = build_group_paths_with_priority_merge(patterns)
+
+    return {
+        "kernel_mode": "fwd_path_group_priority_merge",
+        "merge_priority": ["xy", "x", "y", "w", "single"],
+        "uniq_v_all": list(uniq_v_all),
+        "out_acc_slot_map": dict(out_acc_slot_map),
+
+        "path_patterns": [
+            {
+                "pattern_id": int(p.pattern_id),
+                "v": int(p.v),
+
+                "wi_vals": list(p.wi_vals),
+                "x_vals": list(p.x_vals),
+                "y_vals": list(p.y_vals),
+
+                "wi_slot_map": dict(p.wi_slot_map),
+                "x_slot_map": dict(p.x_slot_map),
+                "y_slot_map": dict(p.y_slot_map),
+
+                "path_ids": list(p.path_ids),
+                "ops": [asdict(op) for op in p.ops],
+            }
+            for p in patterns
+        ],
+
+        "group_paths": [
+            {
+                "group_id": int(g.group_id),
+                "group_type": str(g.group_type),
+
+                "shared_wi_vals": g.shared_wi_vals,
+                "shared_x_vals": g.shared_x_vals,
+                "shared_y_vals": g.shared_y_vals,
+
+                "shared_wi_slot_map": g.shared_wi_slot_map,
+                "shared_x_slot_map": g.shared_x_slot_map,
+                "shared_y_slot_map": g.shared_y_slot_map,
+
+                "member_pattern_ids": list(g.member_pattern_ids),
+                "members": [
+                    {
+                        "pattern_id": int(m.pattern_id),
+                        "v": int(m.v),
+
+                        "wi_vals": list(m.wi_vals),
+                        "x_vals": list(m.x_vals),
+                        "y_vals": list(m.y_vals),
+
+                        "wi_slot_map": dict(m.wi_slot_map),
+                        "x_slot_map": dict(m.x_slot_map),
+                        "y_slot_map": dict(m.y_slot_map),
+
+                        "path_ids": list(m.path_ids),
+                        "ops": [asdict(op) for op in m.ops],
+                    }
+                    for m in g.members
+                ],
+            }
+            for g in groups
+        ],
+    }
+
+
+def emit_fused_fwd_kernel_from_group_schedule(
+    schedule: Dict[str, Any],
+    *,
+    kernel_name: str,
+    scalar_t: str,
+    mode: str,
+    use_x_src: bool,
+    use_y_src: bool,
+    use_scatter: bool,
+    u_dim: int,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+) -> str:
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+    if not isinstance(u_dim, int) or u_dim <= 0:
+        raise ValueError(f"u_dim must be positive int, got {u_dim}")
+    if block_size != 32:
+        raise ValueError(f"Only block_size=32 is supported, got {block_size}")
+
+    uniq_v_all = [int(x) for x in schedule["uniq_v_all"]]
+    out_acc_slot_map = {int(k): int(v) for k, v in schedule["out_acc_slot_map"].items()}
+    group_paths = schedule["group_paths"]
+
+    out_u_offsets = {vv: vv * u_dim for vv in uniq_v_all}
+
+    w_row_stride_const = None if iw_dim is None else int(iw_dim) * u_dim
+    x_row_stride_const = None if ix_dim is None else int(ix_dim) * u_dim
+    y_row_stride_const = None if (mode == "u,u,,u" or ky_dim is None) else int(ky_dim) * u_dim
+    out_row_stride_const = None if v_dim is None else int(v_dim) * u_dim
+
+    def fmt_float(x: float) -> str:
+        return repr(float(x))
+
+    # --------------------------------------------------------
+    # Find max slot counts across all groups / members
+    # --------------------------------------------------------
+    max_wi_slot = -1
+    max_x_slot = -1
+    max_y_slot = -1
+
+    for g in group_paths:
+        if g["shared_wi_slot_map"] is not None:
+            for _, s in g["shared_wi_slot_map"].items():
+                max_wi_slot = max(max_wi_slot, int(s))
+        if g["shared_x_slot_map"] is not None:
+            for _, s in g["shared_x_slot_map"].items():
+                max_x_slot = max(max_x_slot, int(s))
+        if g["shared_y_slot_map"] is not None:
+            for _, s in g["shared_y_slot_map"].items():
+                max_y_slot = max(max_y_slot, int(s))
+
+        for m in g["members"]:
+            for _, s in m["wi_slot_map"].items():
+                max_wi_slot = max(max_wi_slot, int(s))
+            for _, s in m["x_slot_map"].items():
+                max_x_slot = max(max_x_slot, int(s))
+            for _, s in m["y_slot_map"].items():
+                max_y_slot = max(max_y_slot, int(s))
+
+    lines: List[str] = []
+    ap = lines.append
+
+    def wi_expr(op: Dict[str, Any]) -> str:
+        return f"wi_slot_{int(op['wi_slot'])}"
+
+    def x_expr(op: Dict[str, Any]) -> str:
+        return f"x_slot_{int(op['x_slot'])}"
+
+    def y_expr(op: Dict[str, Any]) -> str:
+        return f"y_slot_{int(op['y_slot'])}"
+
+    def emit_preload_w(member: Dict[str, Any], indent: str):
+        for i_val in member["wi_vals"]:
+            slot = int(member["wi_slot_map"][i_val])
+            ap(
+                f"{indent}wi_slot_{slot} = "
+                f"w[w_base + (index_t){int(i_val) * u_dim} + (index_t)u];"
+            )
+
+    def emit_preload_x_from_vals(x_vals, x_slot_map, indent: str):
+        for j_val in x_vals:
+            slot = int(x_slot_map[j_val])
+            ap(
+                f"{indent}x_slot_{slot} = "
+                f"x[x_base + (index_t){int(j_val) * u_dim} + (index_t)u];"
+            )
+
+    def emit_preload_y_from_vals(y_vals, y_slot_map, indent: str):
+        for k_val in y_vals:
+            slot = int(y_slot_map[k_val])
+            if mode == "u,u,,u":
+                ap(f"{indent}y_slot_{slot} = y[y_base + (index_t){int(k_val)}];")
+            else:
+                ap(
+                    f"{indent}y_slot_{slot} = "
+                    f"y[y_base + (index_t){int(k_val) * u_dim} + (index_t)u];"
+                )
+
+    # --------------------------------------------------------
+    # Headers
+    # --------------------------------------------------------
+    ap("#include <stdint.h>")
+    ap("#include <cuda.h>")
+    ap("#include <cuda_runtime.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <ATen/cuda/CUDAContext.h>")
+    ap("#include <c10/cuda/CUDAGuard.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap('#include "cuda_utils.hpp"')
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    scalar_t* __restrict__ out,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("")
+    ap(f"    constexpr int U_CONST = {u_dim};")
+    ap("    (void)U_CONST;")
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+
+    if use_x_src or use_y_src:
+        ap("    const int src = src_idx[e_orig];")
+    if use_scatter:
+        ap("    const int dst = dst_idx[e_orig];")
+    ap("")
+
+    if w_row_stride_const is not None:
+        ap(f"    const index_t w_base = (index_t)w_row * (index_t){w_row_stride_const};")
+    else:
+        ap("    const index_t w_base = (index_t)w_row * (index_t)Iw * (index_t)U;")
+
+    if x_row_stride_const is not None:
+        if use_x_src:
+            ap(f"    const index_t x_base = (index_t)src * (index_t){x_row_stride_const};")
+        else:
+            ap(f"    const index_t x_base = (index_t)e_local * (index_t){x_row_stride_const};")
+    else:
+        if use_x_src:
+            ap("    const index_t x_base = (index_t)src * (index_t)Ix * (index_t)U;")
+        else:
+            ap("    const index_t x_base = (index_t)e_local * (index_t)Ix * (index_t)U;")
+
+    if mode == "u,u,,u":
+        if use_y_src:
+            ap("    const index_t y_base = (index_t)src * (index_t)Ky;")
+        else:
+            ap("    const index_t y_base = (index_t)e_orig * (index_t)Ky;")
+    else:
+        if y_row_stride_const is not None:
+            if use_y_src:
+                ap(f"    const index_t y_base = (index_t)src * (index_t){y_row_stride_const};")
+            else:
+                ap(f"    const index_t y_base = (index_t)e_orig * (index_t){y_row_stride_const};")
+        else:
+            if use_y_src:
+                ap("    const index_t y_base = (index_t)src * (index_t)Ky * (index_t)U;")
+            else:
+                ap("    const index_t y_base = (index_t)e_orig * (index_t)Ky * (index_t)U;")
+
+    if out_row_stride_const is not None:
+        if use_scatter:
+            ap(f"    const index_t out_base = (index_t)dst * (index_t){out_row_stride_const};")
+        else:
+            ap(f"    const index_t out_base = (index_t)e_orig * (index_t){out_row_stride_const};")
+    else:
+        if use_scatter:
+            ap("    const index_t out_base = (index_t)dst * (index_t)V * (index_t)U;")
+        else:
+            ap("    const index_t out_base = (index_t)e_orig * (index_t)V * (index_t)U;")
+
+    ap("")
+    ap("    // full-resident output accumulators")
+    for s in range(len(uniq_v_all)):
+        ap(f"    scalar_t out_acc_v_{s};")
+    ap("")
+
+    ap("    // shared/local operand slots")
+    for s in range(max_wi_slot + 1):
+        ap(f"    scalar_t wi_slot_{s};")
+    for s in range(max_x_slot + 1):
+        ap(f"    scalar_t x_slot_{s};")
+    for s in range(max_y_slot + 1):
+        ap(f"    scalar_t y_slot_{s};")
+    ap("")
+
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        int u = u_base + lane;")
+    ap("        if (u < U) {")
+    ap("")
+
+    ap("            // reset output accumulators")
+    for s in range(len(uniq_v_all)):
+        ap(f"            out_acc_v_{s} = scalar_t(0);")
+    ap("")
+
+    # --------------------------------------------------------
+    # Emit group_path body
+    # --------------------------------------------------------
+    for g in group_paths:
+        gid = int(g["group_id"])
+        gtype = str(g["group_type"])
+
+        ap(f"            // ===== group_path {gid}: type={gtype} =====")
+        ap("            {")
+
+        if gtype == "xy":
+            if g["shared_x_vals"]:
+                ap("                // shared x preload")
+                emit_preload_x_from_vals(
+                    g["shared_x_vals"],
+                    g["shared_x_slot_map"],
+                    "                ",
+                )
+            if g["shared_y_vals"]:
+                ap("                // shared y preload")
+                emit_preload_y_from_vals(
+                    g["shared_y_vals"],
+                    g["shared_y_slot_map"],
+                    "                ",
+                )
+
+            for m in g["members"]:
+                ap(f"                // member pattern {int(m['pattern_id'])}, v={int(m['v'])}")
+                emit_preload_w(m, "                ")
+                for op in m["ops"]:
+                    wi = wi_expr(op)
+                    xe = x_expr(op)
+                    ye = y_expr(op)
+                    c = fmt_float(op["c"])
+                    out_slot = int(op["out_acc_slot"])
+                    ap(
+                        f"                out_acc_v_{out_slot} += scalar_t({c}) * {wi} * {xe} * {ye};"
+                    )
+
+        elif gtype == "x":
+            if g["shared_x_vals"]:
+                ap("                // shared x preload")
+                emit_preload_x_from_vals(
+                    g["shared_x_vals"],
+                    g["shared_x_slot_map"],
+                    "                ",
+                )
+
+            for m in g["members"]:
+                ap(f"                // member pattern {int(m['pattern_id'])}, v={int(m['v'])}")
+                emit_preload_w(m, "                ")
+                emit_preload_y_from_vals(m["y_vals"], m["y_slot_map"], "                ")
+                for op in m["ops"]:
+                    wi = wi_expr(op)
+                    xe = x_expr(op)
+                    ye = y_expr(op)
+                    c = fmt_float(op["c"])
+                    out_slot = int(op["out_acc_slot"])
+                    ap(
+                        f"                out_acc_v_{out_slot} += scalar_t({c}) * {wi} * {xe} * {ye};"
+                    )
+
+        elif gtype == "y":
+            if g["shared_y_vals"]:
+                ap("                // shared y preload")
+                emit_preload_y_from_vals(
+                    g["shared_y_vals"],
+                    g["shared_y_slot_map"],
+                    "                ",
+                )
+
+            for m in g["members"]:
+                ap(f"                // member pattern {int(m['pattern_id'])}, v={int(m['v'])}")
+                emit_preload_w(m, "                ")
+                emit_preload_x_from_vals(m["x_vals"], m["x_slot_map"], "                ")
+                for op in m["ops"]:
+                    wi = wi_expr(op)
+                    xe = x_expr(op)
+                    ye = y_expr(op)
+                    c = fmt_float(op["c"])
+                    out_slot = int(op["out_acc_slot"])
+                    ap(
+                        f"                out_acc_v_{out_slot} += scalar_t({c}) * {wi} * {xe} * {ye};"
+                    )
+
+        elif gtype == "w":
+            if g["shared_wi_vals"]:
+                ap("                // shared w preload")
+                for i_val in g["shared_wi_vals"]:
+                    slot = int(g["shared_wi_slot_map"][i_val])
+                    ap(
+                        f"                wi_slot_{slot} = "
+                        f"w[w_base + (index_t){int(i_val) * u_dim} + (index_t)u];"
+                    )
+
+            for m in g["members"]:
+                ap(f"                // member pattern {int(m['pattern_id'])}, v={int(m['v'])}")
+                emit_preload_x_from_vals(m["x_vals"], m["x_slot_map"], "                ")
+                emit_preload_y_from_vals(m["y_vals"], m["y_slot_map"], "                ")
+                for op in m["ops"]:
+                    wi = wi_expr(op)
+                    xe = x_expr(op)
+                    ye = y_expr(op)
+                    c = fmt_float(op["c"])
+                    out_slot = int(op["out_acc_slot"])
+                    ap(
+                        f"                out_acc_v_{out_slot} += scalar_t({c}) * {wi} * {xe} * {ye};"
+                    )
+
+        elif gtype == "single":
+            for m in g["members"]:
+                ap(f"                // single member pattern {int(m['pattern_id'])}, v={int(m['v'])}")
+                emit_preload_w(m, "                ")
+                emit_preload_x_from_vals(m["x_vals"], m["x_slot_map"], "                ")
+                emit_preload_y_from_vals(m["y_vals"], m["y_slot_map"], "                ")
+                for op in m["ops"]:
+                    wi = wi_expr(op)
+                    xe = x_expr(op)
+                    ye = y_expr(op)
+                    c = fmt_float(op["c"])
+                    out_slot = int(op["out_acc_slot"])
+                    ap(
+                        f"                out_acc_v_{out_slot} += scalar_t({c}) * {wi} * {xe} * {ye};"
+                    )
+
+        else:
+            raise ValueError(f"Unsupported group type: {gtype}")
+
+        ap("            }")
+        ap("")
+
+    # --------------------------------------------------------
+    # Final writeback
+    # --------------------------------------------------------
+    ap("            // final writeback")
+    for s, vv in enumerate(uniq_v_all):
+        if use_scatter:
+            ap(
+                f"            atomicAdd(&out[out_base + (index_t){out_u_offsets[vv]} + (index_t)u], "
+                f"out_acc_v_{s});"
+            )
+        else:
+            ap(
+                f"            out[out_base + (index_t){out_u_offsets[vv]} + (index_t)u] = out_acc_v_{s};"
+            )
+
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    # --------------------------------------------------------
+    # Launcher
+    # --------------------------------------------------------
+    mode_scalar_y = "true" if mode == "u,u,,u" else "false"
+    use_x_src_cpp = "true" if use_x_src else "false"
+    use_y_src_cpp = "true" if use_y_src else "false"
+    use_scatter_cpp = "true" if use_scatter else "false"
+
+    ap("static inline bool mul_fits_int32(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("")
+
+    ap("static inline bool mul3_fits_int32(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32(a, b)) return false;")
+    ap("    return mul_fits_int32(a * b, c);")
+    ap("}")
+    ap("")
+
+    ap("static inline bool should_use_int32_index_fwd(")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    bool use_x_src, bool use_y_src, bool use_scatter, bool mode_scalar_y)")
+    ap("{")
+    ap("    bool w_ok = mul3_fits_int32((int64_t)WB, (int64_t)Iw, (int64_t)U);")
+    ap("    int64_t x_dim0 = use_x_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool x_ok = mul3_fits_int32(x_dim0, (int64_t)Ix, (int64_t)U);")
+    ap("    bool y_ok = false;")
+    ap("    if (mode_scalar_y) {")
+    ap("        int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("        y_ok = mul_fits_int32(y_dim0, (int64_t)Ky);")
+    ap("    } else {")
+    ap("        int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("        y_ok = mul3_fits_int32(y_dim0, (int64_t)Ky, (int64_t)U);")
+    ap("    }")
+    ap("    int64_t out_dim0 = use_scatter ? (int64_t)S : (int64_t)B;")
+    ap("    bool out_ok = mul3_fits_int32(out_dim0, (int64_t)V, (int64_t)U);")
+    ap("    return w_ok && x_ok && y_ok && out_ok;")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap("    dim3 block(32);")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap("        w, x, y, out,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}_auto(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    constexpr bool kUseXSrc = {use_x_src_cpp};")
+    ap(f"    constexpr bool kUseYSrc = {use_y_src_cpp};")
+    ap(f"    constexpr bool kUseScatter = {use_scatter_cpp};")
+    ap(f"    constexpr bool kModeScalarY = {mode_scalar_y};")
+    ap("    if (should_use_int32_index_fwd(B, WB, Iw, Ix, Ky, V, U, S,")
+    ap("                                   kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    cudaStream_t stream)")
+    ap("{")
+    ap(f"    launch_{kernel_name}_auto<scalar_t>(")
+    ap("        w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("}")
+    ap("")
+
+    return "\n".join(lines)
 
 
 def emit_launcher(
@@ -349,672 +1951,11 @@ torch::Tensor launcher_{bundle_name}(
 
     return out;
 }}
-/*
-TORCH_LIBRARY({bundle_name}_codegen, m) {{
-    m.def("run", &launcher_{bundle_name});
-}}
-*/
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &launcher_{bundle_name}, "{bundle_name} forward jit impl");
 }}
 '''
-
-
-def emit_warp_body_lowreg(
-    ap,
-    groups: OrderedDict,
-    warp_id: int,
-    warp_groups: List[tuple],
-    mode: str,
-    scalar_t: str,
-    use_scatter: bool,
-    *,
-    max_i_slots: int = 1,
-    max_j_slots: int = 1,
-    max_k_slots: int = 1,
-    max_groups_per_chunk: int = 1,
-):
-    ap(f"    if (warp == {warp_id}) {{")
-    if not warp_groups:
-        ap("        return;")
-        ap("    }")
-        ap("")
-        return
-
-    v_buckets = OrderedDict()
-    for gk in warp_groups:
-        vv = groups[gk]["v"]
-        if vv not in v_buckets:
-            v_buckets[vv] = []
-        v_buckets[vv].append(gk)
-
-    def build_chunks_for_v(v_groups: List[tuple]):
-        chunks = []
-        cur = []
-        cur_i, cur_j, cur_k = set(), set(), set()
-
-        def flush():
-            nonlocal cur, cur_i, cur_j, cur_k
-            if cur:
-                chunks.append(cur)
-            cur = []
-            cur_i, cur_j, cur_k = set(), set(), set()
-
-        for gk in v_groups:
-            info = groups[gk]
-            ii = info["i"]
-            terms = info["terms"]
-
-            add_i = {ii}
-            add_j = {jj for jj, _, _ in terms}
-            add_k = {kk for _, kk, _ in terms}
-
-            new_i = cur_i | add_i
-            new_j = cur_j | add_j
-            new_k = cur_k | add_k
-
-            if max_groups_per_chunk == 1:
-                over_budget = (
-                    len(cur) >= max_groups_per_chunk
-                    or len(new_i) > max_i_slots
-                )
-            else:
-                over_budget = (
-                    len(cur) >= max_groups_per_chunk
-                    or len(new_i) > max_i_slots
-                    or len(new_j) > max_j_slots
-                    or len(new_k) > max_k_slots
-                )
-
-            if over_budget and cur:
-                flush()
-
-            cur.append(gk)
-            cur_i.add(ii)
-            for jj, kk, _ in terms:
-                cur_j.add(jj)
-                cur_k.add(kk)
-
-        flush()
-        return chunks
-
-    ap("        for (int u = lane; u < U; u += 32) {")
-
-    for vv, v_groups in v_buckets.items():
-        chunks = build_chunks_for_v(v_groups)
-
-        ap(f"            // ---- v = {vv} ----")
-        ap("            {")
-        ap("                scalar_t acc_v = scalar_t(0);")
-        ap("")
-
-        for chunk_id, chunk in enumerate(chunks):
-            uniq_i = []
-            uniq_j = []
-            uniq_k = []
-            seen_i = set()
-            seen_j = set()
-            seen_k = set()
-
-            for gk in chunk:
-                info = groups[gk]
-                ii = info["i"]
-                if ii not in seen_i:
-                    seen_i.add(ii)
-                    uniq_i.append(ii)
-
-                if max_groups_per_chunk != 1:
-                    for jj, kk, _ in info["terms"]:
-                        if jj not in seen_j:
-                            seen_j.add(jj)
-                            uniq_j.append(jj)
-                        if kk not in seen_k:
-                            seen_k.add(kk)
-                            uniq_k.append(kk)
-
-            i2slot = {ii: s for s, ii in enumerate(uniq_i)}
-            j2slot = {jj: s for s, jj in enumerate(uniq_j)}
-            k2slot = {kk: s for s, kk in enumerate(uniq_k)}
-
-            ap(f"                // chunk {chunk_id}")
-            ap("                {")
-
-            for s in range(len(uniq_i)):
-                ap(f"                    scalar_t wi_slot{s} = scalar_t(0);")
-
-            if max_groups_per_chunk != 1:
-                for s in range(len(uniq_j)):
-                    ap(f"                    scalar_t xj_slot{s} = scalar_t(0);")
-                for s in range(len(uniq_k)):
-                    ap(f"                    scalar_t yk_slot{s} = scalar_t(0);")
-
-            ap("")
-
-            for ii in uniq_i:
-                s = i2slot[ii]
-                ap(f"                    wi_slot{s} = w[w_base + (int64_t){ii} * (int64_t)U + u];")
-
-            if max_groups_per_chunk != 1:
-                for jj in uniq_j:
-                    s = j2slot[jj]
-                    ap(f"                    xj_slot{s} = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
-                for kk in uniq_k:
-                    s = k2slot[kk]
-                    ap(f"                    yk_slot{s} = {_y_expr(kk, mode)};")
-
-            ap("")
-
-            for local_gid, gk in enumerate(chunk):
-                info = groups[gk]
-                ii = info["i"]
-                wi = i2slot[ii]
-                terms = info["terms"]
-
-                ap(f"                    // group {local_gid}")
-                ap("                    {")
-
-                if max_groups_per_chunk == 1:
-                    ap("                        scalar_t xj_val, yk_val;")
-                    for jj, kk, cc in terms:
-                        ap(f"                        xj_val = x_all[x_base + (int64_t){jj} * (int64_t)U + u];")
-                        ap(f"                        yk_val = {_y_expr(kk, mode)};")
-                        expr = f"wi_slot{wi} * xj_val * yk_val"
-                        if abs(cc - 1.0) < 1e-12:
-                            ap(f"                        acc_v += {expr};")
-                        elif abs(cc + 1.0) < 1e-12:
-                            ap(f"                        acc_v -= {expr};")
-                        else:
-                            cstr = _fmt_coeff(cc, scalar_t)
-                            ap(f"                        acc_v += scalar_t({cstr}) * {expr};")
-                else:
-                    for jj, kk, cc in terms:
-                        xj = j2slot[jj]
-                        yk = k2slot[kk]
-                        expr = f"wi_slot{wi} * xj_slot{xj} * yk_slot{yk}"
-                        if abs(cc - 1.0) < 1e-12:
-                            ap(f"                        acc_v += {expr};")
-                        elif abs(cc + 1.0) < 1e-12:
-                            ap(f"                        acc_v -= {expr};")
-                        else:
-                            cstr = _fmt_coeff(cc, scalar_t)
-                            ap(f"                        acc_v += scalar_t({cstr}) * {expr};")
-
-                ap("                    }")
-                ap("")
-
-            ap("                }")
-            ap("")
-
-        if use_scatter:
-            ap(f"                atomicAdd(&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], acc_v);")
-        else:
-            ap(f"                out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * (int64_t)U + u] += acc_v;")
-
-        ap("            }")
-        ap("")
-
-    ap("        }")
-    ap("        return;")
-    ap("    }")
-    ap("")
-
-
-from collections import OrderedDict
-from typing import List
-
-
-def emit_warp_body_lowreg_unroll_u(
-    ap,
-    groups: OrderedDict,
-    warp_id: int,
-    warp_groups: List[tuple],
-    mode: str,
-    scalar_t: str,
-    use_scatter: bool,
-    u_dim: int, 
-    *,
-    max_i_slots: int = 1,
-    max_j_slots: int = 1,
-    max_k_slots: int = 1,
-    max_groups_per_chunk: int = 1,
-):
-    """
-    Fully unroll:
-        for (int u = lane; u < U; u += 32)
-    into:
-        { const int u = lane;      ... }
-        { const int u = lane + 32; ... }
-        { const int u = lane + 64; ... }
-        ...
-    Requires U (= u_dim) to be known at codegen time.
-    """
-
-    if u_dim <= 0:
-        raise ValueError(f"u_dim must be positive, got {u_dim}")
-
-    ap(f"    if (warp == {warp_id}) {{")
-    if not warp_groups:
-        ap("        return;")
-        ap("    }")
-        ap("")
-        return
-
-    # ------------------------------------------------------------------
-    # bucket groups by v
-    # ------------------------------------------------------------------
-    v_buckets = OrderedDict()
-    for gk in warp_groups:
-        vv = groups[gk]["v"]
-        if vv not in v_buckets:
-            v_buckets[vv] = []
-        v_buckets[vv].append(gk)
-
-    # ------------------------------------------------------------------
-    # chunk builder
-    # ------------------------------------------------------------------
-    def build_chunks_for_v(v_groups: List[tuple]):
-        chunks = []
-        cur = []
-        cur_i, cur_j, cur_k = set(), set(), set()
-
-        def flush():
-            nonlocal cur, cur_i, cur_j, cur_k
-            if cur:
-                chunks.append(cur)
-            cur = []
-            cur_i, cur_j, cur_k = set(), set(), set()
-
-        for gk in v_groups:
-            info = groups[gk]
-            ii = info["i"]
-            terms = info["terms"]
-
-            add_i = {ii}
-            add_j = {jj for jj, _, _ in terms}
-            add_k = {kk for _, kk, _ in terms}
-
-            new_i = cur_i | add_i
-            new_j = cur_j | add_j
-            new_k = cur_k | add_k
-
-            if max_groups_per_chunk == 1:
-                over_budget = (
-                    len(cur) >= max_groups_per_chunk
-                    or len(new_i) > max_i_slots
-                )
-            else:
-                over_budget = (
-                    len(cur) >= max_groups_per_chunk
-                    or len(new_i) > max_i_slots
-                    or len(new_j) > max_j_slots
-                    or len(new_k) > max_k_slots
-                )
-
-            if over_budget and cur:
-                flush()
-
-            cur.append(gk)
-            cur_i.add(ii)
-            for jj, kk, _ in terms:
-                cur_j.add(jj)
-                cur_k.add(kk)
-
-        flush()
-        return chunks
-
-    # ------------------------------------------------------------------
-    # emit one fixed-u body
-    # ------------------------------------------------------------------
-    def emit_one_u_body(u_expr: str, u_guard: bool):
-        ap("        {")
-        ap(f"            const int u = {u_expr};")
-        if u_guard:
-            ap("            if (u < U) {")
-            inner = "                "
-        else:
-            inner = "            "
-
-        for vv, v_groups in v_buckets.items():
-            chunks = build_chunks_for_v(v_groups)
-
-            ap(f"{inner}// ---- v = {vv} ----")
-            ap(f"{inner}{{")
-            ap(f"{inner}    scalar_t acc_v = scalar_t(0);")
-            ap("")
-
-            for chunk_id, chunk in enumerate(chunks):
-                uniq_i = []
-                uniq_j = []
-                uniq_k = []
-                seen_i = set()
-                seen_j = set()
-                seen_k = set()
-
-                for gk in chunk:
-                    info = groups[gk]
-                    ii = info["i"]
-                    if ii not in seen_i:
-                        seen_i.add(ii)
-                        uniq_i.append(ii)
-
-                    if max_groups_per_chunk != 1:
-                        for jj, kk, _ in info["terms"]:
-                            if jj not in seen_j:
-                                seen_j.add(jj)
-                                uniq_j.append(jj)
-                            if kk not in seen_k:
-                                seen_k.add(kk)
-                                uniq_k.append(kk)
-
-                i2slot = {ii: s for s, ii in enumerate(uniq_i)}
-                j2slot = {jj: s for s, jj in enumerate(uniq_j)}
-                k2slot = {kk: s for s, kk in enumerate(uniq_k)}
-
-                ap(f"{inner}    // chunk {chunk_id}")
-                ap(f"{inner}    {{")
-
-                for s in range(len(uniq_i)):
-                    ap(f"{inner}        scalar_t wi_slot{s} = scalar_t(0);")
-
-                if max_groups_per_chunk != 1:
-                    for s in range(len(uniq_j)):
-                        ap(f"{inner}        scalar_t xj_slot{s} = scalar_t(0);")
-                    for s in range(len(uniq_k)):
-                        ap(f"{inner}        scalar_t yk_slot{s} = scalar_t(0);")
-
-                ap("")
-
-                for ii in uniq_i:
-                    s = i2slot[ii]
-                    ap(
-                        f"{inner}        wi_slot{s} = "
-                        f"w[w_base + (int64_t){ii} * (int64_t)U + u];"
-                    )
-
-                if max_groups_per_chunk != 1:
-                    for jj in uniq_j:
-                        s = j2slot[jj]
-                        ap(
-                            f"{inner}        xj_slot{s} = "
-                            f"x_all[x_base + (int64_t){jj} * (int64_t)U + u];"
-                        )
-                    for kk in uniq_k:
-                        s = k2slot[kk]
-                        ap(f"{inner}        yk_slot{s} = {_y_expr(kk, mode)};")
-
-                ap("")
-
-                for local_gid, gk in enumerate(chunk):
-                    info = groups[gk]
-                    ii = info["i"]
-                    wi = i2slot[ii]
-                    terms = info["terms"]
-
-                    ap(f"{inner}        // group {local_gid}")
-                    ap(f"{inner}        {{")
-
-                    if max_groups_per_chunk == 1:
-                        ap(f"{inner}            scalar_t xj_val, yk_val;")
-                        for jj, kk, cc in terms:
-                            ap(
-                                f"{inner}            xj_val = "
-                                f"x_all[x_base + (int64_t){jj} * (int64_t)U + u];"
-                            )
-                            ap(f"{inner}            yk_val = {_y_expr(kk, mode)};")
-
-                            expr = f"wi_slot{wi} * xj_val * yk_val"
-                            if abs(cc - 1.0) < 1e-12:
-                                ap(f"{inner}            acc_v += {expr};")
-                            elif abs(cc + 1.0) < 1e-12:
-                                ap(f"{inner}            acc_v -= {expr};")
-                            else:
-                                cstr = _fmt_coeff(cc, scalar_t)
-                                ap(f"{inner}            acc_v += scalar_t({cstr}) * {expr};")
-                    else:
-                        for jj, kk, cc in terms:
-                            xj = j2slot[jj]
-                            yk = k2slot[kk]
-                            expr = f"wi_slot{wi} * xj_slot{xj} * yk_slot{yk}"
-                            if abs(cc - 1.0) < 1e-12:
-                                ap(f"{inner}            acc_v += {expr};")
-                            elif abs(cc + 1.0) < 1e-12:
-                                ap(f"{inner}            acc_v -= {expr};")
-                            else:
-                                cstr = _fmt_coeff(cc, scalar_t)
-                                ap(f"{inner}            acc_v += scalar_t({cstr}) * {expr};")
-
-                    ap(f"{inner}        }}")
-                    ap("")
-
-                ap(f"{inner}    }}")
-                ap("")
-
-            if use_scatter:
-                ap(
-                    f"{inner}    atomicAdd("
-                    f"&out[((int64_t)dst * (int64_t)V + (int64_t){vv}) * (int64_t)U + u], "
-                    f"acc_v);"
-                )
-            else:
-                ap(
-                    f"{inner}    out[((int64_t)e_local * (int64_t)V + (int64_t){vv}) * "
-                    f"(int64_t)U + u] += acc_v;"
-                )
-
-            ap(f"{inner}}}")
-            ap("")
-
-        if u_guard:
-            ap("            }")
-        ap("        }")
-        ap("")
-
-    # ------------------------------------------------------------------
-    # fully unroll u-loop at codegen time
-    # ------------------------------------------------------------------
-    num_tiles = (u_dim + 31) // 32
-    for t in range(num_tiles):
-        u0 = 32 * t
-        if u0 + 31 < u_dim:
-            # full tile: no guard needed
-            emit_one_u_body(f"lane + {u0}" if u0 != 0 else "lane", u_guard=False)
-        else:
-            # tail tile
-            emit_one_u_body(f"lane + {u0}" if u0 != 0 else "lane", u_guard=True)
-
-    ap("        return;")
-    ap("    }")
-    ap("")
-
-
-def split_groups_into_one_or_two_warps_by_vi(
-    groups: OrderedDict,
-    num_warps: int,
-) -> Tuple[List[tuple], List[tuple]]:
-    """
-    Keep all groups with the same v inside the same warp.
-
-    Returns:
-        warp0_groups, warp1_groups
-    If num_warps == 1, warp1_groups will be empty.
-    """
-    if num_warps == 1:
-        return list(groups.keys()), []
-
-    # bucket groups by v
-    v_buckets = OrderedDict()
-    for gk, info in groups.items():
-        vv = info["v"]
-        if vv not in v_buckets:
-            v_buckets[vv] = []
-        v_buckets[vv].append(gk)
-
-    # cost per v bucket = number of terms in that bucket
-    items = []
-    for vv, gks in v_buckets.items():
-        cost = sum(len(groups[gk]["terms"]) for gk in gks)
-        items.append((vv, cost))
-
-    # greedy load balancing, unit = whole v bucket
-    warp0_v = []
-    warp1_v = []
-    load0 = 0
-    load1 = 0
-
-    for vv, cost in sorted(items, key=lambda x: x[1], reverse=True):
-        if load0 <= load1:
-            warp0_v.append(vv)
-            load0 += cost
-        else:
-            warp1_v.append(vv)
-            load1 += cost
-
-    # restore original v order
-    v_order = list(v_buckets.keys())
-    pos = {vv: i for i, vv in enumerate(v_order)}
-    warp0_v.sort(key=lambda vv: pos[vv])
-    warp1_v.sort(key=lambda vv: pos[vv])
-
-    warp0_groups = []
-    warp1_groups = []
-    for vv in warp0_v:
-        warp0_groups.extend(v_buckets[vv])
-    for vv in warp1_v:
-        warp1_groups.extend(v_buckets[vv])
-
-    return warp0_groups, warp1_groups
-
-
-def choose_num_warps(groups):
-    #num_v = len({info["v"] for info in groups.values()})
-    total_terms = sum(len(info["terms"]) for info in groups.values())
-    if total_terms > 128: # total_times == path number
-        return 2
-    return 1
-
-
-def emit_adaptive_vgroup_forward_kernel(
-    groups: OrderedDict,
-    kernel_name: str = "stp_codegen_adaptive_vgroup",
-    scalar_t: str = "float",
-    mode: str = "u,u,,u",
-    u_dim: int = 32,
-    *,
-    use_x_src: bool,
-    use_y_src: bool,
-    use_scatter: bool,
-) -> str:
-    if mode not in ("u,u,,u", "u,u,u,u"):
-        raise ValueError(f"Unsupported mode: {mode}")
-
-    #num_warps = choose_num_warps(groups)
-    num_warps = 1
-    warp0_groups, warp1_groups = split_groups_into_one_or_two_warps_by_vi(groups, num_warps)
-    threads_per_block = 32 * num_warps
-
-    lines: List[str] = []
-    ap = lines.append
-
-    ap("#include <stdint.h>")
-    ap("#include <cuda.h>")
-    ap("#include <cuda_runtime.h>")
-    ap("#include <torch/extension.h>")
-    ap("#include <ATen/cuda/CUDAContext.h>")
-    ap("#include <c10/cuda/CUDAGuard.h>")
-    ap("#include <vector>")
-    ap("#include <cstdint>")
-    ap('#include "cuda_utils.hpp"')
-    ap("")
-
-    ap("template <typename scalar_t>")
-    ap(f"__global__ void {kernel_name}(")
-    ap("    const scalar_t* __restrict__ w,")
-    ap("    const scalar_t* __restrict__ x_all,")
-    ap("    const scalar_t* __restrict__ y,")
-    ap("    scalar_t* __restrict__ out,")
-    ap("    const int32_t* __restrict__ src_idx,")
-    ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
-    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
-    ap("{")
-    ap("    int e_local = (int)blockIdx.x;")
-    ap("    if (e_local >= B) return;")
-    ap("")
-    ap("    int e_orig = b_list ? b_list[e_local] : e_local;")
-    ap("    int w_row  = (WB == 1 ? 0 : e_orig);")
-    ap("")
-    ap("    int tid  = (int)threadIdx.x;")
-    ap("    int lane = tid & 31;")
-    ap("    int warp = tid >> 5;")
-    ap(f"    if (warp >= {num_warps}) return;")
-    ap("")
-
-    if use_x_src or use_y_src:
-        ap("    int src = src_idx[e_orig];")
-    if use_scatter:
-        ap("    int dst = dst_idx[e_orig];")
-    ap("")
-
-    ap("    int64_t w_base = (int64_t)w_row * (int64_t)Iw * (int64_t)U;")
-
-    if use_x_src:
-        ap("    int64_t x_base = (int64_t)src * (int64_t)Ix * (int64_t)U;")
-    else:
-        ap("    int64_t x_base = (int64_t)e_local * (int64_t)Ix * (int64_t)U;")
-
-    if mode == 'u,u,,u':
-        if use_y_src:
-            ap("    int64_t y_base = (int64_t)src * (int64_t)Ky;")
-        else:
-            ap("    int64_t y_base = (int64_t)e_orig * (int64_t)Ky;")
-    else:
-        if use_y_src:
-            ap("    int64_t y_base = (int64_t)src * (int64_t)Ky * (int64_t)U;")
-        else:
-            ap("    int64_t y_base = (int64_t)e_local * (int64_t)Ky * (int64_t)U;")
-    ap("")
-
-    
-    """ emit_warp_body_lowreg_unroll_u(
-        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter, u_dim
-    )
-    if num_warps == 2:
-        emit_warp_body_lowreg_unroll_u(
-            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter, u_dim
-        ) """
-    emit_warp_body_lowreg(
-        ap, groups, 0, warp0_groups, mode, scalar_t, use_scatter
-    )
-    if num_warps == 2:
-        emit_warp_body_lowreg(
-            ap, groups, 1, warp1_groups, mode, scalar_t, use_scatter
-        )
-
-    ap("}")
-    ap("")
-
-    ap("template <typename scalar_t>")
-    ap(f"void launch_{kernel_name}(")
-    ap("    const scalar_t* w,")
-    ap("    const scalar_t* x_all,")
-    ap("    const scalar_t* y,")
-    ap("    scalar_t* out,")
-    ap("    const int32_t* src_idx,")
-    ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
-    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
-    ap("    cudaStream_t stream)")
-    ap("{")
-    ap(f"    dim3 block({threads_per_block});")
-    ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t><<<grid, block, 0, stream>>>(")
-    ap("        w, x_all, y, out, src_idx, dst_idx, b_list,")
-    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
-    ap("}")
-    ap("")
-
-    return '\n'.join(lines)
 
 def generate_code_uniform1d_fwd(
     i_list: torch.Tensor,
@@ -1029,8 +1970,6 @@ def generate_code_uniform1d_fwd(
     out_path: str = "generated_uniform1d_fwd.cu",
     kernel_name: str = "stp_codegen_two_warp_vgroup",
     scalar_t: str = "float",
-    reorder_groups: bool = True,
-    tileU: bool = False,
 ):
     """
     input_indices:
@@ -1060,65 +1999,69 @@ def generate_code_uniform1d_fwd(
 
     kernel_name = f"uniform1d_u{u_dim}_path{P}_{mode_str}_{layout_tag}_fwd"
 
-    if reorder_groups:
-        i2, j2, k2, v2, c2, group_order = reorder_groups_for_reuse(
-            i_list, j_list, k_list, v_list, coeff_list
-        )
-    else:
-        i_cpu = _to_int_list(i_list)
-        j_cpu = _to_int_list(j_list)
-        k_cpu = _to_int_list(k_list)
-        v_cpu = _to_int_list(v_list)
-        c_cpu = _to_float_list(coeff_list)
-
-        groups = OrderedDict()
-        for ii, jj, kk, vv, cc in zip(i_cpu, j_cpu, k_cpu, v_cpu, c_cpu):
-            groups.setdefault(vv, []).append((ii, jj, kk, vv, cc))
-
-        reordered = []
-        group_order = list(groups.keys())
-        for vv in group_order:
-            items = sorted(groups[vv], key=lambda x: (x[1], x[2]))
-            reordered.extend(items)
-
-        device = i_list.device
-        i2 = torch.tensor([x[0] for x in reordered], device=device, dtype=i_list.dtype)
-        j2 = torch.tensor([x[1] for x in reordered], device=device, dtype=j_list.dtype)
-        k2 = torch.tensor([x[2] for x in reordered], device=device, dtype=k_list.dtype)
-        v2 = torch.tensor([x[3] for x in reordered], device=device, dtype=v_list.dtype)
-        c2 = torch.tensor([x[4] for x in reordered], device=device, dtype=coeff_list.dtype)
-
-    groups = build_vi_groups(i2, j2, k2, v2, c2)
+    i_cpu = _to_int_list(i_list)
+    j_cpu = _to_int_list(j_list)
+    k_cpu = _to_int_list(k_list)
+    v_cpu = _to_int_list(v_list)
+    c_cpu = _to_float_list(coeff_list)
     
-    
-    code = emit_adaptive_vgroup_forward_kernel(
-        groups,
+
+    """ schedule = schedule_fwd_path_group_priority_merge(
+        i_list=i_cpu,
+        j_list=j_cpu,
+        k_list=k_cpu,
+        v_list=v_cpu,
+        coeff_list=c_cpu,
+    )
+
+    code = emit_fused_fwd_kernel_from_group_schedule(
+        schedule,
         kernel_name=kernel_name,
         scalar_t=scalar_t,
         mode=mode,
-        u_dim=u_dim,
         use_x_src=use_x_src,
         use_y_src=use_y_src,
         use_scatter=use_scatter,
+        u_dim=u_dim,
+        iw_dim=None,
+        ix_dim=None,
+        ky_dim=None,
+        v_dim=None,
+        block_size=32,
+    )"""
+
+
+
+    schedule = schedule_fwd_reuse_first_wx_seed_merge_x(
+        i_list=i_cpu,
+        j_list=j_cpu,
+        k_list=k_cpu,
+        v_list=v_cpu,
+        coeff_list=c_cpu,
+        reg_budget=128,
+        mode=mode, 
     )
 
+    code = emit_fused_fwd_kernel_from_reuse_first_schedule(
+        schedule,
+        kernel_name=kernel_name,
+        scalar_t=scalar_t,
+        mode=mode,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+        u_dim=u_dim,
+        iw_dim=None,
+        ix_dim=None,
+        ky_dim=None,
+        v_dim=None,
+        block_size=32,
+    )
     code = code + "\n" + emit_launcher(
-        kernel_name,
+        bundle_name=kernel_name,
         mode=mode,
         use_x_src=use_x_src,
         use_y_src=use_y_src,
         use_scatter=use_scatter,
     )
-    
-    stats = {
-        "num_paths": int(P),
-        "num_groups": int(len(groups)),
-        "group_keys": list(groups.keys()),
-        "out_path": str(out_path),
-        "mode": mode,
-        "use_x_src": use_x_src,
-        "use_y_src": use_y_src,
-        "use_scatter": use_scatter,
-    }
-
     return code
