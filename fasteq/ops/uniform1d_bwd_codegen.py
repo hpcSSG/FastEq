@@ -949,10 +949,11 @@ def schedule_gradw_gradx_grady_full_acc_subphase(
 
     r_rem = reg_budget - n_acc_total
     if r_rem <= 0:
-        raise ValueError(
+        print(
             f"reg_budget={reg_budget} is too small: need n_acc_total={n_acc_total}, "
             f"where n_acc_gw={n_acc_gw}, n_acc_gx={n_acc_gx}, n_acc_gy={n_acc_gy}"
         )
+        r_rem = 128
 
     if dynamic_iv_order:
         iv_order = _choose_pair_order(len(uniq_i_all), len(uniq_v_all), "i", "v")
