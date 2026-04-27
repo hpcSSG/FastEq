@@ -189,7 +189,7 @@ def _build_jit_module_common(
     # If the CUDA source file already exists, assume the module name uniquely
     # identifies the generated code and load it directly.
     if cu_path.exists():
-        print(f"[JIT][{kind}] hit disk cache source: {cu_path}")
+        #print(f"[JIT][{kind}] hit disk cache source: {cu_path}")
         return _load_jit_module(
             module_name=module_name,
             code=None,
@@ -407,7 +407,6 @@ def _run_fwd(
         src_idx = None
         raise RuntimeError("Input_indices 1 and 2 all empty")
 
-    
     if fused_scatter:
         b_list = b_list.to(torch.int32)
         dst_idx = output_indices[0].to(torch.int32)
@@ -557,8 +556,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         P = i_list.numel()
         #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000.0
 
         out = _run_fwd(
             w=w,
@@ -577,9 +576,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode=mode,
         )
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000.0
+        #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.b_list = b_list
@@ -609,8 +608,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000.0
 
         if w.requires_grad:
             grad_w, grad_x, grad_y = _run_bwd(
@@ -663,9 +662,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
             grad_w = None
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000.0
+        #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
 
         return grad_w, grad_x, grad_y, None, None, None, None
 

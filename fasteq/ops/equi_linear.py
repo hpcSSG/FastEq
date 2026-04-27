@@ -37,9 +37,9 @@ class _FastEquiLinearFn(torch.autograd.Function):
         #I_total = sum(I_list)
         origin_dtype = x.dtype
 
-        if origin_dtype == torch.float64:
+        """ if origin_dtype == torch.float64:
             x = x.float()
-            w = w.float()
+            w = w.float() """
 
         """ torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000 """
@@ -47,9 +47,9 @@ class _FastEquiLinearFn(torch.autograd.Function):
         out = torch.ops.equi_linear.forward(x, w, I_list, cg_list)
         out =  out.view(B, -1)
 
-        if origin_dtype == torch.float64:
+        """ if origin_dtype == torch.float64:
             out = out.double()
-
+ """
         """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
@@ -73,15 +73,15 @@ class _FastEquiLinearFn(torch.autograd.Function):
         start_time = time.perf_counter() * 1000 """
         w, = ctx.saved_tensors
 
-        if ctx.origin_dtype == torch.float64:
+        """ if ctx.origin_dtype == torch.float64:
             grad_out = grad_out.float()
-            w = w.float()
+            w = w.float() """
 
         grad_out = grad_out.view(ctx.B, 16, ctx.u).contiguous() # 只支持out固定为16
         grad_x = torch.ops.equi_linear.backward(grad_out, w, ctx.I_list, ctx.cg_list).view(ctx.B, -1)
 
-        if ctx.origin_dtype == torch.float64:
-            grad_x = grad_x.double()
+        """ if ctx.origin_dtype == torch.float64:
+            grad_x = grad_x.double() """
 
         """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
