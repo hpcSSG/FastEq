@@ -78,7 +78,8 @@ def fused_onehot_wpuvw_kernel(
         acc += tl.sum(x_val[:, :, None] * w_val, axis=1)
 
     # scale
-    acc *= (val[:, None] * tl.full((), alpha, ACC_DTYPE))
+    val = val.to(ACC_DTYPE)
+    acc *= val[:, None] * alpha
 
     # store
     out_off = (pid_b * K + k_ids)[:, None] * W + w_ids[None, :]
@@ -106,6 +107,8 @@ def triton_fused_fctp_fwd(
     B, I, U = x_biu.shape
     P, U2, V, W = w_puvw.shape
     assert U == U2
+
+    alpha = alpha.reshape(-1)[0].item()
 
     out = torch.empty((B, K_total, W), device=x_biu.device, dtype=x_biu.dtype)
 
@@ -234,6 +237,8 @@ def triton_fused_fctp_bwd(
 
     ACC_DTYPE = tl.float64 if grad_out.dtype == torch.float64 else tl.float32
 
+    alpha = alpha.reshape(-1)[0].item()
+
     grid = (B, triton.cdiv(K, BK), triton.cdiv(U, BU))
     fused_onehot_wpuvw_bwd_dx_noatomic_kernel[grid](
         grad_out, w, vstar, p_for_k, i_for_k, val_for_k, grad_x,
@@ -269,33 +274,21 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         
         B = x.shape[0]
         
-        if path_num == 1 and nnz0 == 1:
-            # ====================== torch Implementation ======================
-            
-            vstar = torch.argmax(y, dim=1)
-            w = w.view(U, V, W)
-            w_selected = w[:, vstar, :].permute(1, 0, 2).contiguous()
-
-            # out[b, w] = sum_u a[b, u] * w_selected[b, u, w]
-            out = torch.einsum("bu,buw->bw", x, w_selected)
-            output = out * cg_val
-
-        else:
-            #====================== Triton Implementation ====================== 
-            x = x.view(B, I_total, U)
-            y = y.view(B, V)
-            w = w.view(path_num, U, V, W)
-            vstar = torch.argmax(y, dim=1).to(torch.int32).contiguous()
-            ctx.vstar = vstar
-            
-            output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
-                                                            BK=8, BW=64, BU=32, num_warps=4)
-            
-            """
-            output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, vstar,
-                cg_i_all, cg_j_all, cg_k_all, cg_val_all,
-                nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
-            """
+        #====================== Triton Implementation ====================== 
+        x = x.view(B, I_total, U)
+        y = y.view(B, V)
+        w = w.view(path_num, U, V, W)
+        vstar = torch.argmax(y, dim=1).to(torch.int32).contiguous()
+        ctx.vstar = vstar
+        
+        output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
+                                                        BK=8, BW=64, BU=32, num_warps=4)
+        
+        """
+        output = torch.ops.fctp_fused_multipath_fwd.forward(w, x, y, vstar,
+            cg_i_all, cg_j_all, cg_k_all, cg_val_all,
+            nnz_per_path, K_per_path, path_offset, U, V, W, K_total)
+        """
 
         ctx.save_for_backward(w, x, y)
         ctx.meta = meta
@@ -335,27 +328,14 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         grad_out = grad_out.view(B, K_total, W)
         w = w.view(path_num, U, V, W)
 
-        if path_num == 1 and nnz0 == 1:
-            #================ Path = 1, torch ===============
-            # vstar: [B]
-            vstar = torch.argmax(y, dim=1)
-
-            w = w.view(U, V, W)
-            grad_out = grad_out.view(B, -1)
-            w_selected = w[:, vstar, :].permute(1, 0, 2).contiguous()
-
-            # grad_x[b, u] = cg_val * sum_w grad_out[b, w] * w_selected[b, u, w]
-            grad_x = torch.einsum("bw,buw->bu", grad_out, w_selected)
-            grad_x = grad_x * cg_val
-            
-        else:
-            #====================== Triton Implementation ====================== 
-            grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val, can_use_empty_grad_x,
-                                                            BK=8, BW=32, BU=32, num_warps=4)
-            
-            """ grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, ctx.vstar, 
-                cg_i_all, cg_j_all, cg_k_all, cg_val_all,
-                nnz_per_path, K_per_path, path_offset, U, V, W, K_total) """
+        
+        #====================== Triton Implementation ====================== 
+        grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val, can_use_empty_grad_x,
+                                                        BK=8, BW=32, BU=32, num_warps=4)
+        
+        """ grad_x = torch.ops.fctp_fused_multipath_bwd.backward(grad_out, w, x, y, ctx.vstar, 
+            cg_i_all, cg_j_all, cg_k_all, cg_val_all,
+            nnz_per_path, K_per_path, path_offset, U, V, W, K_total) """
         
 
         return None, grad_x, None, None  # None for w, y, meta gradients

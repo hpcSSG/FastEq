@@ -40,7 +40,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     const int*     __restrict__ path_offset,   // [P]
     int nnz_max,
     int P, int B, int I_total, int U, int V, int W,
-    int K_max, int K_total,
+    int K_total,
     const scalar_t* __restrict__ grad_out,     // [B,K_total,W]
     scalar_t*       __restrict__ grad_a        // [B,I_total,U]
 )
@@ -241,14 +241,6 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
-    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
-    auto K_per_path_cpu = K_per_path.to(at::kCPU);
-    int K_max = 0;
-    for (int p = 0; p < P; ++p) {
-        int Kp = K_per_path_cpu[p].item<int>();
-        if (Kp > K_max) K_max = Kp;
-    }
-
     const int tx = (int)U;   // 每个线程负责一个 u
     const int ty = 1;
     dim3 block(tx, ty, 1);
@@ -263,10 +255,10 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath", [&] {
         using scalar_t_ = scalar_t;
-        cudaFuncSetAttribute(
+        /* cudaFuncSetAttribute(
             fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)shmem_bytes);
+            (int)shmem_bytes); */
 
         fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>
             <<<grid, block, (int)shmem_bytes, stream>>>(
@@ -281,7 +273,7 @@ at::Tensor launch_fused_multipath_fctp_backward(
                 path_offset.data_ptr<int>(),
                 nnz_max,
                 P, B, I_total, (int)U, (int)V, (int)W,
-                K_max, (int)K_total,
+                (int)K_total,
                 grad_out.data_ptr<scalar_t_>(),
                 grad_a.data_ptr<scalar_t_>());
     });
@@ -305,7 +297,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     const int*     __restrict__ path_offset,   // [P]
     int nnz_max,
     int P, int B, int I_total, int U, int V, int W,
-    int K_max, int K_total,
+    int K_total,
     const scalar_t* __restrict__ grad_out,     // [B,K_total,W]
     scalar_t*       __restrict__ grad_a        // [B,I_total,U]
 )
@@ -506,17 +498,17 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     TORCH_CHECK(nnz_max <= 7, "nnz_max<=7 required");
     TORCH_CHECK(W % 4 == 0, "W%4==0 required for Vec4 loads");
 
-    auto grad_a = at::zeros({B, I_total, U}, b_all.options());
-
-    // K_max 目前只是为了接口对齐
-    auto K_per_path_cpu = K_per_path.to(at::kCPU);
-    int K_max = 0;
-    for (int p = 0; p < P; ++p) {
-        int Kp = K_per_path_cpu[p].item<int>();
-        if (Kp > K_max) K_max = Kp;
-    }
+    //auto grad_a = at::zeros({B, I_total, U}, b_all.options());
+    auto grad_a = at::empty({B, I_total, U}, b_all.options());
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaMemsetAsync(
+        grad_a.data_ptr(),
+        0,
+        grad_a.numel() * grad_a.element_size(),
+        stream
+    );
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath_tiledU", [&] {
         using scalar_t_ = scalar_t;
@@ -544,7 +536,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
                     path_offset.data_ptr<int>(),
                     nnz_max,
                     P, B, I_total, (int)U, (int)V, (int)W,
-                    K_max, (int)K_total,
+                    (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
         } else {
@@ -570,7 +562,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
                     path_offset.data_ptr<int>(),
                     nnz_max,
                     P, B, I_total, (int)U, (int)V, (int)W,
-                    K_max, (int)K_total,
+                    (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
             }
@@ -582,130 +574,6 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     return grad_a;
 }
 
-
-template <typename scalar_t, typename acc_t, int BK, int BU, int BW>
-__global__ void fused_onehot_wpuvw_bwd_dx_noatomic_kernel_cuda(
-    const scalar_t* __restrict__ grad_out_ptr,  // [B, K, W]
-    const scalar_t* __restrict__ w_ptr,         // [P, U, V, W]
-    const int32_t* __restrict__ vstar_ptr,      // [B]
-    const int32_t* __restrict__ p_for_k_ptr,    // [K]
-    const int32_t* __restrict__ i_for_k_ptr,    // [K]
-    const scalar_t* __restrict__ val_for_k_ptr, // [K]
-    scalar_t* __restrict__ grad_x_ptr,          // [B, I, U]
-    int B, int I, int K, int U,
-    int P, int V, int W,
-    acc_t alpha)
-{
-    const int b = blockIdx.x;
-    const int k0 = blockIdx.y * BK;
-    const int u0 = blockIdx.z * BU;
-
-    const int tk = threadIdx.y;   // [0, BK)
-    const int tu = threadIdx.x;   // [0, BU)
-
-    const int k = k0 + tk;
-    const int u = u0 + tu;
-
-    if (b >= B || tk >= BK || tu >= BU) return;
-    if (k >= K || u >= U) return;
-
-    const int v = vstar_ptr[b];
-    const int p = p_for_k_ptr[k];
-    const int i = i_for_k_ptr[k];
-
-    acc_t acc = acc_t(0);
-
-    if (i >= 0) {
-        for (int w0 = 0; w0 < W; w0 += BW) {
-#pragma unroll
-            for (int ww = 0; ww < BW; ++ww) {
-                const int widx = w0 + ww;
-                if (widx < W) {
-                    const int64_t go_off =
-                        ((int64_t)b * K + k) * (int64_t)W + widx;
-                    const int64_t w_off =
-                        (((int64_t)p * U + u) * (int64_t)V + v) * (int64_t)W + widx;
-
-                    acc += static_cast<acc_t>(grad_out_ptr[go_off]) *
-                           static_cast<acc_t>(w_ptr[w_off]);
-                }
-            }
-        }
-
-        acc *= static_cast<acc_t>(val_for_k_ptr[k]) * alpha;
-
-        const int64_t gx_off =
-            ((int64_t)b * I + i) * (int64_t)U + u;
-        grad_x_ptr[gx_off] = static_cast<scalar_t>(acc);
-    }
-}
-
-torch::Tensor fused_onehot_wpuvw_bwd_dx(
-    torch::Tensor grad_out,     // [B, K, W]
-    torch::Tensor w,            // [P, U, V, W]
-    torch::Tensor vstar,        // [B] int32
-    torch::Tensor p_for_k,      // [K] int32
-    torch::Tensor i_for_k,      // [K] int32
-    torch::Tensor val_for_k,    // [K]
-    int64_t I,
-    double alpha)
-{
-
-    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be [B, K, W]");
-    TORCH_CHECK(w.dim() == 4, "w must be [P, U, V, W]");
-    TORCH_CHECK(vstar.scalar_type() == torch::kInt32, "vstar must be int32");
-    TORCH_CHECK(p_for_k.scalar_type() == torch::kInt32, "p_for_k must be int32");
-    TORCH_CHECK(i_for_k.scalar_type() == torch::kInt32, "i_for_k must be int32");
-    TORCH_CHECK(grad_out.scalar_type() == w.scalar_type(), "dtype mismatch: grad_out and w");
-    TORCH_CHECK(grad_out.scalar_type() == val_for_k.scalar_type(), "dtype mismatch: grad_out and val_for_k");
-
-    const int B = grad_out.size(0);
-    const int K = grad_out.size(1);
-    const int W_ = grad_out.size(2);
-
-    const int P = w.size(0);
-    const int U = w.size(1);
-    const int V = w.size(2);
-    const int W = w.size(3);
-
-    TORCH_CHECK(W_ == W, "W mismatch");
-    TORCH_CHECK(p_for_k.size(0) == K, "p_for_k size mismatch");
-    TORCH_CHECK(i_for_k.size(0) == K, "i_for_k size mismatch");
-    TORCH_CHECK(val_for_k.size(0) == K, "val_for_k size mismatch");
-
-    auto grad_x = torch::zeros({B, I, U}, grad_out.options());
-
-    const int BW = 32;
-    const int BU = 32;
-    const int BK = 8;
-
-    dim3 block(BU, BK);
-    dim3 grid(B, (K + BK - 1) / BK, (U + BU - 1) / BU);
-
-    auto stream = at::cuda::getDefaultCUDAStream();
-
-    AT_DISPATCH_FLOATING_TYPES(grad_out.scalar_type(), "fused_onehot_wpuvw_bwd_dx_noatomic_cuda", [&] {
-        using acc_t = typename std::conditional<std::is_same<scalar_t, double>::value, double, float>::type;
-
-        fused_onehot_wpuvw_bwd_dx_noatomic_kernel_cuda<scalar_t, acc_t, BK, BU, BW>
-            <<<grid, block, 0, stream>>>(
-                grad_out.data_ptr<scalar_t>(),
-                w.data_ptr<scalar_t>(),
-                vstar.data_ptr<int32_t>(),
-                p_for_k.data_ptr<int32_t>(),
-                i_for_k.data_ptr<int32_t>(),
-                val_for_k.data_ptr<scalar_t>(),
-                grad_x.data_ptr<scalar_t>(),
-                B, static_cast<int>(I), K, U, P, V, W,
-                static_cast<acc_t>(alpha)
-            );
-    });
-    grad_x = grad_x.view({B, I * U});
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return grad_x;
-}
-
 TORCH_LIBRARY(fctp_bwd, m) {
     m.def("backward", &launch_fused_multipath_fctp_tiled_backward);
-    m.def("backward_opt", &fused_onehot_wpuvw_bwd_dx);
 }
