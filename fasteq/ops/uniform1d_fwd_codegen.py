@@ -588,6 +588,7 @@ def schedule_fwd_reuse_first_wx_seed_merge_x(
     }
     return schedule
 
+
 def emit_fused_fwd_kernel_from_reuse_first_schedule(
     schedule: Dict[str, Any],
     *,
@@ -605,11 +606,6 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     block_size: int = 32,
 ) -> str:
 
-    """ if schedule.get("kernel_mode", "") != "fwd_fullacc_reuse_first":
-        raise ValueError(
-            f"schedule kernel_mode mismatch: got {schedule.get('kernel_mode')}"
-        ) """
-
     if block_size != 32:
         raise ValueError("this emitter currently assumes block_size=32")
 
@@ -621,17 +617,20 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     max_x_slots = 0
     max_y_slots = 0
     max_pair_slots = 0
+
     for ph in phases:
         max_wi_slots = max(max_wi_slots, len(ph["wi_vals_phase"]))
         max_x_slots = max(max_x_slots, len(ph["x_vals_phase"]))
         max_y_slots = max(max_y_slots, len(ph["y_vals_phase"]))
         max_pair_slots = max(max_pair_slots, len(ph["pair_vals_phase"]))
 
-    mode_scalar_y = (mode == "u,u,,u")
+    mode_scalar_y = mode == "u,u,,u"
 
     out_acc_by_slot = [None] * len(uniq_v_all)
     for v, s in out_acc_slot_map.items():
         out_acc_by_slot[s] = v
+
+    lines: List[str] = []
 
     def ap(line: str = ""):
         lines.append(line)
@@ -639,24 +638,39 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     def fmt_float(x: float) -> str:
         return repr(float(x))
 
-    def emit_indent(lines_list, indent, text):
-        lines_list.append(f"{indent}{text}")
-
-    lines: List[str] = []
-
-    # ---------- helpers ----------
+    # ------------------------------------------------------------------
+    # HIP / CUDA compatible header
+    # ------------------------------------------------------------------
     ap("#include <stdint.h>")
-    ap("#include <cuda.h>")
-    ap("#include <cuda_runtime.h>")
     ap("#include <torch/extension.h>")
-    ap("#include <ATen/cuda/CUDAContext.h>")
-    ap("#include <c10/cuda/CUDAGuard.h>")
     ap("#include <vector>")
     ap("#include <cstdint>")
+    ap("")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("  #include <hip/hip_runtime.h>")
+    ap("  #include <ATen/hip/HIPContext.h>")
+    ap("  #include <c10/hip/HIPGuard.h>")
+    ap("  using gpuStream_t = hipStream_t;")
+    ap("  using GPU_Guard = c10::hip::HIPGuard;")
+    ap("  #define getCurrentGPUStream at::hip::getCurrentHIPStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()")
+    ap("#else")
+    ap("  #include <cuda.h>")
+    ap("  #include <cuda_runtime.h>")
+    ap("  #include <ATen/cuda/CUDAContext.h>")
+    ap("  #include <c10/cuda/CUDAGuard.h>")
+    ap("  using gpuStream_t = cudaStream_t;")
+    ap("  using GPU_Guard = c10::cuda::CUDAGuard;")
+    ap("  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()")
+    ap("#endif")
+    ap("")
     ap('#include "cuda_utils.hpp"')
     ap("")
 
-    # ---------- kernel ----------
+    # ------------------------------------------------------------------
+    # kernel
+    # ------------------------------------------------------------------
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
@@ -679,6 +693,7 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
+        ap("")
 
     ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
@@ -698,14 +713,16 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
         ap("    const int out_row = dst_idx[e_orig];")
     else:
         ap("    const int out_row = e_orig;")
-    ap("")
 
+    ap("")
     ap("    const index_t w_base = (index_t)w_row  * (index_t)Iw * (index_t)U;")
     ap("    const index_t x_base = (index_t)x_row  * (index_t)Ix * (index_t)U;")
+
     if mode_scalar_y:
         ap("    const index_t y_base = (index_t)y_row  * (index_t)Ky;")
     else:
         ap("    const index_t y_base = (index_t)y_row  * (index_t)Ky * (index_t)U;")
+
     ap("    const index_t out_base = (index_t)out_row * (index_t)V  * (index_t)U;")
     ap("")
 
@@ -735,10 +752,13 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
         ap(f"            out_acc_v_{slot_id} = scalar_t(0);")
     ap("")
 
-    # ---------- emit phases ----------
+    # ------------------------------------------------------------------
+    # phases
+    # ------------------------------------------------------------------
     for ph in phases:
         phase_id = ph["phase_id"]
         main_pair_kind = ph["main_pair_kind"]
+
         wi_vals_phase = list(ph["wi_vals_phase"])
         x_vals_phase = list(ph["x_vals_phase"])
         y_vals_phase = list(ph["y_vals_phase"])
@@ -752,50 +772,60 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
         ap(f"            // ===== phase {phase_id}: main_pair_kind={main_pair_kind} =====")
         ap("            {")
 
-        # preload phase operands
+        # preload wi
         ap("                // phase-local wi preload")
         for i_val in wi_vals_phase:
             slot = wi_slot_map_phase[i_val]
+
             if iw_dim is not None and i_val >= iw_dim:
                 raise ValueError(f"i={i_val} out of iw_dim={iw_dim}")
-            offset = int(i_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
-            if offset is not None:
+
+            if u_dim is not None:
+                offset = int(i_val) * int(u_dim)
                 ap(f"                wi_slot_{slot} = w[w_base + (index_t){offset} + (index_t)u];")
             else:
                 ap(f"                wi_slot_{slot} = w[w_base + (index_t){i_val} * (index_t)U + (index_t)u];")
         ap("")
 
+        # preload x
         ap("                // phase-local x preload")
         for j_val in x_vals_phase:
             slot = x_slot_map_phase[j_val]
+
             if ix_dim is not None and j_val >= ix_dim:
                 raise ValueError(f"j={j_val} out of ix_dim={ix_dim}")
-            offset = int(j_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
-            if offset is not None:
+
+            if u_dim is not None:
+                offset = int(j_val) * int(u_dim)
                 ap(f"                x_slot_{slot} = x[x_base + (index_t){offset} + (index_t)u];")
             else:
                 ap(f"                x_slot_{slot} = x[x_base + (index_t){j_val} * (index_t)U + (index_t)u];")
         ap("")
 
+        # preload y
         ap("                // phase-local y preload")
         for k_val in y_vals_phase:
             slot = y_slot_map_phase[k_val]
+
             if ky_dim is not None and k_val >= ky_dim:
                 raise ValueError(f"k={k_val} out of ky_dim={ky_dim}")
+
             if mode_scalar_y:
                 ap(f"                y_slot_{slot} = y[y_base + (index_t){k_val}];")
             else:
-                offset = int(k_val) * int(u_dim if u_dim is not None else 0) if u_dim is not None else None
-                if offset is not None:
+                if u_dim is not None:
+                    offset = int(k_val) * int(u_dim)
                     ap(f"                y_slot_{slot} = y[y_base + (index_t){offset} + (index_t)u];")
                 else:
                     ap(f"                y_slot_{slot} = y[y_base + (index_t){k_val} * (index_t)U + (index_t)u];")
         ap("")
 
-        # phase-local pair precompute
+        # pair precompute
         ap(f"                // phase-local pair cache kind={main_pair_kind}")
         for pair_val in pair_vals_phase:
-            pair_slot = pair_slot_map_phase[tuple(pair_val) if isinstance(pair_val, list) else pair_val]
+            pair_key = tuple(pair_val) if isinstance(pair_val, list) else pair_val
+            pair_slot = pair_slot_map_phase[pair_key]
+
             if main_pair_kind == "wx":
                 i_val, j_val = pair_val
                 wi_slot = wi_slot_map_phase[i_val]
@@ -815,10 +845,11 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
                 raise ValueError(f"bad main_pair_kind={main_pair_kind}")
         ap("")
 
-        # subphases consume pair cache
+        # subphases
         for sp in ph["subphases"]:
             subphase_id = sp["subphase_id"]
             ap(f"                // ---- subphase {subphase_id} ----")
+
             for op in sp["ops"]:
                 out_acc_slot = int(op["out_acc_slot"])
                 pair_slot = int(op["pair_slot"])
@@ -828,19 +859,16 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
                 coeff = fmt_float(float(op["c"]))
 
                 if main_pair_kind == "wx":
-                    # pair * y
                     ap(
                         f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
                         f"pair_slot_{pair_slot} * y_slot_{y_slot};"
                     )
                 elif main_pair_kind == "wy":
-                    # pair * x
                     ap(
                         f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
                         f"pair_slot_{pair_slot} * x_slot_{x_slot};"
                     )
                 elif main_pair_kind == "xy":
-                    # wi * pair
                     ap(
                         f"                out_acc_v_{out_acc_slot} += scalar_t({coeff}) * "
                         f"wi_slot_{wi_slot} * pair_slot_{pair_slot};"
@@ -852,11 +880,14 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
         ap("            }")
         ap("")
 
-    # ---------- write out ----------
+    # ------------------------------------------------------------------
+    # write out
+    # ------------------------------------------------------------------
     ap("            // write out")
     for slot_id, v_val in enumerate(out_acc_by_slot):
         if v_val is None:
             raise ValueError(f"missing out_acc slot {slot_id}")
+
         if v_dim is not None and v_val >= v_dim:
             raise ValueError(f"v={v_val} out of v_dim={v_dim}")
 
@@ -870,12 +901,15 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
             ap(f"            atomicAdd(&out[{idx_expr}], out_acc_v_{slot_id});")
         else:
             ap(f"            out[{idx_expr}] = out_acc_v_{slot_id};")
+
     ap("        }")
     ap("    }")
     ap("}")
     ap("")
 
-    # ---------- index helper ----------
+    # ------------------------------------------------------------------
+    # index helper
+    # ------------------------------------------------------------------
     ap("static inline bool mul_fits_int32(int64_t a, int64_t b) {")
     ap("    if (a < 0 || b < 0) return false;")
     ap("    constexpr int64_t LIM = 2147483647LL;")
@@ -909,7 +943,9 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     ap("}")
     ap("")
 
-    # ---------- launchers ----------
+    # ------------------------------------------------------------------
+    # launchers
+    # ------------------------------------------------------------------
     ap("template <typename scalar_t, typename index_t>")
     ap(f"void launch_{kernel_name}_typed(")
     ap("    const scalar_t* w,")
@@ -920,7 +956,7 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     ap("    const int32_t* dst_idx,")
     ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
-    ap("    cudaStream_t stream)")
+    ap("    gpuStream_t stream)")
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
@@ -941,7 +977,7 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     ap("    const int32_t* dst_idx,")
     ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
-    ap("    cudaStream_t stream)")
+    ap("    gpuStream_t stream)")
     ap("{")
     ap(f"    constexpr bool kUseXSrc = {'true' if use_x_src else 'false'};")
     ap(f"    constexpr bool kUseYSrc = {'true' if use_y_src else 'false'};")
@@ -970,7 +1006,7 @@ def emit_fused_fwd_kernel_from_reuse_first_schedule(
     ap("    const int32_t* dst_idx,")
     ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
-    ap("    cudaStream_t stream)")
+    ap("    gpuStream_t stream)")
     ap("{")
     ap(f"    launch_{kernel_name}_auto<scalar_t>(")
     ap("        w, x, y, out, src_idx, dst_idx, b_list,")
@@ -1818,6 +1854,7 @@ def emit_fused_fwd_kernel_from_group_schedule(
     return "\n".join(lines)
 
 
+
 def emit_launcher(
     bundle_name: str,
     mode: str = "u,u,,u",
@@ -1828,80 +1865,139 @@ def emit_launcher(
 ) -> str:
     if mode == "u,u,,u":
         y_comment = "[B,Ky,1] or [S,Ky,1]"
-        y_check_u = 'TORCH_CHECK((int)y.size(2) == 1, "y.size(2) must be 1 for mode u,u,,u");'
+        y_check_u = (
+            'TORCH_CHECK((int)y.size(2) == 1, '
+            '"y.size(2) must be 1 for mode u,u,,u");'
+        )
     elif mode == "u,u,u,u":
         y_comment = "[B,Ky,U] or [S,Ky,U]"
-        y_check_u = 'TORCH_CHECK((int)y.size(2) == U, "y.size(2) must equal U for mode u,u,u,u");'
+        y_check_u = (
+            'TORCH_CHECK((int)y.size(2) == U, '
+            '"y.size(2) must equal U for mode u,u,u,u");'
+        )
     else:
         raise ValueError(f"Unsupported mode: {mode}")
 
-    src_decl = '    torch::Tensor src_idx,    // [?] int32\n' if (use_x_src or use_y_src) else ""
-    dst_decl = '    torch::Tensor dst_idx,    // [?] int32\n' if use_scatter else ""
-    blist_decl = '    torch::Tensor b_list,     // [B] int32 optional\n' if use_scatter else ""
+    param_lines = [
+        "    torch::Tensor w",
+        "    torch::Tensor x_all",
+        "    torch::Tensor y",
+    ]
+
+    if use_x_src or use_y_src:
+        param_lines.append("    torch::Tensor src_idx")
+
+    if use_scatter:
+        param_lines.append("    torch::Tensor dst_idx")
+        param_lines.append("    torch::Tensor b_list")
+
+    param_lines.append("    int64_t V64")
+
+    params = ",\n".join(param_lines)
 
     src_check = ""
     if use_x_src or use_y_src:
         src_check = r'''
-    TORCH_CHECK(src_idx.is_cuda(), "src_idx must be CUDA");
+    TORCH_CHECK(src_idx.is_cuda(), "src_idx must be CUDA/HIP");
     TORCH_CHECK(src_idx.scalar_type() == torch::kInt32, "src_idx must be int32");
 '''
 
     dst_check = ""
     if use_scatter:
         dst_check = r'''
-    TORCH_CHECK(dst_idx.is_cuda(), "dst_idx must be CUDA");
+    TORCH_CHECK(dst_idx.is_cuda(), "dst_idx must be CUDA/HIP");
     TORCH_CHECK(dst_idx.scalar_type() == torch::kInt32, "dst_idx must be int32");
 '''
 
-    out_alloc = (
-        '    auto out = torch::zeros({S, V, U}, w.options());'
-        if use_scatter else
-        '    auto out = torch::zeros({B, V, U}, w.options());'
-    )
+    if use_scatter:
+        out_alloc = "    auto out = torch::zeros({S, V, U}, w.options());"
+    else:
+        out_alloc = "    auto out = torch::zeros({B, V, U}, w.options());"
 
     blist_logic = ""
     if use_scatter:
         blist_logic = r'''
     const int32_t* b_list_ptr = nullptr;
     if (b_list.defined() && b_list.numel() > 0) {
-        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA");
+        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA/HIP");
         TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
         TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
         b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
     }
 '''
     else:
-        blist_logic = '    const int32_t* b_list_ptr = nullptr;\n'
+        blist_logic = "    const int32_t* b_list_ptr = nullptr;\n"
 
     src_numel_check = ""
     if use_x_src or use_y_src:
-        src_numel_check = '    TORCH_CHECK(src_idx.numel() >= B, "src_idx numel must be >= B");'
+        src_numel_check = (
+            '    TORCH_CHECK(src_idx.numel() >= B, '
+            '"src_idx numel must be >= B");'
+        )
 
     dst_numel_check = ""
     if use_scatter:
-        dst_numel_check = '    TORCH_CHECK(dst_idx.numel() >= B, "dst_idx numel must be >= B");'
+        dst_numel_check = (
+            '    TORCH_CHECK(dst_idx.numel() >= B, '
+            '"dst_idx numel must be >= B");'
+        )
 
-    launch_src_arg = '(const int32_t*)src_idx.data_ptr<int32_t>(),' if (use_x_src or use_y_src) else 'nullptr,'
-    launch_dst_arg = '(const int32_t*)dst_idx.data_ptr<int32_t>(),' if use_scatter else 'nullptr,'
+    launch_src_arg = (
+        "(const int32_t*)src_idx.data_ptr<int32_t>(),"
+        if (use_x_src or use_y_src)
+        else "nullptr,"
+    )
+
+    launch_dst_arg = (
+        "(const int32_t*)dst_idx.data_ptr<int32_t>(),"
+        if use_scatter
+        else "nullptr,"
+    )
+
+    # ------------------------------------------------------------------
+    # Select B source according to execution mode.
+    #
+    # scatter mode:
+    #   B is number of destination/scatter entries.
+    #
+    # src-index mode:
+    #   B is number of source-index entries.
+    #
+    # dense mode:
+    #   B comes from w.size(0), where w is either [1,Iw,U] or [B,Iw,U].
+    # ------------------------------------------------------------------
+    if use_scatter:
+        b_expr = "dst_idx.size(0)"
+    elif use_x_src or use_y_src:
+        b_expr = "src_idx.size(0)"
+    else:
+        b_expr = "w.size(0)"
 
     return rf'''
 
 torch::Tensor launcher_{bundle_name}(
-    torch::Tensor w,          // [B,Iw,U]
-    torch::Tensor x_all,      // [S,Ix,U]
-    torch::Tensor y,          // {y_comment}
-{src_decl}{dst_decl}{blist_decl}    int64_t V64)
+{params})
 {{
+    // Expected tensors:
+    //   w      : [WB, Iw, U], WB can be 1 or B
+    //   x_all  : [S, Ix, U] or [B, Ix, U]
+    //   y      : {y_comment}
+    // Optional:
+    //   src_idx: [?] int32, enabled when x/y source indirection is used
+    //   dst_idx: [?] int32, enabled when scatter is used
+    //   b_list : [B] int32 optional, enabled when scatter is used
 
-    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda(), "w/x_all/y must be CUDA");
+    TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda(),
+                "w/x_all/y must be CUDA/HIP");
     TORCH_CHECK(w.is_contiguous() && x_all.is_contiguous() && y.is_contiguous(),
                 "w/x_all/y must be contiguous");
 {src_check}{dst_check}
-    TORCH_CHECK(w.dim() == 3, "w must be [B,Iw,U]");
-    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U]");
+
+    TORCH_CHECK(w.dim() == 3, "w must be [WB,Iw,U]");
+    TORCH_CHECK(x_all.dim() == 3, "x_all must be [S,Ix,U] or [B,Ix,U]");
     TORCH_CHECK(y.dim() == 3, "y must be 3D");
 
-    int B  = (int)src_idx.size(0);
+    int B  = (int){b_expr};
     int WB = (int)w.size(0);
     int Iw = (int)w.size(1);
     int U  = (int)w.size(2);
@@ -1911,7 +2007,9 @@ torch::Tensor launcher_{bundle_name}(
     int Ky = (int)y.size(1);
     int V  = (int)V64;
 
-    TORCH_CHECK(w.dim() == 3, "w must be [WB, Iw, U]");
+    TORCH_CHECK(V > 0, "V must be > 0");
+    TORCH_CHECK(B > 0, "B must be > 0");
+
     TORCH_CHECK((int)w.size(2) == U, "w U mismatch");
     TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
                 "w.size(0) must be 1 or B");
@@ -1919,22 +2017,25 @@ torch::Tensor launcher_{bundle_name}(
 
     TORCH_CHECK((int)x_all.size(1) > 0, "Ix must be > 0");
     TORCH_CHECK((int)x_all.size(2) == U, "x_all U mismatch");
+
     {y_check_u}
+
     TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
 {src_numel_check}
 {dst_numel_check}
 
 {blist_logic}
-
 {out_alloc}
 
-    c10::cuda::CUDAGuard device_guard(w.device());
-    cudaStream_t stream = at::cuda::getDefaultCUDAStream(w.device().index());
+    GPU_Guard device_guard(w.device());
+    gpuStream_t stream = getCurrentGPUStream(w.device().index());
 
     AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
 
-        TORCH_CHECK(x_all.scalar_type() == w.scalar_type(), "x_all dtype must match w");
-        TORCH_CHECK(y.scalar_type() == w.scalar_type(), "y dtype must match w");
+        TORCH_CHECK(x_all.scalar_type() == w.scalar_type(),
+                    "x_all dtype must match w");
+        TORCH_CHECK(y.scalar_type() == w.scalar_type(),
+                    "y dtype must match w");
 
         launch_{bundle_name}<scalar_t>(
                 (const scalar_t*)w.data_ptr<scalar_t>(),
@@ -1947,7 +2048,7 @@ torch::Tensor launcher_{bundle_name}(
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
     }});
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    GPU_KERNEL_LAUNCH_CHECK();
 
     return out;
 }}
@@ -1956,6 +2057,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
     m.def("run", &launcher_{bundle_name}, "{bundle_name} forward jit impl");
 }}
 '''
+
 
 def generate_code_uniform1d_fwd(
     i_list: torch.Tensor,

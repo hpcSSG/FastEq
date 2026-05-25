@@ -41,13 +41,48 @@ def _find_fasteq_root(start: Path) -> Path:
             return p
     raise RuntimeError("Cannot find fasteq project root from __file__")
 
+
+
+from pathlib import Path
+import torch
+
+
+def _detect_gpu_backend() -> str:
+    """
+    Return:
+        "cuda" for NVIDIA CUDA
+        "hip"  for AMD ROCm/HIP
+    """
+    if not torch.cuda.is_available():
+        raise RuntimeError("No CUDA/HIP GPU is available.")
+
+    name = torch.cuda.get_device_name(0).lower()
+    if "nvidia" in name:
+        return "cuda"
+    if "amd" in name or "radeon" in name or "instinct" in name or "bw200" in name:
+        return "hip"
+
+    raise RuntimeError(f"Cannot determine GPU backend from device name: {name}")
+
+
 def _default_build_root() -> Path:
-    root = _find_fasteq_root(Path(__file__).parent) / "cuda" / "src" / "uniform1d_jit_codegen"
+    backend = _detect_gpu_backend()
+
+    root = (
+        _find_fasteq_root(Path(__file__).parent)
+        / backend
+        / "src"
+        / "uniform1d_jit_codegen"
+    )
+
     _ensure_dir(root)
     return root
 
+
 def _default_src_path() -> Path:
-    root = _find_fasteq_root(Path(__file__).parent) / "cuda" / "src"
+    backend = _detect_gpu_backend()
+    
+    root = _find_fasteq_root(Path(__file__).parent) / backend / "src"
     _ensure_dir(root)
     return root
 
@@ -87,7 +122,8 @@ def _load_jit_module(
         name=module_name,
         sources=[str(cu_path)],
         extra_cflags=extra_cflags or ["-O3"],
-        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
+        #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
+        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
         extra_include_paths=[str(src_dir)],
         build_directory=str(build_dir),
         verbose=True,
