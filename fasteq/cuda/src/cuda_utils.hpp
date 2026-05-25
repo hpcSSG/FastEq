@@ -1,137 +1,304 @@
-#ifndef CUDA_UTILS_CUH
-#define CUDA_UTILS_CUH
+#ifndef GPU_UTILS_CUH
+#define GPU_UTILS_CUH
 
-#ifdef __CUDA_ARCH__
-#define DEVICE __device__
+#include <stdint.h>
+#include <stdio.h>
+#include <type_traits>
+#include <math.h>
+
+// ============================================================
+// CUDA / HIP compatibility layer
+// ============================================================
+
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+
+  #include <hip/hip_runtime.h>
+
+  #define GPU_BACKEND_HIP 1
+  #define GPU_BACKEND_CUDA 0
+
+  using gpuError_t = hipError_t;
+
+  #define gpuSuccess hipSuccess
+  #define gpuGetErrorString hipGetErrorString
+  #define gpuGetLastError hipGetLastError
+  #define gpuDeviceSynchronize hipDeviceSynchronize
+
 #else
-#define DEVICE
+
+  #include <cuda_runtime.h>
+
+  #define GPU_BACKEND_HIP 0
+  #define GPU_BACKEND_CUDA 1
+
+  using gpuError_t = cudaError_t;
+
+  #define gpuSuccess cudaSuccess
+  #define gpuGetErrorString cudaGetErrorString
+  #define gpuGetLastError cudaGetLastError
+  #define gpuDeviceSynchronize cudaDeviceSynchronize
+
+#endif
+
+// ============================================================
+// Host / device qualifiers
+// ============================================================
+
+#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+  #define DEVICE __device__
+#else
+  #define DEVICE
 #endif
 
 #ifndef WARP_SIZE
 #define WARP_SIZE 32
 #endif
 
-#define CUDA_CHECK(ans) do { \
-  cudaError_t err = (ans); \
-  if (err != cudaSuccess) { \
-    printf("CUDA Error: %s (%d) at %s:%d\n", cudaGetErrorString(err), (int)err, __FILE__, __LINE__); \
-  } \
-} while(0)
+#ifndef FULL_MASK
+#define FULL_MASK 0xffffffffu
+#endif
+
+// ============================================================
+// Error check
+// ============================================================
+
+#define GPU_CHECK(ans) do {                                                   \
+  gpuError_t err = (ans);                                                     \
+  if (err != gpuSuccess) {                                                    \
+    printf("GPU Error: %s (%d) at %s:%d\n",                                   \
+           gpuGetErrorString(err), (int)err, __FILE__, __LINE__);             \
+  }                                                                           \
+} while (0)
+
+// 兼容旧代码中 CUDA_CHECK(...) 的调用
+#define CUDA_CHECK(ans) GPU_CHECK(ans)
+
+// ============================================================
+// Read-only load helper
+// ============================================================
 
 template <typename T>
 __device__ __forceinline__ T ld_g(const T* p) {
-#if __CUDA_ARCH__ >= 350
+#if GPU_BACKEND_CUDA && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 350)
   return __ldg(p);
 #else
+  // HIP 下直接普通 load。
+  // ROCm 编译器一般会自行选择合适的缓存策略。
   return *p;
 #endif
 }
 
+// ============================================================
+// Shuffle compatibility
+// ============================================================
+//
+// CUDA:
+//   __shfl_down_sync(mask, v, offset)
+//   __shfl_xor_sync(mask, v, lane_mask)
+//   __shfl_sync(mask, v, src_lane)
+//
+// HIP:
+//   新版 HIP 通常也支持 __shfl_down / __shfl_xor / __shfl。
+//   某些 ROCm 版本也支持 *_sync，但为了兼容性，这里走非 sync 版本。
+// ============================================================
+
+template <typename T>
+__device__ __forceinline__ T gpu_shfl_down(T v, int offset, unsigned mask = FULL_MASK) {
+#if GPU_BACKEND_HIP
+  (void)mask;
+  return __shfl_down(v, offset);
+#else
+  return __shfl_down_sync(mask, v, offset);
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T gpu_shfl_xor(T v, int lane_mask, unsigned mask = FULL_MASK) {
+#if GPU_BACKEND_HIP
+  (void)mask;
+  return __shfl_xor(v, lane_mask);
+#else
+  return __shfl_xor_sync(mask, v, lane_mask);
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ T gpu_shfl(T v, int src_lane, unsigned mask = FULL_MASK) {
+#if GPU_BACKEND_HIP
+  (void)mask;
+  return __shfl(v, src_lane);
+#else
+  return __shfl_sync(mask, v, src_lane);
+#endif
+}
+
+// ============================================================
+// Warp reductions
+// ============================================================
+
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v, unsigned mask) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        v += __shfl_down_sync(mask, v, offset);
-    }
-    return v;
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    v += gpu_shfl_down(v, offset, mask);
+  }
+  return v;
 }
 
 template <typename T>
 __device__ __forceinline__ T warp_reduce_sum(T v) {
-  unsigned mask = 0xffffffffu;
-  #pragma unroll
-  for (int off = 16; off > 0; off >>= 1)
-    v += __shfl_down_sync(mask, v, off);
+  unsigned mask = FULL_MASK;
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    v += gpu_shfl_down(v, off, mask);
+  }
   return v;
 }
 
 template <typename T>
 __device__ __forceinline__ T warp_sum(T v) {
-    unsigned mask = 0xffffffffu;
-    #pragma unroll
-    for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(mask, v, d);
-    return v;
+  unsigned mask = FULL_MASK;
+#pragma unroll
+  for (int d = 16; d > 0; d >>= 1) {
+    v += gpu_shfl_down(v, d, mask);
+  }
+  return v;
 }
 
 template <typename T>
 __device__ __forceinline__ T warp_sum_xor(T v) {
-    #pragma unroll
-    for (int mask = 16; mask > 0; mask >>= 1) {
-        v += __shfl_xor_sync(0xffffffff, v, mask);
-    }
-    return v;
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    v += gpu_shfl_xor(v, mask, FULL_MASK);
+  }
+  return v;
 }
 
-__device__ __forceinline__ int shfl_i32(int v, int src_lane=0) {
-    return __shfl_sync(0xffffffff, v, src_lane);
+__device__ __forceinline__ int shfl_i32(int v, int src_lane = 0) {
+  return gpu_shfl(v, src_lane, FULL_MASK);
 }
 
 __device__ __forceinline__ int shfl_lane0_i32(int v) {
-  return __shfl_sync(0xffffffffu, v, 0);
+  return gpu_shfl(v, 0, FULL_MASK);
 }
 
-// block-reduce scalar across warps using shared buffer (size >= num_warps)
+// ============================================================
+// Block reduce scalar across warps using shared buffer
+// sh_warp size >= num_warps
+// ============================================================
+
 template <typename AccT>
-__device__ __forceinline__ AccT block_reduce_sum_scalar(AccT v, AccT* __restrict__ sh_warp) {
+__device__ __forceinline__ AccT block_reduce_sum_scalar(
+    AccT v,
+    AccT* __restrict__ sh_warp
+) {
   int lane = threadIdx.x & 31;
   int warp = threadIdx.x >> 5;
   int num_warps = (blockDim.x + 31) >> 5;
 
   v = warp_reduce_sum(v);
-  if (lane == 0) sh_warp[warp] = v;
+
+  if (lane == 0) {
+    sh_warp[warp] = v;
+  }
+
   __syncthreads();
 
   AccT sum = (AccT)0;
+
   if (warp == 0) {
     sum = (lane < num_warps) ? sh_warp[lane] : (AccT)0;
     sum = warp_reduce_sum(sum);
   }
+
   __syncthreads();
-  // broadcast from lane0 of warp0
-  return __shfl_sync(0xffffffffu, sum, 0);
+
+  return gpu_shfl(sum, 0, FULL_MASK);
 }
 
+// ============================================================
+// cp.async helpers
+// CUDA SM80+ only
+// HIP fallback: normal copy path
+// ============================================================
 
-// ---------------------------------------------
-// cp.async helpers (SM80+)
-// ---------------------------------------------
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+#if GPU_BACKEND_CUDA && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
 
-__device__ __forceinline__ void cp_async_ca_16B(void* smem_dst, const void* gmem_src) {
-    // cp.async expects shared address in 32-bit "shared space" address
-    unsigned int smem_u32 = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
-    asm volatile(
-        "cp.async.ca.shared.global [%0], [%1], 16;\n" ::  // 16 bytes
-        "r"(smem_u32), "l"(gmem_src)
-    );
+__device__ __forceinline__ void cp_async_ca_16B(
+    void* smem_dst,
+    const void* gmem_src
+) {
+  unsigned int smem_u32 =
+      static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
+
+  asm volatile(
+      "cp.async.ca.shared.global [%0], [%1], 16;\n" ::
+      "r"(smem_u32), "l"(gmem_src)
+  );
 }
 
+__device__ __forceinline__ void cp_async_cg_16B(
+    void* smem_dst,
+    const void* gmem_src
+) {
+  unsigned int smem_u32 =
+      static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
 
-__device__ __forceinline__ void cp_async_cg_16B(void* smem_dst, const void* gmem_src) {
-    // cp.async expects shared address in 32-bit "shared space" address
-    unsigned int smem_u32 = static_cast<unsigned int>(__cvta_generic_to_shared(smem_dst));
-    asm volatile(
-        "cp.async.cg.shared.global [%0], [%1], 16;\n" ::  // 16 bytes
-        "r"(smem_u32), "l"(gmem_src)
-    );
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;\n" ::
+      "r"(smem_u32), "l"(gmem_src)
+  );
 }
 
 __device__ __forceinline__ void cp_async_commit_group() {
-    asm volatile("cp.async.commit_group;\n" ::);
+  asm volatile("cp.async.commit_group;\n" ::);
 }
 
-template<int N>
+template <int N>
 __device__ __forceinline__ void cp_async_wait_group() {
   asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
 }
 
 __device__ __forceinline__ void cp_async_wait_group0() {
-    asm volatile("cp.async.wait_group 0;\n" ::);
+  asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
 #endif
 
+// ============================================================
+// Vector type helper for 16B copy
+// ============================================================
 
+template <typename T>
+struct Vec16Type;
+
+template <>
+struct Vec16Type<float> {
+#if GPU_BACKEND_HIP
+  using type = float4;
+#else
+  using type = float4;
+#endif
+};
+
+template <>
+struct Vec16Type<double> {
+#if GPU_BACKEND_HIP
+  using type = double2;
+#else
+  using type = double2;
+#endif
+};
+
+// ============================================================
+// stage global memory to shared memory
+//
+// CUDA SM80+:
+//   use cp.async
+//
+// HIP or CUDA < SM80:
+//   normal vector/scalar copy fallback
+// ============================================================
 
 template <typename T>
 __device__ __forceinline__ void stage_gmem_to_smem_cpasync_16B(
@@ -139,40 +306,49 @@ __device__ __forceinline__ void stage_gmem_to_smem_cpasync_16B(
     const T* __restrict__ gmem,
     int n_elems
 ) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    // choose a 16B vector type
-    using Vec = std::conditional_t<std::is_same<T, float>::value, float4, double2>;
-    constexpr int VEC_ELEMS = (int)(sizeof(Vec) / sizeof(T)); // float:4, double:2
+#if GPU_BACKEND_CUDA && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
 
-    // n_elems should be multiple of VEC_ELEMS for fast path
-    int n_vec = n_elems / VEC_ELEMS;
+  using Vec = typename Vec16Type<T>::type;
+  constexpr int VEC_ELEMS = (int)(sizeof(Vec) / sizeof(T));
 
-    int tid = threadIdx.x;
-    int threads = blockDim.x;
+  int n_vec = n_elems / VEC_ELEMS;
 
-    Vec* __restrict__ smem_v = reinterpret_cast<Vec*>(smem);
-    const Vec* __restrict__ gmem_v = reinterpret_cast<const Vec*>(gmem);
+  int tid = threadIdx.x;
+  int threads = blockDim.x;
 
-    // issue cp.async (16B) per thread
-    #pragma unroll 1
-    for (int i = tid; i < n_vec; i += threads) {
-        cp_async_ca_16B((void*)&smem_v[i], (const void*)&gmem_v[i]);
-    }
+  Vec* __restrict__ smem_v = reinterpret_cast<Vec*>(smem);
+  const Vec* __restrict__ gmem_v = reinterpret_cast<const Vec*>(gmem);
 
-    // finalize: commit + wait + sync
-    cp_async_commit_group();
-    cp_async_wait_group0();
+#pragma unroll 1
+  for (int i = tid; i < n_vec; i += threads) {
+    cp_async_ca_16B((void*)&smem_v[i], (const void*)&gmem_v[i]);
+  }
+
+  cp_async_commit_group();
+  cp_async_wait_group0();
+
+  // 如果 n_elems 不是 16B 对齐整数倍，补尾部。
+  for (int i = n_vec * VEC_ELEMS + tid; i < n_elems; i += threads) {
+    smem[i] = gmem[i];
+  }
+
 #else
-    // fallback (shouldn't hit on H100)
-    int tid = threadIdx.x;
-    int threads = blockDim.x;
-    #pragma unroll 1
-    for (int i = tid; i < n_elems; i += threads) {
-        smem[i] = gmem[i];
-    }
+
+  // HIP fallback / CUDA non-SM80 fallback
+  int tid = threadIdx.x;
+  int threads = blockDim.x;
+
+#pragma unroll 1
+  for (int i = tid; i < n_elems; i += threads) {
+    smem[i] = gmem[i];
+  }
+
 #endif
 }
 
+// ============================================================
+// Integer helpers
+// ============================================================
 
 DEVICE inline int find_integer_divisor(int x, int bdim) {
   return (x + bdim - 1) / bdim;
@@ -182,34 +358,64 @@ DEVICE inline int ceil_div(int x, int bdim) {
   return (x + bdim - 1) / bdim;
 }
 
-template <class T>
-DEVICE inline T *shared_array(unsigned int n_elements, void *&ptr,
-                              unsigned int *space) noexcept {
-  const unsigned long long inptr = reinterpret_cast<unsigned long long>(ptr);
-  const unsigned long long end = inptr + n_elements * sizeof(T);
-  if (space)
-    *space += static_cast<unsigned int>(end - inptr);
-  ptr = reinterpret_cast<void *>(end);
-  return reinterpret_cast<T *>(inptr);
+static inline int ceil_div_int(int a, int b) {
+  return (a + b - 1) / b;
 }
 
-static inline int ceil_div_int(int a, int b) { return (a + b - 1) / b; }
+// ============================================================
+// Shared memory pointer bump allocator
+// ============================================================
+
+template <class T>
+DEVICE inline T* shared_array(
+    unsigned int n_elements,
+    void*& ptr,
+    unsigned int* space
+) noexcept {
+  const unsigned long long inptr =
+      reinterpret_cast<unsigned long long>(ptr);
+
+  const unsigned long long end =
+      inptr + n_elements * sizeof(T);
+
+  if (space) {
+    *space += static_cast<unsigned int>(end - inptr);
+  }
+
+  ptr = reinterpret_cast<void*>(end);
+  return reinterpret_cast<T*>(inptr);
+}
+
+// ============================================================
+// FMA helpers
+// ============================================================
 
 template <typename T>
 __device__ __forceinline__ T fma_acc(T a, T b, T c) {
-    // default: fallback (for e.g. half/bfloat16 you might want custom)
-    return a * b + c;
+  return a * b + c;
 }
 
 template <>
-__device__ __forceinline__ float fma_acc<float>(float a, float b, float c) {
-    return fmaf(a, b, c);
+__device__ __forceinline__ float fma_acc<float>(
+    float a,
+    float b,
+    float c
+) {
+  return fmaf(a, b, c);
 }
 
 template <>
-__device__ __forceinline__ double fma_acc<double>(double a, double b, double c) {
-    return fma(a, b, c);
+__device__ __forceinline__ double fma_acc<double>(
+    double a,
+    double b,
+    double c
+) {
+  return fma(a, b, c);
 }
+
+// ============================================================
+// Metadata
+// ============================================================
 
 struct PathMeta {
   int i;
@@ -219,26 +425,25 @@ struct PathMeta {
   float coeff;
 };
 
+// ============================================================
+// Load helpers
+// ============================================================
+
 template <typename scalar_t>
-__device__ __forceinline__ scalar_t load_vec_u(const char* base, int byte_off, int lane) {
-    return *(reinterpret_cast<const scalar_t*>(base + byte_off) + lane);
+__device__ __forceinline__ scalar_t load_vec_u(
+    const char* base,
+    int byte_off,
+    int lane
+) {
+  return *(reinterpret_cast<const scalar_t*>(base + byte_off) + lane);
 }
 
 template <typename scalar_t>
-__device__ __forceinline__ scalar_t load_scalar(const char* base, int byte_off) {
-    return *reinterpret_cast<const scalar_t*>(base + byte_off);
+__device__ __forceinline__ scalar_t load_scalar(
+    const char* base,
+    int byte_off
+) {
+  return *reinterpret_cast<const scalar_t*>(base + byte_off);
 }
 
-
-/*
-// forward declare multiple types...
-template float *shared_array<float>(unsigned int n_elements, void *&ptr,
-                                    unsigned int *space) noexcept;
-template double *shared_array<double>(unsigned int n_elements, void *&ptr,
-                                      unsigned int *space) noexcept;
-template int *shared_array<int>(unsigned int n_elements, void *&ptr,
-                                unsigned int *space) noexcept;
-template short *shared_array<short>(unsigned int n_elements, void *&ptr,
-                                    unsigned int *space) noexcept; */
-
-#endif // CUDA_UTILS_CUH
+#endif // GPU_UTILS_CUH
