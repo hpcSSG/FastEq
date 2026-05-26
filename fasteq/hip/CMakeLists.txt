@@ -37,16 +37,8 @@ find_package(Torch REQUIRED)
 
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(HIP_SRCS
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cpp"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cpp"
 )
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
