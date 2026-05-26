@@ -273,7 +273,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         B = x.shape[0]
 
 
-        if path_num == 1 and nnz0 == 1:
+        if path_num == 1 and nnz0 == 1 and I_total == 1:
             # use torch is better when open MPS
             # ====================== torch Implementation ======================
             vstar = torch.argmax(y, dim=1)
@@ -334,7 +334,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         grad_out = grad_out.view(B, K_total, W)
         w = w.view(path_num, U, V, W)
 
-        if path_num == 1 and nnz0 == 1:
+        if path_num == 1 and nnz0 == 1 and I_total == 1:
             #================ Path = 1, torch ===============
             # vstar: [B]
             vstar = torch.argmax(y, dim=1)
