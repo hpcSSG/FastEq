@@ -129,31 +129,6 @@ def _get_bwd_tune_params() -> Tuple[bool, int, int]:
     return enabled, max(0, warmup), max(1, repeat)
 
 
-def _get_bwd_reg_budget_candidates() -> List[int]:
-    """
-    Backward scheduler candidate budgets.
-
-    Override with e.g.:
-        FASTEQ_UNIFORM1D_BWD_REG_BUDGETS=8,16,24,64
-    """
-    raw = os.environ.get("FASTEQ_UNIFORM1D_BWD_REG_BUDGETS", "16,64")
-    budgets: List[int] = []
-    seen = set()
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        rb = int(part)
-        if rb < 4:
-            raise ValueError(f"reg budget must be at least 4, got {rb}")
-        if rb not in seen:
-            seen.add(rb)
-            budgets.append(rb)
-    if not budgets:
-        raise ValueError("FASTEQ_UNIFORM1D_BWD_REG_BUDGETS produced no valid budgets")
-    return budgets
-
-
 def _ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -582,8 +557,7 @@ def _build_bwd_jit_candidates(
         print(f"[JIT][BWD] hit best candidate cache: {tune_key} -> {best_tag} ({best_ms:.4f} ms)")
         return tune_key, [(best_tag, best_mod)]
 
-    reg_budgets = _get_bwd_reg_budget_candidates()
-
+    reg_budgets = [16, 64, 128]
     def _codegen_candidates():
         return generate_code_uniform1d_bwd_with_scheduler(
             i_list=i_list,

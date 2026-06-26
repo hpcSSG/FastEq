@@ -34,8 +34,10 @@ class U1DPath:
     c: float
 
     @property
-    def labels(self) -> Tuple[Label, Label, Label, Label]:
-        return (("x", self.i), ("y", self.j), ("w", self.k), ("o", self.v))
+    def labels(self) -> Tuple[Label, Label, Label]:
+        # LARS schedules only input operands.  Output accumulators are emitted
+        # as full-resident local variables and are not spill/reload candidates.
+        return (("x", self.i), ("y", self.j), ("w", self.k))
 
 
 @dataclass
@@ -760,22 +762,20 @@ class LARSUniform1DScheduler:
 
     def _emit_path_compute(self, pid: int) -> None:
         p = self._path(pid)
-        lx, ly, lw, lo = p.labels
+        lx, ly, lw = p.labels
 
         rx = self.reg_of[lx]
         ry = self.reg_of[ly]
         rw = self.reg_of[lw]
-        ro = self.reg_of[lo]
 
         self.instructions.append(
             Inst(
-                "fma_u1d",
-                (ro, rx, ry, rw, p.c),
+                "fma_u1d_resident",
+                (p.v, rx, ry, rw, p.c),
                 f"path#{pid}: out[{p.v}] += x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}",
             )
         )
 
-        self.dirty_outputs.add(lo)
         self.path_order.append(pid)
         self.unscheduled.remove(pid)
 
@@ -949,8 +949,8 @@ class CSELARSUniform1DScheduler(LARSUniform1DScheduler):
     # Pair helpers
     # ------------------------------------------------------------------
     def _pair_key_for_path_obj(self, p) -> PairKey:
-        # U1DPath labels are (x, y, w, out). We cache (w * x).
-        lx, _ly, lw, _lo = p.labels
+        # U1DPath labels are now input-only: (x, y, w). We cache (w * x).
+        lx, _ly, lw = p.labels
         return (lw, lx)
 
     def _pair_name(self, key: PairKey) -> str:
@@ -1113,12 +1113,11 @@ class CSELARSUniform1DScheduler(LARSUniform1DScheduler):
     # ------------------------------------------------------------------
     def _emit_path_compute(self, pid: int) -> None:
         p = self._path(pid)
-        lx, ly, lw, lo = p.labels
+        lx, ly, lw = p.labels
 
         rx = self.reg_of[lx]
         ry = self.reg_of[ly]
         rw = self.reg_of[lw]
-        ro = self.reg_of[lo]
 
         pair_key = (lw, lx)
         pair_reg = self._ensure_pair_cached(pair_key)
@@ -1126,21 +1125,20 @@ class CSELARSUniform1DScheduler(LARSUniform1DScheduler):
         if pair_reg is not None:
             self.instructions.append(
                 Inst(
-                    "fma_u1d_pair",
-                    (ro, pair_reg, ry, p.c),
+                    "fma_u1d_pair_resident",
+                    (p.v, pair_reg, ry, p.c),
                     f"path#{pid}: out[{p.v}] += {self._pair_name(pair_key)} * y[{p.j}] * {p.c}",
                 )
             )
         else:
             self.instructions.append(
                 Inst(
-                    "fma_u1d",
-                    (ro, rx, ry, rw, p.c),
+                    "fma_u1d_resident",
+                    (p.v, rx, ry, rw, p.c),
                     f"path#{pid}: out[{p.v}] += x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}",
                 )
             )
 
-        self.dirty_outputs.add(lo)
         self.path_order.append(pid)
         self.unscheduled.remove(pid)
 
@@ -1807,6 +1805,11 @@ def emit_fused_fwd_kernel_from_lars_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+    resident_out_indices = sorted({
+        int(inst.args[0])
+        for inst in schedule_result.instructions
+        if inst.op in ("fma_u1d_resident", "fma_u1d_pair_resident")
+    })
     lines: List[str] = []
 
     def ap(line: str = ""):
@@ -1890,6 +1893,10 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         ap(f"            scalar_t r{rid};")
     if reg_count:
         ap("")
+    for out_idx in resident_out_indices:
+        ap(f"            scalar_t out_acc_v_{out_idx} = scalar_t(0);")
+    if resident_out_indices:
+        ap("")
 
     for inst_id, inst in enumerate(schedule_result.instructions):
         comment = _sanitize_cuda_comment(inst.comment)
@@ -1932,7 +1939,15 @@ def emit_fused_fwd_kernel_from_lars_schedule(
             # The logical output accumulator is a local delta initialized to 0.
             ap(f"            {reg} = scalar_t(0);")
 
+        elif inst.op == "fma_u1d_resident":
+            out_idx, rx, ry, rw, coeff = inst.args
+            c = _fmt_lars_float(float(coeff))
+            # Output accumulators are full-resident local variables.
+            ap(f"            out_acc_v_{int(out_idx)} += scalar_t({c}) * ({rw} * {rx}) * {ry};")
+
         elif inst.op == "fma_u1d":
+            # Backward-compatible support for older schedules that kept output
+            # accumulators inside the LARS register file.
             ro, rx, ry, rw, coeff = inst.args
             c = _fmt_lars_float(float(coeff))
             # Match the baseline emitter's multiplication association as closely
@@ -1969,9 +1984,15 @@ def emit_fused_fwd_kernel_from_lars_schedule(
             pair_reg, rw, rx, pair_name = inst.args
             ap(f"            {pair_reg} = {rw} * {rx};")
 
+        elif inst.op == "fma_u1d_pair_resident":
+            # FMA using a scheduler-created pair register and a full-resident
+            # output accumulator.
+            out_idx, pair_reg, ry, coeff = inst.args
+            c = _fmt_lars_float(float(coeff))
+            ap(f"            out_acc_v_{int(out_idx)} += scalar_t({c}) * {pair_reg} * {ry};")
+
         elif inst.op == "fma_u1d_pair":
-            # FMA using a scheduler-created pair register:
-            #   out += coeff * pair_reg * y
+            # Backward-compatible support for older schedules.
             ro, pair_reg, ry, coeff = inst.args
             c = _fmt_lars_float(float(coeff))
             ap(f"            {ro} += scalar_t({c}) * {pair_reg} * {ry};")
@@ -1989,6 +2010,23 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         else:
             raise ValueError(f"Unsupported LARS instruction op: {inst.op}")
 
+    if resident_out_indices:
+        ap("")
+        ap("            // resident output accumulator writeback")
+    for out_idx in resident_out_indices:
+        expr = _lars_label_index_expr(
+            "o", int(out_idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            w_dim=w_dim,
+            v_dim=v_dim,
+        )
+        if use_scatter:
+            ap(f"            atomicAdd(&out[{expr}], out_acc_v_{out_idx});")
+        else:
+            ap(f"            out[{expr}] += out_acc_v_{out_idx};")
     ap("        }")
     ap("    }")
     ap("}")
@@ -2558,19 +2596,15 @@ class U1DBwdPath:
 
     @property
     def labels(self) -> Tuple[Label, ...]:
-        labs: List[Label] = [
+        # LARS schedules only input operands.  Backward accumulators
+        # (gw/gx/gy) are full-resident emitter variables, so they are never
+        # spill/reload candidates.
+        return (
             ("w", self.i),
             ("x", self.j),
             ("y", self.k),
             ("go", self.v),
-        ]
-        if self.need_grad_w:
-            labs.append(("gw", self.i))
-        labs.extend([
-            ("gx", self.j),
-            ("gy", self.k),
-        ])
-        return tuple(labs)
+        )
 
 
 class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
@@ -2608,7 +2642,7 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         ]
 
         self.reg_budget = int(reg_budget)
-        min_budget = 7 if self.need_grad_w else 6
+        min_budget = 4
         if self.reg_budget < min_budget:
             raise ValueError(f"backward reg_budget must be at least {min_budget}, got {self.reg_budget}")
 
@@ -2750,22 +2784,16 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         lx = ("x", p.j)
         ly = ("y", p.k)
         lgo = ("go", p.v)
-        lgx = ("gx", p.j)
-        lgy = ("gy", p.k)
-        lgw = ("gw", p.i)
 
         rw = self.reg_of[lw]
         rx = self.reg_of[lx]
         ry = self.reg_of[ly]
         rgo = self.reg_of[lgo]
-        rgx = self.reg_of[lgx]
-        rgy = self.reg_of[lgy]
-        rgw = self.reg_of[lgw] if self.need_grad_w else None
 
         self.instructions.append(
             Inst(
-                "bwd_fma",
-                (rgw, rgx, rgy, rw, rx, ry, rgo, p.c, self.need_grad_w),
+                "bwd_fma_resident",
+                (p.i, p.j, p.k, rw, rx, ry, rgo, p.c, self.need_grad_w),
                 (
                     f"path#{pid}: "
                     f"gw[{p.i}] += go[{p.v}]*x[{p.j}]*y[{p.k}], "
@@ -2774,11 +2802,6 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
                 ),
             )
         )
-
-        if self.need_grad_w:
-            self.dirty_outputs.add(lgw)
-        self.dirty_outputs.add(lgx)
-        self.dirty_outputs.add(lgy)
 
         self.path_order.append(pid)
         self.unscheduled.remove(pid)
@@ -2975,17 +2998,11 @@ class CSELARSUniform1DBwdScheduler(LARSUniform1DBwdScheduler):
         lx = ("x", p.j)
         ly = ("y", p.k)
         lgo = ("go", p.v)
-        lgx = ("gx", p.j)
-        lgy = ("gy", p.k)
-        lgw = ("gw", p.i)
 
         rw = self.reg_of[lw]
         rx = self.reg_of[lx]
         ry = self.reg_of[ly]
         rgo = self.reg_of[lgo]
-        rgx = self.reg_of[lgx]
-        rgy = self.reg_of[lgy]
-        rgw = self.reg_of[lgw] if self.need_grad_w else None
 
         pair_key = (lw, lgo)
         pair_reg = self._ensure_pair_cached(pair_key)
@@ -2993,8 +3010,8 @@ class CSELARSUniform1DBwdScheduler(LARSUniform1DBwdScheduler):
         if pair_reg is not None:
             self.instructions.append(
                 Inst(
-                    "bwd_fma_wg_pair",
-                    (rgw, rgx, rgy, pair_reg, rx, ry, rgo, p.c, self.need_grad_w),
+                    "bwd_fma_wg_pair_resident",
+                    (p.i, p.j, p.k, pair_reg, rx, ry, rgo, p.c, self.need_grad_w),
                     (
                         f"path#{pid}: use {self._pair_name(pair_key)}; "
                         f"gx[{p.j}] += wg*y[{p.k}], gy[{p.k}] += wg*x[{p.j}]"
@@ -3004,8 +3021,8 @@ class CSELARSUniform1DBwdScheduler(LARSUniform1DBwdScheduler):
         else:
             self.instructions.append(
                 Inst(
-                    "bwd_fma",
-                    (rgw, rgx, rgy, rw, rx, ry, rgo, p.c, self.need_grad_w),
+                    "bwd_fma_resident",
+                    (p.i, p.j, p.k, rw, rx, ry, rgo, p.c, self.need_grad_w),
                     (
                         f"path#{pid}: "
                         f"gw[{p.i}] += go[{p.v}]*x[{p.j}]*y[{p.k}], "
@@ -3014,11 +3031,6 @@ class CSELARSUniform1DBwdScheduler(LARSUniform1DBwdScheduler):
                     ),
                 )
             )
-
-        if self.need_grad_w:
-            self.dirty_outputs.add(lgw)
-        self.dirty_outputs.add(lgx)
-        self.dirty_outputs.add(lgy)
 
         self.path_order.append(pid)
         self.unscheduled.remove(pid)
@@ -3151,6 +3163,19 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+    resident_gw_indices: Set[int] = set()
+    resident_gx_indices: Set[int] = set()
+    resident_gy_indices: Set[int] = set()
+    for inst in schedule_result.instructions:
+        if inst.op in ("bwd_fma_resident", "bwd_fma_wg_pair_resident"):
+            wi, xj, yk = map(int, inst.args[:3])
+            if need_grad_w:
+                resident_gw_indices.add(wi)
+            resident_gx_indices.add(xj)
+            resident_gy_indices.add(yk)
+    resident_gw_indices_sorted = sorted(resident_gw_indices)
+    resident_gx_indices_sorted = sorted(resident_gx_indices)
+    resident_gy_indices_sorted = sorted(resident_gy_indices)
     lines: List[str] = []
 
     def ap(line: str = ""):
@@ -3274,6 +3299,14 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap(f"            scalar_t r{rid};")
     if reg_count:
         ap("")
+    for gw_idx in resident_gw_indices_sorted:
+        ap(f"            scalar_t gw_acc_i_{gw_idx} = scalar_t(0);")
+    for gx_idx in resident_gx_indices_sorted:
+        ap(f"            scalar_t gx_acc_j_{gx_idx} = scalar_t(0);")
+    for gy_idx in resident_gy_indices_sorted:
+        ap(f"            scalar_t gy_acc_k_{gy_idx} = scalar_t(0);")
+    if resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted:
+        ap("")
 
     for inst_id, inst in enumerate(schedule_result.instructions):
         comment = _sanitize_cuda_comment(inst.comment)
@@ -3306,7 +3339,17 @@ def emit_fused_bwd_kernel_from_lars_schedule(
                 raise ValueError("load_acc expects a backward output label")
             ap(f"            {reg} = scalar_t(0);")
 
+        elif inst.op == "bwd_fma_resident":
+            wi, xj, yk, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
+            c = _fmt_lars_float(float(coeff))
+            if bool(inst_need_grad_w):
+                ap(f"            gw_acc_i_{int(wi)} += scalar_t({c}) * {rgo} * {rx} * {ry};")
+            ap(f"            gx_acc_j_{int(xj)} += scalar_t({c}) * ({rw} * {rgo}) * {ry};")
+            ap(f"            gy_acc_k_{int(yk)} += scalar_t({c}) * ({rw} * {rgo}) * {rx};")
+
         elif inst.op == "bwd_fma":
+            # Backward-compatible support for older schedules that kept
+            # output accumulators inside the LARS register file.
             rgw, rgx, rgy, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
             c = _fmt_lars_float(float(coeff))
             if bool(inst_need_grad_w):
@@ -3318,7 +3361,16 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             pair_reg, ra, rb, pair_name = inst.args
             ap(f"            {pair_reg} = {ra} * {rb};")
 
+        elif inst.op == "bwd_fma_wg_pair_resident":
+            wi, xj, yk, pair_reg, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
+            c = _fmt_lars_float(float(coeff))
+            if bool(inst_need_grad_w):
+                ap(f"            gw_acc_i_{int(wi)} += scalar_t({c}) * {rgo} * {rx} * {ry};")
+            ap(f"            gx_acc_j_{int(xj)} += scalar_t({c}) * {pair_reg} * {ry};")
+            ap(f"            gy_acc_k_{int(yk)} += scalar_t({c}) * {pair_reg} * {rx};")
+
         elif inst.op == "bwd_fma_wg_pair":
+            # Backward-compatible support for older schedules.
             rgw, rgx, rgy, pair_reg, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
             c = _fmt_lars_float(float(coeff))
             if bool(inst_need_grad_w):
@@ -3341,7 +3393,10 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             if kind == "gw":
                 if not need_grad_w:
                     raise ValueError("schedule stores grad_w but need_grad_w=False")
-                ap(f"            atomicAdd(&grad_w[{expr}], {reg});")
+                # grad_w is owned by the current w_row in this generated
+                # backward path, matching the baseline fused implementation:
+                # use a plain store rather than atomicAdd.
+                ap(f"            grad_w[{expr}] = {reg};")
             elif kind == "gx":
                 ap(f"            atomicAdd(&grad_x[{expr}], {reg});")
             elif kind == "gy":
@@ -3360,6 +3415,48 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         else:
             raise ValueError(f"Unsupported backward LARS instruction op: {inst.op}")
 
+    if resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted:
+        ap("")
+        ap("            // resident backward accumulator writeback")
+    for gw_idx in resident_gw_indices_sorted:
+        expr = _bwd_label_index_expr(
+            "gw", int(gw_idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        ap(f"            grad_w[{expr}] = gw_acc_i_{gw_idx};")
+    for gx_idx in resident_gx_indices_sorted:
+        expr = _bwd_label_index_expr(
+            "gx", int(gx_idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        ap(f"            atomicAdd(&grad_x[{expr}], gx_acc_j_{gx_idx});")
+    for gy_idx in resident_gy_indices_sorted:
+        expr = _bwd_label_index_expr(
+            "gy", int(gy_idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        if mode_scalar_y:
+            ap(f"            scalar_t gy_sum_resident_{gy_idx} = warp_sum_xor_lars_bwd(gy_acc_k_{gy_idx});")
+            ap("            if (lane == 0) {")
+            ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_resident_{gy_idx});")
+            ap("            }")
+        else:
+            ap(f"            atomicAdd(&grad_y[{expr}], gy_acc_k_{gy_idx});")
     ap("        }")
     ap("    }")
     ap("}")
