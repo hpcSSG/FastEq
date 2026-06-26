@@ -122,7 +122,7 @@ def _load_jit_module(
         name=module_name,
         sources=[str(cu_path)],
         extra_cflags=extra_cflags or ["-O3"],
-        extra_cuda_cflags=extra_cuda_cflags or ["-O3"],
+        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--ptxas-options=-v"],
         #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
         #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
         extra_include_paths=[str(src_dir)],
@@ -616,6 +616,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
         print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+
+        #print(f"uniform1d forward output:{out}")
 
         ctx.save_for_backward(w, x, y)
         ctx.b_list = b_list

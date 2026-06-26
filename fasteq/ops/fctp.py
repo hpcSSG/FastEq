@@ -272,6 +272,9 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         
         B = x.shape[0]
 
+        #print(f"cg_val_all shape:{cg_val_all.shape}, I_total:{I_total}, path_num:{path_num}")
+        #print(f"K_per_path:{K_per_path}")
+
 
         if path_num == 1 and nnz0 == 1 and I_total == 1:
             # use torch is better when open MPS
