@@ -51,8 +51,6 @@ class Inst:
         return f"{body:<48} # {self.comment}" if self.comment else body
 
 
-
-
 @dataclass
 class ScheduleResult:
     instructions: List[Inst]
@@ -2200,7 +2198,7 @@ def _fold_reg_budget_candidates_by_max_live(
     reg_budget: Union[int, Iterable[int]],
     *,
     lars_paths: List[Tuple[int, int, int, int, float]],
-    consider_cse: bool = True,
+    consider_cse: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     profile: bool = False,
@@ -2344,7 +2342,7 @@ def default_lars_cse_candidate_configs(
         {
             "name": f"lars_r{rb}_cse_auto",
             "reg_budget": int(rb),
-            "enable_cse": True,
+            "enable_cse": False,
         }
         for rb in budgets
     ]
@@ -2367,10 +2365,11 @@ def generate_code_uniform1d_fwd_with_scheduler(
     path_semantics: str = "wxy",
     return_schedule: bool = False,
     fold_reg_budgets_by_max_live: bool = True,
-    profile: bool = True,
+    profile: bool = False,
     profile_interval: int = 1000,
     profile_seconds: float = 2.0,
-    profile_print: bool = True,
+    profile_print: bool = False,
+    consider_cse: bool = True,
 
     # Shared scheduler defaults.
     enable_secondary_affinity: bool = False,
@@ -2435,7 +2434,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
     probed_budgets, budget_fold_info = _fold_reg_budget_candidates_by_max_live(
         reg_budget,
         lars_paths=lars_paths,
-        consider_cse=True,
+        consider_cse=consider_cse,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
@@ -3146,6 +3145,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
+    acc_reg_budget: Optional[int] = None,
+    smem_acc_volatile: bool = False,
 ) -> str:
     """
     Emit CUDA/HIP-compatible fused backward code from a backward LARS schedule.
@@ -3163,19 +3164,123 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_cse_aware(schedule_result)
-    resident_gw_indices: Set[int] = set()
-    resident_gx_indices: Set[int] = set()
-    resident_gy_indices: Set[int] = set()
-    for inst in schedule_result.instructions:
+
+    # ------------------------------------------------------------------
+    # Mixed accumulator placement for backward gradients.
+    #   acc_reg_budget=None: old behavior, keep every gw/gx/gy accumulator
+    #                        as a scalar local variable/register.
+    #   acc_reg_budget=K:    keep only the top-K hottest accumulators in
+    #                        registers and demote the rest to per-thread
+    #                        shared-memory accumulators.  Demoted gx/gy still
+    #                        write back once at the end, preserving atomic
+    #                        coalescing compared with path-level atomicAdd.
+    # ------------------------------------------------------------------
+    gw_use: Counter[int] = Counter()
+    gx_use: Counter[int] = Counter()
+    gy_use: Counter[int] = Counter()
+    first_seen: Dict[Tuple[str, int], int] = {}
+
+    def _note_acc(kind: str, idx: int, inst_id: int) -> None:
+        first_seen.setdefault((kind, int(idx)), int(inst_id))
+
+    for inst_id, inst in enumerate(schedule_result.instructions):
         if inst.op in ("bwd_fma_resident", "bwd_fma_wg_pair_resident"):
             wi, xj, yk = map(int, inst.args[:3])
             if need_grad_w:
-                resident_gw_indices.add(wi)
-            resident_gx_indices.add(xj)
-            resident_gy_indices.add(yk)
+                gw_use[wi] += 1
+                _note_acc("gw", wi, inst_id)
+            gx_use[xj] += 1
+            gy_use[yk] += 1
+            _note_acc("gx", xj, inst_id)
+            _note_acc("gy", yk, inst_id)
+
+    all_accs: Set[Tuple[str, int]] = set()
+    if need_grad_w:
+        all_accs |= {("gw", int(i)) for i in gw_use}
+    all_accs |= {("gx", int(j)) for j in gx_use}
+    all_accs |= {("gy", int(k)) for k in gy_use}
+
+    def _acc_use_count(acc: Tuple[str, int]) -> int:
+        kind, idx = acc
+        if kind == "gw":
+            return int(gw_use.get(idx, 0))
+        if kind == "gx":
+            return int(gx_use.get(idx, 0))
+        if kind == "gy":
+            return int(gy_use.get(idx, 0))
+        return 0
+
+    def _acc_score(acc: Tuple[str, int]) -> Tuple[float, int, int, int, str, int]:
+        # gx/gy have high value because register/shared accumulation reduces
+        # global atomicAdd count.  gy is slightly favored in scalar-y mode
+        # because writeback also needs a warp reduction.
+        kind, idx = acc
+        cnt = _acc_use_count(acc)
+        if kind == "gy":
+            weight = 5.0 if mode_scalar_y else 4.0
+            kind_rank = 3
+        elif kind == "gx":
+            weight = 4.0
+            kind_rank = 2
+        else:  # gw uses non-atomic writeback, so its register value is lower.
+            weight = 2.0
+            kind_rank = 1
+        return (float(cnt) * weight, cnt, -int(first_seen.get(acc, 10**9)), kind_rank, kind, -idx)
+
+    if acc_reg_budget is None:
+        reg_accs: Set[Tuple[str, int]] = set(all_accs)
+    else:
+        budget = max(0, int(acc_reg_budget))
+        ranked = sorted(all_accs, key=_acc_score, reverse=True)
+        reg_accs = set(ranked[:budget])
+
+    smem_accs: Set[Tuple[str, int]] = set(all_accs) - set(reg_accs)
+
+    resident_gw_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gw"}
+    resident_gx_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gx"}
+    resident_gy_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gy"}
     resident_gw_indices_sorted = sorted(resident_gw_indices)
     resident_gx_indices_sorted = sorted(resident_gx_indices)
     resident_gy_indices_sorted = sorted(resident_gy_indices)
+
+    # Stable shared-memory layout: all demoted accumulators are laid out as
+    # [acc_id][lane].  Each lane owns its own scalar slot for its current u.
+    smem_accs_sorted: List[Tuple[str, int]] = sorted(
+        smem_accs,
+        key=lambda acc: ({"gw": 0, "gx": 1, "gy": 2}[acc[0]], acc[1]),
+    )
+    smem_acc_id: Dict[Tuple[str, int], int] = {
+        acc: n for n, acc in enumerate(smem_accs_sorted)
+    }
+
+    def _is_reg_acc(kind: str, idx: int) -> bool:
+        return (kind, int(idx)) in reg_accs
+
+    def _is_smem_acc(kind: str, idx: int) -> bool:
+        return (kind, int(idx)) in smem_acc_id
+
+    def _reg_acc_name(kind: str, idx: int) -> str:
+        if kind == "gw":
+            return f"gw_acc_i_{int(idx)}"
+        if kind == "gx":
+            return f"gx_acc_j_{int(idx)}"
+        if kind == "gy":
+            return f"gy_acc_k_{int(idx)}"
+        raise ValueError(f"Bad accumulator kind: {kind}")
+
+    def _smem_acc_expr(kind: str, idx: int) -> str:
+        sid = smem_acc_id[(kind, int(idx))]
+        return f"smem_acc[{sid} * 32 + lane]"
+
+    def _emit_bwd_acc_update(kind: str, idx: int, value_expr: str) -> None:
+        if _is_reg_acc(kind, idx):
+            ap(f"            {_reg_acc_name(kind, idx)} += {value_expr};")
+        elif _is_smem_acc(kind, idx):
+            ap(f"            {_smem_acc_expr(kind, idx)} += {value_expr};")
+        else:
+            # This path is reachable only if need_grad_w=False and kind==gw.
+            pass
+
     lines: List[str] = []
 
     def ap(line: str = ""):
@@ -3238,6 +3343,12 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
     ap("    if (tid >= 32) return;")
+    if smem_accs_sorted:
+        ap("    extern __shared__ __align__(16) unsigned char smem_raw[];")
+        if smem_acc_volatile:
+            ap("    volatile scalar_t* smem_acc = reinterpret_cast<volatile scalar_t*>(smem_raw);")
+        else:
+            ap("    scalar_t* smem_acc = reinterpret_cast<scalar_t*>(smem_raw);")
     ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
@@ -3295,6 +3406,10 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
+    for sid, (akind, aidx) in enumerate(smem_accs_sorted):
+        ap(f"            smem_acc[{sid} * 32 + lane] = scalar_t(0);  // smem {akind}[{aidx}]")
+    if smem_accs_sorted:
+        ap("")
     for rid in range(reg_count):
         ap(f"            scalar_t r{rid};")
     if reg_count:
@@ -3343,9 +3458,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             wi, xj, yk, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
             c = _fmt_lars_float(float(coeff))
             if bool(inst_need_grad_w):
-                ap(f"            gw_acc_i_{int(wi)} += scalar_t({c}) * {rgo} * {rx} * {ry};")
-            ap(f"            gx_acc_j_{int(xj)} += scalar_t({c}) * ({rw} * {rgo}) * {ry};")
-            ap(f"            gy_acc_k_{int(yk)} += scalar_t({c}) * ({rw} * {rgo}) * {rx};")
+                _emit_bwd_acc_update("gw", int(wi), f"scalar_t({c}) * {rgo} * {rx} * {ry}")
+            _emit_bwd_acc_update("gx", int(xj), f"scalar_t({c}) * ({rw} * {rgo}) * {ry}")
+            _emit_bwd_acc_update("gy", int(yk), f"scalar_t({c}) * ({rw} * {rgo}) * {rx}")
 
         elif inst.op == "bwd_fma":
             # Backward-compatible support for older schedules that kept
@@ -3365,9 +3480,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             wi, xj, yk, pair_reg, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
             c = _fmt_lars_float(float(coeff))
             if bool(inst_need_grad_w):
-                ap(f"            gw_acc_i_{int(wi)} += scalar_t({c}) * {rgo} * {rx} * {ry};")
-            ap(f"            gx_acc_j_{int(xj)} += scalar_t({c}) * {pair_reg} * {ry};")
-            ap(f"            gy_acc_k_{int(yk)} += scalar_t({c}) * {pair_reg} * {rx};")
+                _emit_bwd_acc_update("gw", int(wi), f"scalar_t({c}) * {rgo} * {rx} * {ry}")
+            _emit_bwd_acc_update("gx", int(xj), f"scalar_t({c}) * {pair_reg} * {ry}")
+            _emit_bwd_acc_update("gy", int(yk), f"scalar_t({c}) * {pair_reg} * {rx}")
 
         elif inst.op == "bwd_fma_wg_pair":
             # Backward-compatible support for older schedules.
@@ -3415,9 +3530,12 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         else:
             raise ValueError(f"Unsupported backward LARS instruction op: {inst.op}")
 
-    if resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted:
+    if (resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted
+            or smem_accs_sorted):
         ap("")
-        ap("            // resident backward accumulator writeback")
+        ap("            // mixed register/shared-memory backward accumulator writeback")
+
+    # Register-resident writeback.
     for gw_idx in resident_gw_indices_sorted:
         expr = _bwd_label_index_expr(
             "gw", int(gw_idx),
@@ -3457,6 +3575,36 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ap("            }")
         else:
             ap(f"            atomicAdd(&grad_y[{expr}], gy_acc_k_{gy_idx});")
+
+    # Shared-memory-resident writeback.
+    for kind, idx in smem_accs_sorted:
+        expr = _bwd_label_index_expr(
+            kind, int(idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        smem_expr = _smem_acc_expr(kind, int(idx))
+        if kind == "gw":
+            if not need_grad_w:
+                continue
+            ap(f"            grad_w[{expr}] = {smem_expr};")
+        elif kind == "gx":
+            ap(f"            atomicAdd(&grad_x[{expr}], {smem_expr});")
+        elif kind == "gy":
+            if mode_scalar_y:
+                ap(f"            scalar_t gy_sum_smem_{idx} = warp_sum_xor_lars_bwd({smem_expr});")
+                ap("            if (lane == 0) {")
+                ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_smem_{idx});")
+                ap("            }")
+            else:
+                ap(f"            atomicAdd(&grad_y[{expr}], {smem_expr});")
+        else:
+            raise ValueError(f"Bad smem accumulator kind: {kind}")
+
     ap("        }")
     ap("    }")
     ap("}")
@@ -3508,7 +3656,14 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap(f"    constexpr int kSmemAccCount = {len(smem_accs_sorted)};")
+    ap("    size_t smem_bytes = (size_t)kSmemAccCount * 32u * sizeof(scalar_t);")
+    ap("#if !defined(USE_ROCM) && !defined(__HIP_PLATFORM_AMD__)")
+    ap("    if (smem_bytes > 49152) {")
+    ap(f"        cudaFuncSetAttribute({kernel_name}<scalar_t, index_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);")
+    ap("    }")
+    ap("#endif")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, smem_bytes, stream>>>(")
     if need_grad_w:
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
@@ -3787,7 +3942,7 @@ def _fold_bwd_reg_budget_candidates_by_max_live(
     *,
     bwd_paths: List[Tuple[int, int, int, int, float]],
     need_grad_w: bool = True,
-    consider_cse: bool = True,
+    consider_cse: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     profile: bool = False,
@@ -3861,64 +4016,945 @@ def _fold_bwd_reg_budget_candidates_by_max_live(
     }
 
 
+def _normalize_acc_reg_budget_candidates(
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
+) -> List[Optional[int]]:
+    """
+    Normalize accumulator register-budget candidates.
+
+    None means old behavior: all gw/gx/gy accumulators stay in scalar local
+    variables/registers.  An integer K means keep top-K hot accumulators in
+    registers and demote all remaining accumulators to shared memory.
+    """
+    if acc_reg_budget is None:
+        return [None]
+    if isinstance(acc_reg_budget, int):
+        if int(acc_reg_budget) < 0:
+            raise ValueError(f"acc_reg_budget must be >= 0 or None, got {acc_reg_budget}")
+        return [int(acc_reg_budget)]
+
+    out: List[Optional[int]] = []
+    seen = set()
+    for item in acc_reg_budget:
+        val = None if item is None else int(item)
+        if val is not None and val < 0:
+            raise ValueError(f"acc_reg_budget must be >= 0 or None, got {val}")
+        key = "all" if val is None else val
+        if key not in seen:
+            seen.add(key)
+            out.append(val)
+    if not out:
+        raise ValueError("acc_reg_budget candidate list must not be empty")
+    return out
+
+
 def default_lars_bwd_cse_candidate_configs(
     reg_budget: Union[int, Iterable[int]],
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
+    *,
+    enable_cse: bool = False,
+    smem_acc_volatile: bool = True,
 ) -> List[Dict[str, Any]]:
     budgets, _ = _normalize_reg_budget_candidates(reg_budget)
-    return [
-        {
-            "name": f"lars_bwd_r{rb}_cse_auto",
-            "reg_budget": int(rb),
-            "enable_cse": True,
-        }
-        for rb in budgets
+    acc_budgets = _normalize_acc_reg_budget_candidates(acc_reg_budget)
+    configs: List[Dict[str, Any]] = []
+    cse_tag = "cse_auto" if bool(enable_cse) else "nocse"
+    for rb in budgets:
+        for ab in acc_budgets:
+            acc_tag = "accall" if ab is None else f"acc{int(ab)}_smem"
+            volatile_tag = "_volatile" if (ab is not None and bool(smem_acc_volatile)) else ""
+            configs.append({
+                "name": f"lars_bwd_r{rb}_{acc_tag}_{cse_tag}{volatile_tag}",
+                "reg_budget": int(rb),
+                "acc_reg_budget": ab,
+                "enable_cse": bool(enable_cse),
+                "smem_acc_volatile": bool(smem_acc_volatile),
+            })
+    return configs
+
+
+# =============================================================================
+# Split backward LARS codegen: grad_w / grad_x / grad_y in separate kernels
+# =============================================================================
+
+BWD_SPLIT_KINDS = {"gw", "gx", "gy"}
+
+
+@dataclass(frozen=True)
+class U1DBwdSplitPath:
+    """
+    Backward path used by split-gradient LARS scheduling.
+
+    grad_kind="gw": grad_w[i] += c * grad_out[v] * x[j] * y[k]
+    grad_kind="gx": grad_x[j] += c * w[i]        * grad_out[v] * y[k]
+    grad_kind="gy": grad_y[k] += c * w[i]        * grad_out[v] * x[j]
+    """
+    pid: int
+    i: int
+    j: int
+    k: int
+    v: int
+    c: float
+    grad_kind: str
+
+    @property
+    def target_index(self) -> int:
+        if self.grad_kind == "gw":
+            return int(self.i)
+        if self.grad_kind == "gx":
+            return int(self.j)
+        if self.grad_kind == "gy":
+            return int(self.k)
+        raise ValueError(f"Bad grad_kind: {self.grad_kind}")
+
+    @property
+    def labels(self) -> Tuple[Label, ...]:
+        if self.grad_kind == "gw":
+            return (("x", self.j), ("y", self.k), ("go", self.v))
+        if self.grad_kind == "gx":
+            return (("w", self.i), ("y", self.k), ("go", self.v))
+        if self.grad_kind == "gy":
+            return (("w", self.i), ("x", self.j), ("go", self.v))
+        raise ValueError(f"Bad grad_kind: {self.grad_kind}")
+
+
+class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
+    """
+    Per-gradient backward scheduler.  It keeps code2's LARS label selection,
+    spill-victim selection and path-fallback behavior, but builds labels for a
+    single gradient target only.
+    """
+
+    def __init__(
+        self,
+        paths: Iterable[Tuple[int, int, int, int, float]],
+        reg_budget: int = 24,
+        *,
+        grad_kind: str,
+        enable_secondary_affinity: bool = True,
+        topk_candidates: Optional[int] = None,
+        path_fallback_after: Optional[int] = None,
+        prefer_path_fallback_when_full: bool = True,
+        debug: bool = False,
+        profile: bool = False,
+        profile_name: str = "",
+        profile_interval: int = 1000,
+        profile_seconds: float = 2.0,
+        profile_print: bool = True,
+    ):
+        if grad_kind not in BWD_SPLIT_KINDS:
+            raise ValueError(f"grad_kind must be one of {sorted(BWD_SPLIT_KINDS)}, got {grad_kind!r}")
+        self.grad_kind = str(grad_kind)
+        self.paths: List[U1DBwdSplitPath] = [
+            U1DBwdSplitPath(pid=p, i=i, j=j, k=k, v=v, c=c, grad_kind=self.grad_kind)
+            for p, (i, j, k, v, c) in enumerate(paths)
+        ]
+
+        self.reg_budget = int(reg_budget)
+        if self.reg_budget < 3:
+            raise ValueError(f"split backward reg_budget must be at least 3, got {self.reg_budget}")
+
+        self.enable_secondary_affinity = bool(enable_secondary_affinity)
+        self.topk_candidates = topk_candidates
+        self.prefer_path_fallback_when_full = bool(prefer_path_fallback_when_full)
+        self.path_fallback_after = (
+            int(path_fallback_after)
+            if path_fallback_after is not None
+            else max(8, 2 * self.reg_budget)
+        )
+        self.debug = bool(debug)
+
+        self.label_to_paths: Dict[Label, Set[int]] = defaultdict(set)
+        for path in self.paths:
+            for lab in path.labels:
+                self.label_to_paths[lab].add(path.pid)
+
+        self.path_label_sets: List[Set[Label]] = [set(p.labels) for p in self.paths]
+        self.unscheduled: Set[int] = set(p.pid for p in self.paths)
+
+        self.remaining_uses: Counter[Label] = Counter()
+        for p in self.paths:
+            for lab in p.labels:
+                self.remaining_uses[lab] += 1
+
+        self.live: Set[Label] = set()
+        self.dirty_outputs: Set[Label] = set()
+        self.reg_of: Dict[Label, str] = {}
+        self.free_regs: List[str] = [f"r{r}" for r in range(self.reg_budget)]
+
+        self.instructions: List[Inst] = []
+        self.path_order: List[int] = []
+        self.spills = 0
+        self.reloads = 0
+        self.max_live = 0
+        self.max_live_labels = 0
+        self.max_live_pairs = 0
+        self.max_live_total = 0
+
+        self._score_cache: Dict[Label, Tuple[int, int, int, int, int, int]] = {}
+        self._no_progress_iters = 0
+        self._last_done = 0
+
+        self.profile_enabled = bool(profile)
+        self.profile_name = str(profile_name or f"{self.__class__.__name__}_{self.grad_kind}")
+        self.profile_interval = int(profile_interval)
+        self.profile_seconds = float(profile_seconds)
+        self.profile_print = bool(profile_print)
+        self._profile_t0 = perf_counter()
+        self._profile_last_print_t = self._profile_t0
+        self._profile_last_print_done = 0
+        self._profile_loop_iter = 0
+        self._profile_select_rounds = 0
+        self._profile_fire_rounds = 0
+        self._profile_load_rounds = 0
+        self._profile_fallback_rounds = 0
+        self._profile_records: List[Dict[str, Any]] = []
+        self._profile_last_event = ""
+        self._profile_last_reason = ""
+
+    def _path(self, pid: int) -> U1DBwdSplitPath:
+        return self.paths[pid]
+
+    def _label_name(self, lab: Label) -> str:
+        kind, idx = lab
+        if kind == "go":
+            return f"grad_out[{idx}]"
+        return f"{kind}[{idx}]"
+
+    def _priority(self, lab: Label) -> int:
+        return self.remaining_uses[lab]
+
+    def _emit_path_compute(self, pid: int) -> None:
+        p = self._path(pid)
+        regs: Dict[str, str] = {}
+        for kind, idx in p.labels:
+            regs[kind] = self.reg_of[(kind, idx)]
+
+        self.instructions.append(
+            Inst(
+                "bwd_split_fma_resident",
+                (
+                    self.grad_kind,
+                    p.target_index,
+                    regs.get("w", ""),
+                    regs.get("x", ""),
+                    regs.get("y", ""),
+                    regs.get("go", ""),
+                    p.c,
+                ),
+                (
+                    f"path#{pid}: split {self.grad_kind}; "
+                    f"w[{p.i}], x[{p.j}], y[{p.k}], go[{p.v}], c={p.c}"
+                ),
+            )
+        )
+
+        self.path_order.append(pid)
+        self.unscheduled.remove(pid)
+
+        for lab in p.labels:
+            self.remaining_uses[lab] -= 1
+
+        for lab in p.labels:
+            if self.remaining_uses[lab] == 0 and lab in self.live:
+                self._store_and_release(lab, reason=f"last use after path#{pid}")
+
+
+def _split_grad_acc_name(grad_kind: str, idx: int) -> str:
+    if grad_kind == "gw":
+        return f"gw_acc_i_{int(idx)}"
+    if grad_kind == "gx":
+        return f"gx_acc_j_{int(idx)}"
+    if grad_kind == "gy":
+        return f"gy_acc_k_{int(idx)}"
+    raise ValueError(f"Bad grad_kind: {grad_kind}")
+
+
+def emit_lars_bwd_split_preamble() -> str:
+    return r'''
+#include <stdint.h>
+#include <torch/extension.h>
+#include <vector>
+#include <cstdint>
+
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+  #include <hip/hip_runtime.h>
+  #include <ATen/hip/HIPContext.h>
+  #include <c10/hip/HIPGuard.h>
+  using gpuStream_t = hipStream_t;
+  #define getCurrentGPUStream at::hip::getCurrentHIPStream
+  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()
+#else
+  #include <cuda.h>
+  #include <cuda_runtime.h>
+  #include <ATen/cuda/CUDAContext.h>
+  using gpuStream_t = cudaStream_t;
+  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream
+  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+#endif
+
+using GPU_Guard = c10::DeviceGuard;
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t warp_sum_xor_lars_bwd_split(scalar_t v) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+        v += __shfl_xor(v, offset);
+#else
+        v += __shfl_xor_sync(0xffffffff, v, offset);
+#endif
+    }
+    return v;
+}
+
+static inline bool mul_fits_int32_bwd_split(int64_t a, int64_t b) {
+    if (a < 0 || b < 0) return false;
+    constexpr int64_t LIM = 2147483647LL;
+    if (a == 0 || b == 0) return true;
+    return a <= LIM / b;
+}
+
+static inline bool mul3_fits_int32_bwd_split(int64_t a, int64_t b, int64_t c) {
+    if (!mul_fits_int32_bwd_split(a, b)) return false;
+    return mul_fits_int32_bwd_split(a * b, c);
+}
+
+static inline bool should_use_int32_index_bwd_split(
+    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,
+    bool use_x_src, bool use_y_src, bool use_scatter, bool mode_scalar_y)
+{
+    bool w_ok = mul3_fits_int32_bwd_split((int64_t)WB, (int64_t)Iw, (int64_t)U);
+    int64_t x_dim0 = use_x_src ? (int64_t)S : (int64_t)B;
+    bool x_ok = mul3_fits_int32_bwd_split(x_dim0, (int64_t)Ix, (int64_t)U);
+    int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;
+    bool y_ok = mode_scalar_y ? mul_fits_int32_bwd_split(y_dim0, (int64_t)Ky)
+                              : mul3_fits_int32_bwd_split(y_dim0, (int64_t)Ky, (int64_t)U);
+    int64_t go_dim0 = use_scatter ? (int64_t)S : (int64_t)B;
+    bool go_ok = mul3_fits_int32_bwd_split(go_dim0, (int64_t)V, (int64_t)U);
+    return w_ok && x_ok && y_ok && go_ok;
+}
+'''
+
+
+def emit_lars_bwd_split_kernel_from_schedule(
+    schedule_result: ScheduleResult,
+    *,
+    grad_kind: str,
+    kernel_name: str,
+    mode: str = "u,u,,u",
+    use_x_src: bool = False,
+    use_y_src: bool = False,
+    use_scatter: bool = False,
+    u_dim: Optional[int] = None,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+    acc_reg_budget: Optional[int] = None,
+    smem_acc_volatile: bool = False,
+) -> str:
+    if grad_kind not in BWD_SPLIT_KINDS:
+        raise ValueError(f"grad_kind must be one of {sorted(BWD_SPLIT_KINDS)}, got {grad_kind!r}")
+    if block_size != 32:
+        raise ValueError("this emitter currently assumes block_size=32")
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    mode_scalar_y = mode == "u,u,,u"
+    reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+
+    target_use: Counter[int] = Counter()
+    first_seen: Dict[int, int] = {}
+    for inst_id, inst in enumerate(schedule_result.instructions):
+        if inst.op == "bwd_split_fma_resident":
+            ikind, target_idx = inst.args[0], int(inst.args[1])
+            if ikind != grad_kind:
+                raise ValueError(f"schedule contains {ikind}, but emitter grad_kind is {grad_kind}")
+            target_use[target_idx] += 1
+            first_seen.setdefault(target_idx, inst_id)
+
+    all_targets: Set[int] = set(target_use)
+    if acc_reg_budget is None:
+        reg_targets: Set[int] = set(all_targets)
+    else:
+        budget = max(0, int(acc_reg_budget))
+        ranked = sorted(
+            all_targets,
+            key=lambda idx: (int(target_use[idx]), -int(first_seen.get(idx, 10**9)), -int(idx)),
+            reverse=True,
+        )
+        reg_targets = set(ranked[:budget])
+
+    smem_targets_sorted: List[int] = sorted(all_targets - reg_targets)
+    smem_id: Dict[int, int] = {idx: n for n, idx in enumerate(smem_targets_sorted)}
+    reg_targets_sorted = sorted(reg_targets)
+
+    def _is_reg_target(idx: int) -> bool:
+        return int(idx) in reg_targets
+
+    def _target_acc_name(idx: int) -> str:
+        return _split_grad_acc_name(grad_kind, int(idx))
+
+    def _smem_expr(idx: int) -> str:
+        return f"smem_acc[{smem_id[int(idx)]} * 32 + lane]"
+
+    def _emit_acc_update(idx: int, value_expr: str) -> None:
+        if _is_reg_target(idx):
+            ap(f"            {_target_acc_name(idx)} += {value_expr};")
+        else:
+            ap(f"            {_smem_expr(idx)} += {value_expr};")
+
+    lines: List[str] = []
+
+    def ap(line: str = ""):
+        lines.append(line)
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    const scalar_t* __restrict__ grad_out,")
+    if grad_kind == "gw":
+        ap("    scalar_t* __restrict__ grad_w,")
+    elif grad_kind == "gx":
+        ap("    scalar_t* __restrict__ grad_x,")
+    else:
+        ap("    scalar_t* __restrict__ grad_y,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    if smem_targets_sorted:
+        ap("    extern __shared__ __align__(16) unsigned char smem_raw[];")
+        if smem_acc_volatile:
+            ap("    volatile scalar_t* smem_acc = reinterpret_cast<volatile scalar_t*>(smem_raw);")
+        else:
+            ap("    scalar_t* smem_acc = reinterpret_cast<scalar_t*>(smem_raw);")
+    ap("")
+    if u_dim is not None:
+        ap(f"    constexpr int U_CONST = {int(u_dim)};")
+        ap("    (void)U_CONST;")
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+    if use_x_src or use_y_src:
+        ap("    const int src = src_idx[e_orig];")
+    else:
+        ap("    const int src = e_orig;")
+    if use_scatter:
+        ap("    const int dst = dst_idx[e_orig];")
+    else:
+        ap("    const int dst = e_orig;")
+    ap("")
+    ap("    const int x_row = " + ("src;" if use_x_src else "e_local;"))
+    ap("    const int y_row = " + ("src;" if use_y_src else "e_orig;"))
+    ap("    const int go_row = " + ("dst;" if use_scatter else "e_orig;"))
+    ap("")
+
+    if iw_dim is not None and u_dim is not None:
+        ap(f"    const index_t w_base  = (index_t)w_row * (index_t){int(iw_dim) * int(u_dim)};")
+        if grad_kind == "gw":
+            ap(f"    const index_t gw_base = (index_t)w_row * (index_t){int(iw_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t w_base  = (index_t)w_row * (index_t)Iw * (index_t)U;")
+        if grad_kind == "gw":
+            ap("    const index_t gw_base = (index_t)w_row * (index_t)Iw * (index_t)U;")
+
+    if ix_dim is not None and u_dim is not None:
+        ap(f"    const index_t x_base  = (index_t)x_row * (index_t){int(ix_dim) * int(u_dim)};")
+        if grad_kind == "gx":
+            ap(f"    const index_t gx_base = (index_t)x_row * (index_t){int(ix_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t x_base  = (index_t)x_row * (index_t)Ix * (index_t)U;")
+        if grad_kind == "gx":
+            ap("    const index_t gx_base = (index_t)x_row * (index_t)Ix * (index_t)U;")
+
+    if mode_scalar_y:
+        ap("    const index_t y_base  = (index_t)y_row * (index_t)Ky;")
+        if grad_kind == "gy":
+            ap("    const index_t gy_base = (index_t)y_row * (index_t)Ky;")
+    else:
+        if ky_dim is not None and u_dim is not None:
+            ap(f"    const index_t y_base  = (index_t)y_row * (index_t){int(ky_dim) * int(u_dim)};")
+            if grad_kind == "gy":
+                ap(f"    const index_t gy_base = (index_t)y_row * (index_t){int(ky_dim) * int(u_dim)};")
+        else:
+            ap("    const index_t y_base  = (index_t)y_row * (index_t)Ky * (index_t)U;")
+            if grad_kind == "gy":
+                ap("    const index_t gy_base = (index_t)y_row * (index_t)Ky * (index_t)U;")
+
+    if v_dim is not None and u_dim is not None:
+        ap(f"    const index_t go_base = (index_t)go_row * (index_t){int(v_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
+    ap("")
+
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        const int u = u_base + lane;")
+    ap("        if (u < U) {")
+    for sid, idx in enumerate(smem_targets_sorted):
+        ap(f"            smem_acc[{sid} * 32 + lane] = scalar_t(0);  // smem {grad_kind}[{idx}]")
+    if smem_targets_sorted:
+        ap("")
+    for rid in range(reg_count):
+        ap(f"            scalar_t r{rid};")
+    if reg_count:
+        ap("")
+    for idx in reg_targets_sorted:
+        ap(f"            scalar_t {_target_acc_name(idx)} = scalar_t(0);")
+    if reg_targets_sorted:
+        ap("")
+
+    for inst_id, inst in enumerate(schedule_result.instructions):
+        comment = _sanitize_cuda_comment(inst.comment)
+        prefix = f"            // inst {inst_id}: {inst.op}"
+        if comment:
+            prefix += f" | {comment}"
+        ap(prefix)
+
+        if inst.op == "load":
+            reg, ref = inst.args
+            kind, idx = _parse_bwd_lars_label_ref(ref)
+            if kind in BWD_OUTPUT_KINDS:
+                raise ValueError("load must not be used for backward output labels")
+            expr = _bwd_label_index_expr(
+                kind, idx,
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            arr = "grad_out" if kind == "go" else kind
+            ap(f"            {reg} = {arr}[{expr}];")
+
+        elif inst.op == "bwd_split_fma_resident":
+            ikind, target_idx, rw, rx, ry, rgo, coeff = inst.args
+            if ikind != grad_kind:
+                raise ValueError(f"schedule contains {ikind}, but emitter grad_kind is {grad_kind}")
+            c = _fmt_lars_float(float(coeff))
+            target_idx = int(target_idx)
+            if grad_kind == "gw":
+                _emit_acc_update(target_idx, f"scalar_t({c}) * {rgo} * {rx} * {ry}")
+            elif grad_kind == "gx":
+                _emit_acc_update(target_idx, f"scalar_t({c}) * ({rw} * {rgo}) * {ry}")
+            elif grad_kind == "gy":
+                _emit_acc_update(target_idx, f"scalar_t({c}) * ({rw} * {rgo}) * {rx}")
+            else:
+                raise ValueError(f"Bad grad_kind: {grad_kind}")
+
+        elif inst.op == "release":
+            pass
+        else:
+            raise ValueError(f"Unsupported split backward LARS instruction op: {inst.op}")
+
+    if reg_targets_sorted or smem_targets_sorted:
+        ap("")
+        ap("            // split backward accumulator writeback")
+
+    def _emit_writeback(idx: int, acc_expr: str) -> None:
+        if grad_kind == "gw":
+            expr = _bwd_label_index_expr(
+                "gw", int(idx),
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            ap(f"            grad_w[{expr}] = {acc_expr};")
+        elif grad_kind == "gx":
+            expr = _bwd_label_index_expr(
+                "gx", int(idx),
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            ap(f"            atomicAdd(&grad_x[{expr}], {acc_expr});")
+        elif grad_kind == "gy":
+            expr = _bwd_label_index_expr(
+                "gy", int(idx),
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            if mode_scalar_y:
+                safe_idx = str(int(idx)).replace("-", "m")
+                ap(f"            scalar_t gy_sum_{safe_idx} = warp_sum_xor_lars_bwd_split({acc_expr});")
+                ap("            if (lane == 0) {")
+                ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_{safe_idx});")
+                ap("            }")
+            else:
+                ap(f"            atomicAdd(&grad_y[{expr}], {acc_expr});")
+        else:
+            raise ValueError(f"Bad grad_kind: {grad_kind}")
+
+    for idx in reg_targets_sorted:
+        _emit_writeback(int(idx), _target_acc_name(int(idx)))
+    for idx in smem_targets_sorted:
+        _emit_writeback(int(idx), _smem_expr(int(idx)))
+
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if grad_kind == "gw":
+        ap("    scalar_t* grad_w,")
+    elif grad_kind == "gx":
+        ap("    scalar_t* grad_x,")
+    else:
+        ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+    ap("    dim3 grid(B);")
+    ap(f"    constexpr int kSmemAccCount = {len(smem_targets_sorted)};")
+    ap("    size_t smem_bytes = (size_t)kSmemAccCount * 32u * sizeof(scalar_t);")
+    ap("#if !defined(USE_ROCM) && !defined(__HIP_PLATFORM_AMD__)")
+    ap("    if (smem_bytes > 49152) {")
+    ap(f"        cudaFuncSetAttribute({kernel_name}<scalar_t, index_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);")
+    ap("    }")
+    ap("#endif")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, smem_bytes, stream>>>(")
+    if grad_kind == "gw":
+        ap("        w, x, y, grad_out, grad_w,")
+    elif grad_kind == "gx":
+        ap("        w, x, y, grad_out, grad_x,")
+    else:
+        ap("        w, x, y, grad_out, grad_y,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}_auto(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if grad_kind == "gw":
+        ap("    scalar_t* grad_w,")
+    elif grad_kind == "gx":
+        ap("    scalar_t* grad_x,")
+    else:
+        ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    constexpr bool kUseXSrc = {'true' if use_x_src else 'false'};")
+    ap(f"    constexpr bool kUseYSrc = {'true' if use_y_src else 'false'};")
+    ap(f"    constexpr bool kUseScatter = {'true' if use_scatter else 'false'};")
+    ap(f"    constexpr bool kModeScalarY = {'true' if mode_scalar_y else 'false'};")
+    ap("    if (should_use_int32_index_bwd_split(B, WB, Iw, Ix, Ky, V, U, S,")
+    ap("                                       kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
+    if grad_kind == "gw":
+        ap("            w, x, y, grad_out, grad_w,")
+    elif grad_kind == "gx":
+        ap("            w, x, y, grad_out, grad_x,")
+    else:
+        ap("            w, x, y, grad_out, grad_y,")
+    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
+    if grad_kind == "gw":
+        ap("            w, x, y, grad_out, grad_w,")
+    elif grad_kind == "gx":
+        ap("            w, x, y, grad_out, grad_x,")
+    else:
+        ap("            w, x, y, grad_out, grad_y,")
+    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if grad_kind == "gw":
+        ap("    scalar_t* grad_w,")
+    elif grad_kind == "gx":
+        ap("    scalar_t* grad_x,")
+    else:
+        ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    launch_{kernel_name}_auto<scalar_t>(")
+    if grad_kind == "gw":
+        ap("        w, x, y, grad_out, grad_w,")
+    elif grad_kind == "gx":
+        ap("        w, x, y, grad_out, grad_x,")
+    else:
+        ap("        w, x, y, grad_out, grad_y,")
+    ap("        src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("}")
+    ap("")
+
+    return "\n".join(lines)
+
+
+def emit_lars_bwd_split_launcher(
+    bundle_name: str,
+    mode: str,
+    *,
+    need_grad_w: bool,
+    use_x_src: bool,
+    use_y_src: bool,
+    use_scatter: bool,
+    gradw_kernel: Optional[str],
+    gradx_kernel: str,
+    grady_kernel: str,
+) -> str:
+    if mode == "u,u,,u":
+        y_comment = "[B,Ky,1] or [S,Ky,1]"
+        gy_alloc = "    auto grad_y = torch::zeros({y.size(0), Ky, 1}, y.options());"
+        y_check_u = 'TORCH_CHECK((int)y.size(2) == 1, "y.size(2) must be 1 for mode u,u,,u");'
+    elif mode == "u,u,u,u":
+        y_comment = "[B,Ky,U] or [S,Ky,U]"
+        gy_alloc = "    auto grad_y = torch::zeros_like(y);"
+        y_check_u = 'TORCH_CHECK((int)y.size(2) == U, "y.size(2) must equal U for mode u,u,u,u");'
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    param_lines = [
+        "    torch::Tensor w",
+        "    torch::Tensor x",
+        "    torch::Tensor y",
+        "    torch::Tensor grad_out",
     ]
+    if use_x_src or use_y_src:
+        param_lines.append("    torch::Tensor src_idx")
+    if use_scatter:
+        param_lines.append("    torch::Tensor dst_idx")
+        param_lines.append("    torch::Tensor b_list")
+    param_lines.append("    int64_t V64")
+    params = ",\n".join(param_lines)
+
+    src_check = ""
+    if use_x_src or use_y_src:
+        src_check = r'''
+    TORCH_CHECK(src_idx.is_cuda(), "src_idx must be CUDA/HIP");
+    TORCH_CHECK(src_idx.scalar_type() == torch::kInt32, "src_idx must be int32");
+'''
+    dst_check = ""
+    if use_scatter:
+        dst_check = r'''
+    TORCH_CHECK(dst_idx.is_cuda(), "dst_idx must be CUDA/HIP");
+    TORCH_CHECK(dst_idx.scalar_type() == torch::kInt32, "dst_idx must be int32");
+'''
+
+    if use_x_src or use_y_src:
+        b_expr = "src_idx.size(0)"
+        src_numel_check = '    TORCH_CHECK(src_idx.numel() >= B, "src_idx numel must be >= B");'
+    elif use_scatter:
+        b_expr = "dst_idx.size(0)"
+        src_numel_check = ""
+    else:
+        b_expr = "grad_out.size(0)"
+        src_numel_check = ""
+
+    dst_numel_check = '    TORCH_CHECK(dst_idx.numel() >= B, "dst_idx numel must be >= B");' if use_scatter else ""
+
+    blist_logic = ""
+    if use_scatter:
+        blist_logic = r'''
+    const int32_t* b_list_ptr = nullptr;
+    if (b_list.defined() && b_list.numel() > 0) {
+        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA/HIP");
+        TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
+        TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
+        b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
+    }
+'''
+    else:
+        blist_logic = "    const int32_t* b_list_ptr = nullptr;\n"
+
+    launch_src_arg = "(const int32_t*)src_idx.data_ptr<int32_t>()," if (use_x_src or use_y_src) else "nullptr,"
+    launch_dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()," if use_scatter else "nullptr,"
+
+    grad_w_alloc = "    auto grad_w = torch::zeros_like(w);\n" if need_grad_w else ""
+    grad_w_launch = ""
+    if need_grad_w:
+        assert gradw_kernel is not None
+        grad_w_launch = f'''
+        launch_{gradw_kernel}<scalar_t>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_w.data_ptr<scalar_t>(),
+                {launch_src_arg}
+                {launch_dst_arg}
+                b_list_ptr,
+                B, WB, Iw, Ix, Ky, V, U, S, stream);
+'''
+    ret_expr = "return {grad_w, grad_x, grad_y};" if need_grad_w else "return {grad_x, grad_y};"
+
+    return rf'''
+
+std::vector<torch::Tensor> launcher_{bundle_name}(
+{params})
+{{
+    // Split backward: grad_w / grad_x / grad_y are computed by independent
+    // LARS-scheduled kernels to reduce register pressure for large path lists.
+    // Expected tensors:
+    //   w        : [WB,Iw,U], WB can be 1 or B
+    //   x        : [S,Ix,U] or [B,Ix,U]
+    //   y        : {y_comment}
+    //   grad_out : [B,V,U] or [S,V,U], matching forward output layout
+
+    TORCH_CHECK(w.is_cuda() && x.is_cuda() && y.is_cuda() && grad_out.is_cuda(),
+                "w/x/y/grad_out must be CUDA/HIP");
+    TORCH_CHECK(w.is_contiguous() && x.is_contiguous() && y.is_contiguous() && grad_out.is_contiguous(),
+                "w/x/y/grad_out must be contiguous");
+{src_check}{dst_check}
+
+    TORCH_CHECK(w.dim() == 3, "w must be [WB,Iw,U]");
+    TORCH_CHECK(x.dim() == 3, "x must be [S,Ix,U] or [B,Ix,U]");
+    TORCH_CHECK(y.dim() == 3, "y must be 3D");
+    TORCH_CHECK(grad_out.dim() == 3, "grad_out must be 3D");
+
+    int B  = (int){b_expr};
+    int WB = (int)w.size(0);
+    int Iw = (int)w.size(1);
+    int U  = (int)w.size(2);
+
+    int S  = (int)x.size(0);
+    int Ix = (int)x.size(1);
+    int Ky = (int)y.size(1);
+    int V  = (int)V64;
+
+    TORCH_CHECK(V > 0, "V must be > 0");
+    TORCH_CHECK(B > 0, "B must be > 0");
+    TORCH_CHECK((int)w.size(0) == 1 || (int)w.size(0) == B,
+                "w.size(0) must be 1 or B");
+    TORCH_CHECK((int)w.size(2) == U, "w U mismatch");
+    TORCH_CHECK((int)x.size(2) == U, "x U mismatch");
+    {y_check_u}
+    TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
+    TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
+    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
+{src_numel_check}
+{dst_numel_check}
+
+{blist_logic}
+{grad_w_alloc}    auto grad_x = torch::zeros_like(x);
+{gy_alloc}
+
+    GPU_Guard device_guard(w.device());
+    gpuStream_t stream = getCurrentGPUStream(w.device().index());
+
+    AT_DISPATCH_FLOATING_TYPES(w.scalar_type(), "{bundle_name}", [&] {{
+
+        TORCH_CHECK(x.scalar_type() == w.scalar_type(), "x dtype must match w");
+        TORCH_CHECK(y.scalar_type() == w.scalar_type(), "y dtype must match w");
+        TORCH_CHECK(grad_out.scalar_type() == w.scalar_type(), "grad_out dtype must match w");
+{grad_w_launch}
+        launch_{gradx_kernel}<scalar_t>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_x.data_ptr<scalar_t>(),
+                {launch_src_arg}
+                {launch_dst_arg}
+                b_list_ptr,
+                B, WB, Iw, Ix, Ky, V, U, S, stream);
+
+        launch_{grady_kernel}<scalar_t>(
+                (const scalar_t*)w.data_ptr<scalar_t>(),
+                (const scalar_t*)x.data_ptr<scalar_t>(),
+                (const scalar_t*)y.data_ptr<scalar_t>(),
+                (const scalar_t*)grad_out.data_ptr<scalar_t>(),
+                (scalar_t*)grad_y.data_ptr<scalar_t>(),
+                {launch_src_arg}
+                {launch_dst_arg}
+                b_list_ptr,
+                B, WB, Iw, Ix, Ky, V, U, S, stream);
+    }});
+
+    GPU_KERNEL_LAUNCH_CHECK();
+
+    {ret_expr}
+}}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{bundle_name}, "{bundle_name} backward LARS split jit impl");
+}}
+'''
 
 
-def generate_code_uniform1d_bwd_with_scheduler(
+
+@dataclass(frozen=True)
+class BwdCodegenContext:
+    """Pre-parsed Uniform1D backward codegen inputs shared by fused/split paths."""
+    input_indices: Dict[int, Any]
+    output_indices: Dict[int, Any]
+    use_x_src: bool
+    use_y_src: bool
+    use_scatter: bool
+    P: int
+    i_cpu: List[int]
+    j_cpu: List[int]
+    k_cpu: List[int]
+    v_cpu: List[int]
+    c_cpu: List[float]
+    bwd_paths: List[Tuple[int, int, int, int, float]]
+    mode_str: str
+    layout_tag: str
+
+
+def _prepare_uniform1d_bwd_codegen_context(
     i_list: torch.Tensor,
     j_list: torch.Tensor,
     k_list: torch.Tensor,
     v_list: torch.Tensor,
     coeff_list: torch.Tensor,
-    input_indices: Optional[Dict[int, Any]] = None,
-    output_indices: Optional[Dict[int, Any]] = None,
-    u_dim: int = 1,
-    iw_dim: Optional[int] = None,
-    ix_dim: Optional[int] = None,
-    ky_dim: Optional[int] = None,
-    v_dim: Optional[int] = None,
-    mode: str = "u,u,,u",
-    need_grad_w: bool = True,
-    out_path: str = "generated_uniform1d_bwd_lars_cse.cu",
-    kernel_name: str = "uniform1d_bwd_lars",
-    scalar_t: str = "float",
-    reg_budget: Union[int, Iterable[int]] = 24,
-    path_semantics: str = "wxy",
-    return_schedule: bool = False,
-    fold_reg_budgets_by_max_live: bool = True,
-    profile: bool = True,
-    profile_interval: int = 1000,
-    profile_seconds: float = 2.0,
-    profile_print: bool = True,
-    enable_secondary_affinity: bool = False,
-    topk_candidates: Optional[int] = 128,
-):
-    """
-    Generate one or more LARS backward CUDA implementations with scheduler-level
-    pair CSE.
-
-    The generated backward follows code2's fused-gradient semantics:
-        grad_w[i] += c * grad_out[v] * x[j] * y[k]
-        grad_x[j] += c * w[i] * grad_out[v] * y[k]
-        grad_y[k] += c * w[i] * grad_out[v] * x[j]
-
-    Candidate generation is automatic only: one auto-CSE backward candidate is
-    produced for each kept reg_budget. Pair CSE caches repeated (w, grad_out)
-    products opportunistically when a virtual register is free.
-    """
-    del scalar_t
-
+    input_indices: Optional[Dict[int, Any]],
+    output_indices: Optional[Dict[int, Any]],
+    *,
+    mode: str,
+    path_semantics: str,
+) -> BwdCodegenContext:
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -3930,7 +4966,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
     use_scatter = 0 in output_indices
 
     assert i_list.ndim == j_list.ndim == k_list.ndim == v_list.ndim == coeff_list.ndim == 1
-    P = i_list.numel()
+    P = int(i_list.numel())
     assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
 
     i_cpu = _to_int_list(i_list)
@@ -3944,11 +4980,293 @@ def generate_code_uniform1d_bwd_with_scheduler(
         path_semantics=path_semantics,
     )
 
+    return BwdCodegenContext(
+        input_indices=input_indices,
+        output_indices=output_indices,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+        P=P,
+        i_cpu=i_cpu,
+        j_cpu=j_cpu,
+        k_cpu=k_cpu,
+        v_cpu=v_cpu,
+        c_cpu=c_cpu,
+        bwd_paths=bwd_paths,
+        mode_str="uu_u" if mode == "u,u,,u" else "uuuu",
+        layout_tag=f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}",
+    )
+
+
+def _resolve_split_backward(
+    split_backward: Union[bool, str],
+    *,
+    path_count: int,
+    split_path_threshold: int,
+) -> bool:
+    if isinstance(split_backward, str):
+        split_mode = split_backward.lower()
+        if split_mode in ("auto",):
+            return int(path_count) > int(split_path_threshold)
+        if split_mode in ("split", "true", "always", "on", "yes"):
+            return True
+        if split_mode in ("fused", "false", "never", "off", "no"):
+            return False
+        raise ValueError(
+            "split_backward must be bool or one of "
+            "'auto', 'split'/'always'/'on', 'fused'/'never'/'off'"
+        )
+    return bool(split_backward)
+
+
+def _write_codegen_candidate(
+    *,
+    out_path: str,
+    candidate_count: int,
+    cand_name: str,
+    code: str,
+) -> None:
+    if not out_path:
+        return
+    out_p = Path(out_path)
+    if candidate_count > 1:
+        stem = out_p.stem
+        suffix = out_p.suffix or ".cu"
+        out_p.with_name(f"{stem}_{cand_name}{suffix}").write_text(code, encoding="utf-8")
+    else:
+        out_p.write_text(code, encoding="utf-8")
+
+
+def _finalize_codegen_candidates(candidates: List[Any], *, return_schedule: bool):
+    if return_schedule:
+        return candidates if len(candidates) != 1 else candidates[0]
+    if len(candidates) == 1:
+        return candidates[0][1]
+    return candidates
+
+
+def _bwd_base_kernel_name(
+    *,
+    kernel_name: str,
+    cand_name: str,
+    u_dim: int,
+    path_count: int,
+    mode_str: str,
+    layout_tag: str,
+    grad_tag: str,
+) -> str:
+    safe_cand = cand_name.replace("-", "_").replace(".", "_")
+    if kernel_name and kernel_name != "uniform1d_bwd_lars":
+        return f"{kernel_name}_{safe_cand}"
+    return (
+        f"uniform1d_{safe_cand}_u{u_dim}_path{path_count}_"
+        f"{mode_str}_{layout_tag}_{grad_tag}_bwd"
+    )
+
+
+def _generate_code_uniform1d_bwd_split_from_context(
+    ctx: BwdCodegenContext,
+    *,
+    u_dim: int,
+    iw_dim: Optional[int],
+    ix_dim: Optional[int],
+    ky_dim: Optional[int],
+    v_dim: Optional[int],
+    mode: str,
+    need_grad_w: bool,
+    out_path: str,
+    kernel_name: str,
+    reg_budget: Union[int, Iterable[int]],
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
+    smem_acc_volatile: bool,
+    return_schedule: bool,
+    fold_reg_budgets_by_max_live: bool,
+    profile: bool,
+    profile_interval: int,
+    profile_seconds: float,
+    profile_print: bool,
+    enable_secondary_affinity: bool,
+    topk_candidates: Optional[int],
+):
+    """Internal split-backward implementation.  The public entry is the unified wrapper."""
+    budgets, _ = _normalize_reg_budget_candidates(reg_budget)
+    acc_budgets = _normalize_acc_reg_budget_candidates(acc_reg_budget)
+    configs: List[Dict[str, Any]] = []
+    for rb in budgets:
+        for ab in acc_budgets:
+            acc_tag = "accall" if ab is None else f"acc{int(ab)}_smem"
+            volatile_tag = "_volatile" if (ab is not None and bool(smem_acc_volatile)) else ""
+            configs.append({
+                "name": f"lars_bwd_split_r{int(rb)}_{acc_tag}{volatile_tag}",
+                "reg_budget": int(rb),
+                "acc_reg_budget": ab,
+                "smem_acc_volatile": bool(smem_acc_volatile),
+            })
+
+    if fold_reg_budgets_by_max_live and len(budgets) > 1:
+        max_effective_need = 0
+        for gkind in (["gw"] if need_grad_w else []) + ["gx", "gy"]:
+            probe = LARSUniform1DBwdSplitScheduler(
+                paths=ctx.bwd_paths,
+                reg_budget=max(budgets),
+                grad_kind=gkind,
+                enable_secondary_affinity=enable_secondary_affinity,
+                topk_candidates=topk_candidates,
+                prefer_path_fallback_when_full=False,
+                profile=profile,
+                profile_name=f"bwd_split_budget_probe_{gkind}_r{max(budgets)}",
+                profile_interval=profile_interval,
+                profile_seconds=profile_seconds,
+                profile_print=profile_print,
+            )
+            probe_result = probe.schedule()
+            max_effective_need = max(
+                max_effective_need,
+                int(getattr(probe, "max_live_labels", probe_result.max_live)),
+            )
+        configs = _fold_lars_configs_by_reg_budget(configs, effective_live_need=max_effective_need)
+    else:
+        max_effective_need = 0
+
+    grad_tag = "split" if need_grad_w else "split_nogradw"
+    candidates = []
+    split_kinds = (["gw"] if need_grad_w else []) + ["gx", "gy"]
+
+    for cfg_in in configs:
+        cfg = dict(cfg_in)
+        rb = int(cfg["reg_budget"])
+        acc_rb = cfg.get("acc_reg_budget", None)
+        acc_rb = None if acc_rb is None else int(acc_rb)
+        cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
+        cand_name = str(cfg["name"])
+        auto_fallback_when_full = bool(max_effective_need > 0 and rb < max_effective_need)
+        cfg["auto_fallback_when_full"] = auto_fallback_when_full
+        cfg["effective_live_need"] = int(max_effective_need)
+        cfg["split_backward"] = True
+
+        base_kernel_name = _bwd_base_kernel_name(
+            kernel_name=kernel_name,
+            cand_name=cand_name,
+            u_dim=u_dim,
+            path_count=ctx.P,
+            mode_str=ctx.mode_str,
+            layout_tag=ctx.layout_tag,
+            grad_tag=grad_tag,
+        )
+
+        schedules: Dict[str, ScheduleResult] = {}
+        profiles: Dict[str, Any] = {}
+        code_parts: List[str] = [emit_lars_bwd_split_preamble()]
+        kernel_names: Dict[str, str] = {}
+
+        for gkind in split_kinds:
+            scheduler = LARSUniform1DBwdSplitScheduler(
+                paths=ctx.bwd_paths,
+                reg_budget=rb,
+                grad_kind=gkind,
+                enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
+                topk_candidates=cfg.get("topk_candidates", topk_candidates),
+                prefer_path_fallback_when_full=auto_fallback_when_full,
+                profile=bool(cfg.get("profile", profile)),
+                profile_name=str(cfg.get("profile_name", f"{cand_name}_{gkind}")),
+                profile_interval=int(cfg.get("profile_interval", profile_interval)),
+                profile_seconds=float(cfg.get("profile_seconds", profile_seconds)),
+                profile_print=bool(cfg.get("profile_print", profile_print)),
+            )
+            schedule_result = scheduler.schedule()
+            schedules[gkind] = schedule_result
+            profiles[gkind] = schedule_result.profile
+            split_kernel_name = f"{base_kernel_name}_{gkind}"
+            kernel_names[gkind] = split_kernel_name
+            code_parts.append(
+                emit_lars_bwd_split_kernel_from_schedule(
+                    schedule_result,
+                    grad_kind=gkind,
+                    kernel_name=split_kernel_name,
+                    mode=mode,
+                    use_x_src=ctx.use_x_src,
+                    use_y_src=ctx.use_y_src,
+                    use_scatter=ctx.use_scatter,
+                    u_dim=u_dim,
+                    iw_dim=iw_dim,
+                    ix_dim=ix_dim,
+                    ky_dim=ky_dim,
+                    v_dim=v_dim,
+                    block_size=32,
+                    acc_reg_budget=acc_rb,
+                    smem_acc_volatile=cfg_smem_acc_volatile,
+                )
+            )
+
+        code_parts.append(
+            emit_lars_bwd_split_launcher(
+                bundle_name=base_kernel_name,
+                mode=mode,
+                need_grad_w=need_grad_w,
+                use_x_src=ctx.use_x_src,
+                use_y_src=ctx.use_y_src,
+                use_scatter=ctx.use_scatter,
+                gradw_kernel=kernel_names.get("gw"),
+                gradx_kernel=kernel_names["gx"],
+                grady_kernel=kernel_names["gy"],
+            )
+        )
+        code = "\n".join(code_parts)
+
+        _write_codegen_candidate(
+            out_path=out_path,
+            candidate_count=len(configs),
+            cand_name=cand_name,
+            code=code,
+        )
+
+        if return_schedule:
+            candidates.append({
+                "name": cand_name,
+                "code": code,
+                "schedule": schedules,
+                "config": cfg,
+                "profiles": profiles,
+                "budget_fold_effective_live_need": int(max_effective_need),
+                "auto_fallback_when_full": auto_fallback_when_full,
+            })
+        else:
+            candidates.append((cand_name, code))
+
+    return _finalize_codegen_candidates(candidates, return_schedule=return_schedule)
+
+
+def _generate_code_uniform1d_bwd_fused_from_context(
+    ctx: BwdCodegenContext,
+    *,
+    u_dim: int,
+    iw_dim: Optional[int],
+    ix_dim: Optional[int],
+    ky_dim: Optional[int],
+    v_dim: Optional[int],
+    mode: str,
+    need_grad_w: bool,
+    out_path: str,
+    kernel_name: str,
+    reg_budget: Union[int, Iterable[int]],
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
+    enable_cse: bool,
+    smem_acc_volatile: bool,
+    consider_cse: bool,
+    return_schedule: bool,
+    fold_reg_budgets_by_max_live: bool,
+    profile: bool,
+    profile_interval: int,
+    profile_seconds: float,
+    profile_print: bool,
+    enable_secondary_affinity: bool,
+    topk_candidates: Optional[int],
+):
     probed_budgets, budget_fold_info = _fold_bwd_reg_budget_candidates_by_max_live(
         reg_budget,
-        bwd_paths=bwd_paths,
+        bwd_paths=ctx.bwd_paths,
         need_grad_w=need_grad_w,
-        consider_cse=True,
+        consider_cse=consider_cse,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
@@ -3963,31 +5281,43 @@ def generate_code_uniform1d_bwd_with_scheduler(
         effective_reg_budget, _ = _normalize_reg_budget_candidates(reg_budget)
 
     effective_live_need = int(budget_fold_info.get("effective_live_need", 0))
-    auto_cse_configs = default_lars_bwd_cse_candidate_configs(effective_reg_budget)
+    auto_cse_configs = default_lars_bwd_cse_candidate_configs(
+        effective_reg_budget,
+        acc_reg_budget=acc_reg_budget,
+        enable_cse=enable_cse,
+        smem_acc_volatile=smem_acc_volatile,
+    )
 
-    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
-    layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
     grad_tag = "full" if need_grad_w else "nogradw"
-
     candidates = []
 
     for cfg_in in auto_cse_configs:
         cfg = dict(cfg_in)
         rb = int(cfg.get("reg_budget", reg_budget if isinstance(reg_budget, int) else list(reg_budget)[0]))
-        enable_cse = bool(cfg.get("enable_cse", True))
+        acc_rb = cfg.get("acc_reg_budget", None)
+        acc_rb = None if acc_rb is None else int(acc_rb)
+        cfg_enable_cse = bool(cfg.get("enable_cse", enable_cse))
+        cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
 
-        cand_name = str(cfg.get("name", f"lars_bwd_r{rb}_cse_auto"))
+        acc_tag = "accall" if acc_rb is None else f"acc{acc_rb}_smem"
+        cse_tag = "cse_auto" if cfg_enable_cse else "nocse"
+        volatile_tag = "_volatile" if (acc_rb is not None and cfg_smem_acc_volatile) else ""
+        cand_name = str(cfg.get("name", f"lars_bwd_r{rb}_{acc_tag}_{cse_tag}{volatile_tag}"))
 
         auto_fallback_when_full = bool(effective_live_need > 0 and rb < effective_live_need)
         cfg["auto_fallback_when_full"] = auto_fallback_when_full
         cfg["effective_live_need"] = effective_live_need
         cfg["need_grad_w"] = bool(need_grad_w)
+        cfg["acc_reg_budget"] = acc_rb
+        cfg["enable_cse"] = bool(cfg_enable_cse)
+        cfg["smem_acc_volatile"] = bool(cfg_smem_acc_volatile)
+        cfg["split_backward"] = False
 
         scheduler = CSELARSUniform1DBwdScheduler(
-            paths=bwd_paths,
+            paths=ctx.bwd_paths,
             reg_budget=rb,
             need_grad_w=need_grad_w,
-            enable_cse=enable_cse,
+            enable_cse=cfg_enable_cse,
             enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
             topk_candidates=cfg.get("topk_candidates", topk_candidates),
             prefer_path_fallback_when_full=auto_fallback_when_full,
@@ -3999,49 +5329,49 @@ def generate_code_uniform1d_bwd_with_scheduler(
         )
         schedule_result = scheduler.schedule()
 
-        if kernel_name and kernel_name != "uniform1d_bwd_lars":
-            base_kernel_name = f"{kernel_name}_{cand_name}"
-        else:
-            safe_cand = cand_name.replace("-", "_").replace(".", "_")
-            base_kernel_name = (
-                f"uniform1d_{safe_cand}_u{u_dim}_path{P}_"
-                f"{mode_str}_{layout_tag}_{grad_tag}_bwd"
-            )
+        base_kernel_name = _bwd_base_kernel_name(
+            kernel_name=kernel_name,
+            cand_name=cand_name,
+            u_dim=u_dim,
+            path_count=ctx.P,
+            mode_str=ctx.mode_str,
+            layout_tag=ctx.layout_tag,
+            grad_tag=grad_tag,
+        )
 
         code = emit_fused_bwd_kernel_from_lars_schedule(
             schedule_result,
             kernel_name=base_kernel_name,
             mode=mode,
             need_grad_w=need_grad_w,
-            use_x_src=use_x_src,
-            use_y_src=use_y_src,
-            use_scatter=use_scatter,
+            use_x_src=ctx.use_x_src,
+            use_y_src=ctx.use_y_src,
+            use_scatter=ctx.use_scatter,
             u_dim=u_dim,
             iw_dim=iw_dim,
             ix_dim=ix_dim,
             ky_dim=ky_dim,
             v_dim=v_dim,
             block_size=32,
+            acc_reg_budget=acc_rb,
+            smem_acc_volatile=cfg_smem_acc_volatile,
         )
 
         code = code + "\n" + emit_lars_bwd_launcher(
             bundle_name=base_kernel_name,
             mode=mode,
             need_grad_w=need_grad_w,
-            use_x_src=use_x_src,
-            use_y_src=use_y_src,
-            use_scatter=use_scatter,
+            use_x_src=ctx.use_x_src,
+            use_y_src=ctx.use_y_src,
+            use_scatter=ctx.use_scatter,
         )
 
-        if out_path:
-            out_p = Path(out_path)
-            if len(auto_cse_configs) > 1:
-                stem = out_p.stem
-                suffix = out_p.suffix or ".cu"
-                candidate_path = out_p.with_name(f"{stem}_{cand_name}{suffix}")
-                candidate_path.write_text(code, encoding="utf-8")
-            else:
-                out_p.write_text(code, encoding="utf-8")
+        _write_codegen_candidate(
+            out_path=out_path,
+            candidate_count=len(auto_cse_configs),
+            cand_name=cand_name,
+            code=code,
+        )
 
         if return_schedule:
             candidates.append({
@@ -4066,9 +5396,1069 @@ def generate_code_uniform1d_bwd_with_scheduler(
         else:
             candidates.append((cand_name, code))
 
-    if return_schedule:
-        return candidates if len(candidates) != 1 else candidates[0]
+    return _finalize_codegen_candidates(candidates, return_schedule=return_schedule)
 
-    if len(candidates) == 1:
-        return candidates[0][1]
-    return candidates
+
+def generate_code_uniform1d_bwd_split_with_scheduler(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
+    u_dim: int = 1,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    mode: str = "u,u,,u",
+    need_grad_w: bool = True,
+    out_path: str = "generated_uniform1d_bwd_lars_split.cu",
+    kernel_name: str = "uniform1d_bwd_lars",
+    reg_budget: Union[int, Iterable[int]] = 24,
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
+    smem_acc_volatile: bool = True,
+    path_semantics: str = "wxy",
+    return_schedule: bool = False,
+    fold_reg_budgets_by_max_live: bool = True,
+    profile: bool = True,
+    profile_interval: int = 1000,
+    profile_seconds: float = 2.0,
+    profile_print: bool = True,
+    enable_secondary_affinity: bool = False,
+    topk_candidates: Optional[int] = 128,
+):
+    """
+    Backward-compatible wrapper.  New code should call
+    generate_code_uniform1d_bwd_with_scheduler(..., split_backward=True).
+    """
+    return generate_code_uniform1d_bwd_with_scheduler(
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices,
+        output_indices=output_indices,
+        u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        out_path=out_path,
+        kernel_name=kernel_name,
+        reg_budget=reg_budget,
+        acc_reg_budget=acc_reg_budget,
+        smem_acc_volatile=smem_acc_volatile,
+        path_semantics=path_semantics,
+        return_schedule=return_schedule,
+        fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
+        profile=profile,
+        profile_interval=profile_interval,
+        profile_seconds=profile_seconds,
+        profile_print=profile_print,
+        enable_secondary_affinity=enable_secondary_affinity,
+        topk_candidates=topk_candidates,
+        split_backward=True,
+    )
+
+
+def generate_code_uniform1d_bwd_with_scheduler(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
+    u_dim: int = 1,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    mode: str = "u,u,,u",
+    need_grad_w: bool = True,
+    out_path: str = "generated_uniform1d_bwd_lars_cse.cu",
+    kernel_name: str = "uniform1d_bwd_lars",
+    scalar_t: str = "float",
+    reg_budget: Union[int, Iterable[int]] = 24,
+    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
+    enable_cse: bool = False,
+    smem_acc_volatile: bool = True,
+    consider_cse: bool = False,
+    path_semantics: str = "wxy",
+    return_schedule: bool = False,
+    fold_reg_budgets_by_max_live: bool = True,
+    profile: bool = True,
+    profile_interval: int = 1000,
+    profile_seconds: float = 2.0,
+    profile_print: bool = True,
+    enable_secondary_affinity: bool = False,
+    topk_candidates: Optional[int] = 128,
+    split_backward: Union[bool, str] = "auto",
+    split_path_threshold: int = 256,
+):
+    """
+    Unified LARS backward code generator.
+
+    split_backward controls implementation strategy:
+      - False / "fused": one fused LARS backward kernel.
+      - True / "split": independent grad_w, grad_x and grad_y kernels.
+      - "auto": split when path_count > split_path_threshold.
+    """
+    del scalar_t
+
+    ctx = _prepare_uniform1d_bwd_codegen_context(
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices,
+        output_indices=output_indices,
+        mode=mode,
+        path_semantics=path_semantics,
+    )
+
+    use_split_backward = _resolve_split_backward(
+        split_backward,
+        path_count=ctx.P,
+        split_path_threshold=split_path_threshold,
+    )
+
+    common_kwargs = dict(
+        ctx=ctx,
+        u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        out_path=out_path,
+        kernel_name=kernel_name,
+        reg_budget=reg_budget,
+        acc_reg_budget=acc_reg_budget,
+        smem_acc_volatile=smem_acc_volatile,
+        return_schedule=return_schedule,
+        fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
+        profile=profile,
+        profile_interval=profile_interval,
+        profile_seconds=profile_seconds,
+        profile_print=profile_print,
+        enable_secondary_affinity=enable_secondary_affinity,
+        topk_candidates=topk_candidates,
+    )
+
+    if use_split_backward:
+        return _generate_code_uniform1d_bwd_split_from_context(**common_kwargs)
+
+    return _generate_code_uniform1d_bwd_fused_from_context(
+        **common_kwargs,
+        enable_cse=enable_cse,
+        consider_cse=consider_cse,
+    )
+
+
+# =============================================================================
+# Baseline full-unrolled codegen: no LARS, no CSE, no resident accumulator reuse
+# =============================================================================
+
+def _make_baseline_wxy_paths_from_uniform1d_lists(
+    i_list: List[int],
+    j_list: List[int],
+    k_list: List[int],
+    v_list: List[int],
+    coeff_list: List[float],
+    *,
+    path_semantics: str,
+) -> List[Tuple[int, int, int, int, float]]:
+    """
+    Convert external Uniform1D path indices to baseline-native tuples:
+        (w_index, x_index, y_index, out_index, coeff)
+
+    path_semantics="wxy": external (i,j,k) means w[i], x[j], y[k].
+    path_semantics="xyw": external (i,j,k) means x[i], y[j], w[k].
+
+    This baseline intentionally does not perform path scheduling, operand reuse,
+    pair CSE, or register-budget management.  The Python code generator simply
+    emits one straight-line block per cg path, in the original path order.
+    """
+    if path_semantics not in ("wxy", "xyw"):
+        raise ValueError("path_semantics must be 'wxy' or 'xyw'")
+    if not (len(i_list) == len(j_list) == len(k_list) == len(v_list) == len(coeff_list)):
+        raise ValueError("i/j/k/v/coeff list lengths must match")
+
+    paths: List[Tuple[int, int, int, int, float]] = []
+    for i, j, k, v, c in zip(i_list, j_list, k_list, v_list, coeff_list):
+        i = int(i); j = int(j); k = int(k); v = int(v); c = float(c)
+        if path_semantics == "wxy":
+            paths.append((i, j, k, v, c))
+        else:
+            paths.append((k, i, j, v, c))
+    return paths
+
+
+def emit_fused_fwd_kernel_baseline_unrolled(
+    paths_wxy: List[Tuple[int, int, int, int, float]],
+    *,
+    kernel_name: str,
+    mode: str = "u,u,,u",
+    use_x_src: bool = False,
+    use_y_src: bool = False,
+    use_scatter: bool = False,
+    u_dim: Optional[int] = None,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+) -> str:
+    """
+    Emit a forward baseline kernel with every cg path fully unrolled.
+
+    Baseline policy:
+      - no LARS schedule_result;
+      - no pair CSE;
+      - no resident output accumulator grouping;
+      - every path reloads w/x/y from global memory and immediately updates out.
+
+    This is intended as a diagnostic lower-level baseline for comparing the
+    benefit/cost of LARS scheduling, pair CSE, and accumulator residency.
+    """
+    if block_size != 32:
+        raise ValueError("this baseline emitter currently assumes block_size=32")
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    mode_scalar_y = mode == "u,u,,u"
+    lines: List[str] = []
+
+    def ap(line: str = ""):
+        lines.append(line)
+
+    ap("#include <stdint.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap("")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("  #include <hip/hip_runtime.h>")
+    ap("  #include <ATen/hip/HIPContext.h>")
+    ap("  #include <c10/hip/HIPGuard.h>")
+    ap("  using gpuStream_t = hipStream_t;")
+    ap("  #define getCurrentGPUStream at::hip::getCurrentHIPStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()")
+    ap("#else")
+    ap("  #include <cuda.h>")
+    ap("  #include <cuda_runtime.h>")
+    ap("  #include <ATen/cuda/CUDAContext.h>")
+    ap("  using gpuStream_t = cudaStream_t;")
+    ap("  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()")
+    ap("#endif")
+    ap("")
+    ap("using GPU_Guard = c10::DeviceGuard;")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    scalar_t* __restrict__ out,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("")
+    if u_dim is not None:
+        ap(f"    constexpr int U_CONST = {int(u_dim)};")
+        ap("    (void)U_CONST;")
+        ap("")
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+    ap("    const int x_row = " + ("src_idx[e_orig];" if use_x_src else "e_local;"))
+    ap("    const int y_row = " + ("src_idx[e_orig];" if use_y_src else "e_orig;"))
+    ap("    const int out_row = " + ("dst_idx[e_orig];" if use_scatter else "e_orig;"))
+    ap("")
+
+    if iw_dim is not None and u_dim is not None:
+        ap(f"    const index_t w_base = (index_t)w_row * (index_t){int(iw_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t w_base = (index_t)w_row * (index_t)Iw * (index_t)U;")
+    if ix_dim is not None and u_dim is not None:
+        ap(f"    const index_t x_base = (index_t)x_row * (index_t){int(ix_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t x_base = (index_t)x_row * (index_t)Ix * (index_t)U;")
+    if mode_scalar_y:
+        ap("    const index_t y_base = (index_t)y_row * (index_t)Ky;")
+    else:
+        if ky_dim is not None and u_dim is not None:
+            ap(f"    const index_t y_base = (index_t)y_row * (index_t){int(ky_dim) * int(u_dim)};")
+        else:
+            ap("    const index_t y_base = (index_t)y_row * (index_t)Ky * (index_t)U;")
+    if v_dim is not None and u_dim is not None:
+        ap(f"    const index_t out_base = (index_t)out_row * (index_t){int(v_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t out_base = (index_t)out_row * (index_t)V * (index_t)U;")
+    ap("")
+
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        const int u = u_base + lane;")
+    ap("        if (u < U) {")
+
+    for pid, (wi, xj, yk, ov, coeff) in enumerate(paths_wxy):
+        w_expr = _lars_label_index_expr(
+            "w", int(wi),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=ix_dim,
+            y_dim=ky_dim,
+            w_dim=iw_dim,
+            v_dim=v_dim,
+        )
+        x_expr = _lars_label_index_expr(
+            "x", int(xj),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=ix_dim,
+            y_dim=ky_dim,
+            w_dim=iw_dim,
+            v_dim=v_dim,
+        )
+        y_expr = _lars_label_index_expr(
+            "y", int(yk),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=ix_dim,
+            y_dim=ky_dim,
+            w_dim=iw_dim,
+            v_dim=v_dim,
+        )
+        out_expr = _lars_label_index_expr(
+            "o", int(ov),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=ix_dim,
+            y_dim=ky_dim,
+            w_dim=iw_dim,
+            v_dim=v_dim,
+        )
+        c = _fmt_lars_float(float(coeff))
+        ap(f"            // baseline path#{pid}: out[{int(ov)}] += w[{int(wi)}] * x[{int(xj)}] * y[{int(yk)}] * {c}")
+        ap("            {")
+        ap(f"                const scalar_t wv = w[{w_expr}];")
+        ap(f"                const scalar_t xv = x[{x_expr}];")
+        ap(f"                const scalar_t yv = y[{y_expr}];")
+        ap(f"                const scalar_t delta = scalar_t({c}) * (wv * xv) * yv;")
+        if use_scatter:
+            ap(f"                atomicAdd(&out[{out_expr}], delta);")
+        else:
+            ap(f"                out[{out_expr}] += delta;")
+        ap("            }")
+
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("static inline bool mul_fits_int32_baseline_fwd(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("")
+    ap("static inline bool mul3_fits_int32_baseline_fwd(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32_baseline_fwd(a, b)) return false;")
+    ap("    return mul_fits_int32_baseline_fwd(a * b, c);")
+    ap("}")
+    ap("")
+    ap("static inline bool should_use_int32_index_baseline_fwd(")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    bool use_x_src, bool use_y_src, bool use_scatter, bool mode_scalar_y)")
+    ap("{")
+    ap("    bool w_ok = mul3_fits_int32_baseline_fwd((int64_t)WB, (int64_t)Iw, (int64_t)U);")
+    ap("    int64_t x_dim0 = use_x_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool x_ok = mul3_fits_int32_baseline_fwd(x_dim0, (int64_t)Ix, (int64_t)U);")
+    ap("    int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool y_ok = mode_scalar_y ? mul_fits_int32_baseline_fwd(y_dim0, (int64_t)Ky)")
+    ap("                              : mul3_fits_int32_baseline_fwd(y_dim0, (int64_t)Ky, (int64_t)U);")
+    ap("    int64_t out_dim0 = use_scatter ? (int64_t)S : (int64_t)B;")
+    ap("    bool out_ok = mul3_fits_int32_baseline_fwd(out_dim0, (int64_t)V, (int64_t)U);")
+    ap("    return w_ok && x_ok && y_ok && out_ok;")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap("        w, x, y, out,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}_auto(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    constexpr bool kUseXSrc = {'true' if use_x_src else 'false'};")
+    ap(f"    constexpr bool kUseYSrc = {'true' if use_y_src else 'false'};")
+    ap(f"    constexpr bool kUseScatter = {'true' if use_scatter else 'false'};")
+    ap(f"    constexpr bool kModeScalarY = {'true' if mode_scalar_y else 'false'};")
+    ap("    if (should_use_int32_index_baseline_fwd(B, WB, Iw, Ix, Ky, V, U, S,")
+    ap("                                            kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
+    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    scalar_t* out,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    launch_{kernel_name}_auto<scalar_t>(")
+    ap("        w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("}")
+    ap("")
+
+    return "\n".join(lines)
+
+
+def emit_fused_bwd_kernel_baseline_unrolled(
+    paths_wxy: List[Tuple[int, int, int, int, float]],
+    *,
+    kernel_name: str,
+    mode: str = "u,u,,u",
+    need_grad_w: bool = True,
+    use_x_src: bool = False,
+    use_y_src: bool = False,
+    use_scatter: bool = False,
+    u_dim: Optional[int] = None,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+) -> str:
+    """
+    Emit a backward baseline kernel with every cg path fully unrolled.
+
+    Baseline policy:
+      - no LARS input-register scheduling;
+      - no pair CSE, e.g. no cached w*grad_out;
+      - no resident gw/gx/gy accumulators;
+      - every path reloads w/x/y/grad_out and immediately writes gradients.
+
+    grad_x/grad_y use atomicAdd, matching the fused backward semantics.  grad_w
+    intentionally uses a plain += path update to stay consistent with the
+    existing non-atomic grad_w assumption in this codebase.
+    """
+    if block_size != 32:
+        raise ValueError("this baseline emitter currently assumes block_size=32")
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    mode_scalar_y = mode == "u,u,,u"
+    lines: List[str] = []
+
+    def ap(line: str = ""):
+        lines.append(line)
+
+    ap("#include <stdint.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap("")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("  #include <hip/hip_runtime.h>")
+    ap("  #include <ATen/hip/HIPContext.h>")
+    ap("  #include <c10/hip/HIPGuard.h>")
+    ap("  using gpuStream_t = hipStream_t;")
+    ap("  #define getCurrentGPUStream at::hip::getCurrentHIPStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()")
+    ap("#else")
+    ap("  #include <cuda.h>")
+    ap("  #include <cuda_runtime.h>")
+    ap("  #include <ATen/cuda/CUDAContext.h>")
+    ap("  using gpuStream_t = cudaStream_t;")
+    ap("  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()")
+    ap("#endif")
+    ap("")
+    ap("using GPU_Guard = c10::DeviceGuard;")
+    ap("")
+    ap("template <typename scalar_t>")
+    ap("__device__ __forceinline__ scalar_t warp_sum_xor_baseline_bwd(scalar_t v) {")
+    ap("    for (int offset = 16; offset > 0; offset >>= 1) {")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("        v += __shfl_xor(v, offset);")
+    ap("#else")
+    ap("        v += __shfl_xor_sync(0xffffffff, v, offset);")
+    ap("#endif")
+    ap("    }")
+    ap("    return v;")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ w,")
+    ap("    const scalar_t* __restrict__ x,")
+    ap("    const scalar_t* __restrict__ y,")
+    ap("    const scalar_t* __restrict__ grad_out,")
+    if need_grad_w:
+        ap("    scalar_t* __restrict__ grad_w,")
+    ap("    scalar_t* __restrict__ grad_x,")
+    ap("    scalar_t* __restrict__ grad_y,")
+    ap("    const int32_t* __restrict__ src_idx,")
+    ap("    const int32_t* __restrict__ dst_idx,")
+    ap("    const int32_t* __restrict__ b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
+    ap("{")
+    ap("    const int e_local = (int)blockIdx.x;")
+    ap("    if (e_local >= B) return;")
+    ap("")
+    ap("    const int tid  = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("")
+    if u_dim is not None:
+        ap(f"    constexpr int U_CONST = {int(u_dim)};")
+        ap("    (void)U_CONST;")
+    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
+    ap("")
+    if use_x_src or use_y_src:
+        ap("    const int src = src_idx[e_orig];")
+    else:
+        ap("    const int src = e_orig;")
+    if use_scatter:
+        ap("    const int dst = dst_idx[e_orig];")
+    else:
+        ap("    const int dst = e_orig;")
+    ap("")
+    ap("    const int x_row = " + ("src;" if use_x_src else "e_local;"))
+    ap("    const int y_row = " + ("src;" if use_y_src else "e_orig;"))
+    ap("    const int go_row = " + ("dst;" if use_scatter else "e_orig;"))
+    ap("")
+
+    if iw_dim is not None and u_dim is not None:
+        ap(f"    const index_t w_base  = (index_t)w_row * (index_t){int(iw_dim) * int(u_dim)};")
+        if need_grad_w:
+            ap(f"    const index_t gw_base = (index_t)w_row * (index_t){int(iw_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t w_base  = (index_t)w_row * (index_t)Iw * (index_t)U;")
+        if need_grad_w:
+            ap("    const index_t gw_base = (index_t)w_row * (index_t)Iw * (index_t)U;")
+
+    if ix_dim is not None and u_dim is not None:
+        ap(f"    const index_t x_base  = (index_t)x_row * (index_t){int(ix_dim) * int(u_dim)};")
+        ap(f"    const index_t gx_base = (index_t)x_row * (index_t){int(ix_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t x_base  = (index_t)x_row * (index_t)Ix * (index_t)U;")
+        ap("    const index_t gx_base = (index_t)x_row * (index_t)Ix * (index_t)U;")
+
+    if mode_scalar_y:
+        ap("    const index_t y_base  = (index_t)y_row * (index_t)Ky;")
+        ap("    const index_t gy_base = (index_t)y_row * (index_t)Ky;")
+    else:
+        if ky_dim is not None and u_dim is not None:
+            ap(f"    const index_t y_base  = (index_t)y_row * (index_t){int(ky_dim) * int(u_dim)};")
+            ap(f"    const index_t gy_base = (index_t)y_row * (index_t){int(ky_dim) * int(u_dim)};")
+        else:
+            ap("    const index_t y_base  = (index_t)y_row * (index_t)Ky * (index_t)U;")
+            ap("    const index_t gy_base = (index_t)y_row * (index_t)Ky * (index_t)U;")
+
+    if v_dim is not None and u_dim is not None:
+        ap(f"    const index_t go_base = (index_t)go_row * (index_t){int(v_dim) * int(u_dim)};")
+    else:
+        ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
+    ap("")
+
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        const int u = u_base + lane;")
+    ap("        if (u < U) {")
+
+    for pid, (wi, xj, yk, ov, coeff) in enumerate(paths_wxy):
+        w_expr = _bwd_label_index_expr(
+            "w", int(wi),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        gw_expr = _bwd_label_index_expr(
+            "gw", int(wi),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        x_expr = _bwd_label_index_expr(
+            "x", int(xj),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        gx_expr = _bwd_label_index_expr(
+            "gx", int(xj),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        y_expr = _bwd_label_index_expr(
+            "y", int(yk),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        gy_expr = _bwd_label_index_expr(
+            "gy", int(yk),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        go_expr = _bwd_label_index_expr(
+            "go", int(ov),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        c = _fmt_lars_float(float(coeff))
+        ap(f"            // baseline path#{pid}: immediate gradient writes for w[{int(wi)}], x[{int(xj)}], y[{int(yk)}], go[{int(ov)}]")
+        ap("            {")
+        ap(f"                const scalar_t wv = w[{w_expr}];")
+        ap(f"                const scalar_t xv = x[{x_expr}];")
+        ap(f"                const scalar_t yv = y[{y_expr}];")
+        ap(f"                const scalar_t gov = grad_out[{go_expr}];")
+        ap(f"                const scalar_t cg = scalar_t({c});")
+        if need_grad_w:
+            ap("                const scalar_t dgw = cg * gov * xv * yv;")
+            ap(f"                grad_w[{gw_expr}] += dgw;")
+        ap("                const scalar_t wg = wv * gov;")
+        ap("                const scalar_t dgx = cg * wg * yv;")
+        ap(f"                atomicAdd(&grad_x[{gx_expr}], dgx);")
+        ap("                const scalar_t dgy = cg * wg * xv;")
+        if mode_scalar_y:
+            ap("                const scalar_t dgy_sum = warp_sum_xor_baseline_bwd(dgy);")
+            ap("                if (lane == 0) {")
+            ap(f"                    atomicAdd(&grad_y[{gy_expr}], dgy_sum);")
+            ap("                }")
+        else:
+            ap(f"                atomicAdd(&grad_y[{gy_expr}], dgy);")
+        ap("            }")
+
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("static inline bool mul_fits_int32_baseline_bwd(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("")
+    ap("static inline bool mul3_fits_int32_baseline_bwd(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32_baseline_bwd(a, b)) return false;")
+    ap("    return mul_fits_int32_baseline_bwd(a * b, c);")
+    ap("}")
+    ap("")
+    ap("static inline bool should_use_int32_index_baseline_bwd(")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    bool use_x_src, bool use_y_src, bool use_scatter, bool mode_scalar_y)")
+    ap("{")
+    ap("    bool w_ok = mul3_fits_int32_baseline_bwd((int64_t)WB, (int64_t)Iw, (int64_t)U);")
+    ap("    int64_t x_dim0 = use_x_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool x_ok = mul3_fits_int32_baseline_bwd(x_dim0, (int64_t)Ix, (int64_t)U);")
+    ap("    int64_t y_dim0 = use_y_src ? (int64_t)S : (int64_t)B;")
+    ap("    bool y_ok = mode_scalar_y ? mul_fits_int32_baseline_bwd(y_dim0, (int64_t)Ky)")
+    ap("                              : mul3_fits_int32_baseline_bwd(y_dim0, (int64_t)Ky, (int64_t)U);")
+    ap("    int64_t go_dim0 = use_scatter ? (int64_t)S : (int64_t)B;")
+    ap("    bool go_ok = mul3_fits_int32_baseline_bwd(go_dim0, (int64_t)V, (int64_t)U);")
+    ap("    return w_ok && x_ok && y_ok && go_ok;")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if need_grad_w:
+        ap("    scalar_t* grad_w,")
+    ap("    scalar_t* grad_x,")
+    ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    if need_grad_w:
+        ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
+    else:
+        ap("        w, x, y, grad_out, grad_x, grad_y,")
+    ap("        src_idx, dst_idx, b_list,")
+    ap("        B, WB, Iw, Ix, Ky, V, U, S);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}_auto(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if need_grad_w:
+        ap("    scalar_t* grad_w,")
+    ap("    scalar_t* grad_x,")
+    ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    constexpr bool kUseXSrc = {'true' if use_x_src else 'false'};")
+    ap(f"    constexpr bool kUseYSrc = {'true' if use_y_src else 'false'};")
+    ap(f"    constexpr bool kUseScatter = {'true' if use_scatter else 'false'};")
+    ap(f"    constexpr bool kModeScalarY = {'true' if mode_scalar_y else 'false'};")
+    ap("    if (should_use_int32_index_baseline_bwd(B, WB, Iw, Ix, Ky, V, U, S,")
+    ap("                                            kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
+    if need_grad_w:
+        ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
+    else:
+        ap("            w, x, y, grad_out, grad_x, grad_y,")
+    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
+    if need_grad_w:
+        ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
+    else:
+        ap("            w, x, y, grad_out, grad_x, grad_y,")
+    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* w,")
+    ap("    const scalar_t* x,")
+    ap("    const scalar_t* y,")
+    ap("    const scalar_t* grad_out,")
+    if need_grad_w:
+        ap("    scalar_t* grad_w,")
+    ap("    scalar_t* grad_x,")
+    ap("    scalar_t* grad_y,")
+    ap("    const int32_t* src_idx,")
+    ap("    const int32_t* dst_idx,")
+    ap("    const int32_t* b_list,")
+    ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
+    ap("    gpuStream_t stream)")
+    ap("{")
+    ap(f"    launch_{kernel_name}_auto<scalar_t>(")
+    if need_grad_w:
+        ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
+    else:
+        ap("        w, x, y, grad_out, grad_x, grad_y,")
+    ap("        src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("}")
+    ap("")
+
+    return "\n".join(lines)
+
+
+def generate_code_uniform1d_fwd_baseline_unrolled(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
+    u_dim: int = 1,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    mode: str = "u,u,,u",
+    out_path: str = "generated_uniform1d_fwd_baseline_unrolled.cu",
+    kernel_name: str = "uniform1d_fwd_baseline_unrolled",
+    scalar_t: str = "float",
+    path_semantics: str = "wxy",
+    return_metadata: bool = False,
+):
+    """
+    Generate a forward baseline CUDA implementation by fully unrolling cg paths.
+
+    This entry deliberately bypasses LARS and all reuse-aware scheduling.  It is
+    meant to answer: what happens if we just emit the cg path list as straight-
+    line code?
+    """
+    del scalar_t
+
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    input_indices = {} if input_indices is None else dict(input_indices)
+    output_indices = {} if output_indices is None else dict(output_indices)
+
+    use_x_src = 1 in input_indices
+    use_y_src = 2 in input_indices
+    use_scatter = 0 in output_indices
+
+    assert i_list.ndim == j_list.ndim == k_list.ndim == v_list.ndim == coeff_list.ndim == 1
+    P = i_list.numel()
+    assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
+
+    i_cpu = _to_int_list(i_list)
+    j_cpu = _to_int_list(j_list)
+    k_cpu = _to_int_list(k_list)
+    v_cpu = _to_int_list(v_list)
+    c_cpu = _to_float_list(coeff_list)
+
+    paths_wxy = _make_baseline_wxy_paths_from_uniform1d_lists(
+        i_cpu, j_cpu, k_cpu, v_cpu, c_cpu,
+        path_semantics=path_semantics,
+    )
+
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
+    layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+    if kernel_name and kernel_name != "uniform1d_fwd_baseline_unrolled":
+        base_kernel_name = kernel_name
+    else:
+        base_kernel_name = f"uniform1d_baseline_unrolled_u{u_dim}_path{P}_{mode_str}_{layout_tag}_fwd"
+
+    code = emit_fused_fwd_kernel_baseline_unrolled(
+        paths_wxy,
+        kernel_name=base_kernel_name,
+        mode=mode,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+        u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
+        block_size=32,
+    )
+
+    code = code + "\n" + emit_launcher(
+        bundle_name=base_kernel_name,
+        mode=mode,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+    )
+
+    if out_path:
+        Path(out_path).write_text(code, encoding="utf-8")
+
+    if return_metadata:
+        return {
+            "name": "baseline_unrolled_fwd",
+            "code": code,
+            "kernel_name": base_kernel_name,
+            "num_paths": int(P),
+            "config": {
+                "mode": mode,
+                "path_semantics": path_semantics,
+                "use_x_src": use_x_src,
+                "use_y_src": use_y_src,
+                "use_scatter": use_scatter,
+                "manual_register_management": False,
+                "manual_data_reuse": False,
+                "fully_unrolled_paths": True,
+            },
+        }
+    return code
+
+
+def generate_code_uniform1d_bwd_baseline_unrolled(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
+    u_dim: int = 1,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    mode: str = "u,u,,u",
+    need_grad_w: bool = True,
+    out_path: str = "generated_uniform1d_bwd_baseline_unrolled.cu",
+    kernel_name: str = "uniform1d_bwd_baseline_unrolled",
+    scalar_t: str = "float",
+    path_semantics: str = "wxy",
+    return_metadata: bool = False,
+):
+    """
+    Generate a backward baseline CUDA implementation by fully unrolling cg paths.
+
+    This entry deliberately bypasses LARS, pair CSE, and resident gradient
+    accumulators.  Each path reloads w/x/y/grad_out and immediately writes
+    grad_w/grad_x/grad_y.
+    """
+    del scalar_t
+
+    if mode not in ("u,u,,u", "u,u,u,u"):
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    input_indices = {} if input_indices is None else dict(input_indices)
+    output_indices = {} if output_indices is None else dict(output_indices)
+
+    use_x_src = 1 in input_indices
+    use_y_src = 2 in input_indices
+    use_scatter = 0 in output_indices
+
+    assert i_list.ndim == j_list.ndim == k_list.ndim == v_list.ndim == coeff_list.ndim == 1
+    P = i_list.numel()
+    assert j_list.numel() == P and k_list.numel() == P and v_list.numel() == P and coeff_list.numel() == P
+
+    i_cpu = _to_int_list(i_list)
+    j_cpu = _to_int_list(j_list)
+    k_cpu = _to_int_list(k_list)
+    v_cpu = _to_int_list(v_list)
+    c_cpu = _to_float_list(coeff_list)
+
+    paths_wxy = _make_baseline_wxy_paths_from_uniform1d_lists(
+        i_cpu, j_cpu, k_cpu, v_cpu, c_cpu,
+        path_semantics=path_semantics,
+    )
+
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
+    layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+    grad_tag = "full" if need_grad_w else "nogradw"
+    if kernel_name and kernel_name != "uniform1d_bwd_baseline_unrolled":
+        base_kernel_name = kernel_name
+    else:
+        base_kernel_name = f"uniform1d_baseline_unrolled_u{u_dim}_path{P}_{mode_str}_{layout_tag}_{grad_tag}_bwd"
+
+    code = emit_fused_bwd_kernel_baseline_unrolled(
+        paths_wxy,
+        kernel_name=base_kernel_name,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+        u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
+        block_size=32,
+    )
+
+    code = code + "\n" + emit_lars_bwd_launcher(
+        bundle_name=base_kernel_name,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+    )
+
+    if out_path:
+        Path(out_path).write_text(code, encoding="utf-8")
+
+    if return_metadata:
+        return {
+            "name": "baseline_unrolled_bwd",
+            "code": code,
+            "kernel_name": base_kernel_name,
+            "num_paths": int(P),
+            "config": {
+                "mode": mode,
+                "path_semantics": path_semantics,
+                "need_grad_w": need_grad_w,
+                "use_x_src": use_x_src,
+                "use_y_src": use_y_src,
+                "use_scatter": use_scatter,
+                "manual_register_management": False,
+                "manual_data_reuse": False,
+                "resident_gradient_accumulators": False,
+                "fully_unrolled_paths": True,
+            },
+        }
+    return code

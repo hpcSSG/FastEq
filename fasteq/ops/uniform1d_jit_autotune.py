@@ -1,9 +1,17 @@
 import os
 import time
+import json
+import sys
+import shutil
 import hashlib
 import tempfile
+import traceback
+import importlib.util
+import importlib.machinery
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, Tuple, Optional, Any, List
+from typing import Dict, Tuple, Optional, Any, List, Set
 
 import torch
 import torch._dynamo
@@ -12,6 +20,9 @@ from torch.utils.cpp_extension import load
 from .uniform1d_auto_schedule import (
     generate_code_uniform1d_fwd_with_scheduler,
     generate_code_uniform1d_bwd_with_scheduler,
+    generate_code_uniform1d_fwd_baseline_unrolled,
+    generate_code_uniform1d_bwd_baseline_unrolled,
+
 )
 
 # -----------------------------------------------------------------------------
@@ -25,6 +36,19 @@ _BWD_JIT_CACHE: Dict[str, object] = {}
 # module selected by the first runtime microbenchmark in this Python process.
 _FWD_BEST_CANDIDATE_CACHE: Dict[str, Tuple[str, object, float]] = {}
 _BWD_BEST_CANDIDATE_CACHE: Dict[str, Tuple[str, object, float]] = {}
+
+# Fast hot-path mapping from runtime metadata identity to the final tune_key.
+# This avoids rebuilding the expensive content-hash tune_key on every call.
+_FWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
+_BWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
+
+# Avoid repeating expensive disk cleanup / source pruning on every hot-path call.
+_JIT_PRUNE_DONE_CACHE: Set[Tuple[str, str, str]] = set()
+
+# Cache int32 copies of immutable path metadata tensors.  If meta stores int64
+# tensors, calling .to(torch.int32) in every forward creates fresh tensors and
+# breaks the fast build-cache identity key.
+_META_INT32_TENSOR_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
 
 def _sha1_text(s: str) -> str:
@@ -210,6 +234,17 @@ def _load_jit_module(
     src_dir = _default_src_path()
 
     cu_path = build_dir / f"{module_name}.cu"
+    if code is None:
+        # If the extension binary already exists, import it directly and avoid
+        # torch cpp_extension.load(), which may still run ninja.
+        ext_path = _compiled_extension_path_in_dir(build_dir, module_name)
+        if ext_path is not None:
+            return _load_prebuilt_jit_module(
+                module_name=module_name,
+                cache=cache,
+                kind="JIT",
+            )
+
     if code is not None:
         cu_path.write_text(code, encoding="utf-8")
     elif not cu_path.exists():
@@ -232,6 +267,657 @@ def _load_jit_module(
 
     cache[module_name] = mod
     return mod
+
+
+
+
+# -----------------------------------------------------------------------------
+# Prebuilt JIT module discovery / direct loading
+# -----------------------------------------------------------------------------
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default) not in ("0", "false", "False", "OFF", "off", "no", "No")
+
+
+def _jit_cache_log_enabled() -> bool:
+    # Cache hit prints are useful for debugging, but printing on every autograd
+    # call can easily dominate millisecond-level kernels.
+    return _env_flag("FASTEQ_UNIFORM1D_JIT_CACHE_LOG", "0")
+
+
+def _tensor_runtime_identity(x: Any) -> Tuple[Any, ...]:
+    """Cheap, hashable identity for immutable path metadata tensors.
+
+    The full tune_key still hashes the actual i/j/k/v/coeff contents the first
+    time a signature is seen.  For steady-state calls we only need to recognize
+    that the same metadata object/storage is being reused, so data_ptr/shape/dtype
+    is enough and avoids .cpu().tolist().  Include _version when available to
+    avoid stale reuse after accidental in-place metadata mutation.
+    """
+    if isinstance(x, torch.Tensor):
+        try:
+            return (
+                "tensor",
+                str(x.device),
+                int(x.data_ptr()),
+                tuple(int(d) for d in x.shape),
+                tuple(int(d) for d in x.stride()),
+                int(x.storage_offset()),
+                str(x.dtype),
+                int(getattr(x, "_version", 0)),
+            )
+        except BaseException:
+            return ("tensor_id", id(x))
+
+    if isinstance(x, (list, tuple)):
+        # Path metadata supplied as Python lists is usually small/static.  Use
+        # value identity here so a mutated list naturally changes the key.
+        try:
+            return ("seq", tuple(x))
+        except TypeError:
+            return ("seq_id", id(x), len(x))
+
+    return ("obj", id(x), type(x).__name__)
+
+
+def _as_int32_meta_tensor(x: Any) -> Any:
+    if not isinstance(x, torch.Tensor):
+        return x
+    if x.dtype == torch.int32:
+        return x
+
+    key = ("to_int32",) + _tensor_runtime_identity(x)
+    cached = _META_INT32_TENSOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    out = x.to(torch.int32)
+    if _env_flag("FASTEQ_UNIFORM1D_CACHE_INT32_META", "1"):
+        _META_INT32_TENSOR_CACHE[key] = out
+    return out
+
+
+def _make_candidate_fast_key(
+    *,
+    kind: str,
+    i_list: Any,
+    j_list: Any,
+    k_list: Any,
+    v_list: Any,
+    coeff_list: Any,
+    input_indices: Optional[Dict[int, Any]],
+    output_indices: Optional[Dict[int, Any]],
+    u_dim: int,
+    iw_dim: Optional[int],
+    ix_dim: Optional[int],
+    ky_dim: Optional[int],
+    v_dim: Optional[int],
+    mode: str,
+    dtype_str: str,
+    grad_w: Optional[bool] = None,
+) -> Tuple[Any, ...]:
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    use_x_src = 1 in input_indices
+    use_y_src = 2 in input_indices
+    use_scatter = 0 in output_indices
+    return (
+        kind,
+        _tensor_runtime_identity(i_list),
+        _tensor_runtime_identity(j_list),
+        _tensor_runtime_identity(k_list),
+        _tensor_runtime_identity(v_list),
+        _tensor_runtime_identity(coeff_list),
+        int(u_dim),
+        None if iw_dim is None else int(iw_dim),
+        None if ix_dim is None else int(ix_dim),
+        None if ky_dim is None else int(ky_dim),
+        None if v_dim is None else int(v_dim),
+        str(mode),
+        str(dtype_str),
+        None if grad_w is None else bool(grad_w),
+        bool(use_x_src),
+        bool(use_y_src),
+        bool(use_scatter),
+    )
+
+
+def _compiled_extension_path_in_dir(build_dir: Path, module_name: str) -> Optional[Path]:
+    """
+    Return the compiled extension path for a torch cpp_extension module if it
+    already exists.  This is intentionally stricter than checking for a .cu file:
+    a .cu file means code was generated, but the kernel may not have been built.
+    """
+    if not build_dir.exists():
+        return None
+
+    # Typical torch extension output: <build_dir>/<module_name>.so or .pyd.
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        cand = build_dir / f"{module_name}{suffix}"
+        if cand.exists():
+            return cand
+
+    # Be tolerant of platform-specific suffixes or ABI tags.
+    for cand in build_dir.iterdir():
+        if not cand.is_file():
+            continue
+        name = cand.name
+        if not name.startswith(module_name):
+            continue
+        if any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES):
+            return cand
+
+    return None
+
+
+def _compiled_extension_path(module_name: str) -> Optional[Path]:
+    build_dir = _default_build_root() / module_name
+    return _compiled_extension_path_in_dir(build_dir, module_name)
+
+
+def _has_prebuilt_jit_module(module_name: str) -> bool:
+    return _compiled_extension_path(module_name) is not None
+
+
+def _load_prebuilt_jit_module(
+    *,
+    module_name: str,
+    cache: Dict[str, object],
+    kind: str = "JIT",
+):
+    """
+    Load an already-compiled extension directly from its .so/.pyd.
+
+    This bypasses torch.utils.cpp_extension.load(), so it does not regenerate
+    ninja files or invoke nvcc/hipcc.  It is used only when a compiled extension
+    binary is already present on disk.
+    """
+    if module_name in cache:
+        return cache[module_name]
+
+    if module_name in sys.modules:
+        mod = sys.modules[module_name]
+        cache[module_name] = mod
+        return mod
+
+    ext_path = _compiled_extension_path(module_name)
+    if ext_path is None:
+        raise FileNotFoundError(f"compiled extension not found for {module_name}")
+
+    spec = importlib.util.spec_from_file_location(module_name, str(ext_path))
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create import spec for {ext_path}")
+
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
+    spec.loader.exec_module(mod)
+
+    cache[module_name] = mod
+    print(f"[JIT][{kind}] loaded prebuilt extension: {module_name}")
+    return mod
+
+
+def _parse_candidate_from_module_name(tune_key: str, module_name: str) -> Optional[str]:
+    prefix = f"{tune_key}_"
+    if not module_name.startswith(prefix):
+        return None
+
+    suffix = module_name[len(prefix):]
+    if "_" not in suffix:
+        return None
+
+    safe_tag, code_hash = suffix.rsplit("_", 1)
+    if len(code_hash) != 16:
+        return None
+
+    try:
+        int(code_hash, 16)
+    except ValueError:
+        return None
+
+    return safe_tag or "cand"
+
+
+def _discover_prebuilt_jit_candidates(
+    *,
+    tune_key: str,
+    cache: Dict[str, object],
+    kind: str,
+) -> List[Tuple[str, object]]:
+    """
+    Discover already-compiled candidate modules for this tune_key.
+
+    This is the key fast path: it avoids calling codegen_fn(), so scheduler
+    search/LARS scheduling and CUDA source regeneration are skipped entirely.
+    """
+    if not _env_flag("FASTEQ_UNIFORM1D_LOAD_PREBUILT", "1"):
+        return []
+
+    build_root = _default_build_root()
+    if not build_root.exists():
+        return []
+
+    found: List[Tuple[str, str, Path]] = []
+    prefix = f"{tune_key}_"
+    for build_dir in sorted(build_root.iterdir(), key=lambda p: p.name):
+        if not build_dir.is_dir():
+            continue
+        module_name = build_dir.name
+        if not module_name.startswith(prefix):
+            continue
+
+        safe_tag = _parse_candidate_from_module_name(tune_key, module_name)
+        if safe_tag is None:
+            continue
+
+        ext_path = _compiled_extension_path_in_dir(build_dir, module_name)
+        if ext_path is None:
+            continue
+
+        found.append((safe_tag, module_name, ext_path))
+
+    if not found:
+        return []
+
+    modules: List[Tuple[str, object]] = []
+    errors: List[Tuple[str, BaseException]] = []
+    for safe_tag, module_name, _ext_path in found:
+        try:
+            mod = _load_prebuilt_jit_module(
+                module_name=module_name,
+                cache=cache,
+                kind=f"{kind}:{safe_tag}",
+            )
+            modules.append((safe_tag, mod))
+        except BaseException as exc:
+            errors.append((safe_tag, exc))
+            print(f"[JIT][{kind}] prebuilt candidate {safe_tag} failed to load: {exc}")
+
+    if modules:
+        print(
+            f"[JIT][{kind}] hit prebuilt candidate cache for {tune_key}: "
+            f"{len(modules)} module(s); skip candidate generation, scheduling and compilation"
+        )
+    elif errors:
+        details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
+        print(f"[JIT][{kind}] found prebuilt candidates but none loaded: {details}")
+
+    return modules
+
+
+def _best_candidate_meta_path(kind: str, tune_key: str) -> Path:
+    meta_dir = _default_build_root() / "_uniform1d_jit_best"
+    _ensure_dir(meta_dir)
+    return meta_dir / f"{kind.lower()}_{_sha1_text(tune_key)}.json"
+
+
+def _load_persistent_best_candidate(
+    *,
+    tune_key: str,
+    cache: Dict[str, object],
+    kind: str,
+) -> Optional[Tuple[str, object, float]]:
+    """
+    Load the best candidate selected by a previous process.
+
+    When this hits, callers can skip candidate generation/scheduling/compilation
+    and also skip runtime benchmarking.
+    """
+    if not _env_flag("FASTEQ_UNIFORM1D_PERSIST_BEST", "1"):
+        return None
+
+    meta_path = _best_candidate_meta_path(kind, tune_key)
+    if not meta_path.exists():
+        return None
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if meta.get("tune_key") != tune_key or meta.get("kind") != kind:
+            return None
+
+        module_name = str(meta["module_name"])
+        tag = str(meta.get("tag", "cand"))
+        best_ms = float(meta.get("best_ms", float("nan")))
+
+        if not _has_prebuilt_jit_module(module_name):
+            return None
+
+        mod = _load_prebuilt_jit_module(
+            module_name=module_name,
+            cache=cache,
+            kind=f"{kind}:{tag}:best",
+        )
+        print(
+            f"[JIT][{kind}] hit persistent best candidate: "
+            f"{tune_key} -> {tag} ({best_ms:.4f} ms); "
+            f"skip candidate generation, scheduling, compilation and tuning"
+        )
+        return tag, mod, best_ms
+    except BaseException as exc:
+        print(f"[JIT][{kind}] failed to load persistent best metadata {meta_path}: {exc}")
+        return None
+
+
+def _store_persistent_best_candidate(
+    *,
+    tune_key: str,
+    kind: str,
+    tag: str,
+    mod: object,
+    best_ms: float,
+) -> None:
+    if not _env_flag("FASTEQ_UNIFORM1D_PERSIST_BEST", "1"):
+        return
+
+    module_name = getattr(mod, "__name__", None)
+    if not module_name:
+        return
+
+    try:
+        meta_path = _best_candidate_meta_path(kind, tune_key)
+        tmp_path = meta_path.with_suffix(".json.tmp")
+        tmp_path.write_text(
+            json.dumps(
+                {
+                    "kind": kind,
+                    "tune_key": tune_key,
+                    "tag": tag,
+                    "module_name": module_name,
+                    "best_ms": float(best_ms),
+                    "time": time.time(),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp_path, meta_path)
+    except BaseException as exc:
+        print(f"[JIT][{kind}] failed to store persistent best metadata: {exc}")
+
+
+
+def _is_compiled_extension_file(path: Path, module_name: str) -> bool:
+    if not path.is_file():
+        return False
+    name = path.name
+    if not name.startswith(module_name):
+        return False
+    return any(name.endswith(suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES)
+
+
+def _prune_best_candidate_build_dir(
+    *,
+    build_dir: Path,
+    module_name: str,
+    kind: str,
+    tag: str,
+) -> None:
+    """Keep only the generated source and compiled extension for the best candidate."""
+    if not build_dir.exists() or not build_dir.is_dir():
+        return
+
+    keep_names = {f"{module_name}.cu"}
+    for child in list(build_dir.iterdir()):
+        try:
+            if child.name in keep_names:
+                continue
+            if _is_compiled_extension_file(child, module_name):
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+        except BaseException as exc:
+            print(f"[JIT][{kind}] failed to prune best candidate file {child}: {exc}")
+
+    if _jit_cache_log_enabled():
+        print(f"[JIT][{kind}] pruned best candidate build dir: {tag} -> {build_dir.name}")
+
+
+def _keep_only_best_jit_candidate(
+    *,
+    tune_key: str,
+    kind: str,
+    tag: str,
+    mod: object,
+) -> None:
+    """Delete non-best candidate build dirs for this tune_key.
+
+    After runtime tuning, only the selected candidate is useful for future runs.
+    Keeping only the best directory also makes the prebuilt fast path deterministic:
+    future processes load the persisted best module directly and do not regenerate
+    candidates, rerun scheduling, or recompile.
+    """
+
+    module_name = getattr(mod, "__name__", None)
+    if not module_name:
+        return
+
+    prune_key = (str(kind), str(tune_key), str(module_name))
+    if prune_key in _JIT_PRUNE_DONE_CACHE:
+        return
+
+    build_root = _default_build_root()
+    best_dir = build_root / module_name
+    prefix = f"{tune_key}_"
+
+    removed = 0
+    failed = 0
+    if build_root.exists():
+        for build_dir in list(build_root.iterdir()):
+            if not build_dir.is_dir():
+                continue
+            if not build_dir.name.startswith(prefix):
+                continue
+            if build_dir.name == module_name:
+                continue
+            if _parse_candidate_from_module_name(tune_key, build_dir.name) is None:
+                continue
+
+            try:
+                shutil.rmtree(build_dir, ignore_errors=False)
+                removed += 1
+            except BaseException as exc:
+                failed += 1
+                print(f"[JIT][{kind}] failed to remove non-best candidate {build_dir}: {exc}")
+
+    _prune_best_candidate_build_dir(
+        build_dir=best_dir,
+        module_name=module_name,
+        kind=kind,
+        tag=tag,
+    )
+
+    _JIT_PRUNE_DONE_CACHE.add(prune_key)
+    if _jit_cache_log_enabled():
+        print(
+            f"[JIT][{kind}] keep only best candidate for {tune_key}: "
+            f"best={tag}/{module_name}, removed={removed}, failed={failed}"
+        )
+
+
+# -----------------------------------------------------------------------------
+# Parallel candidate compilation
+# -----------------------------------------------------------------------------
+
+def _get_candidate_compile_workers(kind: str, candidate_count: int) -> int:
+    return max(1, candidate_count)
+
+
+def _compile_jit_candidate_worker(payload: Tuple[int, str, str, str, str]) -> Dict[str, Any]:
+    """
+    Child-process build entry.
+
+    It returns only serializable metadata.  The compiled Python extension module
+    object is intentionally not returned across process boundaries; the parent
+    process loads the already-built module from the same build directory.
+    """
+    cand_idx, safe_tag, module_name, code, kind = payload
+    try:
+        # Prevent oversubscription: multiple candidate processes are already
+        # running concurrently, so each ninja invocation should use few jobs by
+        # default. Users can override this when the machine has enough RAM/cores.
+        os.environ.setdefault("MAX_JOBS", os.environ.get("FASTEQ_UNIFORM1D_NINJA_JOBS", "1"))
+        _load_jit_module(
+            module_name=module_name,
+            code=code,
+            cache={},
+        )
+        return {
+            "ok": True,
+            "idx": int(cand_idx),
+            "tag": safe_tag,
+            "module_name": module_name,
+            "kind": kind,
+            "error": "",
+        }
+    except BaseException:
+        return {
+            "ok": False,
+            "idx": int(cand_idx),
+            "tag": safe_tag,
+            "module_name": module_name,
+            "kind": kind,
+            "error": traceback.format_exc(),
+        }
+
+
+def _candidate_infos_from_sources(
+    *,
+    tune_key: str,
+    raw_candidates: List[Tuple[str, str]],
+) -> List[Tuple[int, str, str, str]]:
+    infos: List[Tuple[int, str, str, str]] = []
+    for cand_idx, (cand_tag, code) in enumerate(raw_candidates):
+        safe_tag = _sanitize_module_tag(cand_tag or f"cand{cand_idx}")
+        code_hash = _sha1_text(code)
+        module_name = f"{tune_key}_{safe_tag}_{code_hash}"
+        infos.append((cand_idx, safe_tag, module_name, code))
+    return infos
+
+
+def _build_jit_candidates_from_sources(
+    *,
+    tune_key: str,
+    raw_candidates: List[Tuple[str, str]],
+    cache: Dict[str, object],
+    kind: str,
+) -> List[Tuple[str, object]]:
+    """
+    Build all generated candidate CUDA sources.
+
+    The old implementation built candidates serially in the main process.  This
+    helper compiles candidates in multiple spawned child processes and then
+    loads successful modules back in the parent process, preserving candidate
+    order for runtime tuning.
+    """
+    candidate_infos = _candidate_infos_from_sources(
+        tune_key=tune_key,
+        raw_candidates=raw_candidates,
+    )
+    if not candidate_infos:
+        return []
+
+    workers = _get_candidate_compile_workers(kind, len(candidate_infos))
+
+    def _build_one_in_parent(cand_idx: int, safe_tag: str, module_name: str, code: str):
+        mod = _build_jit_module_common(
+            module_name=module_name,
+            cache=cache,
+            kind=f"{kind}:{safe_tag}",
+            codegen_fn=lambda code=code: code,
+        )
+        return cand_idx, safe_tag, mod
+
+    # Keep the original serial behavior when disabled or when there is only one
+    # candidate.  This path also serves as a safe fallback if process creation is
+    # not available in the current environment.
+    if workers <= 1:
+        modules: List[Tuple[str, object]] = []
+        errors: List[Tuple[str, BaseException]] = []
+        for cand_idx, safe_tag, module_name, code in candidate_infos:
+            try:
+                _, tag, mod = _build_one_in_parent(cand_idx, safe_tag, module_name, code)
+                modules.append((tag, mod))
+            except BaseException as exc:
+                errors.append((safe_tag, exc))
+                print(f"[JIT][{kind}] candidate {safe_tag} failed to build: {exc}")
+
+        if not modules:
+            details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
+            raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}")
+        return modules
+
+    print(
+        f"[JIT][{kind}] parallel compile {len(candidate_infos)} candidates "
+        f"with {workers} workers "
+        f"(set FASTEQ_UNIFORM1D_{kind}_COMPILE_WORKERS or "
+        f"FASTEQ_UNIFORM1D_PARALLEL_COMPILE=0 to control)"
+    )
+
+    modules_by_idx: Dict[int, Tuple[str, object]] = {}
+    errors: List[Tuple[str, str]] = []
+    tasks = [
+        (cand_idx, safe_tag, module_name, code, kind)
+        for cand_idx, safe_tag, module_name, code in candidate_infos
+        if module_name not in cache
+    ]
+
+    # Already-loaded modules can be inserted directly without spawning work.
+    for cand_idx, safe_tag, module_name, _code in candidate_infos:
+        if module_name in cache:
+            modules_by_idx[cand_idx] = (safe_tag, cache[module_name])
+
+    try:
+        if tasks:
+            ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
+                for result in executor.map(_compile_jit_candidate_worker, tasks):
+                    idx = int(result["idx"])
+                    safe_tag = str(result["tag"])
+                    module_name = str(result["module_name"])
+                    if result.get("ok"):
+                        try:
+                            mod = _load_jit_module(
+                                module_name=module_name,
+                                code=None,
+                                cache=cache,
+                            )
+                            modules_by_idx[idx] = (safe_tag, mod)
+                            print(f"[JIT][{kind}] candidate {safe_tag} compiled and loaded")
+                        except BaseException as exc:
+                            errors.append((safe_tag, repr(exc)))
+                            print(f"[JIT][{kind}] candidate {safe_tag} built but failed to load in parent: {exc}")
+                    else:
+                        err = str(result.get("error", ""))
+                        errors.append((safe_tag, err))
+                        print(f"[JIT][{kind}] candidate {safe_tag} failed to build in worker:\n{err}")
+    except BaseException as pool_exc:
+        # Process creation can fail under certain launch modes.  Do not break
+        # correctness; fall back to the serial build path in the parent process.
+        print(f"[JIT][{kind}] parallel compile failed, fallback to serial build: {pool_exc}")
+        modules: List[Tuple[str, object]] = []
+        serial_errors: List[Tuple[str, BaseException]] = []
+        for cand_idx, safe_tag, module_name, code in candidate_infos:
+            try:
+                _, tag, mod = _build_one_in_parent(cand_idx, safe_tag, module_name, code)
+                modules.append((tag, mod))
+            except BaseException as exc:
+                serial_errors.append((safe_tag, exc))
+                print(f"[JIT][{kind}] candidate {safe_tag} failed to build: {exc}")
+        if not modules:
+            details = "; ".join(f"{tag}: {exc}" for tag, exc in serial_errors)
+            raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}") from pool_exc
+        return modules
+
+    modules = [modules_by_idx[idx] for idx in sorted(modules_by_idx)]
+    if not modules:
+        details = "; ".join(f"{tag}: {err}" for tag, err in errors)
+        raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}")
+
+    return modules
 
 
 # -----------------------------------------------------------------------------
@@ -259,6 +945,10 @@ def _make_fwd_module_name(
     coeff_list,
     dtype_str: str,
     layout_tag: str = "dense",
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
 ) -> str:
     # Include all code-affecting fields in the hash.  The previous version did
     # not include layout flags or coeff_list, which can accidentally reuse a
@@ -266,6 +956,7 @@ def _make_fwd_module_name(
     # x/y indirection, scatter mode, or constants.
     sig = repr((
         P, u_dim, dtype_str, mode, layout_tag,
+        iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
         tuple(float(c) for c in coeff_list),
     ))
@@ -342,7 +1033,9 @@ def _build_jit_module_common(
     # If the CUDA source file already exists, assume the module name uniquely
     # identifies the generated code and load it directly.
     if cu_path.exists():
-        #print(f"[JIT][{kind}] hit disk cache source: {cu_path}")
+        # If both source and compiled extension exist, this becomes a pure
+        # import.  If only source exists, _load_jit_module may invoke the
+        # compiler to finish an incomplete build.
         return _load_jit_module(
             module_name=module_name,
             code=None,
@@ -372,6 +1065,10 @@ def _build_fwd_jit_candidates(
     input_indices: Optional[Dict[int, Any]] = None,
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
     mode: str,
     dtype_str: str,
 ) -> Tuple[str, List[Tuple[str, object]]]:
@@ -387,35 +1084,118 @@ def _build_fwd_jit_candidates(
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
 
-    i_cpu = _tensor_to_cpu_list(i_list)
-    j_cpu = _tensor_to_cpu_list(j_list)
-    k_cpu = _tensor_to_cpu_list(k_list)
-    v_cpu = _tensor_to_cpu_list(v_list)
-    coeff_cpu = _tensor_to_cpu_list(coeff_list)
-
-    P = len(i_cpu)
-    use_x_src = 1 in input_indices
-    use_y_src = 2 in input_indices
-    use_scatter = 0 in output_indices
-    layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
-
-    tune_key = _make_fwd_module_name(
-        P=P,
+    fast_key = _make_candidate_fast_key(
+        kind="FWD",
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices,
+        output_indices=output_indices,
         u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
         mode=mode,
-        i_list=i_cpu,
-        j_list=j_cpu,
-        k_list=k_cpu,
-        v_list=v_cpu,
-        coeff_list=coeff_cpu,
         dtype_str=dtype_str,
-        layout_tag=layout_tag,
     )
+    cached_tune_key = _FWD_TUNE_KEY_FAST_CACHE.get(fast_key)
+    if cached_tune_key is not None:
+        cached_best = _FWD_BEST_CANDIDATE_CACHE.get(cached_tune_key)
+        if cached_best is not None:
+            best_tag, best_mod, _best_ms = cached_best
+            return cached_tune_key, [(best_tag, best_mod)]
+
+        persistent_best = _load_persistent_best_candidate(
+            tune_key=cached_tune_key,
+            cache=_FWD_JIT_CACHE,
+            kind="FWD",
+        )
+        if persistent_best is not None:
+            best_tag, best_mod, best_ms = persistent_best
+            _FWD_BEST_CANDIDATE_CACHE[cached_tune_key] = (best_tag, best_mod, best_ms)
+            _keep_only_best_jit_candidate(
+                tune_key=cached_tune_key,
+                kind="FWD",
+                tag=best_tag,
+                mod=best_mod,
+            )
+            return cached_tune_key, [(best_tag, best_mod)]
+
+        prebuilt_modules = _discover_prebuilt_jit_candidates(
+            tune_key=cached_tune_key,
+            cache=_FWD_JIT_CACHE,
+            kind="FWD",
+        )
+        if prebuilt_modules:
+            return cached_tune_key, prebuilt_modules
+
+        # Fast key is known but no in-memory/disk module was found.  Reuse the
+        # cached tune_key and fall through to codegen without rebuilding it from
+        # CPU lists.
+        tune_key = cached_tune_key
+    else:
+        i_cpu = _tensor_to_cpu_list(i_list)
+        j_cpu = _tensor_to_cpu_list(j_list)
+        k_cpu = _tensor_to_cpu_list(k_list)
+        v_cpu = _tensor_to_cpu_list(v_list)
+        coeff_cpu = _tensor_to_cpu_list(coeff_list)
+
+        P = len(i_cpu)
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        use_scatter = 0 in output_indices
+        layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+
+        tune_key = _make_fwd_module_name(
+            P=P,
+            u_dim=u_dim,
+            mode=mode,
+            i_list=i_cpu,
+            j_list=j_cpu,
+            k_list=k_cpu,
+            v_list=v_cpu,
+            coeff_list=coeff_cpu,
+            dtype_str=dtype_str,
+            layout_tag=layout_tag,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        _FWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
     if tune_key in _FWD_BEST_CANDIDATE_CACHE:
         best_tag, best_mod, best_ms = _FWD_BEST_CANDIDATE_CACHE[tune_key]
-        print(f"[JIT][FWD] hit best candidate cache: {tune_key} -> {best_tag} ({best_ms:.4f} ms)")
+        if _jit_cache_log_enabled():
+            print(f"[JIT][FWD] hit best candidate cache: {tune_key} -> {best_tag} ({best_ms:.4f} ms)")
         return tune_key, [(best_tag, best_mod)]
+
+    persistent_best = _load_persistent_best_candidate(
+        tune_key=tune_key,
+        cache=_FWD_JIT_CACHE,
+        kind="FWD",
+    )
+    if persistent_best is not None:
+        best_tag, best_mod, best_ms = persistent_best
+        _FWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
+        _keep_only_best_jit_candidate(
+            tune_key=tune_key,
+            kind="FWD",
+            tag=best_tag,
+            mod=best_mod,
+        )
+        return tune_key, [(best_tag, best_mod)]
+
+    prebuilt_modules = _discover_prebuilt_jit_candidates(
+        tune_key=tune_key,
+        cache=_FWD_JIT_CACHE,
+        kind="FWD",
+    )
+    if prebuilt_modules:
+        return tune_key, prebuilt_modules
 
     def _codegen_candidates():
         return generate_code_uniform1d_fwd_with_scheduler(
@@ -431,33 +1211,30 @@ def _build_fwd_jit_candidates(
             reg_budget=[16, 64],
         )
 
+        """ return generate_code_uniform1d_fwd_baseline_unrolled(
+            i_list, j_list, k_list, v_list, coeff_list,
+            input_indices=input_indices,
+            output_indices=output_indices,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+            mode=mode,
+            out_path="generated_uniform1d_fwd_baseline_unrolled.cu",
+            path_semantics="wxy",
+        ) """
     print(f"[JIT][FWD] generate candidates for: {tune_key}")
     raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
     if not raw_candidates:
         raise RuntimeError("forward codegen returned zero candidates")
 
-    modules: List[Tuple[str, object]] = []
-    errors: List[Tuple[str, BaseException]] = []
-
-    for cand_idx, (cand_tag, code) in enumerate(raw_candidates):
-        safe_tag = _sanitize_module_tag(cand_tag or f"cand{cand_idx}")
-        code_hash = _sha1_text(code)
-        module_name = f"{tune_key}_{safe_tag}_{code_hash}"
-        try:
-            mod = _build_jit_module_common(
-                module_name=module_name,
-                cache=_FWD_JIT_CACHE,
-                kind=f"FWD:{safe_tag}",
-                codegen_fn=lambda code=code: code,
-            )
-            modules.append((safe_tag, mod))
-        except BaseException as exc:
-            errors.append((safe_tag, exc))
-            print(f"[JIT][FWD] candidate {safe_tag} failed to build: {exc}")
-
-    if not modules:
-        details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
-        raise RuntimeError(f"all forward candidates failed to build: {details}")
+    modules = _build_jit_candidates_from_sources(
+        tune_key=tune_key,
+        raw_candidates=raw_candidates,
+        cache=_FWD_JIT_CACHE,
+        kind="FWD",
+    )
 
     return tune_key, modules
 
@@ -472,6 +1249,10 @@ def _build_fwd_jit_module(
     input_indices: Optional[Dict[int, Any]] = None,
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int,
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
     mode: str,
     dtype_str: str,
 ):
@@ -487,6 +1268,10 @@ def _build_fwd_jit_module(
         input_indices=input_indices,
         output_indices=output_indices,
         u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
         mode=mode,
         dtype_str=dtype_str,
     )
@@ -519,45 +1304,122 @@ def _build_bwd_jit_candidates(
     If a best candidate has already been tuned in this process, only that
     selected module is returned.
     """
-    i_cpu = _tensor_to_cpu_list(i_list)
-    j_cpu = _tensor_to_cpu_list(j_list)
-    k_cpu = _tensor_to_cpu_list(k_list)
-    v_cpu = _tensor_to_cpu_list(v_list)
-    coeff_cpu = _tensor_to_cpu_list(coeff_list)
-
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
 
-    P = len(i_cpu)
-    use_x_src = 1 in input_indices
-    use_y_src = 2 in input_indices
-    use_scatter = 0 in output_indices
-    layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
-
-    tune_key = _make_bwd_module_name(
-        P=P,
+    fast_key = _make_candidate_fast_key(
+        kind="BWD",
+        i_list=i_list,
+        j_list=j_list,
+        k_list=k_list,
+        v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices,
+        output_indices=output_indices,
         u_dim=u_dim,
-        mode=mode,
-        i_list=i_cpu,
-        j_list=j_cpu,
-        k_list=k_cpu,
-        v_list=v_cpu,
-        coeff_list=coeff_cpu,
-        dtype_str=dtype_str,
-        grad_w=grad_w,
-        layout_tag=layout_tag,
         iw_dim=iw_dim,
         ix_dim=ix_dim,
         ky_dim=ky_dim,
         v_dim=v_dim,
+        mode=mode,
+        dtype_str=dtype_str,
+        grad_w=grad_w,
     )
+    cached_tune_key = _BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
+    if cached_tune_key is not None:
+        cached_best = _BWD_BEST_CANDIDATE_CACHE.get(cached_tune_key)
+        if cached_best is not None:
+            best_tag, best_mod, _best_ms = cached_best
+            return cached_tune_key, [(best_tag, best_mod)]
+
+        persistent_best = _load_persistent_best_candidate(
+            tune_key=cached_tune_key,
+            cache=_BWD_JIT_CACHE,
+            kind="BWD",
+        )
+        if persistent_best is not None:
+            best_tag, best_mod, best_ms = persistent_best
+            _BWD_BEST_CANDIDATE_CACHE[cached_tune_key] = (best_tag, best_mod, best_ms)
+            _keep_only_best_jit_candidate(
+                tune_key=cached_tune_key,
+                kind="BWD",
+                tag=best_tag,
+                mod=best_mod,
+            )
+            return cached_tune_key, [(best_tag, best_mod)]
+
+        prebuilt_modules = _discover_prebuilt_jit_candidates(
+            tune_key=cached_tune_key,
+            cache=_BWD_JIT_CACHE,
+            kind="BWD",
+        )
+        if prebuilt_modules:
+            return cached_tune_key, prebuilt_modules
+
+        tune_key = cached_tune_key
+    else:
+        i_cpu = _tensor_to_cpu_list(i_list)
+        j_cpu = _tensor_to_cpu_list(j_list)
+        k_cpu = _tensor_to_cpu_list(k_list)
+        v_cpu = _tensor_to_cpu_list(v_list)
+        coeff_cpu = _tensor_to_cpu_list(coeff_list)
+
+        P = len(i_cpu)
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        use_scatter = 0 in output_indices
+        layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+
+        tune_key = _make_bwd_module_name(
+            P=P,
+            u_dim=u_dim,
+            mode=mode,
+            i_list=i_cpu,
+            j_list=j_cpu,
+            k_list=k_cpu,
+            v_list=v_cpu,
+            coeff_list=coeff_cpu,
+            dtype_str=dtype_str,
+            grad_w=grad_w,
+            layout_tag=layout_tag,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        _BWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
     if tune_key in _BWD_BEST_CANDIDATE_CACHE:
         best_tag, best_mod, best_ms = _BWD_BEST_CANDIDATE_CACHE[tune_key]
-        print(f"[JIT][BWD] hit best candidate cache: {tune_key} -> {best_tag} ({best_ms:.4f} ms)")
+        if _jit_cache_log_enabled():
+            print(f"[JIT][BWD] hit best candidate cache: {tune_key} -> {best_tag} ({best_ms:.4f} ms)")
         return tune_key, [(best_tag, best_mod)]
 
-    reg_budgets = [16, 64, 128]
+    persistent_best = _load_persistent_best_candidate(
+        tune_key=tune_key,
+        cache=_BWD_JIT_CACHE,
+        kind="BWD",
+    )
+    if persistent_best is not None:
+        best_tag, best_mod, best_ms = persistent_best
+        _BWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
+        _keep_only_best_jit_candidate(
+            tune_key=tune_key,
+            kind="BWD",
+            tag=best_tag,
+            mod=best_mod,
+        )
+        return tune_key, [(best_tag, best_mod)]
+
+    prebuilt_modules = _discover_prebuilt_jit_candidates(
+        tune_key=tune_key,
+        cache=_BWD_JIT_CACHE,
+        kind="BWD",
+    )
+    if prebuilt_modules:
+        return tune_key, prebuilt_modules
+
+    reg_budgets = [8, 64]
     def _codegen_candidates():
         return generate_code_uniform1d_bwd_with_scheduler(
             i_list=i_list,
@@ -575,35 +1437,36 @@ def _build_bwd_jit_candidates(
             mode=mode,
             need_grad_w=grad_w,
             reg_budget=reg_budgets,
+            acc_reg_budget=[32, 64, None],
+            consider_cse=True,
         )
+
+        """ return generate_code_uniform1d_bwd_baseline_unrolled(
+            i_list, j_list, k_list, v_list, coeff_list,
+            input_indices=input_indices,
+            output_indices=output_indices,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+            mode=mode,
+            need_grad_w=grad_w,
+            out_path="generated_uniform1d_bwd_baseline_unrolled.cu",
+            path_semantics="wxy",
+        ) """
 
     print(f"[JIT][BWD] generate candidates for: {tune_key}, reg_budget={reg_budgets}")
     raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
     if not raw_candidates:
         raise RuntimeError("backward codegen returned zero candidates")
 
-    modules: List[Tuple[str, object]] = []
-    errors: List[Tuple[str, BaseException]] = []
-
-    for cand_idx, (cand_tag, code) in enumerate(raw_candidates):
-        safe_tag = _sanitize_module_tag(cand_tag or f"cand{cand_idx}")
-        code_hash = _sha1_text(code)
-        module_name = f"{tune_key}_{safe_tag}_{code_hash}"
-        try:
-            mod = _build_jit_module_common(
-                module_name=module_name,
-                cache=_BWD_JIT_CACHE,
-                kind=f"BWD:{safe_tag}",
-                codegen_fn=lambda code=code: code,
-            )
-            modules.append((safe_tag, mod))
-        except BaseException as exc:
-            errors.append((safe_tag, exc))
-            print(f"[JIT][BWD] candidate {safe_tag} failed to build: {exc}")
-
-    if not modules:
-        details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
-        raise RuntimeError(f"all backward candidates failed to build: {details}")
+    modules = _build_jit_candidates_from_sources(
+        tune_key=tune_key,
+        raw_candidates=raw_candidates,
+        cache=_BWD_JIT_CACHE,
+        kind="BWD",
+    )
 
     return tune_key, modules
 
@@ -709,6 +1572,19 @@ def _select_best_fwd_module(
         tag, mod = candidates[0]
         best = (tag, mod, float("nan"))
         _FWD_BEST_CANDIDATE_CACHE[tune_key] = best
+        _store_persistent_best_candidate(
+            tune_key=tune_key,
+            kind="FWD",
+            tag=tag,
+            mod=mod,
+            best_ms=float("nan"),
+        )
+        _keep_only_best_jit_candidate(
+            tune_key=tune_key,
+            kind="FWD",
+            tag=tag,
+            mod=mod,
+        )
         if len(candidates) == 1:
             print(f"[JIT][FWD][tune] only one candidate: {tag}")
         else:
@@ -753,6 +1629,19 @@ def _select_best_fwd_module(
     timings.sort(key=lambda x: x[0])
     best_ms, best_tag, best_mod = timings[0]
     _FWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
+    _store_persistent_best_candidate(
+        tune_key=tune_key,
+        kind="FWD",
+        tag=best_tag,
+        mod=best_mod,
+        best_ms=best_ms,
+    )
+    _keep_only_best_jit_candidate(
+        tune_key=tune_key,
+        kind="FWD",
+        tag=best_tag,
+        mod=best_mod,
+    )
     print(f"[JIT][FWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
     return best_tag, best_mod, best_ms
 
@@ -780,6 +1669,19 @@ def _select_best_bwd_module(
         tag, mod = candidates[0]
         best = (tag, mod, float("nan"))
         _BWD_BEST_CANDIDATE_CACHE[tune_key] = best
+        _store_persistent_best_candidate(
+            tune_key=tune_key,
+            kind="BWD",
+            tag=tag,
+            mod=mod,
+            best_ms=float("nan"),
+        )
+        _keep_only_best_jit_candidate(
+            tune_key=tune_key,
+            kind="BWD",
+            tag=tag,
+            mod=mod,
+        )
         if len(candidates) == 1:
             print(f"[JIT][BWD][tune] only one candidate: {tag}")
         else:
@@ -824,6 +1726,19 @@ def _select_best_bwd_module(
     timings.sort(key=lambda x: x[0])
     best_ms, best_tag, best_mod = timings[0]
     _BWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
+    _store_persistent_best_candidate(
+        tune_key=tune_key,
+        kind="BWD",
+        tag=best_tag,
+        mod=best_mod,
+        best_ms=best_ms,
+    )
+    _keep_only_best_jit_candidate(
+        tune_key=tune_key,
+        kind="BWD",
+        tag=best_tag,
+        mod=best_mod,
+    )
     print(f"[JIT][BWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
     return best_tag, best_mod, best_ms
 
@@ -847,6 +1762,11 @@ def _run_fwd(
 ):
 
     dtype_str = _get_scalar_t_str(w)
+    iw_dim = int(w.size(1))
+    ix_dim = int(x.size(1))
+    ky_dim = int(y.size(1))
+    v_dim = int(out_seg_num)
+
     tune_key, candidates = _build_fwd_jit_candidates(
         i_list=i_list,
         j_list=j_list,
@@ -854,6 +1774,10 @@ def _run_fwd(
         v_list=v_list,
         coeff_list=coeff_list,
         u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
         input_indices=input_indices,
         output_indices=output_indices,
         dtype_str=dtype_str,
@@ -887,13 +1811,14 @@ def _run_fwd(
         fused_scatter=fused_scatter,
     )
 
-    return _call_fwd_module(
+    out = _call_fwd_module(
         best_mod,
         w=w, x=x, y=y,
         src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
+    return out
 
         
 
@@ -970,13 +1895,15 @@ def _run_bwd(
         fused_scatter=fused_scatter,
     )
 
-    return _call_bwd_module(
+    out =  _call_bwd_module(
         best_mod,
         w=w, x=x, y=y, grad_out=grad_out,
         src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
+    
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -987,10 +1914,10 @@ class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, w, x, y, input_indices, output_indices, meta, b_list):
 
-        i_list = meta["i_list"].to(torch.int32)
-        j_list = meta["j_list"].to(torch.int32)
-        k_list = meta["k_list"].to(torch.int32)
-        v_list = meta["v_list"].to(torch.int32)
+        i_list = _as_int32_meta_tensor(meta["i_list"])
+        j_list = _as_int32_meta_tensor(meta["j_list"])
+        k_list = _as_int32_meta_tensor(meta["k_list"])
+        v_list = _as_int32_meta_tensor(meta["v_list"])
         coeff_list = meta["coeff_list"]
 
         out_seg_num = meta["out_seg_num"]
@@ -1095,6 +2022,10 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 b_list=ctx.b_list,
                 out_seg_num=ctx.out_seg_num,
                 u_dim=ctx.u_dim,
+                iw_dim=ctx.w_seg_num,
+                ix_dim=ctx.x_seg_num,
+                ky_dim=ctx.y_seg_num,
+                v_dim=ctx.out_seg_num,
                 mode=ctx.mode,
                 grad_w=w.requires_grad,
             )
