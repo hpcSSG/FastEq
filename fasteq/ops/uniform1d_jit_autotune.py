@@ -1208,7 +1208,6 @@ def _build_fwd_jit_candidates(
             output_indices=output_indices,
             u_dim=u_dim,
             mode=mode,
-            reg_budget=[16, 64],
         )
 
         """ return generate_code_uniform1d_fwd_baseline_unrolled(
@@ -1419,7 +1418,6 @@ def _build_bwd_jit_candidates(
     if prebuilt_modules:
         return tune_key, prebuilt_modules
 
-    reg_budgets = [8, 64]
     def _codegen_candidates():
         return generate_code_uniform1d_bwd_with_scheduler(
             i_list=i_list,
@@ -1436,8 +1434,6 @@ def _build_bwd_jit_candidates(
             v_dim=v_dim,
             mode=mode,
             need_grad_w=grad_w,
-            reg_budget=reg_budgets,
-            acc_reg_budget=[32, 64, None],
         )
 
         """ return generate_code_uniform1d_bwd_baseline_unrolled(
@@ -1455,7 +1451,7 @@ def _build_bwd_jit_candidates(
             path_semantics="wxy",
         ) """
 
-    print(f"[JIT][BWD] generate candidates for: {tune_key}, reg_budget={reg_budgets}")
+    print(f"[JIT][BWD] generate candidates for: {tune_key}")
     raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
     if not raw_candidates:
         raise RuntimeError("backward codegen returned zero candidates")

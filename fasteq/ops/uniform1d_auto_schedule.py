@@ -8,8 +8,6 @@ from pathlib import Path
 import torch
 
 
-
-
 # =============================================================================
 # STC LARS scheduler and CUDA code generation
 # Moved from stc_uniform1d_jit.py so the STC runtime wrapper only keeps
@@ -90,8 +88,6 @@ class STCPath:
                 out.append(lab)
         return tuple(out)
 
-
-# STC now reuses LARSUniform1DScheduler(path_kind="stc").
 
 def _lars_reg_id(reg: str) -> int:
     if not isinstance(reg, str) or not reg.startswith("r"):
@@ -556,7 +552,6 @@ def generate_code_stc_fwd_with_scheduler(
     paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
     scheduler = LARSUniform1DScheduler(
         paths,
-        reg_budget=0,
         path_kind="stc",
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
@@ -862,7 +857,6 @@ def generate_code_stc_bwd_with_scheduler(
     paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
     scheduler = LARSUniform1DScheduler(
         paths,
-        reg_budget=0,
         path_kind="stc",
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
@@ -974,7 +968,6 @@ class LARSUniform1DScheduler:
     LARS score, and fires paths as soon as their input labels are live.
 
     Notes:
-      - reg_budget is kept only for API compatibility and is ignored.
       - ScheduleResult.spills is kept for compatibility and is always zero.
       - Output accumulators are handled by the emitter, not by the LARS label
         allocator.
@@ -983,12 +976,9 @@ class LARSUniform1DScheduler:
     def __init__(
         self,
         paths: Iterable[Tuple[int, int, int, int, float]],
-        reg_budget: int = 16,
         *,
         enable_secondary_affinity: bool = True,
         topk_candidates: Optional[int] = None,
-        path_fallback_after: Optional[int] = None,
-        prefer_path_fallback_when_full: bool = True,
         debug: bool = False,
         path_kind: str = "u1d",
         profile: bool = False,
@@ -1017,18 +1007,7 @@ class LARSUniform1DScheduler:
         else:
             raise ValueError(f"Unsupported LARSUniform1DScheduler path_kind={self.path_kind!r}")
 
-        # reg_budget is kept only for API compatibility.
-        # Input labels are now unbounded: allocate one virtual register for every
-        # distinct x/y/w label that appears in the schedule, so normal inputs are
-        # never exceed the all-input-resident virtual register fileed because of a user-supplied budget.
-        del reg_budget
-        input_label_count = len({lab for path in self.paths for lab in path.labels})
-        self.reg_budget = max(4, int(input_label_count))
-
-        # path_fallback_after and prefer_path_fallback_when_full are legacy
-        # keyword arguments.  They are intentionally ignored now that spill and
-        # victim selection have been removed.
-        del path_fallback_after, prefer_path_fallback_when_full
+        # Input labels are unbounded: virtual registers are allocated on demand.
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
@@ -1056,7 +1035,8 @@ class LARSUniform1DScheduler:
         self.live: Set[Label] = set()
         self.dirty_outputs: Set[Label] = set()
         self.reg_of: Dict[Label, str] = {}
-        self.free_regs: List[str] = [f"r{r}" for r in range(self.reg_budget)]
+        self.free_regs: List[str] = []
+        self._next_reg_id = 0
 
         self.instructions: List[Inst] = []
         self.path_order: List[int] = []
@@ -1142,8 +1122,6 @@ class LARSUniform1DScheduler:
             "progress_pct": float(100.0 * done / max(1, total)),
             "live_labels": int(len(self.live)),
             "live_regs_total": int(self._profile_total_live_regs()),
-            "free_regs": int(len(self.free_regs)),
-            "reg_budget": int(self.reg_budget),
             "max_live": int(self.max_live),
             "max_live_labels": int(getattr(self, "max_live_labels", self.max_live)),
             "max_live_total": int(getattr(self, "max_live_total", self.max_live)),
@@ -1210,10 +1188,8 @@ class LARSUniform1DScheduler:
                 f"iter={snap['iter']} "
                 f"done={snap['done_paths']}/{snap['total_paths']} "
                 f"remain={snap['remaining_paths']} "
-                f"live={snap['live_regs_total']}/{snap['reg_budget']} "
                 f"max=label/total "
                 f"{snap['max_live_labels']}/{snap['max_live_total']} "
-                f"free={snap['free_regs']} "
                 f"fireable={snap['fireable_paths']} "
                 f"candidates={snap['candidate_labels']} "
                 f"label={snap['label']} "
@@ -1239,7 +1215,6 @@ class LARSUniform1DScheduler:
             "total_paths": int(total),
             "done_paths": int(done),
             "remaining_paths": int(remain),
-            "reg_budget": int(self.reg_budget),
             "max_live": int(self.max_live),
             "max_live_labels": int(getattr(self, "max_live_labels", self.max_live)),
             "max_live_total": int(getattr(self, "max_live_total", self.max_live)),
@@ -1271,10 +1246,12 @@ class LARSUniform1DScheduler:
         self._score_cache.clear()
 
     def _alloc_reg_no_spill(self, lab: Label) -> str:
-        if not self.free_regs:
-            raise RuntimeError("_alloc_reg_no_spill called with no free registers")
+        if self.free_regs:
+            reg = self.free_regs.pop(0)
+        else:
+            reg = f"r{self._next_reg_id}"
+            self._next_reg_id += 1
 
-        reg = self.free_regs.pop(0)
         self.reg_of[lab] = reg
         self.live.add(lab)
         self.max_live_labels = max(self.max_live_labels, len(self.live))
@@ -1319,7 +1296,7 @@ class LARSUniform1DScheduler:
             )
 
         self.live.remove(lab)
-        del self.reg_of[lab]
+        self.reg_of.pop(lab, None)
         self.free_regs.insert(0, reg)
         self._invalidate_score_cache()
 
@@ -1482,13 +1459,6 @@ class LARSUniform1DScheduler:
     def _load_label_no_spill(self, lab: Label, reason: str = "") -> None:
         if lab in self.live:
             return
-        if not self.free_regs:
-            raise RuntimeError(
-                "No free virtual register in no-spill scheduler. "
-                "This should not happen because reg_budget is derived from "
-                "the number of distinct input labels."
-            )
-
         reg = self._alloc_reg_no_spill(lab)
         self._emit_load_inst(lab, reg, reason)
 
@@ -1718,7 +1688,7 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
             f"iter={self._loop_iter} "
             f"done={done}/{self._total_paths} ({pct:.2f}%) "
             f"remain={remain} "
-            f"live={len(self.live)}/{self.reg_budget} "
+            f"live={len(self.live)} "
             f"fireable={self._last_fireable_n} "
             f"candidates={self._last_candidate_n} "
             f"mode={self._last_select_mode} "
@@ -2468,15 +2438,6 @@ def _make_lars_paths_from_uniform1d_lists(
             paths.append((i, j, k, v, c))  # LARS native: x[i], y[j], w[k]
     return paths
 
-
-
-
-
-
-
-
-
-
 def generate_code_uniform1d_fwd_with_scheduler(
     i_list: torch.Tensor,
     j_list: torch.Tensor,
@@ -2489,11 +2450,8 @@ def generate_code_uniform1d_fwd_with_scheduler(
     mode: str = "u,u,,u",
     out_path: str = "generated_uniform1d_fwd_lars.cu",
     kernel_name: str = "stp_codegen_lars",
-    scalar_t: str = "float",
-    reg_budget: Union[int, Iterable[int]] = 16,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
-    fold_reg_budgets_by_max_live: bool = True,
     profile: bool = False,
     profile_interval: int = 1000,
     profile_seconds: float = 2.0,
@@ -2504,13 +2462,10 @@ def generate_code_uniform1d_fwd_with_scheduler(
     """
     Generate one LARS forward CUDA implementation.
 
-    The user reg_budget and fold_reg_budgets_by_max_live arguments are kept for
     API compatibility, but this slim scheduler derives an unbounded virtual
     input-register file from all distinct x/y/w labels and emits a single
     single candidate.
     """
-    del scalar_t, reg_budget, fold_reg_budgets_by_max_live
-
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -2540,7 +2495,6 @@ def generate_code_uniform1d_fwd_with_scheduler(
 
     scheduler = LARSUniform1DScheduler(
         paths=lars_paths,
-        reg_budget=0,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
@@ -2596,7 +2550,6 @@ def generate_code_uniform1d_fwd_with_scheduler(
             "schedule": schedule_result,
             "config": {
                 "name": cand_name,
-                "reg_budget": 0,
                 "auto_fallback_when_full": False,
             },
             "profile": schedule_result.profile,
@@ -2657,13 +2610,10 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
     def __init__(
         self,
         paths: Iterable[Tuple[int, int, int, int, float]],
-        reg_budget: int = 24,
         *,
         need_grad_w: bool = True,
         enable_secondary_affinity: bool = True,
         topk_candidates: Optional[int] = None,
-        path_fallback_after: Optional[int] = None,
-        prefer_path_fallback_when_full: bool = True,
         debug: bool = False,
         profile: bool = False,
         profile_name: str = "",
@@ -2682,15 +2632,7 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
             for p, (i, j, k, v, c) in enumerate(paths)
         ]
 
-        # reg_budget is kept only for API compatibility.
-        # Backward input labels (w/x/y/grad_out) are unbounded and never exceed the all-input-resident virtual register file
-        # merely because of a user-supplied virtual budget.
-        del reg_budget
-        input_label_count = len({lab for path in self.paths for lab in path.labels})
-        self.reg_budget = max(4, int(input_label_count))
-
-        # Legacy fallback knobs are ignored in the no-spill scheduler.
-        del path_fallback_after, prefer_path_fallback_when_full
+        # Backward input labels are unbounded: virtual registers are allocated on demand.
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
@@ -2712,7 +2654,8 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         self.live: Set[Label] = set()
         self.dirty_outputs: Set[Label] = set()
         self.reg_of: Dict[Label, str] = {}
-        self.free_regs: List[str] = [f"r{r}" for r in range(self.reg_budget)]
+        self.free_regs: List[str] = []
+        self._next_reg_id = 0
 
         self.instructions: List[Inst] = []
         self.path_order: List[int] = []
@@ -2791,7 +2734,7 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
             )
 
         self.live.remove(lab)
-        del self.reg_of[lab]
+        self.reg_of.pop(lab, None)
         self.free_regs.insert(0, reg)
         self._invalidate_score_cache()
 
@@ -2941,7 +2884,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
-    acc_reg_budget: Optional[int] = None,
     smem_acc_volatile: bool = False,
 ) -> str:
     """
@@ -2961,9 +2903,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     # ------------------------------------------------------------------
     # Mixed accumulator placement for backward gradients.
-    #   acc_reg_budget=None: old behavior, keep every gw/gx/gy accumulator
     #                        as a scalar local variable/register.
-    #   acc_reg_budget=K:    keep only the top-K hottest accumulators in
     #                        registers and demote the rest to per-thread
     #                        shared-memory accumulators.  Demoted gx/gy still
     #                        write back once at the end, preserving atomic
@@ -3021,10 +2961,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             kind_rank = 1
         return (float(cnt) * weight, cnt, -int(first_seen.get(acc, 10**9)), kind_rank, kind, -idx)
 
-    # acc_reg_budget is intentionally ignored: every backward accumulator is
     # resident as a scalar local variable.  No low-frequency accumulator is
     # demoted to shared memory.
-    del acc_reg_budget
     reg_accs: Set[Tuple[str, int]] = set(all_accs)
 
     smem_accs: Set[Tuple[str, int]] = set()
@@ -3751,13 +3689,10 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
     def __init__(
         self,
         paths: Iterable[Tuple[int, int, int, int, float]],
-        reg_budget: int = 24,
         *,
         grad_kind: str,
         enable_secondary_affinity: bool = True,
         topk_candidates: Optional[int] = None,
-        path_fallback_after: Optional[int] = None,
-        prefer_path_fallback_when_full: bool = True,
         debug: bool = False,
         profile: bool = False,
         profile_name: str = "",
@@ -3773,14 +3708,7 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
             for p, (i, j, k, v, c) in enumerate(paths)
         ]
 
-        # reg_budget is kept only for API compatibility.
-        # Split-backward input labels are unbounded as well.
-        del reg_budget
-        input_label_count = len({lab for path in self.paths for lab in path.labels})
-        self.reg_budget = max(3, int(input_label_count))
-
-        # Legacy fallback knobs are ignored in the no-spill scheduler.
-        del path_fallback_after, prefer_path_fallback_when_full
+        # Split-backward input labels are unbounded: virtual registers are allocated on demand.
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
@@ -3802,7 +3730,8 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
         self.live: Set[Label] = set()
         self.dirty_outputs: Set[Label] = set()
         self.reg_of: Dict[Label, str] = {}
-        self.free_regs: List[str] = [f"r{r}" for r in range(self.reg_budget)]
+        self.free_regs: List[str] = []
+        self._next_reg_id = 0
 
         self.instructions: List[Inst] = []
         self.path_order: List[int] = []
@@ -3970,7 +3899,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
-    acc_reg_budget: Optional[int] = None,
     smem_acc_volatile: bool = False,
 ) -> str:
     if grad_kind not in BWD_SPLIT_KINDS:
@@ -3994,9 +3922,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
             first_seen.setdefault(target_idx, inst_id)
 
     all_targets: Set[int] = set(target_use)
-    # acc_reg_budget is intentionally ignored: every split-backward accumulator
     # target is register-resident and no target is demoted to shared memory.
-    del acc_reg_budget
     reg_targets: Set[int] = set(all_targets)
 
     smem_targets_sorted: List[int] = []
@@ -4669,11 +4595,8 @@ def _generate_code_uniform1d_bwd_split_from_context(
     need_grad_w: bool,
     out_path: str,
     kernel_name: str,
-    reg_budget: Union[int, Iterable[int]],
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
     smem_acc_volatile: bool,
     return_schedule: bool,
-    fold_reg_budgets_by_max_live: bool,
     profile: bool,
     profile_interval: int,
     profile_seconds: float,
@@ -4682,14 +4605,10 @@ def _generate_code_uniform1d_bwd_split_from_context(
     topk_candidates: Optional[int],
 ):
     """Internal split-backward implementation.  The public entry is the unified wrapper."""
-    # Disable reg_budget candidate search/folding and acc_reg_budget demotion.
     # One split candidate is emitted, with all input labels and all accumulators
     # resident.  The legacy arguments are retained for caller compatibility.
-    del reg_budget, acc_reg_budget, fold_reg_budgets_by_max_live
     configs: List[Dict[str, Any]] = [{
         "name": "lars_bwd_split_all_inputs_accall",
-        "reg_budget": 0,
-        "acc_reg_budget": None,
         "smem_acc_volatile": False,
     }]
     max_effective_need = 0
@@ -4700,9 +4619,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
 
     for cfg_in in configs:
         cfg = dict(cfg_in)
-        rb = int(cfg["reg_budget"])
-        acc_rb = cfg.get("acc_reg_budget", None)
-        acc_rb = None if acc_rb is None else int(acc_rb)
         cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
         cand_name = str(cfg["name"])
         cfg["auto_fallback_when_full"] = False
@@ -4727,7 +4643,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
         for gkind in split_kinds:
             scheduler = LARSUniform1DBwdSplitScheduler(
                 paths=ctx.bwd_paths,
-                reg_budget=rb,
                 grad_kind=gkind,
                 enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
                 topk_candidates=cfg.get("topk_candidates", topk_candidates),
@@ -4757,7 +4672,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
                     ky_dim=ky_dim,
                     v_dim=v_dim,
                     block_size=32,
-                    acc_reg_budget=acc_rb,
                     smem_acc_volatile=cfg_smem_acc_volatile,
                 )
             )
@@ -4791,7 +4705,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 "schedule": schedules,
                 "config": cfg,
                 "profiles": profiles,
-                "budget_fold_effective_live_need": int(max_effective_need),
                 "auto_fallback_when_full": False,
             })
         else:
@@ -4813,11 +4726,8 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     need_grad_w: bool,
     out_path: str,
     kernel_name: str,
-    reg_budget: Union[int, Iterable[int]],
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
     smem_acc_volatile: bool,
     return_schedule: bool,
-    fold_reg_budgets_by_max_live: bool,
     profile: bool,
     profile_interval: int,
     profile_seconds: float,
@@ -4828,18 +4738,15 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     """
     Generate one fused backward LARS candidate.
 
-    The slim policy ignores reg_budget search and acc_reg_budget demotion:
     input labels are virtually unbounded and all gw/gx/gy accumulators stay
     register-resident in the emitter.
     """
-    del reg_budget, acc_reg_budget, smem_acc_volatile, fold_reg_budgets_by_max_live
 
     grad_tag = "full" if need_grad_w else "nogradw"
     cand_name = "lars_bwd_all_inputs_accall"
 
     scheduler = LARSUniform1DBwdScheduler(
         paths=ctx.bwd_paths,
-        reg_budget=0,
         need_grad_w=need_grad_w,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
@@ -4875,7 +4782,6 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         ky_dim=ky_dim,
         v_dim=v_dim,
         block_size=32,
-        acc_reg_budget=None,
         smem_acc_volatile=False,
     )
 
@@ -4902,8 +4808,6 @@ def _generate_code_uniform1d_bwd_fused_from_context(
             "schedule": schedule_result,
             "config": {
                 "name": cand_name,
-                "reg_budget": 0,
-                "acc_reg_budget": None,
                 "auto_fallback_when_full": False,
                 "need_grad_w": bool(need_grad_w),
                 "split_backward": False,
@@ -4931,12 +4835,9 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
     need_grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_lars_split.cu",
     kernel_name: str = "uniform1d_bwd_lars",
-    reg_budget: Union[int, Iterable[int]] = 24,
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
     smem_acc_volatile: bool = True,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
-    fold_reg_budgets_by_max_live: bool = True,
     profile: bool = True,
     profile_interval: int = 1000,
     profile_seconds: float = 2.0,
@@ -4967,12 +4868,9 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         kernel_name=kernel_name,
         # Keep legacy parameters in the public signature, but force the new
         # policy: input labels unbounded, accumulators all register-resident.
-        reg_budget=reg_budget,
-        acc_reg_budget=None,
         smem_acc_volatile=False,
         path_semantics=path_semantics,
         return_schedule=return_schedule,
-        fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
         profile=profile,
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
@@ -5001,13 +4899,9 @@ def generate_code_uniform1d_bwd_with_scheduler(
     need_grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_lars.cu",
     kernel_name: str = "uniform1d_bwd_lars",
-    scalar_t: str = "float",
-    reg_budget: Union[int, Iterable[int]] = 24,
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
     smem_acc_volatile: bool = True,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
-    fold_reg_budgets_by_max_live: bool = True,
     profile: bool = True,
     profile_interval: int = 1000,
     profile_seconds: float = 2.0,
@@ -5025,8 +4919,6 @@ def generate_code_uniform1d_bwd_with_scheduler(
       - True / "split": independent grad_w, grad_x and grad_y kernels.
       - "auto": split when path_count > split_path_threshold.
     """
-    del scalar_t
-
     ctx = _prepare_uniform1d_bwd_codegen_context(
         i_list=i_list,
         j_list=j_list,
@@ -5056,11 +4948,8 @@ def generate_code_uniform1d_bwd_with_scheduler(
         need_grad_w=need_grad_w,
         out_path=out_path,
         kernel_name=kernel_name,
-        reg_budget=reg_budget,
-        acc_reg_budget=None,
         smem_acc_volatile=False,
         return_schedule=return_schedule,
-        fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
         profile=profile,
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
@@ -5096,7 +4985,6 @@ def _make_baseline_wxy_paths_from_uniform1d_lists(
     path_semantics="xyw": external (i,j,k) means x[i], y[j], w[k].
 
     This baseline intentionally does not perform path scheduling, operand reuse,
-    register-budget management.  The Python code generator simply
     emits one straight-line block per cg path, in the original path order.
     """
     if path_semantics not in ("wxy", "xyw"):
@@ -5762,7 +5650,6 @@ def generate_code_uniform1d_fwd_baseline_unrolled(
     mode: str = "u,u,,u",
     out_path: str = "generated_uniform1d_fwd_baseline_unrolled.cu",
     kernel_name: str = "uniform1d_fwd_baseline_unrolled",
-    scalar_t: str = "float",
     path_semantics: str = "wxy",
     return_metadata: bool = False,
 ):
@@ -5773,8 +5660,6 @@ def generate_code_uniform1d_fwd_baseline_unrolled(
     meant to answer: what happens if we just emit the cg path list as straight-
     line code?
     """
-    del scalar_t
-
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -5870,7 +5755,6 @@ def generate_code_uniform1d_bwd_baseline_unrolled(
     need_grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_baseline_unrolled.cu",
     kernel_name: str = "uniform1d_bwd_baseline_unrolled",
-    scalar_t: str = "float",
     path_semantics: str = "wxy",
     return_metadata: bool = False,
 ):
@@ -5881,8 +5765,6 @@ def generate_code_uniform1d_bwd_baseline_unrolled(
     accumulators.  Each path reloads w/x/y/grad_out and immediately writes
     grad_w/grad_x/grad_y.
     """
-    del scalar_t
-
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 

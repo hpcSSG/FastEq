@@ -193,7 +193,7 @@ def _get_or_build_module(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    name = f"stc_lars_u1d_filejit_{key}"
+    name = f"stc_lars_u1d_fwd_filejit_{key}"
     build_root = _default_build_root()
     build_dir = build_root / name
 
