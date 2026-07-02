@@ -614,18 +614,18 @@ def _check_stc_path_bounds_for_bwd(
                 raise ValueError(f"x1 index {x1_idx} out of x1_dim={x1_dim} in STC path {p.pid}")
 
 
-def _stc_shared_x1_expr(x1_idx: int) -> str:
-    return f"x1_shared[(index_t){int(x1_idx)} * (index_t)TILE_U + (index_t)lj]"
+def _stc_x1_global_expr(x1_idx: int) -> str:
+    return f"x1[((index_t)b * (index_t)X1 + (index_t){int(x1_idx)}) * (index_t)U + (index_t)u]"
 
 
-def _stc_shared_grad_x1_expr(x1_idx: int) -> str:
-    return f"grad_x1_shared[(index_t){int(x1_idx)} * (index_t)TILE_U + (index_t)lj]"
+def _stc_grad_x1_acc_name(x1_idx: int) -> str:
+    return f"gx1_acc_a_{int(x1_idx)}"
 
 
 def _stc_bwd_grad_expr(base_expr: str, other_x1_indices: Sequence[int]) -> str:
     expr = base_expr
     for x1_idx in other_x1_indices:
-        expr = f"({expr} * {_stc_shared_x1_expr(int(x1_idx))})"
+        expr = f"({expr} * {_stc_x1_global_expr(int(x1_idx))})"
     return expr
 
 
@@ -642,13 +642,13 @@ def emit_stc_bwd_kernel_from_paths(
 ) -> str:
     """Emit STC backward CUDA code that computes only grad_x1.
 
-    The generated kernel mirrors the baseline tiled STC backward structure:
-    each block owns one ``(batch, U-tile)`` pair, stages all x1 segments for that
-    tile in shared memory, accumulates grad_x1 in shared memory, and writes the
-    final [B, X1, U] gradient once.  Path computation is statically unrolled.
+    Each CUDA block owns one batch row.  Each thread computes one ``u`` lane at a
+    time, accumulates the touched grad_x1 segments in scalar locals, and writes
+    those segments directly to global memory.  Path computation is statically
+    unrolled and does not allocate dynamic per-block scratch storage.
     """
-    if int(tile_u) <= 0:
-        raise ValueError(f"tile_u must be positive, got {tile_u}")
+    if int(tile_u) != 32:
+        raise ValueError(f"STC backward currently assumes tile_u=32, got {tile_u}")
 
     path_list = list(paths)
     if path_order is None:
@@ -658,6 +658,8 @@ def emit_stc_bwd_kernel_from_paths(
         ordered_paths = [by_pid[int(pid)] for pid in path_order]
 
     _check_stc_path_bounds_for_bwd(ordered_paths, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+
+    touched_x1_indices = sorted({int(idx) for p in ordered_paths for idx in p.x1_indices})
 
     lines: List[str] = []
 
@@ -687,7 +689,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("")
     ap("using GPU_Guard = c10::DeviceGuard;")
     ap("")
-    ap("template <typename scalar_t, typename index_t, int TILE_U>")
+    ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ grad_out,")
     ap("    const scalar_t* __restrict__ x1,")
@@ -695,25 +697,20 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    scalar_t* __restrict__ grad_x1,")
     ap("    int B, int X1, int X0, int V, int U)")
     ap("{")
-    ap("    extern __shared__ __align__(sizeof(scalar_t)) unsigned char smem[];")
-    ap("    scalar_t* x1_shared = reinterpret_cast<scalar_t*>(smem);")
-    ap("    scalar_t* grad_x1_shared = x1_shared + (index_t)X1 * (index_t)TILE_U;")
-    ap("")
     ap("    const int b = (int)blockIdx.x;")
-    ap("    const int tile_id = (int)blockIdx.y;")
-    ap("    const int lj = (int)threadIdx.x;")
-    ap("    const int u = tile_id * TILE_U + lj;")
     ap("    if (b >= B) return;")
     ap("")
-    ap("    for (int a = 0; a < X1; ++a) {")
-    ap("        const index_t idx_global = ((index_t)b * (index_t)X1 + (index_t)a) * (index_t)U + (index_t)u;")
-    ap("        const index_t idx_shared = (index_t)a * (index_t)TILE_U + (index_t)lj;")
-    ap("        x1_shared[idx_shared] = x1[idx_global];")
-    ap("        grad_x1_shared[idx_shared] = scalar_t(0);")
-    ap("    }")
+    ap("    const int tid = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
     ap("")
-    ap("    __syncthreads();")
-    ap("")
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        const int u = u_base + lane;")
+    ap("        if (u < U) {")
+    for x1_idx in touched_x1_indices:
+        ap(f"            scalar_t {_stc_grad_x1_acc_name(x1_idx)} = scalar_t(0);")
+    if touched_x1_indices:
+        ap("")
 
     for inst_id, p in enumerate(ordered_paths):
         x1s = tuple(int(v) for v in p.x1_indices)
@@ -724,9 +721,9 @@ def emit_stc_bwd_kernel_from_paths(
         comment = _sanitize_cuda_comment(
             f"path#{p.pid}: grad_x1 for out[{out_v}] += coeff * grad_out * x0[{x0_idx}]"
         )
-        ap(f"    // bwd inst {inst_id}: {comment}")
+        ap(f"            // bwd inst {inst_id}: {comment}")
         ap(
-            f"    const scalar_t {base_name} = "
+            f"            const scalar_t {base_name} = "
             f"grad_out[((index_t)b * (index_t)V + (index_t){out_v}) * (index_t)U + (index_t)u] "
             f"* scalar_t({_fmt_float(coeff)}) "
             f"* x0[((index_t)b * (index_t)X0 + (index_t){x0_idx}) * (index_t)U + (index_t)u];"
@@ -734,15 +731,16 @@ def emit_stc_bwd_kernel_from_paths(
         for pos, target_x1 in enumerate(x1s):
             other = [idx for q, idx in enumerate(x1s) if q != pos]
             grad_expr = _stc_bwd_grad_expr(base_name, other)
-            ap(f"    {_stc_shared_grad_x1_expr(target_x1)} += {grad_expr};")
+            ap(f"            {_stc_grad_x1_acc_name(target_x1)} += {grad_expr};")
         ap("")
 
-    ap("    __syncthreads();")
-    ap("")
-    ap("    for (int a = 0; a < X1; ++a) {")
-    ap("        const index_t idx_global = ((index_t)b * (index_t)X1 + (index_t)a) * (index_t)U + (index_t)u;")
-    ap("        const index_t idx_shared = (index_t)a * (index_t)TILE_U + (index_t)lj;")
-    ap("        grad_x1[idx_global] = grad_x1_shared[idx_shared];")
+    for x1_idx in touched_x1_indices:
+        ap(
+            f"            grad_x1[((index_t)b * (index_t)X1 + (index_t){int(x1_idx)}) "
+            f"* (index_t)U + (index_t)u] = {_stc_grad_x1_acc_name(x1_idx)};"
+        )
+
+    ap("        }")
     ap("    }")
     ap("}")
     ap("")
@@ -757,19 +755,18 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    return mul_fits_int32(a * b, c);")
     ap("}")
     ap("")
-    ap("template <typename scalar_t, typename index_t, int TILE_U>")
+    ap("template <typename scalar_t, typename index_t>")
     ap(f"void launch_{kernel_name}_typed(")
     ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
     ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
-    ap("    dim3 block(TILE_U);")
-    ap("    dim3 grid(B, U / TILE_U);")
-    ap("    size_t smem_bytes = (size_t)2 * (size_t)X1 * (size_t)TILE_U * sizeof(scalar_t);")
-    ap(f"    {kernel_name}<scalar_t, index_t, TILE_U><<<grid, block, smem_bytes, stream>>>(")
+    ap("    dim3 block(32);")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     ap("        grad_out, x1, x0, grad_x1, B, X1, X0, V, U);")
     ap("}")
     ap("")
-    ap("template <typename scalar_t, int TILE_U>")
+    ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
     ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
@@ -778,9 +775,9 @@ def emit_stc_bwd_kernel_from_paths(
     ap("                   mul3_fits_int32((int64_t)B, (int64_t)X0, (int64_t)U) &&")
     ap("                   mul3_fits_int32((int64_t)B, (int64_t)V,  (int64_t)U);")
     ap("    if (use_i32) {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t, TILE_U>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
     ap("    } else {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t, TILE_U>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
     ap("    }")
     ap("}")
     ap("")
@@ -797,7 +794,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    TORCH_CHECK((int)x0.size(0) == B, \"x0 batch mismatch\");")
     ap("    TORCH_CHECK((int)x0.size(2) == U, \"x0 U mismatch\");")
     ap("    TORCH_CHECK(V > 0, \"V must be > 0\");")
-    ap(f"    TORCH_CHECK((U % {int(tile_u)}) == 0, \"U must be a multiple of TILE_U\");")
+    ap("    TORCH_CHECK((U % 32) == 0, \"U must be a multiple of 32\");")
     ap("    TORCH_CHECK(grad_out.numel() == (int64_t)B * (int64_t)V * (int64_t)U, \"grad_out numel mismatch; expected B*V*U\");")
     if u_dim is not None:
         ap(f"    TORCH_CHECK(U == {int(u_dim)}, \"U mismatch for generated STC backward kernel\");")
@@ -811,7 +808,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    GPU_Guard device_guard(x1.device());")
     ap("    gpuStream_t stream = getCurrentGPUStream(x1.device().index());")
     ap(f"    AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), \"{kernel_name}\", [&] {{")
-    ap(f"        launch_{kernel_name}<scalar_t, {int(tile_u)}>((const scalar_t*)grad_out.data_ptr<scalar_t>(),")
+    ap(f"        launch_{kernel_name}<scalar_t>((const scalar_t*)grad_out.data_ptr<scalar_t>(),")
     ap("            (const scalar_t*)x1.data_ptr<scalar_t>(),")
     ap("            (const scalar_t*)x0.data_ptr<scalar_t>(),")
     ap("            (scalar_t*)grad_x1.data_ptr<scalar_t>(), B, X1, X0, V, U, stream);")
@@ -851,8 +848,8 @@ def generate_code_stc_bwd_with_scheduler(
 
     This uses the same LARSUniform1DScheduler(path_kind="stc") to choose a
     static path order, but the emitted kernel follows the tiled STC backward
-    computation: stage x1 and grad_x1 in shared memory, iterate paths, and write
-    a single [B, X1, U] gradient tensor.
+    computation: iterate paths in static order and write a single [B, X1, U]
+    gradient tensor without dynamic per-block scratch storage.
     """
     paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
     scheduler = LARSUniform1DScheduler(
@@ -2884,7 +2881,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
-    smem_acc_volatile: bool = False,
 ) -> str:
     """
     Emit CUDA/HIP-compatible fused backward code from a backward LARS schedule.
@@ -2905,7 +2901,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     # Mixed accumulator placement for backward gradients.
     #                        as a scalar local variable/register.
     #                        registers and demote the rest to per-thread
-    #                        shared-memory accumulators.  Demoted gx/gy still
     #                        write back once at the end, preserving atomic
     #                        coalescing compared with path-level atomicAdd.
     # ------------------------------------------------------------------
@@ -2945,7 +2940,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         return 0
 
     def _acc_score(acc: Tuple[str, int]) -> Tuple[float, int, int, int, str, int]:
-        # gx/gy have high value because register/shared accumulation reduces
+        # gx/gy have high value because local accumulation reduces
         # global atomicAdd count.  gy is slightly favored in scalar-y mode
         # because writeback also needs a warp reduction.
         kind, idx = acc
@@ -2961,34 +2956,16 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             kind_rank = 1
         return (float(cnt) * weight, cnt, -int(first_seen.get(acc, 10**9)), kind_rank, kind, -idx)
 
-    # resident as a scalar local variable.  No low-frequency accumulator is
-    # demoted to shared memory.
+    # All backward accumulators are resident scalar locals/registers.  Shared-memory
+    # accumulator demotion has been removed, but the emitter still needs stable
+    # sorted index lists for declaring and writing back those scalar locals.
     reg_accs: Set[Tuple[str, int]] = set(all_accs)
-
-    smem_accs: Set[Tuple[str, int]] = set()
-
-    resident_gw_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gw"}
-    resident_gx_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gx"}
-    resident_gy_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gy"}
-    resident_gw_indices_sorted = sorted(resident_gw_indices)
-    resident_gx_indices_sorted = sorted(resident_gx_indices)
-    resident_gy_indices_sorted = sorted(resident_gy_indices)
-
-    # Stable shared-memory layout: all demoted accumulators are laid out as
-    # [acc_id][lane].  Each lane owns its own scalar slot for its current u.
-    smem_accs_sorted: List[Tuple[str, int]] = sorted(
-        smem_accs,
-        key=lambda acc: ({"gw": 0, "gx": 1, "gy": 2}[acc[0]], acc[1]),
-    )
-    smem_acc_id: Dict[Tuple[str, int], int] = {
-        acc: n for n, acc in enumerate(smem_accs_sorted)
-    }
+    resident_gw_indices_sorted = sorted(idx for kind, idx in reg_accs if kind == "gw")
+    resident_gx_indices_sorted = sorted(idx for kind, idx in reg_accs if kind == "gx")
+    resident_gy_indices_sorted = sorted(idx for kind, idx in reg_accs if kind == "gy")
 
     def _is_reg_acc(kind: str, idx: int) -> bool:
         return (kind, int(idx)) in reg_accs
-
-    def _is_smem_acc(kind: str, idx: int) -> bool:
-        return (kind, int(idx)) in smem_acc_id
 
     def _reg_acc_name(kind: str, idx: int) -> str:
         if kind == "gw":
@@ -2999,15 +2976,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             return f"gy_acc_k_{int(idx)}"
         raise ValueError(f"Bad accumulator kind: {kind}")
 
-    def _smem_acc_expr(kind: str, idx: int) -> str:
-        sid = smem_acc_id[(kind, int(idx))]
-        return f"smem_acc[{sid} * 32 + lane]"
-
     def _emit_bwd_acc_update(kind: str, idx: int, value_expr: str) -> None:
         if _is_reg_acc(kind, idx):
             ap(f"            {_reg_acc_name(kind, idx)} += {value_expr};")
-        elif _is_smem_acc(kind, idx):
-            ap(f"            {_smem_acc_expr(kind, idx)} += {value_expr};")
         else:
             # This path is reachable only if need_grad_w=False and kind==gw.
             pass
@@ -3073,13 +3044,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
     ap("    if (tid >= 32) return;")
-    if smem_accs_sorted:
-        ap("    extern __shared__ __align__(16) unsigned char smem_raw[];")
-        if smem_acc_volatile:
-            ap("    volatile scalar_t* smem_acc = reinterpret_cast<volatile scalar_t*>(smem_raw);")
-        else:
-            ap("    scalar_t* smem_acc = reinterpret_cast<scalar_t*>(smem_raw);")
-    ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -3136,10 +3100,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
-    for sid, (akind, aidx) in enumerate(smem_accs_sorted):
-        ap(f"            smem_acc[{sid} * 32 + lane] = scalar_t(0);  // smem {akind}[{aidx}]")
-    if smem_accs_sorted:
-        ap("")
     for rid in range(reg_count):
         ap(f"            scalar_t r{rid};")
     if reg_count:
@@ -3239,10 +3199,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         else:
             raise ValueError(f"Unsupported backward LARS instruction op: {inst.op}")
 
-    if (resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted
-            or smem_accs_sorted):
+    if resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted:
         ap("")
-        ap("            // mixed register/shared-memory backward accumulator writeback")
+        ap("            // register-resident backward accumulator writeback")
 
     # Register-resident writeback.
     for gw_idx in resident_gw_indices_sorted:
@@ -3284,35 +3243,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ap("            }")
         else:
             ap(f"            atomicAdd(&grad_y[{expr}], gy_acc_k_{gy_idx});")
-
-    # Shared-memory-resident writeback.
-    for kind, idx in smem_accs_sorted:
-        expr = _bwd_label_index_expr(
-            kind, int(idx),
-            mode_scalar_y=mode_scalar_y,
-            u_dim=u_dim,
-            iw_dim=iw_dim,
-            ix_dim=ix_dim,
-            ky_dim=ky_dim,
-            v_dim=v_dim,
-        )
-        smem_expr = _smem_acc_expr(kind, int(idx))
-        if kind == "gw":
-            if not need_grad_w:
-                continue
-            ap(f"            grad_w[{expr}] = {smem_expr};")
-        elif kind == "gx":
-            ap(f"            atomicAdd(&grad_x[{expr}], {smem_expr});")
-        elif kind == "gy":
-            if mode_scalar_y:
-                ap(f"            scalar_t gy_sum_smem_{idx} = warp_sum_xor_lars_bwd({smem_expr});")
-                ap("            if (lane == 0) {")
-                ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_smem_{idx});")
-                ap("            }")
-            else:
-                ap(f"            atomicAdd(&grad_y[{expr}], {smem_expr});")
-        else:
-            raise ValueError(f"Bad smem accumulator kind: {kind}")
 
     ap("        }")
     ap("    }")
@@ -3364,14 +3294,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    constexpr int kSmemAccCount = {len(smem_accs_sorted)};")
-    ap("    size_t smem_bytes = (size_t)kSmemAccCount * 32u * sizeof(scalar_t);")
-    ap("#if !defined(USE_ROCM) && !defined(__HIP_PLATFORM_AMD__)")
-    ap("    if (smem_bytes > 49152) {")
-    ap(f"        cudaFuncSetAttribute({kernel_name}<scalar_t, index_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);")
-    ap("    }")
-    ap("#endif")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, smem_bytes, stream>>>(")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     if need_grad_w:
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
@@ -3899,7 +3822,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
-    smem_acc_volatile: bool = False,
 ) -> str:
     if grad_kind not in BWD_SPLIT_KINDS:
         raise ValueError(f"grad_kind must be one of {sorted(BWD_SPLIT_KINDS)}, got {grad_kind!r}")
@@ -3922,11 +3844,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
             first_seen.setdefault(target_idx, inst_id)
 
     all_targets: Set[int] = set(target_use)
-    # target is register-resident and no target is demoted to shared memory.
+    # target is register-resident.
     reg_targets: Set[int] = set(all_targets)
 
-    smem_targets_sorted: List[int] = []
-    smem_id: Dict[int, int] = {idx: n for n, idx in enumerate(smem_targets_sorted)}
     reg_targets_sorted = sorted(reg_targets)
 
     def _is_reg_target(idx: int) -> bool:
@@ -3935,14 +3855,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
     def _target_acc_name(idx: int) -> str:
         return _split_grad_acc_name(grad_kind, int(idx))
 
-    def _smem_expr(idx: int) -> str:
-        return f"smem_acc[{smem_id[int(idx)]} * 32 + lane]"
-
     def _emit_acc_update(idx: int, value_expr: str) -> None:
         if _is_reg_target(idx):
             ap(f"            {_target_acc_name(idx)} += {value_expr};")
-        else:
-            ap(f"            {_smem_expr(idx)} += {value_expr};")
 
     lines: List[str] = []
 
@@ -3971,13 +3886,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
     ap("    if (tid >= 32) return;")
-    if smem_targets_sorted:
-        ap("    extern __shared__ __align__(16) unsigned char smem_raw[];")
-        if smem_acc_volatile:
-            ap("    volatile scalar_t* smem_acc = reinterpret_cast<volatile scalar_t*>(smem_raw);")
-        else:
-            ap("    scalar_t* smem_acc = reinterpret_cast<scalar_t*>(smem_raw);")
-    ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -4039,10 +3947,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
-    for sid, idx in enumerate(smem_targets_sorted):
-        ap(f"            smem_acc[{sid} * 32 + lane] = scalar_t(0);  // smem {grad_kind}[{idx}]")
-    if smem_targets_sorted:
-        ap("")
     for rid in range(reg_count):
         ap(f"            scalar_t r{rid};")
     if reg_count:
@@ -4096,7 +4000,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         else:
             raise ValueError(f"Unsupported split backward LARS instruction op: {inst.op}")
 
-    if reg_targets_sorted or smem_targets_sorted:
+    if reg_targets_sorted:
         ap("")
         ap("            // split backward accumulator writeback")
 
@@ -4146,9 +4050,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
 
     for idx in reg_targets_sorted:
         _emit_writeback(int(idx), _target_acc_name(int(idx)))
-    for idx in smem_targets_sorted:
-        _emit_writeback(int(idx), _smem_expr(int(idx)))
-
     ap("        }")
     ap("    }")
     ap("}")
@@ -4173,14 +4074,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    constexpr int kSmemAccCount = {len(smem_targets_sorted)};")
-    ap("    size_t smem_bytes = (size_t)kSmemAccCount * 32u * sizeof(scalar_t);")
-    ap("#if !defined(USE_ROCM) && !defined(__HIP_PLATFORM_AMD__)")
-    ap("    if (smem_bytes > 49152) {")
-    ap(f"        cudaFuncSetAttribute({kernel_name}<scalar_t, index_t>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);")
-    ap("    }")
-    ap("#endif")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, smem_bytes, stream>>>(")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     if grad_kind == "gw":
         ap("        w, x, y, grad_out, grad_w,")
     elif grad_kind == "gx":
@@ -4445,7 +4339,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 
 @dataclass(frozen=True)
 class BwdCodegenContext:
-    """Pre-parsed Uniform1D backward codegen inputs shared by fused/split paths."""
+    """Pre-parsed Uniform1D backward codegen inputs used by fused/split paths."""
     input_indices: Dict[int, Any]
     output_indices: Dict[int, Any]
     use_x_src: bool
@@ -4595,7 +4489,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
     need_grad_w: bool,
     out_path: str,
     kernel_name: str,
-    smem_acc_volatile: bool,
     return_schedule: bool,
     profile: bool,
     profile_interval: int,
@@ -4609,7 +4502,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
     # resident.  The legacy arguments are retained for caller compatibility.
     configs: List[Dict[str, Any]] = [{
         "name": "lars_bwd_split_all_inputs_accall",
-        "smem_acc_volatile": False,
     }]
     max_effective_need = 0
 
@@ -4619,7 +4511,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
 
     for cfg_in in configs:
         cfg = dict(cfg_in)
-        cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
         cand_name = str(cfg["name"])
         cfg["auto_fallback_when_full"] = False
         cfg["effective_live_need"] = int(max_effective_need)
@@ -4672,7 +4563,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
                     ky_dim=ky_dim,
                     v_dim=v_dim,
                     block_size=32,
-                    smem_acc_volatile=cfg_smem_acc_volatile,
                 )
             )
 
@@ -4726,7 +4616,6 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     need_grad_w: bool,
     out_path: str,
     kernel_name: str,
-    smem_acc_volatile: bool,
     return_schedule: bool,
     profile: bool,
     profile_interval: int,
@@ -4782,7 +4671,6 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         ky_dim=ky_dim,
         v_dim=v_dim,
         block_size=32,
-        smem_acc_volatile=False,
     )
 
     code = code + "\n" + emit_lars_bwd_launcher(
@@ -4835,7 +4723,6 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
     need_grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_lars_split.cu",
     kernel_name: str = "uniform1d_bwd_lars",
-    smem_acc_volatile: bool = True,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
     profile: bool = True,
@@ -4868,7 +4755,6 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         kernel_name=kernel_name,
         # Keep legacy parameters in the public signature, but force the new
         # policy: input labels unbounded, accumulators all register-resident.
-        smem_acc_volatile=False,
         path_semantics=path_semantics,
         return_schedule=return_schedule,
         profile=profile,
@@ -4899,7 +4785,6 @@ def generate_code_uniform1d_bwd_with_scheduler(
     need_grad_w: bool = True,
     out_path: str = "generated_uniform1d_bwd_lars.cu",
     kernel_name: str = "uniform1d_bwd_lars",
-    smem_acc_volatile: bool = True,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
     profile: bool = True,
@@ -4948,7 +4833,6 @@ def generate_code_uniform1d_bwd_with_scheduler(
         need_grad_w=need_grad_w,
         out_path=out_path,
         kernel_name=kernel_name,
-        smem_acc_volatile=False,
         return_schedule=return_schedule,
         profile=profile,
         profile_interval=profile_interval,
