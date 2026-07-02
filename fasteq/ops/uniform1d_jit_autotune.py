@@ -1438,7 +1438,6 @@ def _build_bwd_jit_candidates(
             need_grad_w=grad_w,
             reg_budget=reg_budgets,
             acc_reg_budget=[32, 64, None],
-            consider_cse=True,
         )
 
         """ return generate_code_uniform1d_bwd_baseline_unrolled(
@@ -1523,12 +1522,11 @@ def _call_fwd_module(
     y,
     src_idx,
     dst_idx,
-    b_list,
     out_seg_num,
     fused_scatter: bool,
 ):
     if fused_scatter:
-        return mod.run(w, x, y, src_idx, dst_idx, b_list, out_seg_num)
+        return mod.run(w, x, y, src_idx, dst_idx, out_seg_num)
     return mod.run(w, x, y, src_idx, out_seg_num)
 
 
@@ -1542,12 +1540,11 @@ def _call_bwd_module(
     grad_out,
     src_idx,
     dst_idx,
-    b_list,
     out_seg_num,
     fused_scatter: bool,
 ):
     if fused_scatter:
-        return mod.run(w, x, y, grad_out, src_idx, dst_idx, b_list, out_seg_num)
+        return mod.run(w, x, y, grad_out, src_idx, dst_idx, out_seg_num)
     return mod.run(w, x, y, grad_out, src_idx, out_seg_num)
 
 
@@ -1560,7 +1557,6 @@ def _select_best_fwd_module(
     y,
     src_idx,
     dst_idx,
-    b_list,
     out_seg_num,
     fused_scatter: bool,
 ) -> Tuple[str, object, float]:
@@ -1603,7 +1599,7 @@ def _select_best_fwd_module(
                 _call_fwd_module(
                     mod,
                     w=w, x=x, y=y,
-                    src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+                    src_idx=src_idx, dst_idx=dst_idx,
                     out_seg_num=out_seg_num, fused_scatter=fused_scatter,
                 )
             torch.cuda.synchronize()
@@ -1613,7 +1609,7 @@ def _select_best_fwd_module(
                 _call_fwd_module(
                     mod,
                     w=w, x=x, y=y,
-                    src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+                    src_idx=src_idx, dst_idx=dst_idx,
                     out_seg_num=out_seg_num, fused_scatter=fused_scatter,
                 )
             torch.cuda.synchronize()
@@ -1657,7 +1653,6 @@ def _select_best_bwd_module(
     grad_out,
     src_idx,
     dst_idx,
-    b_list,
     out_seg_num,
     fused_scatter: bool,
 ) -> Tuple[str, object, float]:
@@ -1700,7 +1695,7 @@ def _select_best_bwd_module(
                 _call_bwd_module(
                     mod,
                     w=w, x=x, y=y, grad_out=grad_out,
-                    src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+                    src_idx=src_idx, dst_idx=dst_idx,
                     out_seg_num=out_seg_num, fused_scatter=fused_scatter,
                 )
             torch.cuda.synchronize()
@@ -1710,7 +1705,7 @@ def _select_best_bwd_module(
                 _call_bwd_module(
                     mod,
                     w=w, x=x, y=y, grad_out=grad_out,
-                    src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+                    src_idx=src_idx, dst_idx=dst_idx,
                     out_seg_num=out_seg_num, fused_scatter=fused_scatter,
                 )
             torch.cuda.synchronize()
@@ -1748,7 +1743,6 @@ def _run_fwd(
     w,
     x,
     y,
-    b_list,
     i_list,
     j_list,
     k_list,
@@ -1796,17 +1790,15 @@ def _run_fwd(
         raise RuntimeError("Input_indices 1 and 2 all empty")
 
     if fused_scatter:
-        b_list = b_list.to(torch.int32)
         dst_idx = output_indices[0].to(torch.int32)
     else:
         dst_idx = None
-        b_list = None
 
     best_tag, best_mod, best_ms = _select_best_fwd_module(
         tune_key=tune_key,
         candidates=candidates,
         w=w, x=x, y=y,
-        src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+        src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
@@ -1814,7 +1806,7 @@ def _run_fwd(
     out = _call_fwd_module(
         best_mod,
         w=w, x=x, y=y,
-        src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+        src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
@@ -1828,7 +1820,6 @@ def _run_bwd(
     w,
     x,
     y,
-    b_list,
     i_list,
     j_list,
     k_list,
@@ -1880,17 +1871,15 @@ def _run_bwd(
     grad_out = grad_out.view(-1, out_seg_num, u_dim)
 
     if fused_scatter:
-        b_list = b_list.to(torch.int32)
         dst_idx = output_indices[0].to(torch.int32)
     else:
         dst_idx = None
-        b_list = None
 
     best_tag, best_mod, best_ms = _select_best_bwd_module(
         tune_key=tune_key,
         candidates=candidates,
         w=w, x=x, y=y, grad_out=grad_out,
-        src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+        src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
@@ -1898,7 +1887,7 @@ def _run_bwd(
     out =  _call_bwd_module(
         best_mod,
         w=w, x=x, y=y, grad_out=grad_out,
-        src_idx=src_idx, dst_idx=dst_idx, b_list=b_list,
+        src_idx=src_idx, dst_idx=dst_idx,
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
@@ -1912,7 +1901,7 @@ def _run_bwd(
 
 class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, x, y, input_indices, output_indices, meta, b_list):
+    def forward(ctx, w, x, y, input_indices, output_indices, meta):
 
         i_list = _as_int32_meta_tensor(meta["i_list"])
         j_list = _as_int32_meta_tensor(meta["j_list"])
@@ -1963,11 +1952,12 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             coeff_list=coeff_list,
             input_indices=input_indices,
             output_indices=output_indices,
-            b_list=b_list,
             out_seg_num=out_seg_num,
             u_dim=u_dim,
             mode=mode,
         )
+
+        out = out.view(-1, out_seg_num * u_dim)
 
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
@@ -1976,7 +1966,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         #print(f"uniform1d forward output:{out}")
 
         ctx.save_for_backward(w, x, y)
-        ctx.b_list = b_list
         ctx.i_list = i_list
         ctx.j_list = j_list
         ctx.k_list = k_list
@@ -2019,7 +2008,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 coeff_list=ctx.coeff_list,
                 input_indices=ctx.input_indices,
                 output_indices=ctx.output_indices,
-                b_list=ctx.b_list,
                 out_seg_num=ctx.out_seg_num,
                 u_dim=ctx.u_dim,
                 iw_dim=ctx.w_seg_num,
@@ -2046,7 +2034,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 coeff_list=ctx.coeff_list,
                 input_indices=ctx.input_indices,
                 output_indices=ctx.output_indices,
-                b_list=ctx.b_list,
                 out_seg_num=ctx.out_seg_num,
                 u_dim=ctx.u_dim,
                 iw_dim=ctx.w_seg_num,
@@ -2065,9 +2052,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         end_time = time.perf_counter() * 1000.0
         print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
 
-        return grad_w, grad_x, grad_y, None, None, None, None
+        return grad_w, grad_x, grad_y, None, None, None
 
-def fast_uniform1d_jit(w, x, y, input_indices, output_indices, meta, b_list):
+def fast_uniform1d_jit(w, x, y, input_indices, output_indices, meta):
     return FastUniform1dJITFunction.apply(
-        w, x, y, input_indices, output_indices, meta, b_list
+        w, x, y, input_indices, output_indices, meta
     )

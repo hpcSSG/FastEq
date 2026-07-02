@@ -1,14 +1,600 @@
 from __future__ import annotations
 
-from collections import defaultdict, OrderedDict, Counter
-from dataclasses import dataclass, asdict, field
-from typing import Any, Dict, List, Tuple, Optional, Union, Iterable, Set
+from collections import defaultdict, Counter
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Tuple, Optional, Union, Iterable, Set, Sequence
 from time import perf_counter
-import math, re
 from pathlib import Path
-import struct
-import numpy as np
 import torch
+
+
+
+
+# =============================================================================
+# STC LARS scheduler and CUDA code generation
+# Moved from stc_uniform1d_jit.py so the STC runtime wrapper only keeps
+# forward/backward dispatch and file-based JIT loading.
+# =============================================================================
+
+Label = Tuple[str, int]  # ('x0', i), ('x1', j), ('o', v)
+STC_PAD_VALUE = -1
+
+
+
+def _to_int_list(x: torch.Tensor) -> List[int]:
+    return [int(v) for v in x.detach().cpu().reshape(-1).tolist()]
+
+
+def _to_float_list(x: torch.Tensor) -> List[float]:
+    return [float(v) for v in x.detach().cpu().reshape(-1).tolist()]
+
+
+@dataclass
+class Inst:
+    op: str
+    args: Tuple[Any, ...]
+    comment: str = ""
+
+
+@dataclass
+class ScheduleResult:
+    instructions: List[Inst]
+    path_order: List[int]
+    max_live: int
+    spills: int
+    reloads: int
+    final_reg_map: Dict[Label, str]
+    profile: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class STCPath:
+    """One STC contraction path.
+
+    Padded STC metadata uses baseline-compatible row semantics:
+
+        len == 3: [x1_a,                 x0_d, out_v, pad, ...]
+        len == 4: [x1_a, x1_b,          x0_d, out_v, pad, ...]
+        len == 5: [x1_a, x1_b, x1_c,   x0_d, out_v, pad, ...]
+
+    Only the first ``path_lens[p]`` entries are semantic; right-side padding is
+    ignored.  The generated expression is therefore:
+
+        out[v] += c * prod_i x1[x1_indices[i]] * x0[x0_index]
+
+    Duplicate indices are intentionally preserved in ``product_labels`` so that
+    x1[i] * x1[i] is emitted as a square/cube instead of being collapsed.
+    """
+
+    pid: int
+    x1_indices: Tuple[int, ...]
+    x0_index: int
+    v: int
+    c: float
+
+    @property
+    def product_labels(self) -> Tuple[Label, ...]:
+        labels: List[Label] = [("x1", int(i)) for i in self.x1_indices]
+        labels.append(("x0", int(self.x0_index)))
+        return tuple(labels)
+
+    @property
+    def labels(self) -> Tuple[Label, ...]:
+        # Remove duplicates only for liveness/register allocation.  The product
+        # expression still uses product_labels, so x1[i] * x1[i] remains squared.
+        seen: Set[Label] = set()
+        out: List[Label] = []
+        for lab in self.product_labels:
+            if lab not in seen:
+                seen.add(lab)
+                out.append(lab)
+        return tuple(out)
+
+
+# STC now reuses LARSUniform1DScheduler(path_kind="stc").
+
+def _lars_reg_id(reg: str) -> int:
+    if not isinstance(reg, str) or not reg.startswith("r"):
+        raise ValueError(f"Bad register name: {reg!r}")
+    return int(reg[1:])
+
+
+def _max_reg_count_any(schedule_result: ScheduleResult) -> int:
+    max_id = -1
+
+    def scan(arg: Any) -> None:
+        nonlocal max_id
+        if isinstance(arg, str) and arg.startswith("r"):
+            max_id = max(max_id, _lars_reg_id(arg))
+        elif isinstance(arg, (tuple, list)):
+            for a in arg:
+                scan(a)
+
+    for inst in schedule_result.instructions:
+        for arg in inst.args:
+            scan(arg)
+    return max_id + 1
+
+
+def _parse_label_ref(ref: str) -> Label:
+    if not isinstance(ref, str) or "[" not in ref or not ref.endswith("]"):
+        raise ValueError(f"Bad label ref: {ref!r}")
+    kind, rest = ref.split("[", 1)
+    idx = int(rest[:-1])
+    if kind == "out":
+        kind = "o"
+    if kind not in ("x0", "x1", "o"):
+        raise ValueError(f"Bad STC label kind: {kind!r}")
+    return kind, idx
+
+
+def _fmt_float(x: float) -> str:
+    return repr(float(x))
+
+
+def _sanitize_cuda_comment(s: str) -> str:
+    return str(s).replace("\n", " ").replace("\r", " ").replace("*/", "* /")
+
+
+def _product_expr(regs: Sequence[str], coeff: float) -> str:
+    if not regs:
+        return f"scalar_t({_fmt_float(coeff)})"
+    expr = str(regs[0])
+    for r in regs[1:]:
+        expr = f"({expr} * {r})"
+    return f"scalar_t({_fmt_float(coeff)}) * {expr}"
+
+
+def _index_expr(kind: str, idx: int, *, u_dim: Optional[int], x0_dim: Optional[int], x1_dim: Optional[int], v_dim: Optional[int]) -> str:
+    if kind == "x0":
+        if x0_dim is not None and idx >= x0_dim:
+            raise ValueError(f"x0 index {idx} out of x0_dim={x0_dim}")
+        if u_dim is not None:
+            return f"x0_base + (index_t){int(idx) * int(u_dim)} + (index_t)u"
+        return f"x0_base + (index_t){idx} * (index_t)U + (index_t)u"
+    if kind == "x1":
+        if x1_dim is not None and idx >= x1_dim:
+            raise ValueError(f"x1 index {idx} out of x1_dim={x1_dim}")
+        if u_dim is not None:
+            return f"x1_base + (index_t){int(idx) * int(u_dim)} + (index_t)u"
+        return f"x1_base + (index_t){idx} * (index_t)U + (index_t)u"
+    if kind == "o":
+        if v_dim is not None and idx >= v_dim:
+            raise ValueError(f"out index {idx} out of v_dim={v_dim}")
+        if u_dim is not None:
+            return f"out_base + (index_t){int(idx) * int(u_dim)} + (index_t)u"
+        return f"out_base + (index_t){idx} * (index_t)U + (index_t)u"
+    raise ValueError(f"Bad kind: {kind}")
+
+
+def emit_stc_fwd_kernel_from_lars_schedule(
+    schedule_result: ScheduleResult,
+    *,
+    kernel_name: str,
+    u_dim: Optional[int] = None,
+    x0_dim: Optional[int] = None,
+    x1_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    block_size: int = 32,
+) -> str:
+    if block_size != 32:
+        raise ValueError("this emitter assumes block_size=32")
+
+    reg_count = _max_reg_count_any(schedule_result)
+    resident_out_indices = sorted({int(inst.args[0]) for inst in schedule_result.instructions if inst.op == "mul_stc_resident"})
+    direct_out_indices = sorted({int(inst.args[0]) for inst in schedule_result.instructions if inst.op == "mul_stc_direct"})
+
+    lines: List[str] = []
+
+    def ap(line: str = "") -> None:
+        lines.append(line)
+
+    def emit_out_write(idx: int, value_expr: str) -> None:
+        expr = _index_expr("o", int(idx), u_dim=u_dim, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+        ap(f"            out[{expr}] += {value_expr};")
+
+    ap("#include <stdint.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap("")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("  #include <hip/hip_runtime.h>")
+    ap("  #include <ATen/hip/HIPContext.h>")
+    ap("  #include <c10/hip/HIPGuard.h>")
+    ap("  using gpuStream_t = hipStream_t;")
+    ap("  #define getCurrentGPUStream at::hip::getCurrentHIPStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()")
+    ap("#else")
+    ap("  #include <cuda.h>")
+    ap("  #include <cuda_runtime.h>")
+    ap("  #include <ATen/cuda/CUDAContext.h>")
+    ap("  using gpuStream_t = cudaStream_t;")
+    ap("  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()")
+    ap("#endif")
+    ap("")
+    ap("using GPU_Guard = c10::DeviceGuard;")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ x1,")
+    ap("    const scalar_t* __restrict__ x0,")
+    ap("    scalar_t* __restrict__ out,")
+    ap("    int B, int X1, int X0, int V, int U)")
+    ap("{")
+    ap("    const int b = (int)blockIdx.x;")
+    ap("    if (b >= B) return;")
+    ap("    const int tid = (int)threadIdx.x;")
+    ap("    const int lane = tid & 31;")
+    ap("    if (tid >= 32) return;")
+    ap("    const index_t x1_base = (index_t)b * (index_t)X1 * (index_t)U;")
+    ap("    const index_t x0_base = (index_t)b * (index_t)X0 * (index_t)U;")
+    ap("    const index_t out_base = (index_t)b * (index_t)V * (index_t)U;")
+    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("        const int u = u_base + lane;")
+    ap("        if (u < U) {")
+    for rid in range(reg_count):
+        ap(f"            scalar_t r{rid};")
+    if reg_count:
+        ap("")
+    for out_idx in resident_out_indices:
+        ap(f"            scalar_t out_acc_v_{out_idx} = scalar_t(0);")
+    if resident_out_indices:
+        ap("")
+    if direct_out_indices:
+        ap(f"            // direct single-use output writeback enabled for {len(direct_out_indices)} out accumulator(s)")
+        ap("")
+
+    for inst_id, inst in enumerate(schedule_result.instructions):
+        comment = _sanitize_cuda_comment(inst.comment)
+        prefix = f"            // inst {inst_id}: {inst.op}"
+        if comment:
+            prefix += f" | {comment}"
+        ap(prefix)
+        if inst.op == "load":
+            reg, ref = inst.args
+            kind, idx = _parse_label_ref(ref)
+            if kind == "o":
+                raise ValueError("load must not target output labels")
+            expr = _index_expr(kind, idx, u_dim=u_dim, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+            base = "x0" if kind == "x0" else "x1"
+            ap(f"            {reg} = {base}[{expr}];")
+        elif inst.op == "mul_stc_resident":
+            out_idx, regs, coeff = inst.args
+            ap(f"            out_acc_v_{int(out_idx)} += {_product_expr(tuple(regs), float(coeff))};")
+        elif inst.op == "mul_stc_direct":
+            out_idx, regs, coeff = inst.args
+            emit_out_write(int(out_idx), _product_expr(tuple(regs), float(coeff)))
+        elif inst.op == "release":
+            pass
+        else:
+            raise ValueError(f"Unsupported STC instruction op: {inst.op}")
+
+    if resident_out_indices:
+        ap("")
+        ap("            // resident output accumulator writeback")
+    for out_idx in resident_out_indices:
+        emit_out_write(int(out_idx), f"out_acc_v_{out_idx}")
+
+    ap("        }")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap("static inline bool mul_fits_int32(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("static inline bool mul3_fits_int32(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32(a, b)) return false;")
+    ap("    return mul_fits_int32(a * b, c);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t, typename index_t>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* x1, const scalar_t* x0, scalar_t* out,")
+    ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
+    ap("{")
+    ap(f"    dim3 block({block_size});")
+    ap("    dim3 grid(B);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(x1, x0, out, B, X1, X0, V, U);")
+    ap("}")
+    ap("")
+
+    ap("template <typename scalar_t>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* x1, const scalar_t* x0, scalar_t* out,")
+    ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
+    ap("{")
+    ap("    bool use_i32 = mul3_fits_int32((int64_t)B, (int64_t)X1, (int64_t)U) &&")
+    ap("                   mul3_fits_int32((int64_t)B, (int64_t)X0, (int64_t)U) &&")
+    ap("                   mul3_fits_int32((int64_t)B, (int64_t)V,  (int64_t)U);")
+    ap("    if (use_i32) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(x1, x0, out, B, X1, X0, V, U, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(x1, x0, out, B, X1, X0, V, U, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+
+    ap(f"torch::Tensor launcher_{kernel_name}(torch::Tensor x1, torch::Tensor x0, int64_t V64) {{")
+    ap("    TORCH_CHECK(x1.is_cuda() && x0.is_cuda(), \"x1/x0 must be CUDA/HIP\");")
+    ap("    TORCH_CHECK(x1.is_contiguous() && x0.is_contiguous(), \"x1/x0 must be contiguous\");")
+    ap("    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3, \"x1/x0 must be [B,S,U]\");")
+    ap("    TORCH_CHECK(x1.scalar_type() == x0.scalar_type(), \"x1/x0 dtype mismatch\");")
+    ap("    int B = (int)x1.size(0);")
+    ap("    int X1 = (int)x1.size(1);")
+    ap("    int U = (int)x1.size(2);")
+    ap("    int X0 = (int)x0.size(1);")
+    ap("    int V = (int)V64;")
+    ap("    TORCH_CHECK((int)x0.size(0) == B, \"x0 batch mismatch\");")
+    ap("    TORCH_CHECK((int)x0.size(2) == U, \"x0 U mismatch\");")
+    ap("    TORCH_CHECK(V > 0, \"V must be > 0\");")
+    ap("    TORCH_CHECK((U % 32) == 0, \"U must be a multiple of 32\");")
+    ap("    auto out = torch::zeros({B, V, U}, x1.options());")
+    ap("    GPU_Guard device_guard(x1.device());")
+    ap("    gpuStream_t stream = getCurrentGPUStream(x1.device().index());")
+    ap(f"    AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), \"{kernel_name}\", [&] {{")
+    ap(f"        launch_{kernel_name}<scalar_t>((const scalar_t*)x1.data_ptr<scalar_t>(),")
+    ap("            (const scalar_t*)x0.data_ptr<scalar_t>(),")
+    ap("            (scalar_t*)out.data_ptr<scalar_t>(), B, X1, X0, V, U, stream);")
+    ap("    });")
+    ap("    GPU_KERNEL_LAUNCH_CHECK();")
+    ap("    return out;")
+    ap("}")
+    ap("")
+    ap("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
+    ap(f"    m.def(\"run\", &launcher_{kernel_name}, \"{kernel_name} STC forward jit impl\");")
+    ap("}")
+
+    return "\n".join(lines)
+
+
+def _normalize_stc_padded_paths(
+    idx_lists: torch.Tensor | Sequence[torch.Tensor],
+    coeff_list: Optional[torch.Tensor] = None,
+    path_lens: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Return padded STC paths as a CPU int64 tensor with shape [max_len, P].
+
+    Accepted inputs:
+      * ``idx_lists_tensor`` style: [max_len, P]
+      * ``paths_tensor`` style:    [P, max_len]
+      * Python sequence of max_len tensors, each [P]
+
+    Without ``path_lens``, the path dimension is inferred from
+    ``coeff_list.numel()``.  This allows dropping ``path_lens_tensor`` from the
+    public API as long as padding uses a sentinel value such as -1.
+    """
+    if path_lens is not None:
+        P = int(path_lens.detach().cpu().reshape(-1).numel())
+    elif coeff_list is not None:
+        P = int(coeff_list.detach().cpu().reshape(-1).numel())
+    else:
+        raise ValueError("Either coeff_list or path_lens is required to infer the path dimension")
+
+    if isinstance(idx_lists, torch.Tensor):
+        idx = idx_lists.detach().cpu().to(torch.int64)
+    else:
+        idx = torch.stack([t.detach().cpu().to(torch.int64).reshape(-1) for t in idx_lists], dim=0)
+
+    if idx.dim() != 2:
+        raise ValueError(f"STC padded paths must be 2D, got shape={tuple(idx.shape)}")
+
+    # Already [max_len, P], as in stc_meta['idx_lists_tensor'].
+    if idx.shape[1] == P and idx.shape[0] != P:
+        return idx.contiguous()
+
+    # Row-major [P, max_len], as in stc_meta['paths'].
+    if idx.shape[0] == P and idx.shape[1] != P:
+        return idx.t().contiguous()
+
+    # Ambiguous square case. Prefer the STC convention max_len <= 5 when possible.
+    if idx.shape[0] == P and idx.shape[1] == P:
+        if idx.shape[0] <= 8:
+            raise ValueError(
+                f"Ambiguous square STC padded path shape={tuple(idx.shape)}. "
+                "Pass a non-square [P,max_len]/[max_len,P] tensor or keep path_lens."
+            )
+        return idx.t().contiguous()
+
+    raise ValueError(
+        f"Cannot infer STC path layout from shape={tuple(idx.shape)} and "
+        f"P={P}; expected [max_len, P] or [P, max_len]"
+    )
+
+
+def infer_stc_path_lens_from_padded(
+    idx_lists: torch.Tensor | Sequence[torch.Tensor],
+    coeff_list: torch.Tensor,
+    *,
+    pad_value: int = STC_PAD_VALUE,
+) -> torch.Tensor:
+    """Infer [P] int64 path lengths from sentinel-padded STC paths.
+
+    Padding must be a suffix and must use ``pad_value``.  Valid indices are
+    expected to be non-negative, so -1 is the recommended sentinel.
+    """
+    idx = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list)
+    valid = idx.ne(int(pad_value))
+    lens = valid.to(torch.int64).sum(dim=0)
+    max_len, P = idx.shape
+
+    for p in range(P):
+        L = int(lens[p].item())
+        if L < 3 or L > max_len:
+            raise ValueError(
+                f"Bad inferred STC path length {L} for path {p}; "
+                f"expected 3..{max_len}. Did you use pad_value={pad_value}?"
+            )
+        # Enforce suffix padding: valid entries must be exactly [:L].
+        if not bool(valid[:L, p].all().item()) or bool(valid[L:, p].any().item()):
+            vals = [int(v) for v in idx[:, p].tolist()]
+            raise ValueError(
+                f"Non-suffix padding in STC path {p}: {vals}. "
+                f"Use valid entries first, then pad with {pad_value}."
+            )
+    return lens.contiguous()
+
+
+def _infer_stc_path_lens_tensor_from_padded(
+    padded_paths: torch.Tensor,
+    coeff_list: torch.Tensor,
+    *,
+    pad_value: int = STC_PAD_VALUE,
+) -> torch.Tensor:
+    """Infer CUDA/CPU [P] int32 path lengths from sentinel-padded paths.
+
+    This is used only to call the existing baseline backward kernel, whose API
+    still expects path_lens_tensor.
+    """
+    if not isinstance(padded_paths, torch.Tensor) or padded_paths.dim() != 2:
+        raise ValueError(f"padded_paths must be a 2D tensor, got {type(padded_paths)}")
+    P = int(coeff_list.detach().reshape(-1).numel())
+
+    if int(padded_paths.size(0)) == P and int(padded_paths.size(1)) != P:
+        lens = padded_paths.ne(int(pad_value)).to(torch.int32).sum(dim=1)
+    elif int(padded_paths.size(1)) == P and int(padded_paths.size(0)) != P:
+        lens = padded_paths.ne(int(pad_value)).to(torch.int32).sum(dim=0)
+    elif int(padded_paths.size(0)) == P and int(padded_paths.size(1)) == P:
+        raise ValueError(
+            f"Ambiguous square STC padded path shape={tuple(padded_paths.shape)}; "
+            "cannot infer path dimension without path_lens_tensor."
+        )
+    else:
+        raise ValueError(
+            f"Cannot infer STC path layout from shape={tuple(padded_paths.shape)} and P={P}"
+        )
+
+    return lens.to(device=padded_paths.device, dtype=torch.int32).contiguous()
+
+
+def make_stc_paths_from_padded_lists(
+    idx_lists: torch.Tensor | Sequence[torch.Tensor],
+    coeff_list: torch.Tensor,
+    *,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+) -> List[STCPath]:
+    """Convert padded STC metadata into scheduler-native paths.
+
+    If ``path_lens`` is omitted, lengths are inferred from sentinel padding.
+    Recommended padded format is:
+
+        len == 3: [x1_a,                 x0_d, out_v, -1, -1]
+        len == 4: [x1_a, x1_b,          x0_d, out_v, -1]
+        len == 5: [x1_a, x1_b, x1_c,   x0_d, out_v]
+
+    Baseline-compatible semantics are:
+
+        x1_indices = idx[0 : L-2, p]
+        x0_index   = idx[L-2, p]
+        v          = idx[L-1, p]
+    """
+    idx = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list, path_lens=path_lens)
+    if path_lens is None:
+        lens = infer_stc_path_lens_from_padded(idx, coeff_list, pad_value=pad_value)
+    else:
+        lens = path_lens.detach().cpu().to(torch.int64).reshape(-1).contiguous()
+
+    coeff = coeff_list.detach().cpu().reshape(-1)
+    max_len, P = idx.shape
+
+    if lens.numel() != P:
+        raise ValueError(f"path_lens numel {lens.numel()} does not match P={P}")
+    if coeff.numel() != P:
+        raise ValueError(f"coeff_list numel {coeff.numel()} does not match P={P}")
+
+    paths: List[STCPath] = []
+    for p in range(P):
+        L = int(lens[p].item())
+        if L < 3 or L > max_len:
+            raise ValueError(f"Bad STC path length {L} for path {p}; expected 3..{max_len}")
+
+        vals = [int(idx[t, p].item()) for t in range(L)]
+        x1_indices = tuple(vals[: L - 2])
+        x0_index = vals[L - 2]
+        v = vals[L - 1]
+
+        paths.append(
+            STCPath(
+                pid=p,
+                x1_indices=x1_indices,
+                x0_index=x0_index,
+                v=v,
+                c=float(coeff[p].item()),
+            )
+        )
+    return paths
+
+
+def generate_code_stc_fwd_with_scheduler(
+    idx_lists: torch.Tensor | Sequence[torch.Tensor],
+    coeff_list: torch.Tensor,
+    *,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+    num_out_segments: int,
+    u_dim: int,
+    out_path: str = "generated_stc_fwd_lars.cu",
+    kernel_name: str = "stc_lars_fwd",
+    x0_dim: Optional[int] = None,
+    x1_dim: Optional[int] = None,
+    return_schedule: bool = False,
+    profile: bool = False,
+    profile_interval: int = 1000,
+    profile_seconds: float = 2.0,
+    profile_print: bool = False,
+    enable_secondary_affinity: bool = False,
+    topk_candidates: Optional[int] = 128,
+) -> Any:
+    paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
+    scheduler = LARSUniform1DScheduler(
+        paths,
+        reg_budget=0,
+        path_kind="stc",
+        enable_secondary_affinity=enable_secondary_affinity,
+        topk_candidates=topk_candidates,
+        profile=profile,
+        profile_name="stc_lars_all_inputs",
+        profile_interval=profile_interval,
+        profile_seconds=profile_seconds,
+        profile_print=profile_print,
+    )
+    schedule_result = scheduler.schedule()
+
+    idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list, path_lens=path_lens)
+    if path_lens is None:
+        inferred_lens = infer_stc_path_lens_from_padded(idx_norm, coeff_list, pad_value=pad_value)
+    else:
+        inferred_lens = path_lens.detach().cpu().to(torch.int64).reshape(-1)
+    base_kernel_name = f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_maxlen{int(inferred_lens.max().item())}"
+    code = emit_stc_fwd_kernel_from_lars_schedule(
+        schedule_result,
+        kernel_name=base_kernel_name,
+        u_dim=int(u_dim),
+        x0_dim=x0_dim,
+        x1_dim=x1_dim,
+        v_dim=int(num_out_segments),
+        block_size=32,
+    )
+    if out_path:
+        Path(out_path).write_text(code, encoding="utf-8")
+    if return_schedule:
+        return {
+            "name": "stc_lars_all_inputs",
+            "code": code,
+            "kernel_name": base_kernel_name,
+            "schedule": schedule_result,
+            "num_paths": len(paths),
+            "max_live": schedule_result.max_live,
+        }
+    return code
 
 
 # =============================================================================
@@ -36,8 +622,15 @@ class U1DPath:
     @property
     def labels(self) -> Tuple[Label, Label, Label]:
         # LARS schedules only input operands.  Output accumulators are emitted
-        # as full-resident local variables and are not spill/reload candidates.
+        # as full-resident local variables and are not reload-managed candidates.
         return (("x", self.i), ("y", self.j), ("w", self.k))
+
+    @property
+    def product_labels(self) -> Tuple[Label, Label, Label]:
+        # Uniform1D has no duplicate-input multiplicity beyond x/y/w.  This
+        # property lets the common scheduler handle both fixed-arity Uniform1D
+        # and variable-arity STC paths through the same emission path.
+        return self.labels
 
 
 @dataclass
@@ -64,26 +657,19 @@ class ScheduleResult:
 
 class LARSUniform1DScheduler:
     """
-    Low-register-budget stable LARS scheduler for Uniform1D paths:
+    All-input-resident LARS-style scheduler for Uniform1D paths:
 
         out[v] += x[i] * y[j] * w[k] * c
 
-    Compared with the simple LARSUniform1DScheduler, this version fixes the
-    low-reg thrashing problem:
-
-      old behavior:
-          select label -> _alloc_reg() blindly spills one live label
-
-      optimized behavior:
-          jointly select (label, spill_victim), and when no progress is made,
-          fall back to path-directed scheduling. This avoids repeatedly loading
-          a label while spilling another label required by the same target path.
+    This scheduler no longer implements spill/victim selection.  It allocates
+    one virtual register for every distinct input label, chooses labels by the
+    LARS score, and fires paths as soon as their input labels are live.
 
     Notes:
-      - reg_budget is a virtual scheduling budget, not ptxas max register count.
-      - load_acc/store_acc are emitted as logical accumulator operations. The
-        CUDA emitter should implement load_acc as local acc = 0 and store_acc as
-        out += acc / atomicAdd(out, acc).
+      - reg_budget is kept only for API compatibility and is ignored.
+      - ScheduleResult.spills is kept for compatibility and is always zero.
+      - Output accumulators are handled by the emitter, not by the LARS label
+        allocator.
     """
 
     def __init__(
@@ -96,29 +682,48 @@ class LARSUniform1DScheduler:
         path_fallback_after: Optional[int] = None,
         prefer_path_fallback_when_full: bool = True,
         debug: bool = False,
+        path_kind: str = "u1d",
         profile: bool = False,
         profile_name: str = "",
         profile_interval: int = 1000,
         profile_seconds: float = 2.0,
         profile_print: bool = True,
     ):
-        self.paths: List[U1DPath] = [
-            U1DPath(pid=p, i=i, j=j, k=k, v=v, c=c)
-            for p, (i, j, k, v, c) in enumerate(paths)
-        ]
+        self.path_kind = str(path_kind)
+        if self.path_kind == "u1d":
+            self.paths: List[Any] = [
+                U1DPath(pid=p, i=i, j=j, k=k, v=v, c=c)
+                for p, (i, j, k, v, c) in enumerate(paths)
+            ]
+        elif self.path_kind == "stc":
+            # STC paths are already materialized as STCPath objects.  They expose
+            # labels for live-set management and product_labels for multiplicity-
+            # preserving emission, e.g. x1[i] * x1[i].
+            self.paths = list(paths)
+            for expected_pid, path in enumerate(self.paths):
+                if int(path.pid) != expected_pid:
+                    raise ValueError(
+                        f"STC paths must be dense pid-ordered; "
+                        f"got path.pid={path.pid} at position {expected_pid}"
+                    )
+        else:
+            raise ValueError(f"Unsupported LARSUniform1DScheduler path_kind={self.path_kind!r}")
 
-        self.reg_budget = int(reg_budget)
-        if self.reg_budget < 4:
-            raise ValueError("reg_budget must be at least 4.")
+        # reg_budget is kept only for API compatibility.
+        # Input labels are now unbounded: allocate one virtual register for every
+        # distinct x/y/w label that appears in the schedule, so normal inputs are
+        # never exceed the all-input-resident virtual register fileed because of a user-supplied budget.
+        del reg_budget
+        input_label_count = len({lab for path in self.paths for lab in path.labels})
+        self.reg_budget = max(4, int(input_label_count))
+
+        # path_fallback_after and prefer_path_fallback_when_full are legacy
+        # keyword arguments.  They are intentionally ignored now that spill and
+        # victim selection have been removed.
+        del path_fallback_after, prefer_path_fallback_when_full
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
-        self.prefer_path_fallback_when_full = bool(prefer_path_fallback_when_full)
-        self.path_fallback_after = (
-            int(path_fallback_after)
-            if path_fallback_after is not None
-            else max(8, 2 * self.reg_budget)
-        )
         self.debug = bool(debug)
 
         self.label_to_paths: Dict[Label, Set[int]] = defaultdict(set)
@@ -134,6 +739,12 @@ class LARSUniform1DScheduler:
             for lab in p.labels:
                 self.remaining_uses[lab] += 1
 
+        # Forward output accumulator use counts.  out[v] with exactly one path
+        # does not need a full-resident accumulator: emit one direct writeback
+        # immediately after its computation instead of keeping out_acc_v alive
+        # until the end of the kernel.
+        self.output_uses: Counter[int] = Counter(int(p.v) for p in self.paths)
+
         self.live: Set[Label] = set()
         self.dirty_outputs: Set[Label] = set()
         self.reg_of: Dict[Label, str] = {}
@@ -143,19 +754,14 @@ class LARSUniform1DScheduler:
         self.path_order: List[int] = []
         self.spills = 0
         self.reloads = 0
-        # max_live is kept for backward compatibility.  In the base scheduler
-        # it is the maximum number of live normal labels.  In the CSE scheduler
-        # it is the maximum total live virtual registers, i.e. labels + CSE
-        # pair temporaries.  The explicit fields below make the distinction
-        # visible to profiling and budget folding.
+        # max_live is kept for backward compatibility. It records the maximum
+        # number of live normal input labels in the logical schedule.
         self.max_live = 0
         self.max_live_labels = 0
         self.max_live_pairs = 0
         self.max_live_total = 0
 
         self._score_cache: Dict[Label, Tuple[int, int, int, int, int, int]] = {}
-        self._no_progress_iters = 0
-        self._last_done = 0
 
         # Optional profile / progress reporting.  Kept disabled by default so
         # existing code generation remains silent unless requested.
@@ -171,7 +777,6 @@ class LARSUniform1DScheduler:
         self._profile_select_rounds = 0
         self._profile_fire_rounds = 0
         self._profile_load_rounds = 0
-        self._profile_fallback_rounds = 0
         self._profile_records: List[Dict[str, Any]] = []
         self._profile_last_event = ""
         self._profile_last_reason = ""
@@ -202,16 +807,6 @@ class LARSUniform1DScheduler:
         except Exception:
             return 0
 
-    def _profile_pair_stats(self) -> Dict[str, int]:
-        return {
-            "pair_creates": int(getattr(self, "cse_pair_creates", 0)),
-            "pair_hits": int(getattr(self, "cse_pair_hits", 0)),
-            "pair_releases": int(getattr(self, "cse_pair_releases", 0)),
-            "pair_drops_for_label_release": int(getattr(self, "cse_pair_drops_for_label_release", 0)),
-            "pair_drops_for_reg_pressure": int(getattr(self, "cse_pair_drops_for_reg_pressure", 0)),
-            "live_pairs": int(len(getattr(self, "pair_reg_of", {}))),
-            "max_live_pairs": int(getattr(self, "max_live_pairs", 0)),
-        }
 
     def _profile_snapshot(
         self,
@@ -222,7 +817,6 @@ class LARSUniform1DScheduler:
         candidate_n: Optional[int] = None,
         select_ms: Optional[float] = None,
         lab: Optional[Label] = None,
-        victim: Optional[Label] = None,
     ) -> Dict[str, Any]:
         done = len(self.path_order)
         remain = len(self.unscheduled)
@@ -254,15 +848,12 @@ class LARSUniform1DScheduler:
             "select_rounds": int(self._profile_select_rounds),
             "fire_rounds": int(self._profile_fire_rounds),
             "load_rounds": int(self._profile_load_rounds),
-            "fallback_rounds": int(self._profile_fallback_rounds),
             "elapsed_s": float(elapsed),
             "rate_paths_per_s": float(rate),
             "eta_s": float(eta),
             "reason": str(reason),
             "label": None if lab is None else self._label_name(lab),
-            "victim": None if victim is None else self._label_name(victim),
         }
-        snap.update(self._profile_pair_stats())
         return snap
 
     def _profile_emit(
@@ -275,7 +866,6 @@ class LARSUniform1DScheduler:
         candidate_n: Optional[int] = None,
         select_ms: Optional[float] = None,
         lab: Optional[Label] = None,
-        victim: Optional[Label] = None,
     ) -> None:
         if not self.profile_enabled:
             return
@@ -299,7 +889,6 @@ class LARSUniform1DScheduler:
             candidate_n=candidate_n,
             select_ms=select_ms,
             lab=lab,
-            victim=victim,
         )
         self._profile_records.append(snap)
         self._profile_last_event = event
@@ -308,27 +897,21 @@ class LARSUniform1DScheduler:
         if self.profile_print:
             eta = self._fmt_profile_eta(snap["eta_s"])
             elapsed = self._fmt_profile_eta(snap["elapsed_s"])
-            cse_part = (
-                f" pairs=create/hit/live "
-                f"{snap['pair_creates']}/{snap['pair_hits']}/{snap['live_pairs']}"
-                if hasattr(self, "pair_reg_of") else ""
-            )
             print(
                 f"[LARS][profile] {snap['name']} {event:>8s} "
                 f"iter={snap['iter']} "
                 f"done={snap['done_paths']}/{snap['total_paths']} "
                 f"remain={snap['remaining_paths']} "
                 f"live={snap['live_regs_total']}/{snap['reg_budget']} "
-                f"max=label/pair/total "
-                f"{snap['max_live_labels']}/{snap['max_live_pairs']}/{snap['max_live_total']} "
+                f"max=label/total "
+                f"{snap['max_live_labels']}/{snap['max_live_total']} "
                 f"free={snap['free_regs']} "
                 f"fireable={snap['fireable_paths']} "
                 f"candidates={snap['candidate_labels']} "
-                f"label={snap['label']} victim={snap['victim']} "
+                f"label={snap['label']} "
                 f"select={snap['select_ms']:.2f}ms "
                 f"spills={snap['spills']} reloads={snap['reloads']} "
-                f"insts={snap['instructions']}"
-                f"{cse_part} "
+                f"insts={snap['instructions']} "
                 f"rate={snap['rate_paths_per_s']:.1f} path/s "
                 f"elapsed={elapsed} eta={eta} "
                 f"reason={snap['reason']}",
@@ -358,12 +941,10 @@ class LARSUniform1DScheduler:
             "select_rounds": int(self._profile_select_rounds),
             "fire_rounds": int(self._profile_fire_rounds),
             "load_rounds": int(self._profile_load_rounds),
-            "fallback_rounds": int(self._profile_fallback_rounds),
             "elapsed_s": float(elapsed),
             "rate_paths_per_s": float(done / elapsed if elapsed > 0 else 0.0),
             "records": list(self._profile_records),
         }
-        summary.update(self._profile_pair_stats())
         return summary
 
     # ------------------------------------------------------------------
@@ -443,32 +1024,16 @@ class LARSUniform1DScheduler:
     def _fireable_paths(self) -> List[int]:
         return [pid for pid in self.unscheduled if self.path_label_sets[pid] <= self.live]
 
-    def _fireable_count_after_load_with_victim(
-        self,
-        lab: Label,
-        victim: Optional[Label],
-    ) -> int:
-        if victim is None:
-            tmp_live = self.live | {lab}
-        else:
-            tmp_live = (self.live - {victim}) | {lab}
-
+    def _fireable_count_after_load(self, lab: Label) -> int:
+        tmp_live = self.live | {lab}
         count = 0
         for pid in self.unscheduled:
             if self.path_label_sets[pid] <= tmp_live:
                 count += 1
         return count
 
-    def _best_fireable_release_after_load_with_victim(
-        self,
-        lab: Label,
-        victim: Optional[Label],
-    ) -> int:
-        if victim is None:
-            tmp_live = self.live | {lab}
-        else:
-            tmp_live = (self.live - {victim}) | {lab}
-
+    def _best_fireable_release_after_load(self, lab: Label) -> int:
+        tmp_live = self.live | {lab}
         best = 0
         for pid in self.unscheduled:
             labels = self.path_label_sets[pid]
@@ -580,165 +1145,40 @@ class LARSUniform1DScheduler:
         return list(candidates)
 
     # ------------------------------------------------------------------
-    # Spill victim selection
+    # Label selection / no-spill load
     # ------------------------------------------------------------------
-    def _choose_spill_victim_avoid(self, avoid: Set[Label]) -> Label:
-        candidates = [lab for lab in self.live if lab not in avoid]
-        if not candidates:
-            candidates = list(self.live)
-
-        if not candidates:
-            raise RuntimeError("No live label to spill.")
-
-        def victim_key(lab: Label):
-            remain = self.remaining_uses[lab]
-            dirty_output_penalty = 1 if lab[0] == "o" and lab in self.dirty_outputs else 0
-            output_penalty = 1 if lab[0] == "o" else 0
-            return (
-                remain,
-                dirty_output_penalty,
-                output_penalty,
-                str(lab),
-            )
-
-        return min(candidates, key=victim_key)
-
-    def _select_next_label_and_victim_global(self) -> Tuple[Label, Optional[Label], str]:
+    def _select_next_label_global(self) -> Tuple[Label, str]:
         candidates = self._candidate_labels()
-        has_free_reg = bool(self.free_regs)
 
         best_lab: Optional[Label] = None
-        best_victim: Optional[Label] = None
         best_key = None
 
         for lab in candidates:
             lab_score = self._label_score(lab)
-
-            if has_free_reg:
-                fire_after = self._fireable_count_after_load_with_victim(lab, None)
-                release_after = self._best_fireable_release_after_load_with_victim(lab, None)
-                key = (
-                    fire_after,
-                    release_after,
-                    lab_score,
-                    str(lab),
-                )
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_lab = lab
-                    best_victim = None
-                continue
-
-            # Register file is full: explicitly evaluate spill victims.
-            for victim in list(self.live):
-                if victim == lab:
-                    continue
-
-                fire_after = self._fireable_count_after_load_with_victim(lab, victim)
-                if fire_after <= 0:
-                    # Loading this label while spilling this victim makes no
-                    # immediate progress, so skip to avoid thrashing.
-                    continue
-
-                release_after = self._best_fireable_release_after_load_with_victim(lab, victim)
-                victim_remaining = self.remaining_uses[victim]
-                victim_dirty = 1 if victim[0] == "o" and victim in self.dirty_outputs else 0
-                victim_is_output = 1 if victim[0] == "o" else 0
-
-                key = (
-                    fire_after,
-                    release_after,
-                    lab_score,
-                    -victim_remaining,
-                    -victim_dirty,
-                    -victim_is_output,
-                    str(lab),
-                    str(victim),
-                )
-
-                if best_key is None or key > best_key:
-                    best_key = key
-                    best_lab = lab
-                    best_victim = victim
-
-        if best_lab is not None:
-            return best_lab, best_victim, f"global key={best_key}"
-
-        # No (lab, victim) pair can immediately create a fireable path.
-        # Use path-directed fallback to avoid load/spill oscillation.
-        lab, victim, reason = self._select_label_and_victim_by_target_path()
-        return lab, victim, "global-no-fire -> " + reason
-
-    def _select_label_and_victim_by_target_path(self) -> Tuple[Label, Optional[Label], str]:
-        """
-        Low-reg fallback:
-          1. Pick an unscheduled path closest to fireable.
-          2. Load one missing label from that path.
-          3. If spilling is required, avoid spilling labels already live and
-             required by that same target path.
-        """
-        best_pid: Optional[int] = None
-        best_key = None
-
-        for pid in self.unscheduled:
-            labels = self.path_label_sets[pid]
-            live_hits = len(labels & self.live)
-            missing = len(labels - self.live)
-            p = self._path(pid)
-
-            out_lab = ("o", p.v)
-            out_dirty = 1 if out_lab in self.dirty_outputs else 0
-            release_now = sum(1 for l in labels if self.remaining_uses[l] == 1)
-
+            fire_after = self._fireable_count_after_load(lab)
+            release_after = self._best_fireable_release_after_load(lab)
             key = (
-                live_hits,
-                -missing,
-                out_dirty,
-                release_now,
-                -pid,
+                fire_after,
+                release_after,
+                lab_score,
+                str(lab),
             )
-
             if best_key is None or key > best_key:
                 best_key = key
-                best_pid = pid
+                best_lab = lab
 
-        if best_pid is None:
-            raise RuntimeError("No target path found.")
+        if best_lab is None:
+            raise RuntimeError("No candidate label but no path is fireable.")
+        return best_lab, f"global key={best_key}"
 
-        target_labels = self.path_label_sets[best_pid]
-        missing_labels = list(target_labels - self.live)
-        if not missing_labels:
-            raise RuntimeError("Target path is already fireable; schedule loop should have fired it first.")
-
-        lab = max(
-            missing_labels,
-            key=lambda l: (self._label_score(l), str(l)),
-        )
-
-        if self.free_regs:
-            return lab, None, f"path-fallback pid={best_pid}"
-
-        # Do not spill labels that are already part of the target path.
-        avoid = target_labels & self.live
-        victim = self._choose_spill_victim_avoid(avoid=avoid)
-        return lab, victim, f"path-fallback pid={best_pid} avoid={sorted(avoid)}"
-
-    def _load_label_with_victim(
-        self,
-        lab: Label,
-        victim: Optional[Label],
-        reason: str = "",
-    ) -> None:
+    def _load_label_no_spill(self, lab: Label, reason: str = "") -> None:
         if lab in self.live:
             return
-
         if not self.free_regs:
-            if victim is None:
-                victim = self._choose_spill_victim_avoid(avoid=set())
-            self.spills += 1
-            self._store_and_release(
-                victim,
-                reason=f"spill before loading {self._label_name(lab)}; {reason}",
+            raise RuntimeError(
+                "No free virtual register in no-spill scheduler. "
+                "This should not happen because reg_budget is derived from "
+                "the number of distinct input labels."
             )
 
         reg = self._alloc_reg_no_spill(lab)
@@ -752,27 +1192,67 @@ class LARSUniform1DScheduler:
             labels = self.path_label_sets[pid]
             p = self._path(pid)
             release_now = sum(1 for l in labels if self.remaining_uses[l] == 1)
-            out_dirty = 1 if ("o", p.v) in self.dirty_outputs else 0
             reuse_score = sum(self.remaining_uses[l] for l in labels)
+
+            if getattr(self, "path_kind", "u1d") == "stc":
+                # Prefer shorter products as a final tie-breaker; this keeps the
+                # emitted STC expression compact when all other reuse signals tie.
+                arity = len(getattr(p, "product_labels", p.labels))
+                return (release_now, reuse_score, -arity, -pid)
+
+            out_dirty = 1 if ("o", p.v) in self.dirty_outputs else 0
             return (release_now, out_dirty, reuse_score, -pid)
 
         return max(fireable, key=key)
 
     def _emit_path_compute(self, pid: int) -> None:
         p = self._path(pid)
-        lx, ly, lw = p.labels
 
-        rx = self.reg_of[lx]
-        ry = self.reg_of[ly]
-        rw = self.reg_of[lw]
+        if getattr(self, "path_kind", "u1d") == "stc":
+            product_labels = tuple(getattr(p, "product_labels", p.labels))
+            regs = tuple(self.reg_of[lab] for lab in product_labels)
+            if self.output_uses[int(p.v)] <= 1:
+                self.instructions.append(
+                    Inst(
+                        "mul_stc_direct",
+                        (int(p.v), regs, float(p.c)),
+                        f"path#{pid}: direct out[{p.v}] += c * product",
+                    )
+                )
+            else:
+                self.instructions.append(
+                    Inst(
+                        "mul_stc_resident",
+                        (int(p.v), regs, float(p.c)),
+                        f"path#{pid}: out[{p.v}] += c * product",
+                    )
+                )
+        else:
+            lx, ly, lw = p.labels
 
-        self.instructions.append(
-            Inst(
-                "fma_u1d_resident",
-                (p.v, rx, ry, rw, p.c),
-                f"path#{pid}: out[{p.v}] += x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}",
-            )
-        )
+            rx = self.reg_of[lx]
+            ry = self.reg_of[ly]
+            rw = self.reg_of[lw]
+
+            if self.output_uses[int(p.v)] <= 1:
+                self.instructions.append(
+                    Inst(
+                        "fma_u1d_direct",
+                        (p.v, rx, ry, rw, p.c),
+                        (
+                            f"path#{pid}: direct out[{p.v}] += "
+                            f"x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}"
+                        ),
+                    )
+                )
+            else:
+                self.instructions.append(
+                    Inst(
+                        "fma_u1d_resident",
+                        (p.v, rx, ry, rw, p.c),
+                        f"path#{pid}: out[{p.v}] += x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}",
+                    )
+                )
 
         self.path_order.append(pid)
         self.unscheduled.remove(pid)
@@ -792,16 +1272,6 @@ class LARSUniform1DScheduler:
 
         while self.unscheduled:
             self._profile_loop_iter += 1
-            done = len(self.path_order)
-            if done == self._last_done:
-                self._no_progress_iters += 1
-            else:
-                self._no_progress_iters = 0
-                self._last_done = done
-
-            # Deadlock/thrash guard: if no progress for too long, force
-            # path-directed selection.
-            force_path_fallback = self._no_progress_iters > self.path_fallback_after
 
             fireable = self._fireable_paths()
             fireable_n = len(fireable)
@@ -819,21 +1289,11 @@ class LARSUniform1DScheduler:
 
             select_t0 = perf_counter()
             candidate_n = self._profile_candidate_count_safe()
-            if force_path_fallback or (self.prefer_path_fallback_when_full and not self.free_regs):
-                lab, victim, reason = self._select_label_and_victim_by_target_path()
-                self._no_progress_iters = 0
-                self._profile_fallback_rounds += 1
-            else:
-                lab, victim, reason = self._select_next_label_and_victim_global()
-
+            lab, reason = self._select_next_label_global()
             select_ms = (perf_counter() - select_t0) * 1000.0
             self._profile_select_rounds += 1
 
-            self._load_label_with_victim(
-                lab,
-                victim,
-                reason=reason,
-            )
+            self._load_label_no_spill(lab, reason=reason)
             self._profile_load_rounds += 1
             self._profile_emit(
                 event="load",
@@ -842,17 +1302,7 @@ class LARSUniform1DScheduler:
                 candidate_n=candidate_n,
                 select_ms=select_ms,
                 lab=lab,
-                victim=victim,
             )
-
-            if self.debug and len(self.path_order) == done and self._no_progress_iters > self.path_fallback_after:
-                print(
-                    "[OptimizedLARS] no progress guard active: "
-                    f"done={done}, live={len(self.live)}/{self.reg_budget}, "
-                    f"remain={len(self.unscheduled)}, "
-                    f"spills={self.spills}, reloads={self.reloads}",
-                    flush=True,
-                )
 
         for lab in list(self.live):
             self._store_and_release(lab, reason="end of schedule")
@@ -864,7 +1314,7 @@ class LARSUniform1DScheduler:
             instructions=self.instructions,
             path_order=self.path_order,
             max_live=self.max_live,
-            spills=self.spills,
+            spills=0,
             reloads=self.reloads,
             final_reg_map=dict(self.reg_of),
             profile=profile_summary,
@@ -874,299 +1324,10 @@ class LARSUniform1DScheduler:
 PairKey = Tuple[Label, Label]  # (w-label, x-label)
 
 
-class CSELARSUniform1DScheduler(LARSUniform1DScheduler):
-    """
-    LARS scheduler with schedule-level common subexpression elimination (CSE)
-    for repeated pair products:
-
-        pair = w[k] * x[i]
-        out[v] += coeff * pair * y[j]
-
-    Compared with emitter-only CSE, this version makes pair reuse explicit in the
-    instruction stream. It emits extra logical instructions:
-
-        pair_cse      (pair_reg, w_reg, x_reg, pair_name)
-        fma_u1d_pair  (out_reg, pair_reg, y_reg, coeff)
-        release_pair  (pair_reg, pair_name)
-
-    Important behavior:
-      - Pair temporaries consume the same virtual register budget as normal
-        x/y/w/out labels.
-      - CSE is opportunistic only: a pair is cached only when the current
-        schedule has at least one free virtual register. It never forces a spill
-        and it has no cse_min/cse_max tuning knobs.
-      - New pair caches are created only when the pair has at least two
-        remaining uses; this is a fixed correctness/performance guard, not a
-        tunable search parameter.
-      - If a label used by a live pair is released/spilled, the pair is released
-        first. It can be recomputed later if useful.
-    """
-
-    def __init__(
-        self,
-        paths: Iterable[Tuple[int, int, int, int, float]],
-        reg_budget: int = 16,
-        *,
-        enable_cse: bool = True,
-        cse_release_pair_before_label_spill: bool = True,
-        **kwargs,
-    ):
-        super().__init__(paths=paths, reg_budget=reg_budget, **kwargs)
-
-        self.enable_cse = bool(enable_cse)
-        self.cse_release_pair_before_label_spill = bool(
-            cse_release_pair_before_label_spill
-        )
-
-        # Count initial and remaining uses of every (w, x) pair.  There are no
-        # tunable cse_min/cse_max knobs: every repeated pair is a potential CSE
-        # candidate, and _ensure_pair_cached() will only materialize it when a
-        # virtual register is actually free.
-        self.initial_pair_uses: Counter[PairKey] = Counter()
-        for p in self.paths:
-            self.initial_pair_uses[self._pair_key_for_path_obj(p)] += 1
-
-        self.remaining_pair_uses: Counter[PairKey] = Counter(self.initial_pair_uses)
-        self.cse_candidate_pairs: Set[PairKey] = {
-            key for key, cnt in self.initial_pair_uses.items()
-            if cnt >= 2
-        }
-
-        # Live pair temporaries.
-        self.pair_reg_of: Dict[PairKey, str] = {}
-        self.pair_key_of_reg: Dict[str, PairKey] = {}
-
-        # Debug counters.
-        self.cse_pair_creates = 0
-        self.cse_pair_hits = 0
-        self.cse_pair_releases = 0
-        self.cse_pair_drops_for_label_release = 0
-        self.cse_pair_drops_for_reg_pressure = 0
-
-    # ------------------------------------------------------------------
-    # Pair helpers
-    # ------------------------------------------------------------------
-    def _pair_key_for_path_obj(self, p) -> PairKey:
-        # U1DPath labels are now input-only: (x, y, w). We cache (w * x).
-        lx, _ly, lw = p.labels
-        return (lw, lx)
-
-    def _pair_name(self, key: PairKey) -> str:
-        lw, lx = key
-        return f"pair[{self._label_name(lw)}*{self._label_name(lx)}]"
-
-    def _total_live_regs(self) -> int:
-        return len(self.live) + len(self.pair_reg_of)
-
-    def _update_max_live_total(self) -> None:
-        self.max_live_labels = max(self.max_live_labels, len(self.live))
-        self.max_live_pairs = max(self.max_live_pairs, len(self.pair_reg_of))
-        self.max_live_total = max(self.max_live_total, self._total_live_regs())
-        # For CSE schedules, expose total virtual-register pressure through
-        # the legacy max_live field.
-        self.max_live = max(self.max_live, self._total_live_regs())
-
-    def _alloc_reg_no_spill(self, lab: Label) -> str:
-        reg = super()._alloc_reg_no_spill(lab)
-        self._update_max_live_total()
-        return reg
-
-    def _choose_pair_victim(self) -> Optional[PairKey]:
-        if not self.pair_reg_of:
-            return None
-
-        def key_fn(pair_key: PairKey):
-            # Prefer dropping pairs with fewer future uses. If equal, drop the
-            # one that was originally less reusable.
-            return (
-                self.remaining_pair_uses[pair_key],
-                self.initial_pair_uses[pair_key],
-                self._pair_name(pair_key),
-            )
-
-        return min(self.pair_reg_of.keys(), key=key_fn)
-
-    def _release_pair(self, pair_key: PairKey, reason: str = "") -> None:
-        reg = self.pair_reg_of.pop(pair_key, None)
-        if reg is None:
-            return
-
-        self.pair_key_of_reg.pop(reg, None)
-        self.instructions.append(
-            Inst("release_pair", (reg, self._pair_name(pair_key)), reason)
-        )
-        self.free_regs.insert(0, reg)
-        self.cse_pair_releases += 1
-        self._invalidate_score_cache()
-
-    def _release_pairs_touching_label(self, lab: Label, reason: str = "") -> None:
-        # Conservative rule: pair value is only kept while both operands remain
-        # live. If either operand is released/spilled, drop the pair; it can be
-        # recomputed later if useful.
-        to_release = [key for key in self.pair_reg_of if lab in key]
-        for key in to_release:
-            self.cse_pair_drops_for_label_release += 1
-            self._release_pair(
-                key,
-                reason=f"drop pair before releasing {self._label_name(lab)}; {reason}",
-            )
-
-    def _store_and_release(self, lab: Label, reason: str = "") -> None:
-        # Pair regs must be released before their operand label is released.
-        self._release_pairs_touching_label(lab, reason=reason)
-        super()._store_and_release(lab, reason=reason)
-        self._update_max_live_total()
-
-    def _load_label_with_victim(
-        self,
-        lab: Label,
-        victim: Optional[Label],
-        reason: str = "",
-    ) -> None:
-        if lab in self.live:
-            return
-
-        # A live pair is cheaper to drop than spilling a normal label/output.
-        # This prevents CSE temporaries from causing low-reg thrashing.
-        if (
-            not self.free_regs
-            and self.cse_release_pair_before_label_spill
-            and self.pair_reg_of
-        ):
-            pair_victim = self._choose_pair_victim()
-            if pair_victim is not None:
-                self.cse_pair_drops_for_reg_pressure += 1
-                self._release_pair(
-                    pair_victim,
-                    reason=f"drop pair under reg pressure before loading {self._label_name(lab)}",
-                )
-
-        super()._load_label_with_victim(lab, victim, reason=reason)
-        self._update_max_live_total()
-
-    def _should_cache_pair(self, pair_key: PairKey) -> bool:
-        if not self.enable_cse:
-            return False
-
-        # Only repeated pairs are worth considering. This is fixed policy, not a
-        # user/config search knob.
-        if pair_key not in self.cse_candidate_pairs:
-            return False
-
-        # Already-live pairs do not consume another register.
-        if pair_key in self.pair_reg_of:
-            return True
-
-        # New CSE temporaries are allowed only when the current schedule has
-        # spare virtual registers. Larger reg_budget values therefore help only
-        # when they expose actual slack; CSE never spills normal operands.
-        if not self.free_regs:
-            return False
-
-        # Creating a pair for its last use would add pair_cse without reuse.
-        if self.remaining_pair_uses[pair_key] < 2:
-            return False
-
-        return True
-
-    def _ensure_pair_cached(self, pair_key: PairKey) -> Optional[str]:
-        if not self._should_cache_pair(pair_key):
-            return None
-
-        reg = self.pair_reg_of.get(pair_key)
-        if reg is not None:
-            self.cse_pair_hits += 1
-            return reg
-
-        # Both operands must be live at the point of creating the pair.
-        lw, lx = pair_key
-        if lw not in self.live or lx not in self.live:
-            return None
-
-        # Opportunistic CSE: do not force a spill just to create a pair cache.
-        # If no free register exists, emit normal fma_u1d for this use.
-        if not self.free_regs:
-            return None
-
-        pair_reg = self.free_regs.pop(0)
-        self.pair_reg_of[pair_key] = pair_reg
-        self.pair_key_of_reg[pair_reg] = pair_key
-        self._update_max_live_total()
-        self._invalidate_score_cache()
-
-        rw = self.reg_of[lw]
-        rx = self.reg_of[lx]
-        self.instructions.append(
-            Inst(
-                "pair_cse",
-                (pair_reg, rw, rx, self._pair_name(pair_key)),
-                f"create {self._pair_name(pair_key)} reuse_left={self.remaining_pair_uses[pair_key]}",
-            )
-        )
-        self.cse_pair_creates += 1
-        return pair_reg
-
-    # ------------------------------------------------------------------
-    # Path firing with pair CSE
-    # ------------------------------------------------------------------
-    def _emit_path_compute(self, pid: int) -> None:
-        p = self._path(pid)
-        lx, ly, lw = p.labels
-
-        rx = self.reg_of[lx]
-        ry = self.reg_of[ly]
-        rw = self.reg_of[lw]
-
-        pair_key = (lw, lx)
-        pair_reg = self._ensure_pair_cached(pair_key)
-
-        if pair_reg is not None:
-            self.instructions.append(
-                Inst(
-                    "fma_u1d_pair_resident",
-                    (p.v, pair_reg, ry, p.c),
-                    f"path#{pid}: out[{p.v}] += {self._pair_name(pair_key)} * y[{p.j}] * {p.c}",
-                )
-            )
-        else:
-            self.instructions.append(
-                Inst(
-                    "fma_u1d_resident",
-                    (p.v, rx, ry, rw, p.c),
-                    f"path#{pid}: out[{p.v}] += x[{p.i}] * y[{p.j}] * w[{p.k}] * {p.c}",
-                )
-            )
-
-        self.path_order.append(pid)
-        self.unscheduled.remove(pid)
-
-        # Consume one pair use after emitting the path.
-        self.remaining_pair_uses[pair_key] -= 1
-        if self.remaining_pair_uses[pair_key] <= 0 and pair_key in self.pair_reg_of:
-            self._release_pair(pair_key, reason=f"last pair use after path#{pid}")
-
-        for lab in p.labels:
-            self.remaining_uses[lab] -= 1
-
-        for lab in p.labels:
-            if self.remaining_uses[lab] == 0 and lab in self.live:
-                self._store_and_release(lab, reason=f"last use after path#{pid}")
 
 
 class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
-    """
-    Progress-printing wrapper for LARSUniform1DScheduler.
-
-    Compatible with the optimized scheduler whose methods are:
-      - _select_next_label_and_victim_global() -> (lab, victim, reason)
-      - _select_label_and_victim_by_target_path() -> (lab, victim, reason)
-      - _load_label_with_victim(lab, victim, reason)
-
-    Key fix:
-      Do not call the old _load_label(lab), because it may trigger blind spill.
-      Instead, select label and spill victim together, then call
-      _load_label_with_victim(lab, victim).
-    """
+    """Progress-printing wrapper for the no-spill all-input-resident scheduler."""
 
     def __init__(
         self,
@@ -1184,11 +1345,9 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
 
         self._total_paths = len(self.paths)
         self._loop_iter = 0
-
         self._select_rounds = 0
         self._fire_rounds = 0
         self._load_rounds = 0
-        self._fallback_rounds = 0
 
         self._t0 = perf_counter()
         self._last_print_t = self._t0
@@ -1197,17 +1356,10 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
         self._last_fireable_n = 0
         self._last_candidate_n = 0
         self._last_best_lab = None
-        self._last_victim = None
         self._last_best_score = None
         self._last_select_ms = 0.0
         self._last_select_mode = ""
         self._last_select_reason = ""
-
-        # Local progress guard for printing wrapper.
-        # The optimized base class may also have its own guard, but this wrapper
-        # does not call base schedule(), so we maintain one here.
-        self._progress_last_done = 0
-        self._progress_no_progress_iters = 0
 
     def _fmt_lab(self, lab) -> str:
         if lab is None:
@@ -1225,33 +1377,10 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
         return f"{seconds / 3600:.1f}h"
 
     def _candidate_count(self) -> int:
-        # Prefer optimized scheduler's candidate filter if it exists, because it
-        # may apply topk_candidates and other pruning rules.
-        if hasattr(self, "_candidate_labels"):
-            try:
-                return len(self._candidate_labels())
-            except Exception:
-                pass
-
-        return sum(
-            1
-            for pid in self.unscheduled
-            for lab in self._path(pid).labels
-            if lab not in self.live
-        )
-
-    def _update_progress_guard(self) -> None:
-        done = len(self.path_order)
-        if done == self._progress_last_done:
-            self._progress_no_progress_iters += 1
-        else:
-            self._progress_no_progress_iters = 0
-            self._progress_last_done = done
-
-    def _should_force_path_fallback(self) -> bool:
-        # If the base optimized scheduler exposes path_fallback_after, use it.
-        threshold = int(getattr(self, "path_fallback_after", max(8, 2 * int(self.reg_budget))))
-        return self._progress_no_progress_iters > threshold
+        try:
+            return len(self._candidate_labels())
+        except Exception:
+            return 0
 
     def _print_progress(self, *, force: bool = False, event: str = "") -> None:
         if not self.verbose:
@@ -1268,7 +1397,6 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
             and done % self.progress_interval == 0
         )
         enough_time = (now - self._last_print_t) >= self.progress_seconds
-
         if not (force or enough_paths or enough_time):
             return
 
@@ -1287,10 +1415,9 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
             f"candidates={self._last_candidate_n} "
             f"mode={self._last_select_mode} "
             f"best={self._fmt_lab(self._last_best_lab)} "
-            f"victim={self._fmt_lab(self._last_victim)} "
             f"score={self._last_best_score} "
             f"select={self._last_select_ms:.2f}ms "
-            f"spills={self.spills} reloads={self.reloads} "
+            f"reloads={self.reloads} "
             f"insts={len(self.instructions)} "
             f"rate={rate:.1f} path/s "
             f"elapsed={self._fmt_eta(elapsed)} eta={self._fmt_eta(eta)} "
@@ -1301,59 +1428,26 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
         self._last_print_t = now
         self._last_print_done = done
 
-    def _select_label_victim_with_progress(self):
-        """
-        Select (lab, victim) using the optimized scheduler API and collect
-        progress/debug stats.
-
-        The optimized base class returns:
-            lab, victim, reason
-        """
+    def _select_label_with_progress(self):
         t0 = perf_counter()
-
         self._last_candidate_n = self._candidate_count()
-        force_fallback = self._should_force_path_fallback()
-        prefer_fallback_when_full = bool(
-            getattr(self, "prefer_path_fallback_when_full", True)
-        )
-
-        if force_fallback:
-            lab, victim, reason = self._select_label_and_victim_by_target_path()
-            self._last_select_mode = "thrash_path"
-            self._fallback_rounds += 1
-            self._progress_no_progress_iters = 0
-
-        elif (not self.free_regs) and prefer_fallback_when_full:
-            lab, victim, reason = self._select_label_and_victim_by_target_path()
-            self._last_select_mode = "path"
-            self._fallback_rounds += 1
-
-        else:
-            # This is the method name used by the optimized scheduler you loaded.
-            lab, victim, reason = self._select_next_label_and_victim_global()
-            self._last_select_mode = "global"
-
+        lab, reason = self._select_next_label_global()
         self._select_rounds += 1
         self._last_select_ms = (perf_counter() - t0) * 1000.0
         self._last_best_lab = lab
-        self._last_victim = victim
+        self._last_select_mode = "global"
         self._last_select_reason = str(reason)
-
-        # For logging only. Do not use this for choosing after victim selection.
         try:
             self._last_best_score = self._label_score(lab)
         except Exception:
             self._last_best_score = None
-
-        return lab, victim, reason
+        return lab, reason
 
     def schedule(self) -> ScheduleResult:
         self._print_progress(force=True, event="start")
 
         while self.unscheduled:
             self._loop_iter += 1
-            self._update_progress_guard()
-
             fireable = self._fireable_paths()
             self._last_fireable_n = len(fireable)
 
@@ -1361,37 +1455,25 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
                 pid = self._choose_fireable_path(fireable)
                 self._emit_path_compute(pid)
                 self._fire_rounds += 1
-
                 self._last_select_mode = "fire"
                 self._last_best_lab = None
-                self._last_victim = None
                 self._last_best_score = None
                 self._last_select_reason = f"path#{pid}"
-
                 self._print_progress(event="fire")
                 continue
 
-            lab, victim, reason = self._select_label_victim_with_progress()
-
-            # Critical fix:
-            # Do not call old _load_label(lab). It may call _alloc_reg() and
-            # blind-spill an arbitrary victim. The optimized scheduler has already
-            # selected an explicit victim that preserves/creates progress.
+            lab, reason = self._select_label_with_progress()
             self._load_rounds += 1
-            self._load_label_with_victim(
+            self._load_label_no_spill(
                 lab,
-                victim,
                 reason=(
                     f"LARS-score={self._last_best_score}, "
                     f"mode={self._last_select_mode}, "
-                    f"victim={victim}, "
                     f"select_reason={reason}"
                 ),
             )
-
             self._print_progress(event="load")
 
-        # Flush live labels at the end.
         for lab in list(self.live):
             self._store_and_release(lab, reason="end of schedule")
 
@@ -1403,9 +1485,8 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
                 f"select_rounds={self._select_rounds} "
                 f"fire_rounds={self._fire_rounds} "
                 f"load_rounds={self._load_rounds} "
-                f"fallback_rounds={self._fallback_rounds} "
                 f"max_live={self.max_live} "
-                f"spills={self.spills} "
+                f"spills=0 "
                 f"reloads={self.reloads}",
                 flush=True,
             )
@@ -1414,7 +1495,7 @@ class ProgressLARSUniform1DScheduler(LARSUniform1DScheduler):
             instructions=self.instructions,
             path_order=self.path_order,
             max_live=self.max_live,
-            spills=self.spills,
+            spills=0,
             reloads=self.reloads,
             final_reg_map=dict(self.reg_of),
             profile=self._build_profile_summary(),
@@ -1453,27 +1534,12 @@ def _sanitize_cuda_comment(s: str) -> str:
     return str(s).replace("\n", " ").replace("\r", " ").replace("*/", "* /")
 
 
-def _max_lars_reg_count(schedule_result: ScheduleResult) -> int:
-    max_id = -1
-    for inst in schedule_result.instructions:
-        if inst.op in ("load", "load_acc"):
-            max_id = max(max_id, _lars_reg_id(inst.args[0]))
-        elif inst.op == "release":
-            max_id = max(max_id, _lars_reg_id(inst.args[0]))
-        elif inst.op == "store_acc":
-            max_id = max(max_id, _lars_reg_id(inst.args[1]))
-        elif inst.op == "fma_u1d":
-            ro, rx, ry, rw, _ = inst.args
-            max_id = max(max_id, _lars_reg_id(ro), _lars_reg_id(rx), _lars_reg_id(ry), _lars_reg_id(rw))
-        else:
-            raise ValueError(f"Unsupported LARS instruction op: {inst.op}")
-    return max_id + 1
 
 
 def _lars_has_output_reload_after_store(schedule_result: ScheduleResult) -> bool:
     """
-    Scatter mode cannot safely use out[] as an accumulator-spill buffer, because
-    another block may atomically update the same out element between a spill store
+    Scatter mode cannot safely use out[] as an accumulator temporary buffer, because
+    another block may atomically update the same out element between a temporary store
     and a later reload. Dense mode is safe because one block owns one output row.
     """
     stored = set()
@@ -1567,7 +1633,6 @@ def emit_launcher(
 
     if use_scatter:
         param_lines.append("    torch::Tensor dst_idx")
-        param_lines.append("    torch::Tensor b_list")
 
     param_lines.append("    int64_t V64")
 
@@ -1593,18 +1658,6 @@ def emit_launcher(
         out_alloc = "    auto out = torch::zeros({B, V, U}, w.options());"
 
     blist_logic = ""
-    if use_scatter:
-        blist_logic = r'''
-    const int32_t* b_list_ptr = nullptr;
-    if (b_list.defined() && b_list.numel() > 0) {
-        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA/HIP");
-        TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
-        TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
-        b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
-    }
-'''
-    else:
-        blist_logic = "    const int32_t* b_list_ptr = nullptr;\n"
 
     src_numel_check = ""
     if use_x_src or use_y_src:
@@ -1663,7 +1716,6 @@ torch::Tensor launcher_{bundle_name}(
     // Optional:
     //   src_idx: [?] int32, enabled when x/y source indirection is used
     //   dst_idx: [?] int32, enabled when scatter is used
-    //   b_list : [B] int32 optional, enabled when scatter is used
 
     TORCH_CHECK(w.is_cuda() && x_all.is_cuda() && y.is_cuda(),
                 "w/x_all/y must be CUDA/HIP");
@@ -1722,7 +1774,6 @@ torch::Tensor launcher_{bundle_name}(
                 (scalar_t*)out.data_ptr<scalar_t>(),
                 {launch_src_arg}
                 {launch_dst_arg}
-                b_list_ptr,
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
     }});
 
@@ -1737,21 +1788,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
 '''
 
 
-def _max_lars_reg_count_cse_aware(schedule_result) -> int:
+
+def _max_lars_reg_count_any(schedule_result: ScheduleResult) -> int:
     """
-    Return max virtual register id + 1 by scanning every string argument in
-    every LARS instruction. This is required after scheduler-level CSE because
-    pair_cse / fma_u1d_pair / release_pair may introduce additional rN names.
+    Return max virtual register id + 1 by scanning string register arguments
+    in the logical instruction stream.
     """
     max_id = -1
-    pat = re.compile(r"^r(\d+)$")
     for inst in schedule_result.instructions:
         for arg in inst.args:
-            if isinstance(arg, str):
-                m = pat.match(arg)
-                if m:
-                    max_id = max(max_id, int(m.group(1)))
+            if isinstance(arg, str) and arg.startswith("r"):
+                try:
+                    max_id = max(max_id, _lars_reg_id(arg))
+                except ValueError:
+                    pass
     return max_id + 1
+
 
 
 
@@ -1775,43 +1827,54 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     """
     Emit CUDA/HIP-compatible forward code directly from LARS instruction order.
 
-    This version is scheduler-CSE-aware. In addition to the original ops
-    load/load_acc/fma_u1d/store_acc/release, it supports:
-      - pair_cse:      pair_reg = w_reg * x_reg
-      - fma_u1d_pair:  out_reg += coeff * pair_reg * y_reg
-      - release_pair:  logical lifetime marker only
+    Supported logical ops:
+      - load / release
+      - fma_u1d_resident: accumulate into full-resident out_acc_v_<idx>
+      - fma_u1d_direct: direct writeback for single-use out[v]
+      - fma_u1d / load_acc / store_acc are kept only for old ScheduleResult
+        compatibility.
 
-    LARS-native label semantics:
-        x[i], y[j], w[k], out[v]
-
-    The generated kernel keeps the previous emitter's runtime ABI so it can reuse
-    emit_launcher(...):
-        w:   [WB, Iw, U]
-        x:   [S or B, Ix, U]
-        y:   [B, Ky, 1] for mode="u,u,,u" or [B, Ky, U] for mode="u,u,u,u"
-        out: [B or S, V, U]
+    LARS-native path semantics:
+        out[v] += x[i] * y[j] * w[k] * c
     """
     if block_size != 32:
         raise ValueError("this emitter currently assumes block_size=32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
-    # Important semantics fix:
-    # LARS output registers are treated as block-local delta accumulators.
-    # load_acc initializes a fresh local delta accumulator to zero; store_acc
-    # adds that delta to global out. Therefore output reload after store is safe
-    # even in scatter mode: we never use global out[] as spill memory.
 
     mode_scalar_y = mode == "u,u,,u"
-    reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+    reg_count = _max_lars_reg_count_any(schedule_result)
+
     resident_out_indices = sorted({
         int(inst.args[0])
         for inst in schedule_result.instructions
-        if inst.op in ("fma_u1d_resident", "fma_u1d_pair_resident")
+        if inst.op == "fma_u1d_resident"
     })
+    direct_out_indices = sorted({
+        int(inst.args[0])
+        for inst in schedule_result.instructions
+        if inst.op == "fma_u1d_direct"
+    })
+
     lines: List[str] = []
 
     def ap(line: str = ""):
         lines.append(line)
+
+    def emit_out_write(idx: int, value_expr: str) -> None:
+        expr = _lars_label_index_expr(
+            "o", int(idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            w_dim=w_dim,
+            v_dim=v_dim,
+        )
+        if use_scatter:
+            ap(f"            atomicAdd(&out[{expr}], {value_expr});")
+        else:
+            ap(f"            out[{expr}] += {value_expr};")
 
     ap("#include <stdint.h>")
     ap("#include <torch/extension.h>")
@@ -1845,7 +1908,6 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    scalar_t* __restrict__ out,")
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
     ap("    const int e_local = (int)blockIdx.x;")
@@ -1859,7 +1921,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
         ap("")
-    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     if use_x_src:
@@ -1895,6 +1957,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         ap(f"            scalar_t out_acc_v_{out_idx} = scalar_t(0);")
     if resident_out_indices:
         ap("")
+    if direct_out_indices:
+        ap(f"            // direct single-use output writeback enabled for {len(direct_out_indices)} out accumulator(s)")
+        ap("")
 
     for inst_id, inst in enumerate(schedule_result.instructions):
         comment = _sanitize_cuda_comment(inst.comment)
@@ -1907,7 +1972,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
             reg, ref = inst.args
             kind, idx = _parse_lars_label_ref(ref)
             if kind == "o":
-                raise ValueError("load must not be used for output labels; expected load_acc")
+                raise ValueError("load must not be used for output labels")
             expr = _lars_label_index_expr(
                 kind, idx,
                 mode_scalar_y=mode_scalar_y,
@@ -1921,35 +1986,27 @@ def emit_fused_fwd_kernel_from_lars_schedule(
 
         elif inst.op == "load_acc":
             reg, ref = inst.args
-            kind, idx = _parse_lars_label_ref(ref)
+            kind, _idx = _parse_lars_label_ref(ref)
             if kind != "o":
                 raise ValueError("load_acc expects an output label")
-            expr = _lars_label_index_expr(
-                kind, idx,
-                mode_scalar_y=mode_scalar_y,
-                u_dim=u_dim,
-                x_dim=x_dim,
-                y_dim=y_dim,
-                w_dim=w_dim,
-                v_dim=v_dim,
-            )
-            # Do NOT read global out here.
-            # The logical output accumulator is a local delta initialized to 0.
             ap(f"            {reg} = scalar_t(0);")
 
         elif inst.op == "fma_u1d_resident":
             out_idx, rx, ry, rw, coeff = inst.args
             c = _fmt_lars_float(float(coeff))
-            # Output accumulators are full-resident local variables.
             ap(f"            out_acc_v_{int(out_idx)} += scalar_t({c}) * ({rw} * {rx}) * {ry};")
 
+        elif inst.op == "fma_u1d_direct":
+            out_idx, rx, ry, rw, coeff = inst.args
+            c = _fmt_lars_float(float(coeff))
+            emit_out_write(
+                int(out_idx),
+                f"scalar_t({c}) * ({rw} * {rx}) * {ry}",
+            )
+
         elif inst.op == "fma_u1d":
-            # Backward-compatible support for older schedules that kept output
-            # accumulators inside the LARS register file.
             ro, rx, ry, rw, coeff = inst.args
             c = _fmt_lars_float(float(coeff))
-            # Match the baseline emitter's multiplication association as closely
-            # as possible: pair = w * x, then coeff * pair * y.
             ap(f"            {ro} += scalar_t({c}) * ({rw} * {rx}) * {ry};")
 
         elif inst.op == "store_acc":
@@ -1957,53 +2014,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
             kind, idx = _parse_lars_label_ref(ref)
             if kind != "o":
                 raise ValueError("store_acc expects an output label")
-            expr = _lars_label_index_expr(
-                kind, idx,
-                mode_scalar_y=mode_scalar_y,
-                u_dim=u_dim,
-                x_dim=x_dim,
-                y_dim=y_dim,
-                w_dim=w_dim,
-                v_dim=v_dim,
-            )
-            if use_scatter:
-                ap(f"            atomicAdd(&out[{expr}], {reg});")
-            else:
-                # LARS may flush the same output accumulator multiple times
-                # when the register budget is tight, so non-scatter must also
-                # accumulate partial deltas instead of overwriting.
-                ap(f"            out[{expr}] += {reg};")
-
-        elif inst.op == "pair_cse":
-            # Scheduler-level CSE instruction:
-            #   pair_reg = rw * rx
-            # The scheduler owns the pair_reg lifetime and counts it against
-            # the virtual register budget.
-            pair_reg, rw, rx, pair_name = inst.args
-            ap(f"            {pair_reg} = {rw} * {rx};")
-
-        elif inst.op == "fma_u1d_pair_resident":
-            # FMA using a scheduler-created pair register and a full-resident
-            # output accumulator.
-            out_idx, pair_reg, ry, coeff = inst.args
-            c = _fmt_lars_float(float(coeff))
-            ap(f"            out_acc_v_{int(out_idx)} += scalar_t({c}) * {pair_reg} * {ry};")
-
-        elif inst.op == "fma_u1d_pair":
-            # Backward-compatible support for older schedules.
-            ro, pair_reg, ry, coeff = inst.args
-            c = _fmt_lars_float(float(coeff))
-            ap(f"            {ro} += scalar_t({c}) * {pair_reg} * {ry};")
-
-        elif inst.op == "release_pair":
-            # Logical lifetime marker only. No CUDA statement is needed because
-            # virtual register reuse is already represented by later load/pair_cse
-            # instructions assigning the same rN variable.
-            pass
+            emit_out_write(int(idx), str(reg))
 
         elif inst.op == "release":
-            # Non-output registers are simply allowed to die; the virtual register
-            # name may be reused by later generated instructions.
             pass
         else:
             raise ValueError(f"Unsupported LARS instruction op: {inst.op}")
@@ -2012,19 +2025,8 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         ap("")
         ap("            // resident output accumulator writeback")
     for out_idx in resident_out_indices:
-        expr = _lars_label_index_expr(
-            "o", int(out_idx),
-            mode_scalar_y=mode_scalar_y,
-            u_dim=u_dim,
-            x_dim=x_dim,
-            y_dim=y_dim,
-            w_dim=w_dim,
-            v_dim=v_dim,
-        )
-        if use_scatter:
-            ap(f"            atomicAdd(&out[{expr}], out_acc_v_{out_idx});")
-        else:
-            ap(f"            out[{expr}] += out_acc_v_{out_idx};")
+        emit_out_write(int(out_idx), f"out_acc_v_{out_idx}")
+
     ap("        }")
     ap("    }")
     ap("}")
@@ -2066,7 +2068,6 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -2074,7 +2075,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     ap("        w, x, y, out,")
-    ap("        src_idx, dst_idx, b_list,")
+    ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
@@ -2087,7 +2088,6 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -2098,11 +2098,11 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    if (should_use_int32_index_fwd(B, WB, Iw, Ix, Ky, V, U, S,")
     ap("                                   kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
-    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            w, x, y, out, src_idx, dst_idx,")
     ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    } else {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
-    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            w, x, y, out, src_idx, dst_idx,")
     ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    }")
     ap("}")
@@ -2116,12 +2116,11 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
     ap(f"    launch_{kernel_name}_auto<scalar_t>(")
-    ap("        w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("        w, x, y, out, src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("}")
     ap("")
@@ -2163,189 +2162,11 @@ def _make_lars_paths_from_uniform1d_lists(
 
 
 
-def _normalize_reg_budget_candidates(
-    reg_budget: Union[int, Iterable[int]],
-) -> Tuple[List[int], bool]:
-    """
-    Normalize a single register budget or a list of budgets.
-
-    Returns:
-      budgets: unique positive budgets in input order
-      is_multi_budget: True if input describes multiple budgets
-    """
-    if isinstance(reg_budget, int):
-        if reg_budget < 4:
-            raise ValueError(f"reg_budget must be at least 4, got {reg_budget}")
-        return [int(reg_budget)], False
-
-    budgets: List[int] = []
-    seen = set()
-    for rb in reg_budget:
-        rb = int(rb)
-        if rb < 4:
-            raise ValueError(f"reg_budget must be at least 4, got {rb}")
-        if rb not in seen:
-            seen.add(rb)
-            budgets.append(rb)
-
-    if not budgets:
-        raise ValueError("reg_budget candidate list must not be empty")
-
-    return budgets, len(budgets) > 1
 
 
-def _fold_reg_budget_candidates_by_max_live(
-    reg_budget: Union[int, Iterable[int]],
-    *,
-    lars_paths: List[Tuple[int, int, int, int, float]],
-    consider_cse: bool = False,
-    enable_secondary_affinity: bool = False,
-    topk_candidates: Optional[int] = 128,
-    profile: bool = False,
-    profile_interval: int = 1000,
-    profile_seconds: float = 2.0,
-    profile_print: bool = True,
-) -> Tuple[List[int], Dict[str, int]]:
-    """
-    Remove register-budget candidates that cannot change the generated schedule.
 
-    The old folding rule used only no-CSE max_live.  That is too aggressive for
-    auto-CSE: if no-CSE max_live=6, then reg_budget=8 has only 2 spare registers
-    for pair CSE, while reg_budget=12 has 6 spare registers and may generate a
-    different CSE schedule.  Therefore the equivalence threshold is:
 
-        effective_live_need = no_cse_max_live_labels + probed_max_cse_live_pairs
 
-    where probed_max_cse_live_pairs is measured by running an auto-CSE probe at
-    the largest candidate budget.  We keep every budget <= effective_live_need
-    and only fold budgets larger than that to the first over-threshold budget.
-
-    Example:
-        reg_budget=[8, 12, 16, 20, 24, 28]
-        no_cse_max_live=6, max_cse_live_pairs=8
-        effective_live_need=14
-        -> keep [8, 12, 16]
-    """
-    budgets, is_multi_budget = _normalize_reg_budget_candidates(reg_budget)
-    if not is_multi_budget:
-        return budgets, {
-            "no_cse_max_live": 0,
-            "max_cse_live_pairs": 0,
-            "effective_live_need": 0,
-            "probe_budget": int(budgets[0]),
-            "auto_fallback_threshold": 0,
-        }
-
-    probe_budget = max(budgets)
-
-    # Probe normal label pressure without CSE.
-    no_cse_probe = LARSUniform1DScheduler(
-        paths=lars_paths,
-        reg_budget=probe_budget,
-        enable_secondary_affinity=enable_secondary_affinity,
-        topk_candidates=topk_candidates,
-        # Probe the natural high-budget schedule. Fallback is disabled here so
-        # the probe measures max_live + max CSE capacity rather than forcing a
-        # low-budget path-directed order.
-        prefer_path_fallback_when_full=False,
-        profile=profile,
-        profile_name=f"budget_probe_nocse_r{probe_budget}",
-        profile_interval=profile_interval,
-        profile_seconds=profile_seconds,
-        profile_print=profile_print,
-    )
-    no_cse_result = no_cse_probe.schedule()
-    no_cse_max_live = int(getattr(no_cse_probe, "max_live_labels", no_cse_result.max_live))
-
-    max_cse_live_pairs = 0
-    if consider_cse:
-        # Probe opportunistic pair-CSE pressure using the largest candidate.  This
-        # estimates how many pair temporaries can be simultaneously useful when
-        # the budget is not the limiting factor within the user's candidate set.
-        cse_probe = CSELARSUniform1DScheduler(
-            paths=lars_paths,
-            reg_budget=probe_budget,
-            enable_cse=True,
-            enable_secondary_affinity=enable_secondary_affinity,
-            topk_candidates=topk_candidates,
-            prefer_path_fallback_when_full=False,
-            profile=profile,
-            profile_name=f"budget_probe_cse_r{probe_budget}",
-            profile_interval=profile_interval,
-            profile_seconds=profile_seconds,
-            profile_print=profile_print,
-        )
-        cse_probe.schedule()
-        max_cse_live_pairs = int(getattr(cse_probe, "max_live_pairs", 0))
-
-    effective_live_need = int(no_cse_max_live + max_cse_live_pairs)
-
-    kept: List[int] = []
-    added_first_over = False
-    for rb in budgets:
-        if rb <= effective_live_need:
-            kept.append(rb)
-        elif not added_first_over:
-            kept.append(rb)
-            added_first_over = True
-
-    return kept, {
-        "no_cse_max_live": int(no_cse_max_live),
-        "max_cse_live_pairs": int(max_cse_live_pairs),
-        "effective_live_need": int(effective_live_need),
-        "probe_budget": int(probe_budget),
-        "auto_fallback_threshold": int(effective_live_need),
-    }
-
-def _fold_lars_configs_by_reg_budget(
-    configs: List[Dict[str, Any]],
-    *,
-    effective_live_need: Optional[int],
-) -> List[Dict[str, Any]]:
-    """
-    Apply budget folding to explicit config lists while preserving distinct
-    non-budget variants for the kept budgets.
-    """
-    if effective_live_need is None:
-        return configs
-
-    kept_budgets: Set[int] = set()
-    first_over: Optional[int] = None
-    ordered_budgets: List[int] = []
-    for cfg in configs:
-        rb = int(cfg["reg_budget"])
-        if rb not in ordered_budgets:
-            ordered_budgets.append(rb)
-
-    for rb in ordered_budgets:
-        if rb <= effective_live_need:
-            kept_budgets.add(rb)
-        elif first_over is None:
-            first_over = rb
-            kept_budgets.add(rb)
-
-    return [cfg for cfg in configs if int(cfg["reg_budget"]) in kept_budgets]
-
-def default_lars_cse_candidate_configs(
-    reg_budget: Union[int, Iterable[int]],
-) -> List[Dict[str, Any]]:
-    """
-    Build the automatic LARS+CSE candidate configs.
-
-    There is no explicit config list and no no-CSE baseline generation here:
-    each kept register budget produces exactly one candidate, using auto CSE.
-    Pair CSE itself is opportunistic: a repeated (w, x) pair is materialized
-    only when the current schedule has a free virtual register.
-    """
-    budgets, _ = _normalize_reg_budget_candidates(reg_budget)
-    return [
-        {
-            "name": f"lars_r{rb}_cse_auto",
-            "reg_budget": int(rb),
-            "enable_cse": False,
-        }
-        for rb in budgets
-    ]
 
 
 def generate_code_uniform1d_fwd_with_scheduler(
@@ -2358,7 +2179,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
     output_indices: Optional[Dict[int, Any]] = None,
     u_dim: int = 1,
     mode: str = "u,u,,u",
-    out_path: str = "generated_uniform1d_fwd_lars_cse.cu",
+    out_path: str = "generated_uniform1d_fwd_lars.cu",
     kernel_name: str = "stp_codegen_lars",
     scalar_t: str = "float",
     reg_budget: Union[int, Iterable[int]] = 16,
@@ -2369,37 +2190,18 @@ def generate_code_uniform1d_fwd_with_scheduler(
     profile_interval: int = 1000,
     profile_seconds: float = 2.0,
     profile_print: bool = False,
-    consider_cse: bool = True,
-
-    # Shared scheduler defaults.
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
 ):
     """
-    Generate one or more LARS forward CUDA implementations with scheduler-level
-    pair CSE candidates.
+    Generate one LARS forward CUDA implementation.
 
-    Return forms:
-      - if a single automatic candidate is produced and return_schedule=False:
-            code: str
-      - if multiple automatic candidates are produced and return_schedule=False:
-            [(candidate_name, code), ...]
-      - if return_schedule=True:
-            [{"name", "code", "schedule", "config", "profile"}, ...]
-
-    Candidate generation is automatic only: one auto-CSE candidate is produced
-    for each kept reg_budget. No explicit candidate-list parameter and no no-CSE
-    baseline are exposed/generated by this entry.
-
-    Profile options:
-      - profile=True prints scheduling progress for each candidate.
-      - each profile line includes done/remaining path counts, live registers,
-        free registers, fireable/candidate counts, spills/reloads, instruction
-        count, and CSE pair statistics.
-      - return_schedule=True also returns the structured profile summary in
-        result["profile"].
+    The user reg_budget and fold_reg_budgets_by_max_live arguments are kept for
+    API compatibility, but this slim scheduler derives an unbounded virtual
+    input-register file from all distinct x/y/w labels and emits a single
+    single candidate.
     """
-    del scalar_t
+    del scalar_t, reg_budget, fold_reg_budgets_by_max_live
 
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
@@ -2426,146 +2228,73 @@ def generate_code_uniform1d_fwd_with_scheduler(
         path_semantics=path_semantics,
     )
 
-    budget_fold_info: Dict[str, int] = {}
+    cand_name = "lars_all_inputs"
 
-    # Always probe when a budget list is supplied so fallback can be decided
-    # from effective_live_need = max_live_labels + max_live_pairs.  Folding then
-    # optionally removes budgets that cannot expose more label/CSE liveness.
-    probed_budgets, budget_fold_info = _fold_reg_budget_candidates_by_max_live(
-        reg_budget,
-        lars_paths=lars_paths,
-        consider_cse=consider_cse,
+    scheduler = LARSUniform1DScheduler(
+        paths=lars_paths,
+        reg_budget=0,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
+        profile_name=cand_name,
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
         profile_print=profile_print,
     )
-
-    if fold_reg_budgets_by_max_live:
-        effective_reg_budget = probed_budgets
-    else:
-        effective_reg_budget, _ = _normalize_reg_budget_candidates(reg_budget)
-
-    effective_live_need = int(budget_fold_info.get("effective_live_need", 0))
-    auto_cse_configs = default_lars_cse_candidate_configs(effective_reg_budget)
+    schedule_result = scheduler.schedule()
 
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
 
-    candidates = []
-
-    for cfg_in in auto_cse_configs:
-        cfg = dict(cfg_in)
-        rb = int(cfg.get("reg_budget", reg_budget if isinstance(reg_budget, int) else list(reg_budget)[0]))
-        if rb < 4:
-            raise ValueError(f"reg_budget must be at least 4, got {rb}")
-
-        enable_cse = bool(cfg.get("enable_cse", True))
-
-        cand_name = str(cfg.get(
-            "name",
-            f"lars_r{rb}_" + ("cse_auto" if enable_cse else "nocse")
-        ))
-
-        # Automatic fallback policy:
-        #   rb < effective_live_need  -> path-directed fallback when full
-        #   rb >= effective_live_need -> global LARS only, no full-reg fallback
-        # If there is only one budget and no meaningful probe threshold, keep
-        # fallback disabled; the global selector still has its no-fire deadlock
-        # fallback for correctness.
-        auto_fallback_when_full = bool(effective_live_need > 0 and rb < effective_live_need)
-        cfg["auto_fallback_when_full"] = auto_fallback_when_full
-        cfg["effective_live_need"] = effective_live_need
-
-        scheduler = CSELARSUniform1DScheduler(
-            paths=lars_paths,
-            reg_budget=rb,
-            enable_cse=enable_cse,
-            enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
-            topk_candidates=cfg.get("topk_candidates", topk_candidates),
-            prefer_path_fallback_when_full=auto_fallback_when_full,
-            profile=bool(cfg.get("profile", profile)),
-            profile_name=str(cfg.get("profile_name", cand_name)),
-            profile_interval=int(cfg.get("profile_interval", profile_interval)),
-            profile_seconds=float(cfg.get("profile_seconds", profile_seconds)),
-            profile_print=bool(cfg.get("profile_print", profile_print)),
-        )
-        schedule_result = scheduler.schedule()
-
-        if kernel_name and kernel_name != "stp_codegen_lars":
-            base_kernel_name = f"{kernel_name}_{cand_name}"
-        else:
-            safe_cand = cand_name.replace("-", "_").replace(".", "_")
-            base_kernel_name = (
-                f"uniform1d_{safe_cand}_u{u_dim}_path{P}_"
-                f"{mode_str}_{layout_tag}_fwd"
-            )
-
-        code = emit_fused_fwd_kernel_from_lars_schedule(
-            schedule_result,
-            kernel_name=base_kernel_name,
-            mode=mode,
-            use_x_src=use_x_src,
-            use_y_src=use_y_src,
-            use_scatter=use_scatter,
-            u_dim=u_dim,
-            x_dim=None,
-            y_dim=None,
-            w_dim=None,
-            v_dim=None,
-            block_size=32,
+    if kernel_name and kernel_name != "stp_codegen_lars":
+        base_kernel_name = f"{kernel_name}_{cand_name}"
+    else:
+        safe_cand = cand_name.replace("-", "_").replace(".", "_")
+        base_kernel_name = (
+            f"uniform1d_{safe_cand}_u{u_dim}_path{P}_"
+            f"{mode_str}_{layout_tag}_fwd"
         )
 
-        code = code + "\n" + emit_launcher(
-            bundle_name=base_kernel_name,
-            mode=mode,
-            use_x_src=use_x_src,
-            use_y_src=use_y_src,
-            use_scatter=use_scatter,
-        )
+    code = emit_fused_fwd_kernel_from_lars_schedule(
+        schedule_result,
+        kernel_name=base_kernel_name,
+        mode=mode,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+        u_dim=u_dim,
+        x_dim=None,
+        y_dim=None,
+        w_dim=None,
+        v_dim=None,
+        block_size=32,
+    )
 
-        if out_path:
-            out_p = Path(out_path)
-            if len(auto_cse_configs) > 1:
-                stem = out_p.stem
-                suffix = out_p.suffix or ".cu"
-                candidate_path = out_p.with_name(f"{stem}_{cand_name}{suffix}")
-                candidate_path.write_text(code, encoding="utf-8")
-            else:
-                out_p.write_text(code, encoding="utf-8")
+    code = code + "\n" + emit_launcher(
+        bundle_name=base_kernel_name,
+        mode=mode,
+        use_x_src=use_x_src,
+        use_y_src=use_y_src,
+        use_scatter=use_scatter,
+    )
 
-        if return_schedule:
-            candidates.append({
+    if out_path:
+        Path(out_path).write_text(code, encoding="utf-8")
+
+    if return_schedule:
+        return {
+            "name": cand_name,
+            "code": code,
+            "schedule": schedule_result,
+            "config": {
                 "name": cand_name,
-                "code": code,
-                "schedule": schedule_result,
-                "config": cfg,
-                "budget_fold_info": dict(budget_fold_info),
-                "budget_fold_max_live": budget_fold_info.get("no_cse_max_live"),
-                "budget_fold_max_cse": budget_fold_info.get("max_cse_live_pairs"),
-                "budget_fold_effective_live_need": budget_fold_info.get("effective_live_need"),
-                "auto_fallback_when_full": auto_fallback_when_full,
-                "profile": schedule_result.profile,
-                "cse_stats": {
-                    "pair_creates": getattr(scheduler, "cse_pair_creates", 0),
-                    "pair_hits": getattr(scheduler, "cse_pair_hits", 0),
-                    "pair_releases": getattr(scheduler, "cse_pair_releases", 0),
-                    "pair_drops_for_label_release": getattr(scheduler, "cse_pair_drops_for_label_release", 0),
-                    "pair_drops_for_reg_pressure": getattr(scheduler, "cse_pair_drops_for_reg_pressure", 0),
-                },
-            })
-        else:
-            candidates.append((cand_name, code))
+                "reg_budget": 0,
+                "auto_fallback_when_full": False,
+            },
+            "profile": schedule_result.profile,
+        }
 
-    if len(candidates) == 1:
-        item = candidates[0]
-        if return_schedule:
-            return item
-        return item[1]
-
-    return candidates
+    return code
 
 # =============================================================================
 # LARS backward scheduler/codegen
@@ -2597,7 +2326,7 @@ class U1DBwdPath:
     def labels(self) -> Tuple[Label, ...]:
         # LARS schedules only input operands.  Backward accumulators
         # (gw/gx/gy) are full-resident emitter variables, so they are never
-        # spill/reload candidates.
+        # reload-managed candidates.
         return (
             ("w", self.i),
             ("x", self.j),
@@ -2634,25 +2363,29 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         profile_seconds: float = 2.0,
         profile_print: bool = True,
     ):
+        # Backward reuses the generic forward scheduler helpers such as
+        # _choose_fireable_path().  Those helpers now branch on path_kind for
+        # STC, so make the backward kind explicit and keep it on the normal
+        # Uniform1D branch.
+        self.path_kind = "u1d_bwd"
         self.need_grad_w = bool(need_grad_w)
         self.paths: List[U1DBwdPath] = [
             U1DBwdPath(pid=p, i=i, j=j, k=k, v=v, c=c, need_grad_w=self.need_grad_w)
             for p, (i, j, k, v, c) in enumerate(paths)
         ]
 
-        self.reg_budget = int(reg_budget)
-        min_budget = 4
-        if self.reg_budget < min_budget:
-            raise ValueError(f"backward reg_budget must be at least {min_budget}, got {self.reg_budget}")
+        # reg_budget is kept only for API compatibility.
+        # Backward input labels (w/x/y/grad_out) are unbounded and never exceed the all-input-resident virtual register file
+        # merely because of a user-supplied virtual budget.
+        del reg_budget
+        input_label_count = len({lab for path in self.paths for lab in path.labels})
+        self.reg_budget = max(4, int(input_label_count))
+
+        # Legacy fallback knobs are ignored in the no-spill scheduler.
+        del path_fallback_after, prefer_path_fallback_when_full
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
-        self.prefer_path_fallback_when_full = bool(prefer_path_fallback_when_full)
-        self.path_fallback_after = (
-            int(path_fallback_after)
-            if path_fallback_after is not None
-            else max(8, 2 * self.reg_budget)
-        )
         self.debug = bool(debug)
 
         self.label_to_paths: Dict[Label, Set[int]] = defaultdict(set)
@@ -2683,8 +2416,6 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         self.max_live_total = 0
 
         self._score_cache: Dict[Label, Tuple[int, int, int, int, int, int]] = {}
-        self._no_progress_iters = 0
-        self._last_done = 0
 
         self.profile_enabled = bool(profile)
         self.profile_name = str(profile_name or self.__class__.__name__)
@@ -2698,7 +2429,6 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         self._profile_select_rounds = 0
         self._profile_fire_rounds = 0
         self._profile_load_rounds = 0
-        self._profile_fallback_rounds = 0
         self._profile_records: List[Dict[str, Any]] = []
         self._profile_last_event = ""
         self._profile_last_reason = ""
@@ -2757,20 +2487,6 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
         self.free_regs.insert(0, reg)
         self._invalidate_score_cache()
 
-    def _choose_spill_victim_avoid(self, avoid: Set[Label]) -> Label:
-        candidates = [lab for lab in self.live if lab not in avoid]
-        if not candidates:
-            candidates = list(self.live)
-        if not candidates:
-            raise RuntimeError("No live label to spill.")
-
-        def victim_key(lab: Label):
-            remain = self.remaining_uses[lab]
-            dirty_output_penalty = 1 if self._is_output_label(lab) and lab in self.dirty_outputs else 0
-            output_penalty = 1 if self._is_output_label(lab) else 0
-            return (remain, dirty_output_penalty, output_penalty, str(lab))
-
-        return min(candidates, key=victim_key)
 
     def _priority(self, lab: Label) -> int:
         acc_bonus = 1 if self._is_output_label(lab) else 0
@@ -2816,234 +2532,6 @@ class LARSUniform1DBwdScheduler(LARSUniform1DScheduler):
 BwdPairKey = Tuple[Label, Label]  # (w-label, grad_out-label)
 
 
-class CSELARSUniform1DBwdScheduler(LARSUniform1DBwdScheduler):
-    """
-    Backward LARS scheduler with opportunistic pair CSE.
-
-    The default backward pair is:
-        wg = w[i] * grad_out[v]
-
-    This pair is used by both grad_x and grad_y for the same path and can also
-    be reused across paths sharing the same (w, grad_out) pair.
-    """
-
-    def __init__(
-        self,
-        paths: Iterable[Tuple[int, int, int, int, float]],
-        reg_budget: int = 24,
-        *,
-        enable_cse: bool = True,
-        cse_release_pair_before_label_spill: bool = True,
-        **kwargs,
-    ):
-        super().__init__(paths=paths, reg_budget=reg_budget, **kwargs)
-        self.enable_cse = bool(enable_cse)
-        self.cse_release_pair_before_label_spill = bool(cse_release_pair_before_label_spill)
-
-        self.initial_pair_uses: Counter[BwdPairKey] = Counter()
-        for p in self.paths:
-            self.initial_pair_uses[self._pair_key_for_path_obj(p)] += 1
-
-        self.remaining_pair_uses: Counter[BwdPairKey] = Counter(self.initial_pair_uses)
-        self.cse_candidate_pairs: Set[BwdPairKey] = {
-            key for key, cnt in self.initial_pair_uses.items()
-            if cnt >= 2
-        }
-
-        self.pair_reg_of: Dict[BwdPairKey, str] = {}
-        self.pair_key_of_reg: Dict[str, BwdPairKey] = {}
-
-        self.cse_pair_creates = 0
-        self.cse_pair_hits = 0
-        self.cse_pair_releases = 0
-        self.cse_pair_drops_for_label_release = 0
-        self.cse_pair_drops_for_reg_pressure = 0
-
-    def _pair_key_for_path_obj(self, p: U1DBwdPath) -> BwdPairKey:
-        return (("w", p.i), ("go", p.v))
-
-    def _pair_name(self, key: BwdPairKey) -> str:
-        lw, lgo = key
-        return f"pair[{self._label_name(lw)}*{self._label_name(lgo)}]"
-
-    def _total_live_regs(self) -> int:
-        return len(self.live) + len(self.pair_reg_of)
-
-    def _update_max_live_total(self) -> None:
-        self.max_live_labels = max(self.max_live_labels, len(self.live))
-        self.max_live_pairs = max(self.max_live_pairs, len(self.pair_reg_of))
-        self.max_live_total = max(self.max_live_total, self._total_live_regs())
-        self.max_live = max(self.max_live, self._total_live_regs())
-
-    def _alloc_reg_no_spill(self, lab: Label) -> str:
-        reg = super()._alloc_reg_no_spill(lab)
-        self._update_max_live_total()
-        return reg
-
-    def _choose_pair_victim(self) -> Optional[BwdPairKey]:
-        if not self.pair_reg_of:
-            return None
-
-        def key_fn(pair_key: BwdPairKey):
-            return (
-                self.remaining_pair_uses[pair_key],
-                self.initial_pair_uses[pair_key],
-                self._pair_name(pair_key),
-            )
-
-        return min(self.pair_reg_of.keys(), key=key_fn)
-
-    def _release_pair(self, pair_key: BwdPairKey, reason: str = "") -> None:
-        reg = self.pair_reg_of.pop(pair_key, None)
-        if reg is None:
-            return
-        self.pair_key_of_reg.pop(reg, None)
-        self.instructions.append(
-            Inst("release_pair", (reg, self._pair_name(pair_key)), reason)
-        )
-        self.free_regs.insert(0, reg)
-        self.cse_pair_releases += 1
-        self._invalidate_score_cache()
-
-    def _release_pairs_touching_label(self, lab: Label, reason: str = "") -> None:
-        to_release = [key for key in self.pair_reg_of if lab in key]
-        for key in to_release:
-            self.cse_pair_drops_for_label_release += 1
-            self._release_pair(
-                key,
-                reason=f"drop pair before releasing {self._label_name(lab)}; {reason}",
-            )
-
-    def _store_and_release(self, lab: Label, reason: str = "") -> None:
-        self._release_pairs_touching_label(lab, reason=reason)
-        super()._store_and_release(lab, reason=reason)
-        self._update_max_live_total()
-
-    def _load_label_with_victim(
-        self,
-        lab: Label,
-        victim: Optional[Label],
-        reason: str = "",
-    ) -> None:
-        if lab in self.live:
-            return
-
-        if (
-            not self.free_regs
-            and self.cse_release_pair_before_label_spill
-            and self.pair_reg_of
-        ):
-            pair_victim = self._choose_pair_victim()
-            if pair_victim is not None:
-                self.cse_pair_drops_for_reg_pressure += 1
-                self._release_pair(
-                    pair_victim,
-                    reason=f"drop pair under reg pressure before loading {self._label_name(lab)}",
-                )
-
-        super()._load_label_with_victim(lab, victim, reason=reason)
-        self._update_max_live_total()
-
-    def _should_cache_pair(self, pair_key: BwdPairKey) -> bool:
-        if not self.enable_cse:
-            return False
-        if pair_key not in self.cse_candidate_pairs:
-            return False
-        if pair_key in self.pair_reg_of:
-            return True
-        if not self.free_regs:
-            return False
-        if self.remaining_pair_uses[pair_key] < 2:
-            return False
-        return True
-
-    def _ensure_pair_cached(self, pair_key: BwdPairKey) -> Optional[str]:
-        if not self._should_cache_pair(pair_key):
-            return None
-
-        reg = self.pair_reg_of.get(pair_key)
-        if reg is not None:
-            self.cse_pair_hits += 1
-            return reg
-
-        lw, lgo = pair_key
-        if lw not in self.live or lgo not in self.live:
-            return None
-        if not self.free_regs:
-            return None
-
-        pair_reg = self.free_regs.pop(0)
-        self.pair_reg_of[pair_key] = pair_reg
-        self.pair_key_of_reg[pair_reg] = pair_key
-        self._update_max_live_total()
-        self._invalidate_score_cache()
-
-        rw = self.reg_of[lw]
-        rgo = self.reg_of[lgo]
-        self.instructions.append(
-            Inst(
-                "pair_cse",
-                (pair_reg, rw, rgo, self._pair_name(pair_key)),
-                f"create {self._pair_name(pair_key)} reuse_left={self.remaining_pair_uses[pair_key]}",
-            )
-        )
-        self.cse_pair_creates += 1
-        return pair_reg
-
-    def _emit_path_compute(self, pid: int) -> None:
-        p = self._path(pid)
-
-        lw = ("w", p.i)
-        lx = ("x", p.j)
-        ly = ("y", p.k)
-        lgo = ("go", p.v)
-
-        rw = self.reg_of[lw]
-        rx = self.reg_of[lx]
-        ry = self.reg_of[ly]
-        rgo = self.reg_of[lgo]
-
-        pair_key = (lw, lgo)
-        pair_reg = self._ensure_pair_cached(pair_key)
-
-        if pair_reg is not None:
-            self.instructions.append(
-                Inst(
-                    "bwd_fma_wg_pair_resident",
-                    (p.i, p.j, p.k, pair_reg, rx, ry, rgo, p.c, self.need_grad_w),
-                    (
-                        f"path#{pid}: use {self._pair_name(pair_key)}; "
-                        f"gx[{p.j}] += wg*y[{p.k}], gy[{p.k}] += wg*x[{p.j}]"
-                    ),
-                )
-            )
-        else:
-            self.instructions.append(
-                Inst(
-                    "bwd_fma_resident",
-                    (p.i, p.j, p.k, rw, rx, ry, rgo, p.c, self.need_grad_w),
-                    (
-                        f"path#{pid}: "
-                        f"gw[{p.i}] += go[{p.v}]*x[{p.j}]*y[{p.k}], "
-                        f"gx[{p.j}] += w[{p.i}]*go[{p.v}]*y[{p.k}], "
-                        f"gy[{p.k}] += w[{p.i}]*go[{p.v}]*x[{p.j}]"
-                    ),
-                )
-            )
-
-        self.path_order.append(pid)
-        self.unscheduled.remove(pid)
-
-        self.remaining_pair_uses[pair_key] -= 1
-        if self.remaining_pair_uses[pair_key] <= 0 and pair_key in self.pair_reg_of:
-            self._release_pair(pair_key, reason=f"last pair use after path#{pid}")
-
-        for lab in p.labels:
-            self.remaining_uses[lab] -= 1
-
-        for lab in p.labels:
-            if self.remaining_uses[lab] == 0 and lab in self.live:
-                self._store_and_release(lab, reason=f"last use after path#{pid}")
 
 
 def _parse_bwd_lars_label_ref(ref: str) -> Tuple[str, int]:
@@ -3153,9 +2641,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     Supported instruction ops:
       - load/load_acc/release/store_acc
-      - pair_cse/release_pair
       - bwd_fma
-      - bwd_fma_wg_pair
     """
     if block_size != 32:
         raise ValueError("this emitter currently assumes block_size=32")
@@ -3163,7 +2649,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         raise ValueError(f"Unsupported mode: {mode}")
 
     mode_scalar_y = mode == "u,u,,u"
-    reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+    reg_count = _max_lars_reg_count_any(schedule_result)
 
     # ------------------------------------------------------------------
     # Mixed accumulator placement for backward gradients.
@@ -3184,7 +2670,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         first_seen.setdefault((kind, int(idx)), int(inst_id))
 
     for inst_id, inst in enumerate(schedule_result.instructions):
-        if inst.op in ("bwd_fma_resident", "bwd_fma_wg_pair_resident"):
+        if inst.op == "bwd_fma_resident":
             wi, xj, yk = map(int, inst.args[:3])
             if need_grad_w:
                 gw_use[wi] += 1
@@ -3227,14 +2713,13 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             kind_rank = 1
         return (float(cnt) * weight, cnt, -int(first_seen.get(acc, 10**9)), kind_rank, kind, -idx)
 
-    if acc_reg_budget is None:
-        reg_accs: Set[Tuple[str, int]] = set(all_accs)
-    else:
-        budget = max(0, int(acc_reg_budget))
-        ranked = sorted(all_accs, key=_acc_score, reverse=True)
-        reg_accs = set(ranked[:budget])
+    # acc_reg_budget is intentionally ignored: every backward accumulator is
+    # resident as a scalar local variable.  No low-frequency accumulator is
+    # demoted to shared memory.
+    del acc_reg_budget
+    reg_accs: Set[Tuple[str, int]] = set(all_accs)
 
-    smem_accs: Set[Tuple[str, int]] = set(all_accs) - set(reg_accs)
+    smem_accs: Set[Tuple[str, int]] = set()
 
     resident_gw_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gw"}
     resident_gx_indices: Set[int] = {idx for kind, idx in reg_accs if kind == "gx"}
@@ -3334,7 +2819,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    scalar_t* __restrict__ grad_y,")
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
     ap("    const int e_local = (int)blockIdx.x;")
@@ -3353,7 +2837,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
-    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     if use_x_src or use_y_src:
@@ -3472,27 +2956,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ap(f"            {rgx} += scalar_t({c}) * ({rw} * {rgo}) * {ry};")
             ap(f"            {rgy} += scalar_t({c}) * ({rw} * {rgo}) * {rx};")
 
-        elif inst.op == "pair_cse":
-            pair_reg, ra, rb, pair_name = inst.args
-            ap(f"            {pair_reg} = {ra} * {rb};")
-
-        elif inst.op == "bwd_fma_wg_pair_resident":
-            wi, xj, yk, pair_reg, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
-            c = _fmt_lars_float(float(coeff))
-            if bool(inst_need_grad_w):
-                _emit_bwd_acc_update("gw", int(wi), f"scalar_t({c}) * {rgo} * {rx} * {ry}")
-            _emit_bwd_acc_update("gx", int(xj), f"scalar_t({c}) * {pair_reg} * {ry}")
-            _emit_bwd_acc_update("gy", int(yk), f"scalar_t({c}) * {pair_reg} * {rx}")
-
-        elif inst.op == "bwd_fma_wg_pair":
-            # Backward-compatible support for older schedules.
-            rgw, rgx, rgy, pair_reg, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
-            c = _fmt_lars_float(float(coeff))
-            if bool(inst_need_grad_w):
-                ap(f"            {rgw} += scalar_t({c}) * {rgo} * {rx} * {ry};")
-            ap(f"            {rgx} += scalar_t({c}) * {pair_reg} * {ry};")
-            ap(f"            {rgy} += scalar_t({c}) * {pair_reg} * {rx};")
-
         elif inst.op == "store_acc":
             ref, reg = inst.args
             kind, idx = _parse_bwd_lars_label_ref(ref)
@@ -3525,7 +2988,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             else:
                 raise ValueError("store_acc expects a backward output label")
 
-        elif inst.op in ("release", "release_pair"):
+        elif inst.op == "release":
             pass
         else:
             raise ValueError(f"Unsupported backward LARS instruction op: {inst.op}")
@@ -3650,7 +3113,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -3668,7 +3130,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("        w, x, y, grad_out, grad_x, grad_y,")
-    ap("        src_idx, dst_idx, b_list,")
+    ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
@@ -3685,7 +3147,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -3700,14 +3161,14 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("            w, x, y, grad_out, grad_x, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    } else {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
     if need_grad_w:
         ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("            w, x, y, grad_out, grad_x, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    }")
     ap("}")
     ap("")
@@ -3724,7 +3185,6 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -3733,7 +3193,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("        w, x, y, grad_out, grad_x, grad_y,")
-    ap("        src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("        src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("}")
     ap("")
 
@@ -3770,7 +3230,6 @@ def emit_lars_bwd_launcher(
         param_lines.append("    torch::Tensor src_idx")
     if use_scatter:
         param_lines.append("    torch::Tensor dst_idx")
-        param_lines.append("    torch::Tensor b_list")
     param_lines.append("    int64_t V64")
     params = ",\n".join(param_lines)
 
@@ -3800,18 +3259,6 @@ def emit_lars_bwd_launcher(
     dst_numel_check = '    TORCH_CHECK(dst_idx.numel() >= B, "dst_idx numel must be >= B");' if use_scatter else ""
 
     blist_logic = ""
-    if use_scatter:
-        blist_logic = r'''
-    const int32_t* b_list_ptr = nullptr;
-    if (b_list.defined() && b_list.numel() > 0) {
-        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA/HIP");
-        TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
-        TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
-        b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
-    }
-'''
-    else:
-        blist_logic = "    const int32_t* b_list_ptr = nullptr;\n"
 
     launch_src_arg = "(const int32_t*)src_idx.data_ptr<int32_t>()," if (use_x_src or use_y_src) else "nullptr,"
     launch_dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()," if use_scatter else "nullptr,"
@@ -3887,7 +3334,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
                 (scalar_t*)grad_y.data_ptr<scalar_t>(),
                 {launch_src_arg}
                 {launch_dst_arg}
-                b_list_ptr,
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
     }});
 
@@ -3937,140 +3383,10 @@ def _make_lars_bwd_paths_from_uniform1d_lists(
     return paths
 
 
-def _fold_bwd_reg_budget_candidates_by_max_live(
-    reg_budget: Union[int, Iterable[int]],
-    *,
-    bwd_paths: List[Tuple[int, int, int, int, float]],
-    need_grad_w: bool = True,
-    consider_cse: bool = False,
-    enable_secondary_affinity: bool = False,
-    topk_candidates: Optional[int] = 128,
-    profile: bool = False,
-    profile_interval: int = 1000,
-    profile_seconds: float = 2.0,
-    profile_print: bool = True,
-) -> Tuple[List[int], Dict[str, int]]:
-    budgets, is_multi_budget = _normalize_reg_budget_candidates(reg_budget)
-    if not is_multi_budget:
-        return budgets, {
-            "no_cse_max_live": 0,
-            "max_cse_live_pairs": 0,
-            "effective_live_need": 0,
-            "probe_budget": int(budgets[0]),
-            "auto_fallback_threshold": 0,
-        }
-
-    probe_budget = max(budgets)
-
-    no_cse_probe = LARSUniform1DBwdScheduler(
-        paths=bwd_paths,
-        reg_budget=probe_budget,
-        need_grad_w=need_grad_w,
-        enable_secondary_affinity=enable_secondary_affinity,
-        topk_candidates=topk_candidates,
-        prefer_path_fallback_when_full=False,
-        profile=profile,
-        profile_name=f"bwd_budget_probe_nocse_r{probe_budget}",
-        profile_interval=profile_interval,
-        profile_seconds=profile_seconds,
-        profile_print=profile_print,
-    )
-    no_cse_result = no_cse_probe.schedule()
-    no_cse_max_live = int(getattr(no_cse_probe, "max_live_labels", no_cse_result.max_live))
-
-    max_cse_live_pairs = 0
-    if consider_cse:
-        cse_probe = CSELARSUniform1DBwdScheduler(
-            paths=bwd_paths,
-            reg_budget=probe_budget,
-            need_grad_w=need_grad_w,
-            enable_cse=True,
-            enable_secondary_affinity=enable_secondary_affinity,
-            topk_candidates=topk_candidates,
-            prefer_path_fallback_when_full=False,
-            profile=profile,
-            profile_name=f"bwd_budget_probe_cse_r{probe_budget}",
-            profile_interval=profile_interval,
-            profile_seconds=profile_seconds,
-            profile_print=profile_print,
-        )
-        cse_probe.schedule()
-        max_cse_live_pairs = int(getattr(cse_probe, "max_live_pairs", 0))
-
-    effective_live_need = int(no_cse_max_live + max_cse_live_pairs)
-    kept: List[int] = []
-    added_first_over = False
-    for rb in budgets:
-        if rb <= effective_live_need:
-            kept.append(rb)
-        elif not added_first_over:
-            kept.append(rb)
-            added_first_over = True
-
-    return kept, {
-        "no_cse_max_live": int(no_cse_max_live),
-        "max_cse_live_pairs": int(max_cse_live_pairs),
-        "effective_live_need": int(effective_live_need),
-        "probe_budget": int(probe_budget),
-        "auto_fallback_threshold": int(effective_live_need),
-    }
 
 
-def _normalize_acc_reg_budget_candidates(
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
-) -> List[Optional[int]]:
-    """
-    Normalize accumulator register-budget candidates.
-
-    None means old behavior: all gw/gx/gy accumulators stay in scalar local
-    variables/registers.  An integer K means keep top-K hot accumulators in
-    registers and demote all remaining accumulators to shared memory.
-    """
-    if acc_reg_budget is None:
-        return [None]
-    if isinstance(acc_reg_budget, int):
-        if int(acc_reg_budget) < 0:
-            raise ValueError(f"acc_reg_budget must be >= 0 or None, got {acc_reg_budget}")
-        return [int(acc_reg_budget)]
-
-    out: List[Optional[int]] = []
-    seen = set()
-    for item in acc_reg_budget:
-        val = None if item is None else int(item)
-        if val is not None and val < 0:
-            raise ValueError(f"acc_reg_budget must be >= 0 or None, got {val}")
-        key = "all" if val is None else val
-        if key not in seen:
-            seen.add(key)
-            out.append(val)
-    if not out:
-        raise ValueError("acc_reg_budget candidate list must not be empty")
-    return out
 
 
-def default_lars_bwd_cse_candidate_configs(
-    reg_budget: Union[int, Iterable[int]],
-    acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
-    *,
-    enable_cse: bool = False,
-    smem_acc_volatile: bool = True,
-) -> List[Dict[str, Any]]:
-    budgets, _ = _normalize_reg_budget_candidates(reg_budget)
-    acc_budgets = _normalize_acc_reg_budget_candidates(acc_reg_budget)
-    configs: List[Dict[str, Any]] = []
-    cse_tag = "cse_auto" if bool(enable_cse) else "nocse"
-    for rb in budgets:
-        for ab in acc_budgets:
-            acc_tag = "accall" if ab is None else f"acc{int(ab)}_smem"
-            volatile_tag = "_volatile" if (ab is not None and bool(smem_acc_volatile)) else ""
-            configs.append({
-                "name": f"lars_bwd_r{rb}_{acc_tag}_{cse_tag}{volatile_tag}",
-                "reg_budget": int(rb),
-                "acc_reg_budget": ab,
-                "enable_cse": bool(enable_cse),
-                "smem_acc_volatile": bool(smem_acc_volatile),
-            })
-    return configs
 
 
 # =============================================================================
@@ -4120,9 +3436,8 @@ class U1DBwdSplitPath:
 
 class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
     """
-    Per-gradient backward scheduler.  It keeps code2's LARS label selection,
-    spill-victim selection and path-fallback behavior, but builds labels for a
-    single gradient target only.
+    Per-gradient backward scheduler.  It keeps the no-spill LARS label
+    selection policy, but builds labels for a single gradient target only.
     """
 
     def __init__(
@@ -4150,18 +3465,17 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
             for p, (i, j, k, v, c) in enumerate(paths)
         ]
 
-        self.reg_budget = int(reg_budget)
-        if self.reg_budget < 3:
-            raise ValueError(f"split backward reg_budget must be at least 3, got {self.reg_budget}")
+        # reg_budget is kept only for API compatibility.
+        # Split-backward input labels are unbounded as well.
+        del reg_budget
+        input_label_count = len({lab for path in self.paths for lab in path.labels})
+        self.reg_budget = max(3, int(input_label_count))
+
+        # Legacy fallback knobs are ignored in the no-spill scheduler.
+        del path_fallback_after, prefer_path_fallback_when_full
 
         self.enable_secondary_affinity = bool(enable_secondary_affinity)
         self.topk_candidates = topk_candidates
-        self.prefer_path_fallback_when_full = bool(prefer_path_fallback_when_full)
-        self.path_fallback_after = (
-            int(path_fallback_after)
-            if path_fallback_after is not None
-            else max(8, 2 * self.reg_budget)
-        )
         self.debug = bool(debug)
 
         self.label_to_paths: Dict[Label, Set[int]] = defaultdict(set)
@@ -4192,8 +3506,6 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
         self.max_live_total = 0
 
         self._score_cache: Dict[Label, Tuple[int, int, int, int, int, int]] = {}
-        self._no_progress_iters = 0
-        self._last_done = 0
 
         self.profile_enabled = bool(profile)
         self.profile_name = str(profile_name or f"{self.__class__.__name__}_{self.grad_kind}")
@@ -4207,7 +3519,6 @@ class LARSUniform1DBwdSplitScheduler(LARSUniform1DScheduler):
         self._profile_select_rounds = 0
         self._profile_fire_rounds = 0
         self._profile_load_rounds = 0
-        self._profile_fallback_rounds = 0
         self._profile_records: List[Dict[str, Any]] = []
         self._profile_last_event = ""
         self._profile_last_reason = ""
@@ -4362,7 +3673,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         raise ValueError(f"Unsupported mode: {mode}")
 
     mode_scalar_y = mode == "u,u,,u"
-    reg_count = _max_lars_reg_count_cse_aware(schedule_result)
+    reg_count = _max_lars_reg_count_any(schedule_result)
 
     target_use: Counter[int] = Counter()
     first_seen: Dict[int, int] = {}
@@ -4375,18 +3686,12 @@ def emit_lars_bwd_split_kernel_from_schedule(
             first_seen.setdefault(target_idx, inst_id)
 
     all_targets: Set[int] = set(target_use)
-    if acc_reg_budget is None:
-        reg_targets: Set[int] = set(all_targets)
-    else:
-        budget = max(0, int(acc_reg_budget))
-        ranked = sorted(
-            all_targets,
-            key=lambda idx: (int(target_use[idx]), -int(first_seen.get(idx, 10**9)), -int(idx)),
-            reverse=True,
-        )
-        reg_targets = set(ranked[:budget])
+    # acc_reg_budget is intentionally ignored: every split-backward accumulator
+    # target is register-resident and no target is demoted to shared memory.
+    del acc_reg_budget
+    reg_targets: Set[int] = set(all_targets)
 
-    smem_targets_sorted: List[int] = sorted(all_targets - reg_targets)
+    smem_targets_sorted: List[int] = []
     smem_id: Dict[int, int] = {idx: n for n, idx in enumerate(smem_targets_sorted)}
     reg_targets_sorted = sorted(reg_targets)
 
@@ -4424,7 +3729,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    scalar_t* __restrict__ grad_y,")
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
     ap("    const int e_local = (int)blockIdx.x;")
@@ -4443,7 +3747,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
-    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     if use_x_src or use_y_src:
@@ -4630,7 +3934,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -4650,7 +3953,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("        w, x, y, grad_out, grad_x,")
     else:
         ap("        w, x, y, grad_out, grad_y,")
-    ap("        src_idx, dst_idx, b_list,")
+    ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
@@ -4669,7 +3972,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -4686,7 +3988,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("            w, x, y, grad_out, grad_x,")
     else:
         ap("            w, x, y, grad_out, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    } else {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
     if grad_kind == "gw":
@@ -4695,7 +3997,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("            w, x, y, grad_out, grad_x,")
     else:
         ap("            w, x, y, grad_out, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    }")
     ap("}")
     ap("")
@@ -4714,7 +4016,6 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -4725,7 +4026,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("        w, x, y, grad_out, grad_x,")
     else:
         ap("        w, x, y, grad_out, grad_y,")
-    ap("        src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("        src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("}")
     ap("")
 
@@ -4765,7 +4066,6 @@ def emit_lars_bwd_split_launcher(
         param_lines.append("    torch::Tensor src_idx")
     if use_scatter:
         param_lines.append("    torch::Tensor dst_idx")
-        param_lines.append("    torch::Tensor b_list")
     param_lines.append("    int64_t V64")
     params = ",\n".join(param_lines)
 
@@ -4795,18 +4095,6 @@ def emit_lars_bwd_split_launcher(
     dst_numel_check = '    TORCH_CHECK(dst_idx.numel() >= B, "dst_idx numel must be >= B");' if use_scatter else ""
 
     blist_logic = ""
-    if use_scatter:
-        blist_logic = r'''
-    const int32_t* b_list_ptr = nullptr;
-    if (b_list.defined() && b_list.numel() > 0) {
-        TORCH_CHECK(b_list.is_cuda(), "b_list must be CUDA/HIP");
-        TORCH_CHECK(b_list.scalar_type() == torch::kInt32, "b_list must be int32");
-        TORCH_CHECK((int)b_list.numel() == B, "b_list must be [B]");
-        b_list_ptr = (const int32_t*)b_list.data_ptr<int32_t>();
-    }
-'''
-    else:
-        blist_logic = "    const int32_t* b_list_ptr = nullptr;\n"
 
     launch_src_arg = "(const int32_t*)src_idx.data_ptr<int32_t>()," if (use_x_src or use_y_src) else "nullptr,"
     launch_dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()," if use_scatter else "nullptr,"
@@ -4824,7 +4112,6 @@ def emit_lars_bwd_split_launcher(
                 (scalar_t*)grad_w.data_ptr<scalar_t>(),
                 {launch_src_arg}
                 {launch_dst_arg}
-                b_list_ptr,
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
 '''
     ret_expr = "return {grad_w, grad_x, grad_y};" if need_grad_w else "return {grad_x, grad_y};"
@@ -4897,7 +4184,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
                 (scalar_t*)grad_x.data_ptr<scalar_t>(),
                 {launch_src_arg}
                 {launch_dst_arg}
-                b_list_ptr,
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
 
         launch_{grady_kernel}<scalar_t>(
@@ -4908,7 +4194,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
                 (scalar_t*)grad_y.data_ptr<scalar_t>(),
                 {launch_src_arg}
                 {launch_dst_arg}
-                b_list_ptr,
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
     }});
 
@@ -5089,44 +4374,17 @@ def _generate_code_uniform1d_bwd_split_from_context(
     topk_candidates: Optional[int],
 ):
     """Internal split-backward implementation.  The public entry is the unified wrapper."""
-    budgets, _ = _normalize_reg_budget_candidates(reg_budget)
-    acc_budgets = _normalize_acc_reg_budget_candidates(acc_reg_budget)
-    configs: List[Dict[str, Any]] = []
-    for rb in budgets:
-        for ab in acc_budgets:
-            acc_tag = "accall" if ab is None else f"acc{int(ab)}_smem"
-            volatile_tag = "_volatile" if (ab is not None and bool(smem_acc_volatile)) else ""
-            configs.append({
-                "name": f"lars_bwd_split_r{int(rb)}_{acc_tag}{volatile_tag}",
-                "reg_budget": int(rb),
-                "acc_reg_budget": ab,
-                "smem_acc_volatile": bool(smem_acc_volatile),
-            })
-
-    if fold_reg_budgets_by_max_live and len(budgets) > 1:
-        max_effective_need = 0
-        for gkind in (["gw"] if need_grad_w else []) + ["gx", "gy"]:
-            probe = LARSUniform1DBwdSplitScheduler(
-                paths=ctx.bwd_paths,
-                reg_budget=max(budgets),
-                grad_kind=gkind,
-                enable_secondary_affinity=enable_secondary_affinity,
-                topk_candidates=topk_candidates,
-                prefer_path_fallback_when_full=False,
-                profile=profile,
-                profile_name=f"bwd_split_budget_probe_{gkind}_r{max(budgets)}",
-                profile_interval=profile_interval,
-                profile_seconds=profile_seconds,
-                profile_print=profile_print,
-            )
-            probe_result = probe.schedule()
-            max_effective_need = max(
-                max_effective_need,
-                int(getattr(probe, "max_live_labels", probe_result.max_live)),
-            )
-        configs = _fold_lars_configs_by_reg_budget(configs, effective_live_need=max_effective_need)
-    else:
-        max_effective_need = 0
+    # Disable reg_budget candidate search/folding and acc_reg_budget demotion.
+    # One split candidate is emitted, with all input labels and all accumulators
+    # resident.  The legacy arguments are retained for caller compatibility.
+    del reg_budget, acc_reg_budget, fold_reg_budgets_by_max_live
+    configs: List[Dict[str, Any]] = [{
+        "name": "lars_bwd_split_all_inputs_accall",
+        "reg_budget": 0,
+        "acc_reg_budget": None,
+        "smem_acc_volatile": False,
+    }]
+    max_effective_need = 0
 
     grad_tag = "split" if need_grad_w else "split_nogradw"
     candidates = []
@@ -5139,8 +4397,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
         acc_rb = None if acc_rb is None else int(acc_rb)
         cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
         cand_name = str(cfg["name"])
-        auto_fallback_when_full = bool(max_effective_need > 0 and rb < max_effective_need)
-        cfg["auto_fallback_when_full"] = auto_fallback_when_full
+        cfg["auto_fallback_when_full"] = False
         cfg["effective_live_need"] = int(max_effective_need)
         cfg["split_backward"] = True
 
@@ -5166,7 +4423,6 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 grad_kind=gkind,
                 enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
                 topk_candidates=cfg.get("topk_candidates", topk_candidates),
-                prefer_path_fallback_when_full=auto_fallback_when_full,
                 profile=bool(cfg.get("profile", profile)),
                 profile_name=str(cfg.get("profile_name", f"{cand_name}_{gkind}")),
                 profile_interval=int(cfg.get("profile_interval", profile_interval)),
@@ -5228,12 +4484,13 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 "config": cfg,
                 "profiles": profiles,
                 "budget_fold_effective_live_need": int(max_effective_need),
-                "auto_fallback_when_full": auto_fallback_when_full,
+                "auto_fallback_when_full": False,
             })
         else:
             candidates.append((cand_name, code))
 
     return _finalize_codegen_candidates(candidates, return_schedule=return_schedule)
+
 
 
 def _generate_code_uniform1d_bwd_fused_from_context(
@@ -5250,9 +4507,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     kernel_name: str,
     reg_budget: Union[int, Iterable[int]],
     acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]],
-    enable_cse: bool,
     smem_acc_volatile: bool,
-    consider_cse: bool,
     return_schedule: bool,
     fold_reg_budgets_by_max_live: bool,
     profile: bool,
@@ -5262,141 +4517,93 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     enable_secondary_affinity: bool,
     topk_candidates: Optional[int],
 ):
-    probed_budgets, budget_fold_info = _fold_bwd_reg_budget_candidates_by_max_live(
-        reg_budget,
-        bwd_paths=ctx.bwd_paths,
+    """
+    Generate one fused backward LARS candidate.
+
+    The slim policy ignores reg_budget search and acc_reg_budget demotion:
+    input labels are virtually unbounded and all gw/gx/gy accumulators stay
+    register-resident in the emitter.
+    """
+    del reg_budget, acc_reg_budget, smem_acc_volatile, fold_reg_budgets_by_max_live
+
+    grad_tag = "full" if need_grad_w else "nogradw"
+    cand_name = "lars_bwd_all_inputs_accall"
+
+    scheduler = LARSUniform1DBwdScheduler(
+        paths=ctx.bwd_paths,
+        reg_budget=0,
         need_grad_w=need_grad_w,
-        consider_cse=consider_cse,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
+        profile_name=cand_name,
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
         profile_print=profile_print,
     )
+    schedule_result = scheduler.schedule()
 
-    if fold_reg_budgets_by_max_live:
-        effective_reg_budget = probed_budgets
-    else:
-        effective_reg_budget, _ = _normalize_reg_budget_candidates(reg_budget)
-
-    effective_live_need = int(budget_fold_info.get("effective_live_need", 0))
-    auto_cse_configs = default_lars_bwd_cse_candidate_configs(
-        effective_reg_budget,
-        acc_reg_budget=acc_reg_budget,
-        enable_cse=enable_cse,
-        smem_acc_volatile=smem_acc_volatile,
+    base_kernel_name = _bwd_base_kernel_name(
+        kernel_name=kernel_name,
+        cand_name=cand_name,
+        u_dim=u_dim,
+        path_count=ctx.P,
+        mode_str=ctx.mode_str,
+        layout_tag=ctx.layout_tag,
+        grad_tag=grad_tag,
     )
 
-    grad_tag = "full" if need_grad_w else "nogradw"
-    candidates = []
+    code = emit_fused_bwd_kernel_from_lars_schedule(
+        schedule_result,
+        kernel_name=base_kernel_name,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        use_x_src=ctx.use_x_src,
+        use_y_src=ctx.use_y_src,
+        use_scatter=ctx.use_scatter,
+        u_dim=u_dim,
+        iw_dim=iw_dim,
+        ix_dim=ix_dim,
+        ky_dim=ky_dim,
+        v_dim=v_dim,
+        block_size=32,
+        acc_reg_budget=None,
+        smem_acc_volatile=False,
+    )
 
-    for cfg_in in auto_cse_configs:
-        cfg = dict(cfg_in)
-        rb = int(cfg.get("reg_budget", reg_budget if isinstance(reg_budget, int) else list(reg_budget)[0]))
-        acc_rb = cfg.get("acc_reg_budget", None)
-        acc_rb = None if acc_rb is None else int(acc_rb)
-        cfg_enable_cse = bool(cfg.get("enable_cse", enable_cse))
-        cfg_smem_acc_volatile = bool(cfg.get("smem_acc_volatile", smem_acc_volatile))
+    code = code + "\n" + emit_lars_bwd_launcher(
+        bundle_name=base_kernel_name,
+        mode=mode,
+        need_grad_w=need_grad_w,
+        use_x_src=ctx.use_x_src,
+        use_y_src=ctx.use_y_src,
+        use_scatter=ctx.use_scatter,
+    )
 
-        acc_tag = "accall" if acc_rb is None else f"acc{acc_rb}_smem"
-        cse_tag = "cse_auto" if cfg_enable_cse else "nocse"
-        volatile_tag = "_volatile" if (acc_rb is not None and cfg_smem_acc_volatile) else ""
-        cand_name = str(cfg.get("name", f"lars_bwd_r{rb}_{acc_tag}_{cse_tag}{volatile_tag}"))
+    _write_codegen_candidate(
+        out_path=out_path,
+        candidate_count=1,
+        cand_name=cand_name,
+        code=code,
+    )
 
-        auto_fallback_when_full = bool(effective_live_need > 0 and rb < effective_live_need)
-        cfg["auto_fallback_when_full"] = auto_fallback_when_full
-        cfg["effective_live_need"] = effective_live_need
-        cfg["need_grad_w"] = bool(need_grad_w)
-        cfg["acc_reg_budget"] = acc_rb
-        cfg["enable_cse"] = bool(cfg_enable_cse)
-        cfg["smem_acc_volatile"] = bool(cfg_smem_acc_volatile)
-        cfg["split_backward"] = False
-
-        scheduler = CSELARSUniform1DBwdScheduler(
-            paths=ctx.bwd_paths,
-            reg_budget=rb,
-            need_grad_w=need_grad_w,
-            enable_cse=cfg_enable_cse,
-            enable_secondary_affinity=bool(cfg.get("enable_secondary_affinity", enable_secondary_affinity)),
-            topk_candidates=cfg.get("topk_candidates", topk_candidates),
-            prefer_path_fallback_when_full=auto_fallback_when_full,
-            profile=bool(cfg.get("profile", profile)),
-            profile_name=str(cfg.get("profile_name", cand_name)),
-            profile_interval=int(cfg.get("profile_interval", profile_interval)),
-            profile_seconds=float(cfg.get("profile_seconds", profile_seconds)),
-            profile_print=bool(cfg.get("profile_print", profile_print)),
-        )
-        schedule_result = scheduler.schedule()
-
-        base_kernel_name = _bwd_base_kernel_name(
-            kernel_name=kernel_name,
-            cand_name=cand_name,
-            u_dim=u_dim,
-            path_count=ctx.P,
-            mode_str=ctx.mode_str,
-            layout_tag=ctx.layout_tag,
-            grad_tag=grad_tag,
-        )
-
-        code = emit_fused_bwd_kernel_from_lars_schedule(
-            schedule_result,
-            kernel_name=base_kernel_name,
-            mode=mode,
-            need_grad_w=need_grad_w,
-            use_x_src=ctx.use_x_src,
-            use_y_src=ctx.use_y_src,
-            use_scatter=ctx.use_scatter,
-            u_dim=u_dim,
-            iw_dim=iw_dim,
-            ix_dim=ix_dim,
-            ky_dim=ky_dim,
-            v_dim=v_dim,
-            block_size=32,
-            acc_reg_budget=acc_rb,
-            smem_acc_volatile=cfg_smem_acc_volatile,
-        )
-
-        code = code + "\n" + emit_lars_bwd_launcher(
-            bundle_name=base_kernel_name,
-            mode=mode,
-            need_grad_w=need_grad_w,
-            use_x_src=ctx.use_x_src,
-            use_y_src=ctx.use_y_src,
-            use_scatter=ctx.use_scatter,
-        )
-
-        _write_codegen_candidate(
-            out_path=out_path,
-            candidate_count=len(auto_cse_configs),
-            cand_name=cand_name,
-            code=code,
-        )
-
-        if return_schedule:
-            candidates.append({
+    if return_schedule:
+        return {
+            "name": cand_name,
+            "code": code,
+            "schedule": schedule_result,
+            "config": {
                 "name": cand_name,
-                "code": code,
-                "schedule": schedule_result,
-                "config": cfg,
-                "budget_fold_info": dict(budget_fold_info),
-                "budget_fold_max_live": budget_fold_info.get("no_cse_max_live"),
-                "budget_fold_max_cse": budget_fold_info.get("max_cse_live_pairs"),
-                "budget_fold_effective_live_need": budget_fold_info.get("effective_live_need"),
-                "auto_fallback_when_full": auto_fallback_when_full,
-                "profile": schedule_result.profile,
-                "cse_stats": {
-                    "pair_creates": getattr(scheduler, "cse_pair_creates", 0),
-                    "pair_hits": getattr(scheduler, "cse_pair_hits", 0),
-                    "pair_releases": getattr(scheduler, "cse_pair_releases", 0),
-                    "pair_drops_for_label_release": getattr(scheduler, "cse_pair_drops_for_label_release", 0),
-                    "pair_drops_for_reg_pressure": getattr(scheduler, "cse_pair_drops_for_reg_pressure", 0),
-                },
-            })
-        else:
-            candidates.append((cand_name, code))
+                "reg_budget": 0,
+                "acc_reg_budget": None,
+                "auto_fallback_when_full": False,
+                "need_grad_w": bool(need_grad_w),
+                "split_backward": False,
+            },
+            "profile": schedule_result.profile,
+        }
 
-    return _finalize_codegen_candidates(candidates, return_schedule=return_schedule)
+    return code
 
 
 def generate_code_uniform1d_bwd_split_with_scheduler(
@@ -5450,9 +4657,11 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         need_grad_w=need_grad_w,
         out_path=out_path,
         kernel_name=kernel_name,
+        # Keep legacy parameters in the public signature, but force the new
+        # policy: input labels unbounded, accumulators all register-resident.
         reg_budget=reg_budget,
-        acc_reg_budget=acc_reg_budget,
-        smem_acc_volatile=smem_acc_volatile,
+        acc_reg_budget=None,
+        smem_acc_volatile=False,
         path_semantics=path_semantics,
         return_schedule=return_schedule,
         fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
@@ -5464,6 +4673,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         topk_candidates=topk_candidates,
         split_backward=True,
     )
+
 
 
 def generate_code_uniform1d_bwd_with_scheduler(
@@ -5481,14 +4691,12 @@ def generate_code_uniform1d_bwd_with_scheduler(
     v_dim: Optional[int] = None,
     mode: str = "u,u,,u",
     need_grad_w: bool = True,
-    out_path: str = "generated_uniform1d_bwd_lars_cse.cu",
+    out_path: str = "generated_uniform1d_bwd_lars.cu",
     kernel_name: str = "uniform1d_bwd_lars",
     scalar_t: str = "float",
     reg_budget: Union[int, Iterable[int]] = 24,
     acc_reg_budget: Optional[Union[int, Iterable[Optional[int]]]] = None,
-    enable_cse: bool = False,
     smem_acc_volatile: bool = True,
-    consider_cse: bool = False,
     path_semantics: str = "wxy",
     return_schedule: bool = False,
     fold_reg_budgets_by_max_live: bool = True,
@@ -5541,8 +4749,8 @@ def generate_code_uniform1d_bwd_with_scheduler(
         out_path=out_path,
         kernel_name=kernel_name,
         reg_budget=reg_budget,
-        acc_reg_budget=acc_reg_budget,
-        smem_acc_volatile=smem_acc_volatile,
+        acc_reg_budget=None,
+        smem_acc_volatile=False,
         return_schedule=return_schedule,
         fold_reg_budgets_by_max_live=fold_reg_budgets_by_max_live,
         profile=profile,
@@ -5556,15 +4764,11 @@ def generate_code_uniform1d_bwd_with_scheduler(
     if use_split_backward:
         return _generate_code_uniform1d_bwd_split_from_context(**common_kwargs)
 
-    return _generate_code_uniform1d_bwd_fused_from_context(
-        **common_kwargs,
-        enable_cse=enable_cse,
-        consider_cse=consider_cse,
-    )
+    return _generate_code_uniform1d_bwd_fused_from_context(**common_kwargs)
 
 
 # =============================================================================
-# Baseline full-unrolled codegen: no LARS, no CSE, no resident accumulator reuse
+# Baseline full-unrolled codegen: no LARS and no resident accumulator reuse
 # =============================================================================
 
 def _make_baseline_wxy_paths_from_uniform1d_lists(
@@ -5584,7 +4788,7 @@ def _make_baseline_wxy_paths_from_uniform1d_lists(
     path_semantics="xyw": external (i,j,k) means x[i], y[j], w[k].
 
     This baseline intentionally does not perform path scheduling, operand reuse,
-    pair CSE, or register-budget management.  The Python code generator simply
+    register-budget management.  The Python code generator simply
     emits one straight-line block per cg path, in the original path order.
     """
     if path_semantics not in ("wxy", "xyw"):
@@ -5622,12 +4826,11 @@ def emit_fused_fwd_kernel_baseline_unrolled(
 
     Baseline policy:
       - no LARS schedule_result;
-      - no pair CSE;
       - no resident output accumulator grouping;
       - every path reloads w/x/y from global memory and immediately updates out.
 
     This is intended as a diagnostic lower-level baseline for comparing the
-    benefit/cost of LARS scheduling, pair CSE, and accumulator residency.
+    benefit/cost of LARS scheduling and accumulator residency.
     """
     if block_size != 32:
         raise ValueError("this baseline emitter currently assumes block_size=32")
@@ -5672,7 +4875,6 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    scalar_t* __restrict__ out,")
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
     ap("    const int e_local = (int)blockIdx.x;")
@@ -5686,7 +4888,7 @@ def emit_fused_fwd_kernel_baseline_unrolled(
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
         ap("")
-    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     ap("    const int x_row = " + ("src_idx[e_orig];" if use_x_src else "e_local;"))
@@ -5810,7 +5012,6 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -5818,7 +5019,7 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     ap("        w, x, y, out,")
-    ap("        src_idx, dst_idx, b_list,")
+    ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
@@ -5831,7 +5032,6 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -5842,11 +5042,11 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    if (should_use_int32_index_baseline_fwd(B, WB, Iw, Ix, Ky, V, U, S,")
     ap("                                            kUseXSrc, kUseYSrc, kUseScatter, kModeScalarY)) {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(")
-    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            w, x, y, out, src_idx, dst_idx,")
     ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    } else {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
-    ap("            w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("            w, x, y, out, src_idx, dst_idx,")
     ap("            B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    }")
     ap("}")
@@ -5860,12 +5060,11 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("    scalar_t* out,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
     ap(f"    launch_{kernel_name}_auto<scalar_t>(")
-    ap("        w, x, y, out, src_idx, dst_idx, b_list,")
+    ap("        w, x, y, out, src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("}")
     ap("")
@@ -5894,7 +5093,6 @@ def emit_fused_bwd_kernel_baseline_unrolled(
 
     Baseline policy:
       - no LARS input-register scheduling;
-      - no pair CSE, e.g. no cached w*grad_out;
       - no resident gw/gx/gy accumulators;
       - every path reloads w/x/y/grad_out and immediately writes gradients.
 
@@ -5961,7 +5159,6 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("    scalar_t* __restrict__ grad_y,")
     ap("    const int32_t* __restrict__ src_idx,")
     ap("    const int32_t* __restrict__ dst_idx,")
-    ap("    const int32_t* __restrict__ b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S)")
     ap("{")
     ap("    const int e_local = (int)blockIdx.x;")
@@ -5974,7 +5171,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
-    ap("    const int e_orig = b_list ? b_list[e_local] : e_local;")
+    ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
     if use_x_src or use_y_src:
@@ -6161,7 +5358,6 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -6172,7 +5368,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("        w, x, y, grad_out, grad_x, grad_y,")
-    ap("        src_idx, dst_idx, b_list,")
+    ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
     ap("}")
     ap("")
@@ -6189,7 +5385,6 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -6204,14 +5399,14 @@ def emit_fused_bwd_kernel_baseline_unrolled(
         ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("            w, x, y, grad_out, grad_x, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    } else {")
     ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(")
     if need_grad_w:
         ap("            w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("            w, x, y, grad_out, grad_x, grad_y,")
-    ap("            src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("            src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("    }")
     ap("}")
     ap("")
@@ -6228,7 +5423,6 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("    scalar_t* grad_y,")
     ap("    const int32_t* src_idx,")
     ap("    const int32_t* dst_idx,")
-    ap("    const int32_t* b_list,")
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
@@ -6237,7 +5431,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
         ap("        w, x, y, grad_out, grad_x, grad_y,")
-    ap("        src_idx, dst_idx, b_list, B, WB, Iw, Ix, Ky, V, U, S, stream);")
+    ap("        src_idx, dst_idx, B, WB, Iw, Ix, Ky, V, U, S, stream);")
     ap("}")
     ap("")
 
@@ -6375,7 +5569,7 @@ def generate_code_uniform1d_bwd_baseline_unrolled(
     """
     Generate a backward baseline CUDA implementation by fully unrolling cg paths.
 
-    This entry deliberately bypasses LARS, pair CSE, and resident gradient
+    This entry deliberately bypasses LARS and resident gradient
     accumulators.  Each path reloads w/x/y/grad_out and immediately writes
     grad_w/grad_x/grad_y.
     """

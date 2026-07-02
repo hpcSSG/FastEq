@@ -275,6 +275,8 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         #print(f"cg_val_all shape:{cg_val_all.shape}, I_total:{I_total}, path_num:{path_num}")
         #print(f"K_per_path:{K_per_path}")
 
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
         if path_num == 1 and nnz0 == 1 and I_total == 1:
             # use torch is better when open MPS
@@ -297,7 +299,11 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
             
             output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
                                                         BK=8, BW=64, BU=32, num_warps=4)
-       
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.meta = meta
@@ -306,8 +312,8 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_out):
-        """ torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000 """
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
 
         w, x, y = ctx.saved_tensors
@@ -354,6 +360,11 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
             #====================== Triton Implementation ====================== 
             grad_x = triton_fused_fctp_bwd(grad_out, w, ctx.vstar, p_for_k, i_for_k, val_for_k, I_total, cg_val, can_use_empty_grad_x,
                                                             BK=8, BW=32, BU=32, num_warps=4)
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        execution_time_ms = end_time - start_time
+        print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
 
         return None, grad_x, None, None  # None for w, y, meta gradients
 
