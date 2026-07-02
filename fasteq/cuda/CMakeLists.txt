@@ -29,6 +29,9 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
+if(NOT TARGET CUDA::nvToolsExt)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED GLOBAL)
+endif()
 
 # ---- Find CUDA runtime shipped with PyTorch (pip wheel) ----
 execute_process(
@@ -67,14 +70,7 @@ include_directories(src)
 set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
 
 add_subdirectory(src/equi_linear_kernels)

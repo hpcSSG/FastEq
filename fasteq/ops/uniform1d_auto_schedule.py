@@ -597,6 +597,314 @@ def generate_code_stc_fwd_with_scheduler(
     return code
 
 
+
+def _check_stc_path_bounds_for_bwd(
+    paths: Sequence[STCPath],
+    *,
+    x0_dim: Optional[int],
+    x1_dim: Optional[int],
+    v_dim: Optional[int],
+) -> None:
+    for p in paths:
+        if x0_dim is not None and int(p.x0_index) >= int(x0_dim):
+            raise ValueError(f"x0 index {p.x0_index} out of x0_dim={x0_dim} in STC path {p.pid}")
+        if v_dim is not None and int(p.v) >= int(v_dim):
+            raise ValueError(f"out index {p.v} out of v_dim={v_dim} in STC path {p.pid}")
+        if int(p.x0_index) < 0 or int(p.v) < 0:
+            raise ValueError(f"negative x0/out index in STC path {p.pid}: x0={p.x0_index}, out={p.v}")
+        for x1_idx in p.x1_indices:
+            if int(x1_idx) < 0:
+                raise ValueError(f"negative x1 index {x1_idx} in STC path {p.pid}")
+            if x1_dim is not None and int(x1_idx) >= int(x1_dim):
+                raise ValueError(f"x1 index {x1_idx} out of x1_dim={x1_dim} in STC path {p.pid}")
+
+
+def _stc_shared_x1_expr(x1_idx: int) -> str:
+    return f"x1_shared[(index_t){int(x1_idx)} * (index_t)TILE_U + (index_t)lj]"
+
+
+def _stc_shared_grad_x1_expr(x1_idx: int) -> str:
+    return f"grad_x1_shared[(index_t){int(x1_idx)} * (index_t)TILE_U + (index_t)lj]"
+
+
+def _stc_bwd_grad_expr(base_expr: str, other_x1_indices: Sequence[int]) -> str:
+    expr = base_expr
+    for x1_idx in other_x1_indices:
+        expr = f"({expr} * {_stc_shared_x1_expr(int(x1_idx))})"
+    return expr
+
+
+def emit_stc_bwd_kernel_from_paths(
+    paths: Sequence[STCPath],
+    *,
+    kernel_name: str,
+    path_order: Optional[Sequence[int]] = None,
+    u_dim: Optional[int] = None,
+    x0_dim: Optional[int] = None,
+    x1_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    tile_u: int = 32,
+) -> str:
+    """Emit STC backward CUDA code that computes only grad_x1.
+
+    The generated kernel mirrors the baseline tiled STC backward structure:
+    each block owns one ``(batch, U-tile)`` pair, stages all x1 segments for that
+    tile in shared memory, accumulates grad_x1 in shared memory, and writes the
+    final [B, X1, U] gradient once.  Path computation is statically unrolled.
+    """
+    if int(tile_u) <= 0:
+        raise ValueError(f"tile_u must be positive, got {tile_u}")
+
+    path_list = list(paths)
+    if path_order is None:
+        ordered_paths = path_list
+    else:
+        by_pid = {int(p.pid): p for p in path_list}
+        ordered_paths = [by_pid[int(pid)] for pid in path_order]
+
+    _check_stc_path_bounds_for_bwd(ordered_paths, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+
+    lines: List[str] = []
+
+    def ap(line: str = "") -> None:
+        lines.append(line)
+
+    ap("#include <stdint.h>")
+    ap("#include <torch/extension.h>")
+    ap("#include <vector>")
+    ap("#include <cstdint>")
+    ap("")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap("  #include <hip/hip_runtime.h>")
+    ap("  #include <ATen/hip/HIPContext.h>")
+    ap("  #include <c10/hip/HIPGuard.h>")
+    ap("  using gpuStream_t = hipStream_t;")
+    ap("  #define getCurrentGPUStream at::hip::getCurrentHIPStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()")
+    ap("#else")
+    ap("  #include <cuda.h>")
+    ap("  #include <cuda_runtime.h>")
+    ap("  #include <ATen/cuda/CUDAContext.h>")
+    ap("  using gpuStream_t = cudaStream_t;")
+    ap("  #define getCurrentGPUStream at::cuda::getCurrentCUDAStream")
+    ap("  #define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()")
+    ap("#endif")
+    ap("")
+    ap("using GPU_Guard = c10::DeviceGuard;")
+    ap("")
+    ap("template <typename scalar_t, typename index_t, int TILE_U>")
+    ap(f"__global__ void {kernel_name}(")
+    ap("    const scalar_t* __restrict__ grad_out,")
+    ap("    const scalar_t* __restrict__ x1,")
+    ap("    const scalar_t* __restrict__ x0,")
+    ap("    scalar_t* __restrict__ grad_x1,")
+    ap("    int B, int X1, int X0, int V, int U)")
+    ap("{")
+    ap("    extern __shared__ __align__(sizeof(scalar_t)) unsigned char smem[];")
+    ap("    scalar_t* x1_shared = reinterpret_cast<scalar_t*>(smem);")
+    ap("    scalar_t* grad_x1_shared = x1_shared + (index_t)X1 * (index_t)TILE_U;")
+    ap("")
+    ap("    const int b = (int)blockIdx.x;")
+    ap("    const int tile_id = (int)blockIdx.y;")
+    ap("    const int lj = (int)threadIdx.x;")
+    ap("    const int u = tile_id * TILE_U + lj;")
+    ap("    if (b >= B) return;")
+    ap("")
+    ap("    for (int a = 0; a < X1; ++a) {")
+    ap("        const index_t idx_global = ((index_t)b * (index_t)X1 + (index_t)a) * (index_t)U + (index_t)u;")
+    ap("        const index_t idx_shared = (index_t)a * (index_t)TILE_U + (index_t)lj;")
+    ap("        x1_shared[idx_shared] = x1[idx_global];")
+    ap("        grad_x1_shared[idx_shared] = scalar_t(0);")
+    ap("    }")
+    ap("")
+    ap("    __syncthreads();")
+    ap("")
+
+    for inst_id, p in enumerate(ordered_paths):
+        x1s = tuple(int(v) for v in p.x1_indices)
+        x0_idx = int(p.x0_index)
+        out_v = int(p.v)
+        coeff = float(p.c)
+        base_name = f"base_{inst_id}"
+        comment = _sanitize_cuda_comment(
+            f"path#{p.pid}: grad_x1 for out[{out_v}] += coeff * grad_out * x0[{x0_idx}]"
+        )
+        ap(f"    // bwd inst {inst_id}: {comment}")
+        ap(
+            f"    const scalar_t {base_name} = "
+            f"grad_out[((index_t)b * (index_t)V + (index_t){out_v}) * (index_t)U + (index_t)u] "
+            f"* scalar_t({_fmt_float(coeff)}) "
+            f"* x0[((index_t)b * (index_t)X0 + (index_t){x0_idx}) * (index_t)U + (index_t)u];"
+        )
+        for pos, target_x1 in enumerate(x1s):
+            other = [idx for q, idx in enumerate(x1s) if q != pos]
+            grad_expr = _stc_bwd_grad_expr(base_name, other)
+            ap(f"    {_stc_shared_grad_x1_expr(target_x1)} += {grad_expr};")
+        ap("")
+
+    ap("    __syncthreads();")
+    ap("")
+    ap("    for (int a = 0; a < X1; ++a) {")
+    ap("        const index_t idx_global = ((index_t)b * (index_t)X1 + (index_t)a) * (index_t)U + (index_t)u;")
+    ap("        const index_t idx_shared = (index_t)a * (index_t)TILE_U + (index_t)lj;")
+    ap("        grad_x1[idx_global] = grad_x1_shared[idx_shared];")
+    ap("    }")
+    ap("}")
+    ap("")
+    ap("static inline bool mul_fits_int32(int64_t a, int64_t b) {")
+    ap("    if (a < 0 || b < 0) return false;")
+    ap("    constexpr int64_t LIM = 2147483647LL;")
+    ap("    if (a == 0 || b == 0) return true;")
+    ap("    return a <= LIM / b;")
+    ap("}")
+    ap("static inline bool mul3_fits_int32(int64_t a, int64_t b, int64_t c) {")
+    ap("    if (!mul_fits_int32(a, b)) return false;")
+    ap("    return mul_fits_int32(a * b, c);")
+    ap("}")
+    ap("")
+    ap("template <typename scalar_t, typename index_t, int TILE_U>")
+    ap(f"void launch_{kernel_name}_typed(")
+    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
+    ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
+    ap("{")
+    ap("    dim3 block(TILE_U);")
+    ap("    dim3 grid(B, U / TILE_U);")
+    ap("    size_t smem_bytes = (size_t)2 * (size_t)X1 * (size_t)TILE_U * sizeof(scalar_t);")
+    ap(f"    {kernel_name}<scalar_t, index_t, TILE_U><<<grid, block, smem_bytes, stream>>>(")
+    ap("        grad_out, x1, x0, grad_x1, B, X1, X0, V, U);")
+    ap("}")
+    ap("")
+    ap("template <typename scalar_t, int TILE_U>")
+    ap(f"void launch_{kernel_name}(")
+    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
+    ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
+    ap("{")
+    ap("    bool use_i32 = mul3_fits_int32((int64_t)B, (int64_t)X1, (int64_t)U) &&")
+    ap("                   mul3_fits_int32((int64_t)B, (int64_t)X0, (int64_t)U) &&")
+    ap("                   mul3_fits_int32((int64_t)B, (int64_t)V,  (int64_t)U);")
+    ap("    if (use_i32) {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t, TILE_U>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap("    } else {")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t, TILE_U>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap("    }")
+    ap("}")
+    ap("")
+    ap(f"torch::Tensor launcher_{kernel_name}(torch::Tensor grad_out, torch::Tensor x1, torch::Tensor x0, int64_t V64) {{")
+    ap("    TORCH_CHECK(grad_out.is_cuda() && x1.is_cuda() && x0.is_cuda(), \"grad_out/x1/x0 must be CUDA/HIP\");")
+    ap("    TORCH_CHECK(grad_out.is_contiguous() && x1.is_contiguous() && x0.is_contiguous(), \"grad_out/x1/x0 must be contiguous\");")
+    ap("    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3, \"x1/x0 must be [B,S,U]\");")
+    ap("    TORCH_CHECK(grad_out.scalar_type() == x1.scalar_type() && x1.scalar_type() == x0.scalar_type(), \"grad_out/x1/x0 dtype mismatch\");")
+    ap("    int B = (int)x1.size(0);")
+    ap("    int X1 = (int)x1.size(1);")
+    ap("    int U = (int)x1.size(2);")
+    ap("    int X0 = (int)x0.size(1);")
+    ap("    int V = (int)V64;")
+    ap("    TORCH_CHECK((int)x0.size(0) == B, \"x0 batch mismatch\");")
+    ap("    TORCH_CHECK((int)x0.size(2) == U, \"x0 U mismatch\");")
+    ap("    TORCH_CHECK(V > 0, \"V must be > 0\");")
+    ap(f"    TORCH_CHECK((U % {int(tile_u)}) == 0, \"U must be a multiple of TILE_U\");")
+    ap("    TORCH_CHECK(grad_out.numel() == (int64_t)B * (int64_t)V * (int64_t)U, \"grad_out numel mismatch; expected B*V*U\");")
+    if u_dim is not None:
+        ap(f"    TORCH_CHECK(U == {int(u_dim)}, \"U mismatch for generated STC backward kernel\");")
+    if x0_dim is not None:
+        ap(f"    TORCH_CHECK(X0 == {int(x0_dim)}, \"X0 mismatch for generated STC backward kernel\");")
+    if x1_dim is not None:
+        ap(f"    TORCH_CHECK(X1 == {int(x1_dim)}, \"X1 mismatch for generated STC backward kernel\");")
+    if v_dim is not None:
+        ap(f"    TORCH_CHECK(V == {int(v_dim)}, \"V mismatch for generated STC backward kernel\");")
+    ap("    auto grad_x1 = torch::zeros_like(x1);")
+    ap("    GPU_Guard device_guard(x1.device());")
+    ap("    gpuStream_t stream = getCurrentGPUStream(x1.device().index());")
+    ap(f"    AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), \"{kernel_name}\", [&] {{")
+    ap(f"        launch_{kernel_name}<scalar_t, {int(tile_u)}>((const scalar_t*)grad_out.data_ptr<scalar_t>(),")
+    ap("            (const scalar_t*)x1.data_ptr<scalar_t>(),")
+    ap("            (const scalar_t*)x0.data_ptr<scalar_t>(),")
+    ap("            (scalar_t*)grad_x1.data_ptr<scalar_t>(), B, X1, X0, V, U, stream);")
+    ap("    });")
+    ap("    GPU_KERNEL_LAUNCH_CHECK();")
+    ap("    return grad_x1;")
+    ap("}")
+    ap("")
+    ap("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
+    ap(f"    m.def(\"run\", &launcher_{kernel_name}, \"{kernel_name} STC backward x1-only jit impl\");")
+    ap("}")
+    return "\n".join(lines)
+
+
+def generate_code_stc_bwd_with_scheduler(
+    idx_lists: torch.Tensor | Sequence[torch.Tensor],
+    coeff_list: torch.Tensor,
+    *,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+    num_out_segments: int,
+    u_dim: int,
+    out_path: str = "generated_stc_bwd_lars.cu",
+    kernel_name: str = "stc_lars_bwd",
+    x0_dim: Optional[int] = None,
+    x1_dim: Optional[int] = None,
+    return_schedule: bool = False,
+    profile: bool = False,
+    profile_interval: int = 1000,
+    profile_seconds: float = 2.0,
+    profile_print: bool = False,
+    enable_secondary_affinity: bool = False,
+    topk_candidates: Optional[int] = 128,
+    tile_u: int = 32,
+) -> Any:
+    """Generate STC backward code for grad_x1 only.
+
+    This uses the same LARSUniform1DScheduler(path_kind="stc") to choose a
+    static path order, but the emitted kernel follows the tiled STC backward
+    computation: stage x1 and grad_x1 in shared memory, iterate paths, and write
+    a single [B, X1, U] gradient tensor.
+    """
+    paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
+    scheduler = LARSUniform1DScheduler(
+        paths,
+        reg_budget=0,
+        path_kind="stc",
+        enable_secondary_affinity=enable_secondary_affinity,
+        topk_candidates=topk_candidates,
+        profile=profile,
+        profile_name="stc_lars_bwd_x1_only",
+        profile_interval=profile_interval,
+        profile_seconds=profile_seconds,
+        profile_print=profile_print,
+    )
+    schedule_result = scheduler.schedule()
+
+    idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list, path_lens=path_lens)
+    if path_lens is None:
+        inferred_lens = infer_stc_path_lens_from_padded(idx_norm, coeff_list, pad_value=pad_value)
+    else:
+        inferred_lens = path_lens.detach().cpu().to(torch.int64).reshape(-1)
+    base_kernel_name = f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_maxlen{int(inferred_lens.max().item())}"
+
+    code = emit_stc_bwd_kernel_from_paths(
+        paths,
+        path_order=schedule_result.path_order,
+        kernel_name=base_kernel_name,
+        u_dim=int(u_dim),
+        x0_dim=x0_dim,
+        x1_dim=x1_dim,
+        v_dim=int(num_out_segments),
+        tile_u=int(tile_u),
+    )
+    if out_path:
+        Path(out_path).write_text(code, encoding="utf-8")
+    if return_schedule:
+        return {
+            "name": "stc_lars_bwd_x1_only",
+            "code": code,
+            "kernel_name": base_kernel_name,
+            "schedule": schedule_result,
+            "num_paths": len(paths),
+            "max_live": schedule_result.max_live,
+        }
+    return code
+
+
 # =============================================================================
 # LARS scheduler integration
 # =============================================================================
