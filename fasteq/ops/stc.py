@@ -41,6 +41,22 @@ except ImportError:  # Allows direct local testing when this file is not importe
         _infer_stc_path_lens_tensor_from_padded,
     )
 
+
+try:
+    from .uniform1d_jit import (
+        _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
+        _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
+        _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
+        _benchmark_and_select_best_jit_candidate as _u1d_benchmark_and_select_best_jit_candidate,
+    )
+except ImportError:  # Allows direct local testing when this file is not imported as a package module.
+    from uniform1d import (
+        _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
+        _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
+        _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
+        _benchmark_and_select_best_jit_candidate as _u1d_benchmark_and_select_best_jit_candidate,
+    )
+
 _MODULE_CACHE: Dict[str, Any] = {}
 
 
@@ -351,6 +367,50 @@ def _stable_meta_hash(
     return h.hexdigest()[:16]
 
 
+
+def _make_stc_fwd_tune_key(
+    idx_lists: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    V: int,
+    U: int,
+    dtype: torch.dtype,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+) -> str:
+    key = _stable_meta_hash(
+        idx_lists,
+        coeffs,
+        V=V,
+        U=U,
+        dtype=dtype,
+        path_lens=path_lens,
+        pad_value=pad_value,
+    )
+    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_filejit_{key}"
+
+
+def _make_stc_bwd_tune_key(
+    idx_lists: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    V: int,
+    U: int,
+    dtype: torch.dtype,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+) -> str:
+    key = _stable_meta_hash(
+        idx_lists,
+        coeffs,
+        V=V,
+        U=U,
+        dtype=dtype,
+        path_lens=path_lens,
+        pad_value=pad_value,
+    )
+    return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_filejit_{key}"
+
 def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: Path, verbose: bool = False):
     if load is None:
         raise RuntimeError("torch.utils.cpp_extension.load is not available")
@@ -402,36 +462,15 @@ def _build_stc_candidate_modules(
     u_dim: int,
     verbose: bool = False,
 ) -> list[tuple[str, Any]]:
-    build_root = _default_build_root()
-    candidates: list[tuple[str, Any]] = []
-
-    # Compile 1 warp first to get compiler-reported register usage.
-    warp_size = _runtime_warp_size()
-    code_w1 = _make_multiwarp_cuda_source(base_code, 1, warp_size=warp_size)
-    name_w1 = f"{base_name}_w1_{_sha1_text(code_w1)}"
-    build_dir_w1 = build_root / name_w1
-    mod_w1 = _load_jit_module_file(module_name=name_w1, code=code_w1, build_dir=build_dir_w1, verbose=verbose)
-    candidates.append(("w1", mod_w1))
-
-    registers = getattr(mod_w1, "__fasteq_registers_per_thread__", None)
-    warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
-    print(
-        f"[JIT][STC][{kind}] regs32/thread={registers} "
-        f"warp_size={warp_size} regs_per_sm={_runtime_register_file_regs_per_sm()} "
-        f"u_tiles={(int(u_dim) + max(1, int(warp_size)) - 1) // max(1, int(warp_size))} "
-        f"warp_candidates={warp_candidates}"
+    """Build STC candidates through Uniform1D's shared JIT candidate layer."""
+    del dtype, verbose  # kept for backward-compatible callers
+    return _u1d_build_jit_candidates_from_sources(
+        tune_key=base_name,
+        raw_candidates=[("cand0", base_code)],
+        cache=_MODULE_CACHE,
+        kind=f"STC_{kind.upper()}",
+        u_dim=int(u_dim),
     )
-
-    for warps in warp_candidates:
-        if int(warps) == 1:
-            continue
-        code_w = _make_multiwarp_cuda_source(base_code, int(warps), warp_size=warp_size)
-        name_w = f"{base_name}_w{int(warps)}_{_sha1_text(code_w)}"
-        build_dir_w = build_root / name_w
-        mod_w = _load_jit_module_file(module_name=name_w, code=code_w, build_dir=build_dir_w, verbose=verbose)
-        candidates.append((f"w{int(warps)}", mod_w))
-    return candidates
-
 
 def _get_or_build_module_candidates(
     idx_lists: torch.Tensor,
@@ -444,7 +483,7 @@ def _get_or_build_module_candidates(
     pad_value: int = STC_PAD_VALUE,
     verbose: bool = False,
 ):
-    key = _stable_meta_hash(
+    base_name = _make_stc_fwd_tune_key(
         idx_lists,
         coeffs,
         V=V,
@@ -453,9 +492,27 @@ def _get_or_build_module_candidates(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    base_name = f"stc_u1d_fwd_path_{idx_lists.shape[1]}_filejit_{key}"
     if base_name in _FWD_BEST_CANDIDATE_CACHE:
-        return [("best", _FWD_BEST_CANDIDATE_CACHE[base_name][1])]
+        best_tag, best_mod, _best_ms = _FWD_BEST_CANDIDATE_CACHE[base_name]
+        return [(best_tag, best_mod)]
+
+    persistent_best = _u1d_load_persistent_best_candidate(
+        tune_key=base_name,
+        cache=_MODULE_CACHE,
+        kind="STC_FWD",
+    )
+    if persistent_best is not None:
+        best_tag, best_mod, best_ms = persistent_best
+        _FWD_BEST_CANDIDATE_CACHE[base_name] = (best_tag, best_mod, best_ms)
+        return [(best_tag, best_mod)]
+
+    prebuilt_modules = _u1d_discover_prebuilt_jit_candidates(
+        tune_key=base_name,
+        cache=_MODULE_CACHE,
+        kind="STC_FWD",
+    )
+    if prebuilt_modules:
+        return prebuilt_modules
 
     idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeffs, path_lens=path_lens)
     if path_lens is None:
@@ -479,7 +536,6 @@ def _get_or_build_module_candidates(
     )
     return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="fwd", dtype=dtype, u_dim=int(U), verbose=verbose)
 
-
 def _get_or_build_module(*args, **kwargs):
     # Backward-compatible helper: return the first built candidate.
     return _get_or_build_module_candidates(*args, **kwargs)[0][1]
@@ -497,7 +553,7 @@ def _get_or_build_bwd_module_candidates(
     pad_value: int = STC_PAD_VALUE,
     verbose: bool = False,
 ):
-    key = _stable_meta_hash(
+    base_name = _make_stc_bwd_tune_key(
         idx_lists,
         coeffs,
         V=V,
@@ -506,9 +562,27 @@ def _get_or_build_bwd_module_candidates(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    base_name = f"stc_u1d_bwd_path_{idx_lists.shape[1]}_filejit_{key}"
     if base_name in _BWD_BEST_CANDIDATE_CACHE:
-        return [("best", _BWD_BEST_CANDIDATE_CACHE[base_name][1])]
+        best_tag, best_mod, _best_ms = _BWD_BEST_CANDIDATE_CACHE[base_name]
+        return [(best_tag, best_mod)]
+
+    persistent_best = _u1d_load_persistent_best_candidate(
+        tune_key=base_name,
+        cache=_MODULE_CACHE,
+        kind="STC_BWD",
+    )
+    if persistent_best is not None:
+        best_tag, best_mod, best_ms = persistent_best
+        _BWD_BEST_CANDIDATE_CACHE[base_name] = (best_tag, best_mod, best_ms)
+        return [(best_tag, best_mod)]
+
+    prebuilt_modules = _u1d_discover_prebuilt_jit_candidates(
+        tune_key=base_name,
+        cache=_MODULE_CACHE,
+        kind="STC_BWD",
+    )
+    if prebuilt_modules:
+        return prebuilt_modules
 
     code = generate_code_stc_bwd_with_scheduler(
         idx_lists,
@@ -523,83 +597,35 @@ def _get_or_build_bwd_module_candidates(
     )
     return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="bwd", dtype=dtype, u_dim=int(U), verbose=verbose)
 
-
 def _get_or_build_bwd_module(*args, **kwargs):
     return _get_or_build_bwd_module_candidates(*args, **kwargs)[0][1]
 
 
 def _select_best_stc_fwd_module(base_key: str, candidates: list[tuple[str, Any]], x1, x0_g, V: int):
-    if base_key in _FWD_BEST_CANDIDATE_CACHE:
-        return _FWD_BEST_CANDIDATE_CACHE[base_key]
     tune_enabled, warmup, repeat = _get_tune_params("fwd")
-    if len(candidates) == 1 or not tune_enabled:
-        tag, mod = candidates[0]
-        best = (tag, mod, float("nan"))
-        _FWD_BEST_CANDIDATE_CACHE[base_key] = best
-        return best
-    timings = []
-    print(f"[JIT][STC][FWD][tune] benchmarking {len(candidates)} warp candidates")
-    for tag, mod in candidates:
-        try:
-            for _ in range(warmup):
-                mod.run(x1.contiguous(), x0_g.contiguous(), int(V))
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(repeat):
-                mod.run(x1.contiguous(), x0_g.contiguous(), int(V))
-            torch.cuda.synchronize()
-            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
-            timings.append((avg_ms, tag, mod))
-            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
-            print(f"[JIT][STC][FWD][tune] candidate={tag} regs={regs} avg={avg_ms:.4f} ms")
-        except BaseException as exc:
-            print(f"[JIT][STC][FWD][tune] candidate={tag} failed: {exc}")
-    if not timings:
-        raise RuntimeError("all STC forward warp candidates failed")
-    timings.sort(key=lambda x: x[0])
-    best_ms, best_tag, best_mod = timings[0]
-    best = (best_tag, best_mod, best_ms)
-    _FWD_BEST_CANDIDATE_CACHE[base_key] = best
-    print(f"[JIT][STC][FWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
-    return best
-
+    return _u1d_benchmark_and_select_best_jit_candidate(
+        tune_key=base_key,
+        candidates=candidates,
+        best_cache=_FWD_BEST_CANDIDATE_CACHE,
+        kind="STC_FWD",
+        tune_enabled=tune_enabled,
+        warmup=warmup,
+        repeat=repeat,
+        call_fn=lambda mod: mod.run(x1.contiguous(), x0_g.contiguous(), int(V)),
+    )
 
 def _select_best_stc_bwd_module(base_key: str, candidates: list[tuple[str, Any]], grad_out, x1, x0_g, V: int):
-    if base_key in _BWD_BEST_CANDIDATE_CACHE:
-        return _BWD_BEST_CANDIDATE_CACHE[base_key]
     tune_enabled, warmup, repeat = _get_tune_params("bwd")
-    if len(candidates) == 1 or not tune_enabled:
-        tag, mod = candidates[0]
-        best = (tag, mod, float("nan"))
-        _BWD_BEST_CANDIDATE_CACHE[base_key] = best
-        return best
-    timings = []
-    print(f"[JIT][STC][BWD][tune] benchmarking {len(candidates)} warp candidates")
-    for tag, mod in candidates:
-        try:
-            for _ in range(warmup):
-                mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V))
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            for _ in range(repeat):
-                mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V))
-            torch.cuda.synchronize()
-            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
-            timings.append((avg_ms, tag, mod))
-            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
-            print(f"[JIT][STC][BWD][tune] candidate={tag} regs={regs} avg={avg_ms:.4f} ms")
-        except BaseException as exc:
-            print(f"[JIT][STC][BWD][tune] candidate={tag} failed: {exc}")
-    if not timings:
-        raise RuntimeError("all STC backward warp candidates failed")
-    timings.sort(key=lambda x: x[0])
-    best_ms, best_tag, best_mod = timings[0]
-    best = (best_tag, best_mod, best_ms)
-    _BWD_BEST_CANDIDATE_CACHE[base_key] = best
-    print(f"[JIT][STC][BWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
-    return best
-
-
+    return _u1d_benchmark_and_select_best_jit_candidate(
+        tune_key=base_key,
+        candidates=candidates,
+        best_cache=_BWD_BEST_CANDIDATE_CACHE,
+        kind="STC_BWD",
+        tune_enabled=tune_enabled,
+        warmup=warmup,
+        repeat=repeat,
+        call_fn=lambda mod: mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V)),
+    )
 
 class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
     """Forward uses generated STC-LARS code with preprocessed STC metadata.
@@ -644,9 +670,14 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             # keeps the function robust if a caller only stores paths_tensor.
             idx_lists_tensor = paths_tensor
 
-        fwd_key = "stc_lars_u1d_fwd_filejit_" + _stable_meta_hash(
-            idx_lists_tensor, coeffs_tensor, V=int(num_out_segments), U=U, dtype=x1.dtype,
-            path_lens=None, pad_value=int(pad_value)
+        fwd_key = _make_stc_fwd_tune_key(
+            idx_lists_tensor,
+            coeffs_tensor,
+            V=int(num_out_segments),
+            U=U,
+            dtype=x1.dtype,
+            path_lens=None,
+            pad_value=int(pad_value),
         )
         candidates = _get_or_build_module_candidates(
             idx_lists_tensor,
@@ -679,9 +710,14 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         start_time = time.perf_counter() * 1000
 
         x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
-        bwd_key = "stc_lars_u1d_bwd_x1_filejit_" + _stable_meta_hash(
-            idx_lists_tensor, coeffs_tensor, V=int(ctx.num_out_segments), U=int(x1.size(2)), dtype=x1.dtype,
-            path_lens=None, pad_value=int(ctx.pad_value)
+        bwd_key = _make_stc_bwd_tune_key(
+            idx_lists_tensor,
+            coeffs_tensor,
+            V=int(ctx.num_out_segments),
+            U=int(x1.size(2)),
+            dtype=x1.dtype,
+            path_lens=None,
+            pad_value=int(ctx.pad_value),
         )
         candidates = _get_or_build_bwd_module_candidates(
             idx_lists_tensor,

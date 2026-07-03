@@ -16,7 +16,6 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any, List, Set
 
-
 import torch
 import torch._dynamo
 from torch.utils.cpp_extension import load
@@ -145,6 +144,82 @@ def _autowarp_runtime_policy() -> Tuple[int, int, int]:
     max_threads_per_block = _runtime_max_threads_per_block()
     return regs_per_sm, warp_size, max_threads_per_block
 
+
+def _format_cuda_arch_list_from_runtime() -> Optional[str]:
+    """Return a TORCH_CUDA_ARCH_LIST string using the parent process runtime.
+
+    torch.utils.cpp_extension.load() calls _get_cuda_arch_flags().  When
+    TORCH_CUDA_ARCH_LIST is unset, PyTorch queries torch.cuda.get_device_capability()
+    inside the process that performs compilation.  That is unsafe in a forked
+    worker after the parent has initialized CUDA and causes:
+
+        RuntimeError: Cannot re-initialize CUDA in forked subprocess
+
+    Therefore the parent process should materialize the arch list once and pass
+    it to compile workers through the environment.
+    """
+    try:
+        if not torch.cuda.is_available():
+            return None
+        archs = set()
+        ndev = max(1, int(torch.cuda.device_count()))
+        for i in range(ndev):
+            major, minor = torch.cuda.get_device_capability(i)
+            archs.add(f"{int(major)}.{int(minor)}")
+        return ";".join(sorted(archs)) if archs else None
+    except BaseException:
+        return None
+
+
+def _format_rocm_arch_list_from_runtime() -> Optional[str]:
+    """Best-effort ROCm arch list for HIP compile workers."""
+    try:
+        if not torch.cuda.is_available():
+            return None
+        archs = set()
+        ndev = max(1, int(torch.cuda.device_count()))
+        for i in range(ndev):
+            props = torch.cuda.get_device_properties(i)
+            for attr in ("gcnArchName", "gcn_arch_name"):
+                value = getattr(props, attr, None)
+                if value:
+                    # PyTorch may return gfx90a:sramecc-:xnack-.  HIP compile
+                    # flags generally accept the full string, and users can
+                    # override with PYTORCH_ROCM_ARCH if their toolchain wants
+                    # plain gfx90a/gfx936.
+                    archs.add(str(value))
+                    break
+        return ";".join(sorted(archs)) if archs else None
+    except BaseException:
+        return None
+
+
+def _ensure_compile_arch_env(*, allow_runtime_query: bool = True) -> None:
+    """Set compile arch env vars before entering subprocess JIT builds.
+
+    This avoids CUDA/HIP runtime probing in forked compile workers.  It also
+    makes spawn/forkserver workers cheaper because cpp_extension can skip device
+    capability discovery.
+    """
+    if getattr(torch.version, "hip", None):
+        if os.environ.get("PYTORCH_ROCM_ARCH") or os.environ.get("AMDGPU_TARGETS"):
+            return
+        if allow_runtime_query:
+            arch = _format_rocm_arch_list_from_runtime()
+            if arch:
+                os.environ.setdefault("PYTORCH_ROCM_ARCH", arch)
+                os.environ.setdefault("AMDGPU_TARGETS", arch)
+        return
+
+    if getattr(torch.version, "cuda", None):
+        if os.environ.get("TORCH_CUDA_ARCH_LIST"):
+            return
+        if allow_runtime_query:
+            arch = _format_cuda_arch_list_from_runtime()
+            if arch:
+                os.environ.setdefault("TORCH_CUDA_ARCH_LIST", arch)
+        return
+
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
 
@@ -261,21 +336,34 @@ def _find_fasteq_root(start: Path) -> Path:
     raise RuntimeError("Cannot find fasteq project root from __file__")
 
 
+
+from pathlib import Path
+import torch
+
+
 def _detect_gpu_backend() -> str:
+    """Return the build backend without forcing CUDA/HIP runtime init.
+
+    Compile workers may be forked after the parent process has already used the
+    GPU.  Calling torch.cuda.is_available()/get_device_name() in those workers
+    can trigger CUDA re-initialization errors.  torch.version is enough to decide
+    which source tree should be used for a PyTorch build.
     """
-    Return:
-        "cuda" for NVIDIA CUDA
-        "hip"  for AMD ROCm/HIP
-    """
+    if getattr(torch.version, "hip", None):
+        return "hip"
+    if getattr(torch.version, "cuda", None):
+        return "cuda"
+
+    # Last-resort fallback for unusual builds.  This branch may initialize the
+    # runtime, so normal CUDA/HIP builds should not reach it.
     if not torch.cuda.is_available():
         raise RuntimeError("No CUDA/HIP GPU is available.")
 
     name = torch.cuda.get_device_name(0).lower()
-    if "nvidia" in name:
-        return "cuda"
     if "amd" in name or "radeon" in name or "instinct" in name or "bw200" in name:
         return "hip"
-
+    if "nvidia" in name:
+        return "cuda"
     raise RuntimeError(f"Cannot determine GPU backend from device name: {name}")
 
 
@@ -495,6 +583,9 @@ def _load_jit_module(
     cache[module_name] = mod
     return mod
 
+
+
+
 # -----------------------------------------------------------------------------
 # Prebuilt JIT module discovery / direct loading
 # -----------------------------------------------------------------------------
@@ -504,10 +595,10 @@ def _env_flag(name: str, default: str = "1") -> bool:
 
 
 def _jit_cache_log_enabled() -> bool:
-    # Cache hit prints are useful for debugging, but printing on every autograd
-    # call can easily dominate millisecond-level kernels.
-    #return _env_flag("FASTEQ_UNIFORM1D_JIT_CACHE_LOG", "0")
-    return True
+    # Cache-hit/prune prints are useful when debugging the JIT cache, but they
+    # easily dominate millisecond-level kernels and become very noisy when
+    # subprocesses are used for candidate compilation.
+    return _env_flag("FASTEQ_UNIFORM1D_JIT_CACHE_LOG", "0")
 
 
 def _tensor_runtime_identity(x: Any) -> Tuple[Any, ...]:
@@ -683,7 +774,8 @@ def _load_prebuilt_jit_module(
         _attach_register_metadata(mod, build_dir, module_name, None)
     except BaseException:
         pass
-    print(f"[JIT][{kind}] loaded prebuilt extension: {module_name}")
+    if _jit_cache_log_enabled():
+        print(f"[JIT][{kind}] loaded prebuilt extension: {module_name}")
     return mod
 
 
@@ -762,10 +854,11 @@ def _discover_prebuilt_jit_candidates(
             print(f"[JIT][{kind}] prebuilt candidate {safe_tag} failed to load: {exc}")
 
     if modules:
-        print(
-            f"[JIT][{kind}] hit prebuilt candidate cache for {tune_key}: "
-            f"{len(modules)} module(s); skip candidate generation, scheduling and compilation"
-        )
+        if _jit_cache_log_enabled():
+            print(
+                f"[JIT][{kind}] hit prebuilt candidate cache for {tune_key}: "
+                f"{len(modules)} module(s); skip candidate generation, scheduling and compilation"
+            )
     elif errors:
         details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
         print(f"[JIT][{kind}] found prebuilt candidates but none loaded: {details}")
@@ -813,11 +906,12 @@ def _load_persistent_best_candidate(
             cache=cache,
             kind=f"{kind}:{tag}:best",
         )
-        print(
-            f"[JIT][{kind}] hit persistent best candidate: "
-            f"{tune_key} -> {tag} ({best_ms:.4f} ms); "
-            f"skip candidate generation, scheduling, compilation and tuning"
-        )
+        if _jit_cache_log_enabled():
+            print(
+                f"[JIT][{kind}] hit persistent best candidate: "
+                f"{tune_key} -> {tag} ({best_ms:.4f} ms); "
+                f"skip candidate generation, scheduling, compilation and tuning"
+            )
         return tag, mod, best_ms
     except BaseException as exc:
         print(f"[JIT][{kind}] failed to load persistent best metadata {meta_path}: {exc}")
@@ -966,9 +1060,29 @@ def _keep_only_best_jit_candidate(
 # Parallel candidate compilation
 # -----------------------------------------------------------------------------
 
-def _get_candidate_compile_workers(kind: str, candidate_count: int) -> int:
-    return max(1, candidate_count)
+def _default_compile_mp_context_name() -> str:
+    if os.name == "posix":
+        return "fork"
+    return "spawn"
 
+def _get_candidate_compile_workers(kind: str, candidate_count: int) -> int:
+    """Return process count for parallel JIT candidate compilation.
+
+    ``candidate_count`` is the number of non-w1 warp variants waiting to be
+    compiled.  The default intentionally caps by CPU count, while
+    FASTEQ_UNIFORM1D_COMPILE_WORKERS / FASTEQ_JIT_COMPILE_WORKERS can override
+    it for large build machines.
+    """
+    candidate_count = max(1, int(candidate_count))
+    raw = os.environ.get("FASTEQ_UNIFORM1D_COMPILE_WORKERS") or os.environ.get("FASTEQ_JIT_COMPILE_WORKERS")
+    if raw not in (None, ""):
+        try:
+            return max(1, min(candidate_count, int(raw)))
+        except ValueError:
+            pass
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(candidate_count, int(cpu_count)))
 
 def _compile_jit_candidate_worker(payload: Tuple[int, str, str, str, str]) -> Dict[str, Any]:
     """
@@ -980,6 +1094,10 @@ def _compile_jit_candidate_worker(payload: Tuple[int, str, str, str, str]) -> Di
     """
     cand_idx, safe_tag, module_name, code, kind = payload
     try:
+        # Parent should already set TORCH_CUDA_ARCH_LIST/PYTORCH_ROCM_ARCH.
+        # Do not query runtime here: forked workers cannot safely reinitialize CUDA.
+        _ensure_compile_arch_env(allow_runtime_query=False)
+
         # Prevent oversubscription: multiple candidate processes are already
         # running concurrently, so each ninja invocation should use few jobs by
         # default. Users can override this when the machine has enough RAM/cores.
@@ -1030,12 +1148,16 @@ def _build_jit_candidates_from_sources(
     kind: str,
     u_dim: int,
 ) -> List[Tuple[str, object]]:
-    """Build warp-count candidate CUDA sources.
+    """Build scheduler candidates plus auto-warp variants.
 
-    For each scheduler candidate, compile the 1-warp variant first, parse the
-    compiler-reported register count, derive a safe set of warps/block from the
-    register capacity, then compile all allowed warp variants. Runtime tuning
-    later benchmarks these compiled modules and caches the fastest one.
+    The build order is intentionally two-stage:
+      1. Compile each scheduler candidate's w1 variant in the parent process.
+         The w1 build gives compiler-reported registers/thread.
+      2. Derive legal warps/block from the w1 register count and compile the
+         remaining warp variants concurrently in child processes.
+
+    This function is shared by Uniform1D and STC.  STC passes one raw CUDA
+    source, while Uniform1D may pass multiple scheduler/codegen candidates.
     """
     base_infos = _candidate_infos_from_sources(
         tune_key=tune_key,
@@ -1046,23 +1168,25 @@ def _build_jit_candidates_from_sources(
 
     modules: List[Tuple[str, object]] = []
     errors: List[Tuple[str, BaseException]] = []
+    parallel_payloads: List[Tuple[int, str, str, str, str]] = []
+    warp_size = _runtime_warp_size()
 
+    # First pass: compile w1 variants serially so each source gets an accurate
+    # register count.  This avoids guessing occupancy from source-level features.
     for cand_idx, safe_tag, _base_module_name, code in base_infos:
         try:
-            warp_size = _runtime_warp_size()
-            base_code = _make_multiwarp_cuda_source(code, 1, warp_size=warp_size)
-            base_hash = _sha1_text(base_code)
-            base_tag = f"{safe_tag}_w1"
-            base_module_name = f"{tune_key}_{base_tag}_{base_hash}"
-            base_mod = _build_jit_module_common(
-                module_name=base_module_name,
+            code_w1 = _make_multiwarp_cuda_source(code, 1, warp_size=warp_size)
+            tag_w1 = f"{safe_tag}_w1"
+            module_name_w1 = f"{tune_key}_{tag_w1}_{_sha1_text(code_w1)}"
+            mod_w1 = _build_jit_module_common(
+                module_name=module_name_w1,
                 cache=cache,
-                kind=f"{kind}:{base_tag}",
-                codegen_fn=lambda base_code=base_code: base_code,
+                kind=f"{kind}:{tag_w1}",
+                codegen_fn=lambda code_w1=code_w1: code_w1,
             )
-            modules.append((base_tag, base_mod))
+            modules.append((tag_w1, mod_w1))
 
-            registers = getattr(base_mod, "__fasteq_registers_per_thread__", None)
+            registers = getattr(mod_w1, "__fasteq_registers_per_thread__", None)
             warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
             print(
                 f"[JIT][{kind}] candidate={safe_tag} regs32/thread={registers} "
@@ -1077,22 +1201,81 @@ def _build_jit_candidates_from_sources(
                 code_w = _make_multiwarp_cuda_source(code, int(warps), warp_size=warp_size)
                 tag_w = f"{safe_tag}_w{int(warps)}"
                 module_name_w = f"{tune_key}_{tag_w}_{_sha1_text(code_w)}"
-                mod_w = _build_jit_module_common(
-                    module_name=module_name_w,
-                    cache=cache,
-                    kind=f"{kind}:{tag_w}",
-                    codegen_fn=lambda code_w=code_w: code_w,
-                )
-                modules.append((tag_w, mod_w))
+
+                # Fast path for variants that were compiled in an earlier run.
+                if module_name_w in cache:
+                    modules.append((tag_w, cache[module_name_w]))
+                    continue
+                if _has_prebuilt_jit_module(module_name_w):
+                    mod_w = _load_prebuilt_jit_module(
+                        module_name=module_name_w,
+                        cache=cache,
+                        kind=f"{kind}:{tag_w}",
+                    )
+                    modules.append((tag_w, mod_w))
+                    continue
+
+                parallel_payloads.append((
+                    len(parallel_payloads),
+                    tag_w,
+                    module_name_w,
+                    code_w,
+                    f"{kind}:{tag_w}",
+                ))
         except BaseException as exc:
             errors.append((safe_tag, exc))
-            print(f"[JIT][{kind}] candidate {safe_tag} failed to build autowarp variants: {exc}")
+            print(f"[JIT][{kind}] candidate {safe_tag} failed to build w1/autowarp metadata: {exc}")
+
+    # Second pass: compile non-w1 variants in parallel.  The worker writes the
+    # extension to disk; the parent then imports the built module into its cache.
+    if parallel_payloads:
+        # Critical for forked compile workers: materialize CUDA/HIP arch flags in
+        # the parent so torch cpp_extension does not call torch.cuda capability
+        # APIs in a forked child process.
+        _ensure_compile_arch_env(allow_runtime_query=True)
+
+        parallel_enabled = _env_bool("FASTEQ_UNIFORM1D_PARALLEL_COMPILE", True)
+        workers = _get_candidate_compile_workers(kind, len(parallel_payloads))
+        print(
+            f"[JIT][{kind}] parallel compile {len(parallel_payloads)} non-w1 "
+            f"warp candidates with workers={workers}, enabled={int(parallel_enabled)}"
+        )
+
+        if not parallel_enabled or workers <= 1:
+            results = [_compile_jit_candidate_worker(payload) for payload in parallel_payloads]
+        else:
+            ctx_name = _default_compile_mp_context_name()
+            try:
+                mp_ctx = mp.get_context(ctx_name)
+            except ValueError:
+                mp_ctx = mp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
+                results = list(ex.map(_compile_jit_candidate_worker, parallel_payloads))
+
+        for result in sorted(results, key=lambda item: int(item.get("idx", 0))):
+            tag = str(result.get("tag", "cand"))
+            module_name = str(result.get("module_name", ""))
+            result_kind = str(result.get("kind", kind))
+            if not result.get("ok", False):
+                err = RuntimeError(str(result.get("error", "unknown compile failure")))
+                errors.append((tag, err))
+                print(f"[JIT][{kind}] candidate {tag} failed to build:\n{result.get('error', '')}")
+                continue
+            try:
+                mod = _load_prebuilt_jit_module(
+                    module_name=module_name,
+                    cache=cache,
+                    kind=result_kind,
+                )
+                modules.append((tag, mod))
+            except BaseException as exc:
+                errors.append((tag, exc))
+                print(f"[JIT][{kind}] candidate {tag} built but failed to load: {exc}")
 
     if not modules:
         details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
         raise RuntimeError(f"all {kind.lower()} autowarp candidates failed to build: {details}")
     return modules
-
 
 # -----------------------------------------------------------------------------
 # codegen -> jit module
@@ -1192,10 +1375,12 @@ def _build_jit_module_common(
 ):
     # Step 1: Check the in-memory cache for the current process.
     if module_name in cache:
-        print(f"[JIT][{kind}] hit in-memory cache: {module_name}")
+        if _jit_cache_log_enabled():
+            print(f"[JIT][{kind}] hit in-memory cache: {module_name}")
         return cache[module_name]
 
-    print(f"[JIT][{kind}] build/check module: {module_name}")
+    if _jit_cache_log_enabled():
+        print(f"[JIT][{kind}] build/check module: {module_name}")
 
     build_root = _default_build_root()
     build_dir = build_root / module_name
@@ -1290,12 +1475,6 @@ def _build_fwd_jit_candidates(
         if persistent_best is not None:
             best_tag, best_mod, best_ms = persistent_best
             _FWD_BEST_CANDIDATE_CACHE[cached_tune_key] = (best_tag, best_mod, best_ms)
-            _keep_only_best_jit_candidate(
-                tune_key=cached_tune_key,
-                kind="FWD",
-                tag=best_tag,
-                mod=best_mod,
-            )
             return cached_tune_key, [(best_tag, best_mod)]
 
         prebuilt_modules = _discover_prebuilt_jit_candidates(
@@ -1355,12 +1534,6 @@ def _build_fwd_jit_candidates(
     if persistent_best is not None:
         best_tag, best_mod, best_ms = persistent_best
         _FWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
-        _keep_only_best_jit_candidate(
-            tune_key=tune_key,
-            kind="FWD",
-            tag=best_tag,
-            mod=best_mod,
-        )
         return tune_key, [(best_tag, best_mod)]
 
     prebuilt_modules = _discover_prebuilt_jit_candidates(
@@ -1514,12 +1687,6 @@ def _build_bwd_jit_candidates(
         if persistent_best is not None:
             best_tag, best_mod, best_ms = persistent_best
             _BWD_BEST_CANDIDATE_CACHE[cached_tune_key] = (best_tag, best_mod, best_ms)
-            _keep_only_best_jit_candidate(
-                tune_key=cached_tune_key,
-                kind="BWD",
-                tag=best_tag,
-                mod=best_mod,
-            )
             return cached_tune_key, [(best_tag, best_mod)]
 
         prebuilt_modules = _discover_prebuilt_jit_candidates(
@@ -1577,12 +1744,6 @@ def _build_bwd_jit_candidates(
     if persistent_best is not None:
         best_tag, best_mod, best_ms = persistent_best
         _BWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
-        _keep_only_best_jit_candidate(
-            tune_key=tune_key,
-            kind="BWD",
-            tag=best_tag,
-            mod=best_mod,
-        )
         return tune_key, [(best_tag, best_mod)]
 
     prebuilt_modules = _discover_prebuilt_jit_candidates(
@@ -1720,6 +1881,98 @@ def _call_bwd_module(
     return mod.run(w, x, y, grad_out, src_idx, out_seg_num)
 
 
+
+def _benchmark_and_select_best_jit_candidate(
+    *,
+    tune_key: str,
+    candidates: List[Tuple[str, object]],
+    best_cache: Dict[str, Tuple[str, object, float]],
+    kind: str,
+    tune_enabled: bool,
+    warmup: int,
+    repeat: int,
+    call_fn,
+) -> Tuple[str, object, float]:
+    """Benchmark compiled candidates and persist/prune the selected one.
+
+    ``call_fn`` receives a module and launches its ``run`` entry with the
+    operator-specific ABI.  Everything else is operator-agnostic and is reused
+    by Uniform1D FWD/BWD and STC FWD/BWD.
+    """
+    if tune_key in best_cache:
+        return best_cache[tune_key]
+    if not candidates:
+        raise RuntimeError(f"no {kind.lower()} candidates to benchmark")
+
+    if len(candidates) == 1 or not tune_enabled:
+        tag, mod = candidates[0]
+        best = (tag, mod, float("nan"))
+        best_cache[tune_key] = best
+        _store_persistent_best_candidate(
+            tune_key=tune_key,
+            kind=kind,
+            tag=tag,
+            mod=mod,
+            best_ms=float("nan"),
+        )
+        _keep_only_best_jit_candidate(
+            tune_key=tune_key,
+            kind=kind,
+            tag=tag,
+            mod=mod,
+        )
+        if len(candidates) == 1:
+            print(f"[JIT][{kind}][tune] only one candidate: {tag}")
+        else:
+            print(f"[JIT][{kind}][tune] disabled, use first candidate: {tag}")
+        return best
+
+    print(
+        f"[JIT][{kind}][tune] benchmarking {len(candidates)} candidates "
+        f"for {tune_key}, warmup={warmup}, repeat={repeat}"
+    )
+
+    timings: List[Tuple[float, str, object]] = []
+    for tag, mod in candidates:
+        try:
+            for _ in range(warmup):
+                call_fn(mod)
+            torch.cuda.synchronize()
+
+            t0 = time.perf_counter()
+            for _ in range(repeat):
+                call_fn(mod)
+            torch.cuda.synchronize()
+            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
+            timings.append((avg_ms, tag, mod))
+            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
+            print(f"[JIT][{kind}][tune] candidate={tag:>16s} regs={regs} avg={avg_ms:.4f} ms")
+        except BaseException as exc:
+            print(f"[JIT][{kind}][tune] candidate={tag} failed at runtime: {exc}")
+
+    if not timings:
+        raise RuntimeError(f"all {kind.lower()} candidates failed during runtime benchmark")
+
+    timings.sort(key=lambda x: x[0])
+    best_ms, best_tag, best_mod = timings[0]
+    best = (best_tag, best_mod, best_ms)
+    best_cache[tune_key] = best
+    _store_persistent_best_candidate(
+        tune_key=tune_key,
+        kind=kind,
+        tag=best_tag,
+        mod=best_mod,
+        best_ms=best_ms,
+    )
+    _keep_only_best_jit_candidate(
+        tune_key=tune_key,
+        kind=kind,
+        tag=best_tag,
+        mod=best_mod,
+    )
+    print(f"[JIT][{kind}][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
+    return best
+
 def _select_best_fwd_module(
     *,
     tune_key: str,
@@ -1732,88 +1985,26 @@ def _select_best_fwd_module(
     out_seg_num,
     fused_scatter: bool,
 ) -> Tuple[str, object, float]:
-    if tune_key in _FWD_BEST_CANDIDATE_CACHE:
-        return _FWD_BEST_CANDIDATE_CACHE[tune_key]
-
     tune_enabled, warmup, repeat = _get_fwd_tune_params()
-    if len(candidates) == 1 or not tune_enabled:
-        tag, mod = candidates[0]
-        best = (tag, mod, float("nan"))
-        _FWD_BEST_CANDIDATE_CACHE[tune_key] = best
-        _store_persistent_best_candidate(
-            tune_key=tune_key,
-            kind="FWD",
-            tag=tag,
-            mod=mod,
-            best_ms=float("nan"),
-        )
-        _keep_only_best_jit_candidate(
-            tune_key=tune_key,
-            kind="FWD",
-            tag=tag,
-            mod=mod,
-        )
-        if len(candidates) == 1:
-            print(f"[JIT][FWD][tune] only one candidate: {tag}")
-        else:
-            print(f"[JIT][FWD][tune] disabled, use first candidate: {tag}")
-        return best
-
-    print(
-        f"[JIT][FWD][tune] benchmarking {len(candidates)} candidates "
-        f"for {tune_key}, warmup={warmup}, repeat={repeat}"
-    )
-
-    timings: List[Tuple[float, str, object]] = []
-    for tag, mod in candidates:
-        try:
-            for _ in range(warmup):
-                _call_fwd_module(
-                    mod,
-                    w=w, x=x, y=y,
-                    src_idx=src_idx, dst_idx=dst_idx,
-                    out_seg_num=out_seg_num, fused_scatter=fused_scatter,
-                )
-            torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            for _ in range(repeat):
-                _call_fwd_module(
-                    mod,
-                    w=w, x=x, y=y,
-                    src_idx=src_idx, dst_idx=dst_idx,
-                    out_seg_num=out_seg_num, fused_scatter=fused_scatter,
-                )
-            torch.cuda.synchronize()
-            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
-            timings.append((avg_ms, tag, mod))
-            print(f"[JIT][FWD][tune] candidate={tag:>16s} avg={avg_ms:.4f} ms")
-        except BaseException as exc:
-            print(f"[JIT][FWD][tune] candidate={tag} failed at runtime: {exc}")
-
-    if not timings:
-        raise RuntimeError("all forward candidates failed during runtime benchmark")
-
-    timings.sort(key=lambda x: x[0])
-    best_ms, best_tag, best_mod = timings[0]
-    _FWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
-    _store_persistent_best_candidate(
+    return _benchmark_and_select_best_jit_candidate(
         tune_key=tune_key,
+        candidates=candidates,
+        best_cache=_FWD_BEST_CANDIDATE_CACHE,
         kind="FWD",
-        tag=best_tag,
-        mod=best_mod,
-        best_ms=best_ms,
+        tune_enabled=tune_enabled,
+        warmup=warmup,
+        repeat=repeat,
+        call_fn=lambda mod: _call_fwd_module(
+            mod,
+            w=w,
+            x=x,
+            y=y,
+            src_idx=src_idx,
+            dst_idx=dst_idx,
+            out_seg_num=out_seg_num,
+            fused_scatter=fused_scatter,
+        ),
     )
-    _keep_only_best_jit_candidate(
-        tune_key=tune_key,
-        kind="FWD",
-        tag=best_tag,
-        mod=best_mod,
-    )
-    print(f"[JIT][FWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
-    return best_tag, best_mod, best_ms
-
-
 
 def _select_best_bwd_module(
     *,
@@ -1828,87 +2019,27 @@ def _select_best_bwd_module(
     out_seg_num,
     fused_scatter: bool,
 ) -> Tuple[str, object, float]:
-    if tune_key in _BWD_BEST_CANDIDATE_CACHE:
-        return _BWD_BEST_CANDIDATE_CACHE[tune_key]
-
     tune_enabled, warmup, repeat = _get_bwd_tune_params()
-    if len(candidates) == 1 or not tune_enabled:
-        tag, mod = candidates[0]
-        best = (tag, mod, float("nan"))
-        _BWD_BEST_CANDIDATE_CACHE[tune_key] = best
-        _store_persistent_best_candidate(
-            tune_key=tune_key,
-            kind="BWD",
-            tag=tag,
-            mod=mod,
-            best_ms=float("nan"),
-        )
-        _keep_only_best_jit_candidate(
-            tune_key=tune_key,
-            kind="BWD",
-            tag=tag,
-            mod=mod,
-        )
-        if len(candidates) == 1:
-            print(f"[JIT][BWD][tune] only one candidate: {tag}")
-        else:
-            print(f"[JIT][BWD][tune] disabled, use first candidate: {tag}")
-        return best
-
-    print(
-        f"[JIT][BWD][tune] benchmarking {len(candidates)} candidates "
-        f"for {tune_key}, warmup={warmup}, repeat={repeat}"
-    )
-
-    timings: List[Tuple[float, str, object]] = []
-    for tag, mod in candidates:
-        try:
-            for _ in range(warmup):
-                _call_bwd_module(
-                    mod,
-                    w=w, x=x, y=y, grad_out=grad_out,
-                    src_idx=src_idx, dst_idx=dst_idx,
-                    out_seg_num=out_seg_num, fused_scatter=fused_scatter,
-                )
-            torch.cuda.synchronize()
-
-            t0 = time.perf_counter()
-            for _ in range(repeat):
-                _call_bwd_module(
-                    mod,
-                    w=w, x=x, y=y, grad_out=grad_out,
-                    src_idx=src_idx, dst_idx=dst_idx,
-                    out_seg_num=out_seg_num, fused_scatter=fused_scatter,
-                )
-            torch.cuda.synchronize()
-            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
-            timings.append((avg_ms, tag, mod))
-            print(f"[JIT][BWD][tune] candidate={tag:>16s} avg={avg_ms:.4f} ms")
-        except BaseException as exc:
-            print(f"[JIT][BWD][tune] candidate={tag} failed at runtime: {exc}")
-
-    if not timings:
-        raise RuntimeError("all backward candidates failed during runtime benchmark")
-
-    timings.sort(key=lambda x: x[0])
-    best_ms, best_tag, best_mod = timings[0]
-    _BWD_BEST_CANDIDATE_CACHE[tune_key] = (best_tag, best_mod, best_ms)
-    _store_persistent_best_candidate(
+    return _benchmark_and_select_best_jit_candidate(
         tune_key=tune_key,
+        candidates=candidates,
+        best_cache=_BWD_BEST_CANDIDATE_CACHE,
         kind="BWD",
-        tag=best_tag,
-        mod=best_mod,
-        best_ms=best_ms,
+        tune_enabled=tune_enabled,
+        warmup=warmup,
+        repeat=repeat,
+        call_fn=lambda mod: _call_bwd_module(
+            mod,
+            w=w,
+            x=x,
+            y=y,
+            grad_out=grad_out,
+            src_idx=src_idx,
+            dst_idx=dst_idx,
+            out_seg_num=out_seg_num,
+            fused_scatter=fused_scatter,
+        ),
     )
-    _keep_only_best_jit_candidate(
-        tune_key=tune_key,
-        kind="BWD",
-        tag=best_tag,
-        mod=best_mod,
-    )
-    print(f"[JIT][BWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
-    return best_tag, best_mod, best_ms
-
 
 def _run_fwd(
     *,
