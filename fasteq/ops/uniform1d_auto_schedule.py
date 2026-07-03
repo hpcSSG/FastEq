@@ -173,8 +173,9 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     v_dim: Optional[int] = None,
     block_size: int = 32,
 ) -> str:
-    if block_size != 32:
-        raise ValueError("this emitter assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
 
     reg_count = _max_reg_count_any(schedule_result)
     resident_out_indices = sorted({int(inst.args[0]) for inst in schedule_result.instructions if inst.op == "mul_stc_resident"})
@@ -224,11 +225,12 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     ap("    if (b >= B) return;")
     ap("    const int tid = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     ap("    const index_t x1_base = (index_t)b * (index_t)X1 * (index_t)U;")
     ap("    const index_t x0_base = (index_t)b * (index_t)X0 * (index_t)U;")
     ap("    const index_t out_base = (index_t)b * (index_t)V * (index_t)U;")
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for rid in range(reg_count):
@@ -548,6 +550,7 @@ def generate_code_stc_fwd_with_scheduler(
     profile_print: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
+    block_size: int = 32,
 ) -> Any:
     paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
     scheduler = LARSUniform1DScheduler(
@@ -576,7 +579,7 @@ def generate_code_stc_fwd_with_scheduler(
         x0_dim=x0_dim,
         x1_dim=x1_dim,
         v_dim=int(num_out_segments),
-        block_size=32,
+        block_size=int(block_size),
     )
     if out_path:
         Path(out_path).write_text(code, encoding="utf-8")
@@ -639,6 +642,7 @@ def emit_stc_bwd_kernel_from_paths(
     x1_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     tile_u: int = 32,
+    block_size: int = 32,
 ) -> str:
     """Emit STC backward CUDA code that computes only grad_x1.
 
@@ -649,6 +653,9 @@ def emit_stc_bwd_kernel_from_paths(
     """
     if int(tile_u) != 32:
         raise ValueError(f"STC backward currently assumes tile_u=32, got {tile_u}")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
 
     path_list = list(paths)
     if path_order is None:
@@ -702,9 +709,10 @@ def emit_stc_bwd_kernel_from_paths(
     ap("")
     ap("    const int tid = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     ap("")
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for x1_idx in touched_x1_indices:
@@ -760,7 +768,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
     ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
-    ap("    dim3 block(32);")
+    ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
     ap("        grad_out, x1, x0, grad_x1, B, X1, X0, V, U);")
@@ -843,6 +851,7 @@ def generate_code_stc_bwd_with_scheduler(
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     tile_u: int = 32,
+    block_size: int = 32,
 ) -> Any:
     """Generate STC backward code for grad_x1 only.
 
@@ -881,6 +890,7 @@ def generate_code_stc_bwd_with_scheduler(
         x1_dim=x1_dim,
         v_dim=int(num_out_segments),
         tile_u=int(tile_u),
+        block_size=int(block_size),
     )
     if out_path:
         Path(out_path).write_text(code, encoding="utf-8")
@@ -2112,8 +2122,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     LARS-native path semantics:
         out[v] += x[i] * y[j] * w[k] * c
     """
-    if block_size != 32:
-        raise ValueError("this emitter currently assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -2190,7 +2201,8 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
@@ -2221,7 +2233,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    const index_t out_base = (index_t)out_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for rid in range(reg_count):
@@ -2455,6 +2467,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
     profile_print: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
+    block_size: int = 32,
 ):
     """
     Generate one LARS forward CUDA implementation.
@@ -2526,7 +2539,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
         y_dim=None,
         w_dim=None,
         v_dim=None,
-        block_size=32,
+        block_size=int(block_size),
     )
 
     code = code + "\n" + emit_launcher(
@@ -2889,8 +2902,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
       - load/load_acc/release/store_acc
       - bwd_fma
     """
-    if block_size != 32:
-        raise ValueError("this emitter currently assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -3043,7 +3057,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -3097,7 +3112,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for rid in range(reg_count):
@@ -3825,8 +3840,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
 ) -> str:
     if grad_kind not in BWD_SPLIT_KINDS:
         raise ValueError(f"grad_kind must be one of {sorted(BWD_SPLIT_KINDS)}, got {grad_kind!r}")
-    if block_size != 32:
-        raise ValueError("this emitter currently assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -3885,7 +3901,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -3944,7 +3961,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for rid in range(reg_count):
@@ -4496,6 +4513,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
     profile_print: bool,
     enable_secondary_affinity: bool,
     topk_candidates: Optional[int],
+    block_size: int = 32,
 ):
     """Internal split-backward implementation.  The public entry is the unified wrapper."""
     # One split candidate is emitted, with all input labels and all accumulators
@@ -4562,7 +4580,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
                     ix_dim=ix_dim,
                     ky_dim=ky_dim,
                     v_dim=v_dim,
-                    block_size=32,
+                    block_size=int(block_size),
                 )
             )
 
@@ -4623,6 +4641,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     profile_print: bool,
     enable_secondary_affinity: bool,
     topk_candidates: Optional[int],
+    block_size: int = 32,
 ):
     """
     Generate one fused backward LARS candidate.
@@ -4670,7 +4689,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         ix_dim=ix_dim,
         ky_dim=ky_dim,
         v_dim=v_dim,
-        block_size=32,
+        block_size=int(block_size),
     )
 
     code = code + "\n" + emit_lars_bwd_launcher(
@@ -4795,6 +4814,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
     topk_candidates: Optional[int] = 128,
     split_backward: Union[bool, str] = "auto",
     split_path_threshold: int = 256,
+    block_size: int = 32,
 ):
     """
     Unified LARS backward code generator.
@@ -4840,6 +4860,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
         profile_print=profile_print,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
+        block_size=int(block_size),
     )
 
     if use_split_backward:
@@ -4912,8 +4933,9 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     This is intended as a diagnostic lower-level baseline for comparing the
     benefit/cost of LARS scheduling and accumulator residency.
     """
-    if block_size != 32:
-        raise ValueError("this baseline emitter currently assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -4962,7 +4984,8 @@ def emit_fused_fwd_kernel_baseline_unrolled(
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
@@ -4997,7 +5020,7 @@ def emit_fused_fwd_kernel_baseline_unrolled(
         ap("    const index_t out_base = (index_t)out_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
 
@@ -5180,8 +5203,9 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     intentionally uses a plain += path update to stay consistent with the
     existing non-atomic grad_w assumption in this codebase.
     """
-    if block_size != 32:
-        raise ValueError("this baseline emitter currently assumes block_size=32")
+    block_size = int(block_size)
+    if block_size < 32 or block_size % 32 != 0:
+        raise ValueError("block_size must be a positive multiple of 32")
     if mode not in ("u,u,,u", "u,u,u,u"):
         raise ValueError(f"Unsupported mode: {mode}")
 
@@ -5246,7 +5270,8 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
     ap("    const int lane = tid & 31;")
-    ap("    if (tid >= 32) return;")
+    ap("    const int warp_id = tid >> 5;")
+    ap("    const int warp_count = blockDim.x >> 5;")
     ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
@@ -5301,7 +5326,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
         ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = 0; u_base < U; u_base += 32) {")
+    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
 

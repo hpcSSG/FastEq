@@ -4,6 +4,10 @@ import hashlib
 import os
 import tempfile
 import time
+import re
+import io
+import json
+import contextlib
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -38,6 +42,92 @@ except ImportError:  # Allows direct local testing when this file is not importe
     )
 
 _MODULE_CACHE: Dict[str, Any] = {}
+
+
+# -----------------------------------------------------------------------------
+# Default auto-warp tuning policy
+# -----------------------------------------------------------------------------
+# Normal callers do not need to set warp/register-capacity environment variables.
+# Warp size and register-file capacity are read from torch CUDA/HIP runtime device
+# properties.  The maximum tested warps/block is derived after compiling the
+# 1-warp candidate and parsing its compiler-reported registers/thread.
+_DEFAULT_STC_FWD_TUNE_ENABLED = True
+_DEFAULT_STC_BWD_TUNE_ENABLED = True
+_DEFAULT_STC_TUNE_WARMUP = 3
+_DEFAULT_STC_TUNE_REPEAT = 10
+
+# Fallbacks are used only when importing or smoke-testing without a visible GPU.
+# Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
+_FALLBACK_STC_REGISTER_FILE_REGS_PER_SM = 65536
+_FALLBACK_STC_WARP_SIZE = 32
+_FALLBACK_STC_MAX_THREADS_PER_BLOCK = 1024
+
+
+def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return max(int(min_value), int(default))
+    try:
+        return max(int(min_value), int(raw))
+    except ValueError:
+        return max(int(min_value), int(default))
+
+
+def _runtime_device_properties():
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(torch.cuda.current_device())
+    except BaseException:
+        pass
+    return None
+
+
+def _runtime_register_file_regs_per_sm() -> int:
+    """Return total 32-bit register-file capacity per SM/CU from runtime API."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("regs_per_multiprocessor", "regsPerMultiprocessor"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_STC_REGISTER_FILE_REGS_PER_SM
+
+
+def _runtime_warp_size() -> int:
+    """Return backend warp/wavefront size from runtime API."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("warp_size", "warpSize"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_STC_WARP_SIZE
+
+
+def _runtime_max_threads_per_block() -> int:
+    """Return max block size from runtime API, used to cap generated warp candidates."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("max_threads_per_block", "maxThreadsPerBlock"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_STC_MAX_THREADS_PER_BLOCK
+
+
+def _autowarp_runtime_policy() -> tuple[int, int, int]:
+    """Return (regs_per_sm, warp_size, max_threads_per_block) from runtime API.
+
+    ptxas/hipcc registers/thread already accounts for dtype in 32-bit register
+    words, so the auto-warp formula does not multiply by dtype bytes/words.
+    """
+    regs_per_sm = _runtime_register_file_regs_per_sm()
+    warp_size = _runtime_warp_size()
+    max_threads_per_block = _runtime_max_threads_per_block()
+    return regs_per_sm, warp_size, max_threads_per_block
+
+_FWD_BEST_CANDIDATE_CACHE: Dict[str, Any] = {}
+_BWD_BEST_CANDIDATE_CACHE: Dict[str, Any] = {}
 
 
 def _ensure_dir(p: Path) -> None:
@@ -90,6 +180,125 @@ def _compiled_extension_path_in_dir(build_dir: Path, module_name: str) -> Option
     return None
 
 
+
+def _env_flag(name: str, default: str = "1") -> bool:
+    return os.environ.get(name, default) not in ("0", "false", "False", "OFF", "off", "no", "No")
+
+
+def _parse_register_count_from_build_log(log: str) -> Optional[int]:
+    if not log:
+        return None
+    best = None
+    for pat in [r"Used\s+(\d+)\s+registers", r"used\s+(\d+)\s+registers", r"vgpr_count\s*[:=]\s*(\d+)"]:
+        for m in re.finditer(pat, log, flags=re.IGNORECASE):
+            val = int(m.group(1))
+            best = val if best is None else max(best, val)
+    return best
+
+
+def _register_meta_path(build_dir: Path, module_name: str) -> Path:
+    return build_dir / f"{module_name}.registers.json"
+
+
+def _store_register_metadata(build_dir: Path, module_name: str, registers: Optional[int], build_log: str = "") -> None:
+    if registers is None:
+        return
+    try:
+        _register_meta_path(build_dir, module_name).write_text(
+            json.dumps({"registers_per_thread": int(registers)}, indent=2),
+            encoding="utf-8",
+        )
+        if build_log:
+            (build_dir / f"{module_name}.build.log").write_text(build_log, encoding="utf-8", errors="ignore")
+    except BaseException:
+        pass
+
+
+def _load_register_metadata(build_dir: Path, module_name: str) -> Optional[int]:
+    try:
+        meta_path = _register_meta_path(build_dir, module_name)
+        if not meta_path.exists():
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        value = meta.get("registers_per_thread")
+        return None if value is None else int(value)
+    except BaseException:
+        return None
+
+
+def _attach_register_metadata(mod: Any, build_dir: Path, module_name: str, registers: Optional[int]) -> None:
+    if registers is None:
+        registers = _load_register_metadata(build_dir, module_name)
+    try:
+        setattr(mod, "__fasteq_registers_per_thread__", None if registers is None else int(registers))
+    except BaseException:
+        pass
+
+
+def _warp_candidates_from_registers(registers: Optional[int], *, u_dim: int) -> list[int]:
+    """Return candidate warps/block using block_size * nvcc_reg <= regs_per_sm.
+
+    block_size = warps_per_block * warp_size.  ``registers`` is the 1-warp
+    compiler-reported registers/thread.  More warps than ceil(U / warp_size)
+    are skipped because they would not own any U tile.
+    """
+    regs_per_sm, warp_size, max_threads_per_block = _autowarp_runtime_policy()
+    warp_size = max(1, int(warp_size))
+    max_warps_by_block = max(1, int(max_threads_per_block) // warp_size)
+    max_warps_by_u = max(1, (int(u_dim) + warp_size - 1) // warp_size)
+
+    if registers is None or int(registers) <= 0:
+        n = min(max_warps_by_block, max_warps_by_u)
+        return list(range(1, max(1, n) + 1))
+
+    nvcc_reg = max(1, int(registers))
+    max_warps_by_regs = max(1, int(regs_per_sm) // max(1, warp_size * nvcc_reg))
+    n = max(1, min(max_warps_by_regs, max_warps_by_block, max_warps_by_u))
+    return list(range(1, n + 1))
+
+def _make_multiwarp_cuda_source(code: str, warps_per_block: int, *, warp_size: Optional[int] = None) -> str:
+    warp_size = max(1, int(warp_size if warp_size is not None else _runtime_warp_size()))
+    warps = max(1, int(warps_per_block))
+    block_size = warp_size * warps
+    out = str(code)
+
+    multiwarp_header = (
+        f"const int lane = tid % {warp_size};\n"
+        f"    const int warp_id = tid / {warp_size};\n"
+        f"    const int warp_count = blockDim.x / {warp_size};"
+    )
+    out = out.replace(
+        "const int lane = tid & 31;\n    if (tid >= 32) return;",
+        multiwarp_header,
+    )
+    out = out.replace(
+        "const int lane = tid & 31;\n    const int warp_id = tid >> 5;\n    const int warp_count = blockDim.x >> 5;",
+        multiwarp_header,
+    )
+    out = out.replace(
+        "for (int u_base = 0; u_base < U; u_base += 32)",
+        f"for (int u_base = warp_id * {warp_size}; u_base < U; u_base += warp_count * {warp_size})",
+    )
+    out = out.replace(
+        "for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32)",
+        f"for (int u_base = warp_id * {warp_size}; u_base < U; u_base += warp_count * {warp_size})",
+    )
+    out = re.sub(r"dim3 block\(\d+\);", f"dim3 block({block_size});", out)
+    return out
+
+def _sha1_text(s: str) -> str:
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
+def _get_tune_params(kind: str) -> tuple[bool, int, int]:
+    prefix = "FASTEQ_STC_FWD" if kind == "fwd" else "FASTEQ_STC_BWD"
+    default_enabled = _DEFAULT_STC_FWD_TUNE_ENABLED if kind == "fwd" else _DEFAULT_STC_BWD_TUNE_ENABLED
+    return (
+        _env_flag(f"{prefix}_TUNE", "1" if default_enabled else "0"),
+        _env_int(f"{prefix}_TUNE_WARMUP", _DEFAULT_STC_TUNE_WARMUP, min_value=0),
+        _env_int(f"{prefix}_TUNE_REPEAT", _DEFAULT_STC_TUNE_REPEAT, min_value=1),
+    )
+
 def _load_prebuilt_jit_module(module_name: str, build_dir: Path):
     if module_name in _MODULE_CACHE:
         return _MODULE_CACHE[module_name]
@@ -107,6 +316,7 @@ def _load_prebuilt_jit_module(module_name: str, build_dir: Path):
     sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
     _MODULE_CACHE[module_name] = mod
+    _attach_register_metadata(mod, build_dir, module_name, None)
     if os.environ.get("FASTEQ_STC_JIT_CACHE_LOG", "0") != "0":
         print(f"[JIT][STC] loaded prebuilt extension: {module_name}")
     return mod
@@ -160,20 +370,70 @@ def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: P
     else:
         cu_path.write_text(code, encoding="utf-8")
 
-    mod = load(
-        name=module_name,
-        sources=[str(cu_path)],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--ptxas-options=-v"],
-        build_directory=str(build_dir),
-        verbose=verbose,
-        with_cuda=True,
-    )
+    log_buf = io.StringIO()
+    with contextlib.redirect_stdout(log_buf), contextlib.redirect_stderr(log_buf):
+        mod = load(
+            name=module_name,
+            sources=[str(cu_path)],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--ptxas-options=-v"],
+            build_directory=str(build_dir),
+            verbose=verbose,
+            with_cuda=True,
+        )
+    build_log = log_buf.getvalue()
+    if build_log:
+        print(build_log, end="")
+    registers = _parse_register_count_from_build_log(build_log)
+    _store_register_metadata(build_dir, module_name, registers, build_log)
+    _attach_register_metadata(mod, build_dir, module_name, registers)
+    if registers is not None and _env_flag("FASTEQ_STC_AUTOWARP_LOG", "0"):
+        print(f"[JIT][STC] {module_name} registers_per_thread={registers}")
     _MODULE_CACHE[module_name] = mod
     return mod
 
 
-def _get_or_build_module(
+def _build_stc_candidate_modules(
+    *,
+    base_name: str,
+    base_code: str,
+    kind: str,
+    dtype: Any,
+    u_dim: int,
+    verbose: bool = False,
+) -> list[tuple[str, Any]]:
+    build_root = _default_build_root()
+    candidates: list[tuple[str, Any]] = []
+
+    # Compile 1 warp first to get compiler-reported register usage.
+    warp_size = _runtime_warp_size()
+    code_w1 = _make_multiwarp_cuda_source(base_code, 1, warp_size=warp_size)
+    name_w1 = f"{base_name}_w1_{_sha1_text(code_w1)}"
+    build_dir_w1 = build_root / name_w1
+    mod_w1 = _load_jit_module_file(module_name=name_w1, code=code_w1, build_dir=build_dir_w1, verbose=verbose)
+    candidates.append(("w1", mod_w1))
+
+    registers = getattr(mod_w1, "__fasteq_registers_per_thread__", None)
+    warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
+    print(
+        f"[JIT][STC][{kind}] regs32/thread={registers} "
+        f"warp_size={warp_size} regs_per_sm={_runtime_register_file_regs_per_sm()} "
+        f"u_tiles={(int(u_dim) + max(1, int(warp_size)) - 1) // max(1, int(warp_size))} "
+        f"warp_candidates={warp_candidates}"
+    )
+
+    for warps in warp_candidates:
+        if int(warps) == 1:
+            continue
+        code_w = _make_multiwarp_cuda_source(base_code, int(warps), warp_size=warp_size)
+        name_w = f"{base_name}_w{int(warps)}_{_sha1_text(code_w)}"
+        build_dir_w = build_root / name_w
+        mod_w = _load_jit_module_file(module_name=name_w, code=code_w, build_dir=build_dir_w, verbose=verbose)
+        candidates.append((f"w{int(warps)}", mod_w))
+    return candidates
+
+
+def _get_or_build_module_candidates(
     idx_lists: torch.Tensor,
     coeffs: torch.Tensor,
     *,
@@ -193,16 +453,9 @@ def _get_or_build_module(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    name = f"stc_lars_u1d_fwd_filejit_{key}"
-    build_root = _default_build_root()
-    build_dir = build_root / name
-
-    if name in _MODULE_CACHE:
-        return _MODULE_CACHE[name]
-
-    cu_path = build_dir / f"{name}.cu"
-    if cu_path.exists():
-        return _load_jit_module_file(module_name=name, code=None, build_dir=build_dir, verbose=verbose)
+    base_name = f"stc_u1d_fwd_path_{idx_lists.shape[1]}_filejit_{key}"
+    if base_name in _FWD_BEST_CANDIDATE_CACHE:
+        return [("best", _FWD_BEST_CANDIDATE_CACHE[base_name][1])]
 
     idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeffs, path_lens=path_lens)
     if path_lens is None:
@@ -212,7 +465,7 @@ def _get_or_build_module(
 
     max_path_len = int(lens.max().item())
     num_paths = int(lens.numel())
-    launcher_name = f"{name}_u{int(U)}_path{num_paths}_maxlen{max_path_len}"
+    _launcher_name = f"{base_name}_u{int(U)}_path{num_paths}_maxlen{max_path_len}"
 
     code = generate_code_stc_fwd_with_scheduler(
         idx_lists,
@@ -222,17 +475,18 @@ def _get_or_build_module(
         num_out_segments=int(V),
         u_dim=int(U),
         out_path="",
-        kernel_name=name,
+        kernel_name=base_name,
     )
-
-    # The generated CUDA source contains both launcher_<launcher_name>() and
-    # PYBIND11_MODULE. It is compiled as a single source file, matching the
-    # file-based Uniform1D JIT style.
-    return _load_jit_module_file(module_name=name, code=code, build_dir=build_dir, verbose=verbose)
+    return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="fwd", dtype=dtype, u_dim=int(U), verbose=verbose)
 
 
+def _get_or_build_module(*args, **kwargs):
+    # Backward-compatible helper: return the first built candidate.
+    return _get_or_build_module_candidates(*args, **kwargs)[0][1]
 
-def _get_or_build_bwd_module(
+
+
+def _get_or_build_bwd_module_candidates(
     idx_lists: torch.Tensor,
     coeffs: torch.Tensor,
     *,
@@ -252,16 +506,9 @@ def _get_or_build_bwd_module(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    name = f"stc_lars_u1d_bwd_x1_filejit_{key}"
-    build_root = _default_build_root()
-    build_dir = build_root / name
-
-    if name in _MODULE_CACHE:
-        return _MODULE_CACHE[name]
-
-    cu_path = build_dir / f"{name}.cu"
-    if cu_path.exists():
-        return _load_jit_module_file(module_name=name, code=None, build_dir=build_dir, verbose=verbose)
+    base_name = f"stc_u1d_bwd_path_{idx_lists.shape[1]}_filejit_{key}"
+    if base_name in _BWD_BEST_CANDIDATE_CACHE:
+        return [("best", _BWD_BEST_CANDIDATE_CACHE[base_name][1])]
 
     code = generate_code_stc_bwd_with_scheduler(
         idx_lists,
@@ -271,13 +518,87 @@ def _get_or_build_bwd_module(
         num_out_segments=int(V),
         u_dim=int(U),
         out_path="",
-        kernel_name=name,
+        kernel_name=base_name,
         tile_u=32,
     )
+    return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="bwd", dtype=dtype, u_dim=int(U), verbose=verbose)
 
-    # Separate file-based extension for backward. The generated CUDA source
-    # exports a single run(grad_out, x1, x0_g, V) function that returns grad_x1.
-    return _load_jit_module_file(module_name=name, code=code, build_dir=build_dir, verbose=verbose)
+
+def _get_or_build_bwd_module(*args, **kwargs):
+    return _get_or_build_bwd_module_candidates(*args, **kwargs)[0][1]
+
+
+def _select_best_stc_fwd_module(base_key: str, candidates: list[tuple[str, Any]], x1, x0_g, V: int):
+    if base_key in _FWD_BEST_CANDIDATE_CACHE:
+        return _FWD_BEST_CANDIDATE_CACHE[base_key]
+    tune_enabled, warmup, repeat = _get_tune_params("fwd")
+    if len(candidates) == 1 or not tune_enabled:
+        tag, mod = candidates[0]
+        best = (tag, mod, float("nan"))
+        _FWD_BEST_CANDIDATE_CACHE[base_key] = best
+        return best
+    timings = []
+    print(f"[JIT][STC][FWD][tune] benchmarking {len(candidates)} warp candidates")
+    for tag, mod in candidates:
+        try:
+            for _ in range(warmup):
+                mod.run(x1.contiguous(), x0_g.contiguous(), int(V))
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(repeat):
+                mod.run(x1.contiguous(), x0_g.contiguous(), int(V))
+            torch.cuda.synchronize()
+            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
+            timings.append((avg_ms, tag, mod))
+            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
+            print(f"[JIT][STC][FWD][tune] candidate={tag} regs={regs} avg={avg_ms:.4f} ms")
+        except BaseException as exc:
+            print(f"[JIT][STC][FWD][tune] candidate={tag} failed: {exc}")
+    if not timings:
+        raise RuntimeError("all STC forward warp candidates failed")
+    timings.sort(key=lambda x: x[0])
+    best_ms, best_tag, best_mod = timings[0]
+    best = (best_tag, best_mod, best_ms)
+    _FWD_BEST_CANDIDATE_CACHE[base_key] = best
+    print(f"[JIT][STC][FWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
+    return best
+
+
+def _select_best_stc_bwd_module(base_key: str, candidates: list[tuple[str, Any]], grad_out, x1, x0_g, V: int):
+    if base_key in _BWD_BEST_CANDIDATE_CACHE:
+        return _BWD_BEST_CANDIDATE_CACHE[base_key]
+    tune_enabled, warmup, repeat = _get_tune_params("bwd")
+    if len(candidates) == 1 or not tune_enabled:
+        tag, mod = candidates[0]
+        best = (tag, mod, float("nan"))
+        _BWD_BEST_CANDIDATE_CACHE[base_key] = best
+        return best
+    timings = []
+    print(f"[JIT][STC][BWD][tune] benchmarking {len(candidates)} warp candidates")
+    for tag, mod in candidates:
+        try:
+            for _ in range(warmup):
+                mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V))
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(repeat):
+                mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V))
+            torch.cuda.synchronize()
+            avg_ms = (time.perf_counter() - t0) * 1000.0 / float(repeat)
+            timings.append((avg_ms, tag, mod))
+            regs = getattr(mod, "__fasteq_registers_per_thread__", None)
+            print(f"[JIT][STC][BWD][tune] candidate={tag} regs={regs} avg={avg_ms:.4f} ms")
+        except BaseException as exc:
+            print(f"[JIT][STC][BWD][tune] candidate={tag} failed: {exc}")
+    if not timings:
+        raise RuntimeError("all STC backward warp candidates failed")
+    timings.sort(key=lambda x: x[0])
+    best_ms, best_tag, best_mod = timings[0]
+    best = (best_tag, best_mod, best_ms)
+    _BWD_BEST_CANDIDATE_CACHE[base_key] = best
+    print(f"[JIT][STC][BWD][tune] selected candidate={best_tag} avg={best_ms:.4f} ms")
+    return best
+
 
 
 class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
@@ -323,7 +644,11 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             # keeps the function robust if a caller only stores paths_tensor.
             idx_lists_tensor = paths_tensor
 
-        mod = _get_or_build_module(
+        fwd_key = "stc_lars_u1d_fwd_filejit_" + _stable_meta_hash(
+            idx_lists_tensor, coeffs_tensor, V=int(num_out_segments), U=U, dtype=x1.dtype,
+            path_lens=None, pad_value=int(pad_value)
+        )
+        candidates = _get_or_build_module_candidates(
             idx_lists_tensor,
             coeffs_tensor,
             path_lens=None,
@@ -331,6 +656,9 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             V=int(num_out_segments),
             U=U,
             dtype=x1.dtype,
+        )
+        best_tag, mod, _best_ms = _select_best_stc_fwd_module(
+            fwd_key, candidates, x1.contiguous(), x0_g.contiguous(), int(num_out_segments)
         )
         out = mod.run(x1.contiguous(), x0_g.contiguous(), int(num_out_segments))
 
@@ -351,7 +679,11 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         start_time = time.perf_counter() * 1000
 
         x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
-        mod = _get_or_build_bwd_module(
+        bwd_key = "stc_lars_u1d_bwd_x1_filejit_" + _stable_meta_hash(
+            idx_lists_tensor, coeffs_tensor, V=int(ctx.num_out_segments), U=int(x1.size(2)), dtype=x1.dtype,
+            path_lens=None, pad_value=int(ctx.pad_value)
+        )
+        candidates = _get_or_build_bwd_module_candidates(
             idx_lists_tensor,
             coeffs_tensor,
             path_lens=None,
@@ -359,6 +691,9 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             V=int(ctx.num_out_segments),
             U=int(x1.size(2)),
             dtype=x1.dtype,
+        )
+        best_tag, mod, _best_ms = _select_best_stc_bwd_module(
+            bwd_key, candidates, grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(ctx.num_out_segments)
         )
         grad_x1 = mod.run(
             grad_out.contiguous(),

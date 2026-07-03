@@ -6,12 +6,16 @@ import shutil
 import hashlib
 import tempfile
 import traceback
+import re
+import io
+import contextlib
 import importlib.util
 import importlib.machinery
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Tuple, Optional, Any, List, Set
+
 
 import torch
 import torch._dynamo
@@ -50,6 +54,96 @@ _JIT_PRUNE_DONE_CACHE: Set[Tuple[str, str, str]] = set()
 # breaks the fast build-cache identity key.
 _META_INT32_TENSOR_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
+
+# -----------------------------------------------------------------------------
+# Default auto-warp tuning policy
+# -----------------------------------------------------------------------------
+# Normal callers do not need to set warp/register-capacity environment variables.
+# Warp size and register-file capacity are read from torch CUDA/HIP runtime device
+# properties.  The maximum tested warps/block is derived after compiling the
+# 1-warp candidate and parsing its compiler-reported registers/thread.
+_DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = True
+_DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = True
+_DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
+_DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
+
+# Fallbacks are used only when importing or smoke-testing without a visible GPU.
+# Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
+_FALLBACK_UNIFORM1D_REGISTER_FILE_REGS_PER_SM = 65536
+_FALLBACK_UNIFORM1D_WARP_SIZE = 32
+_FALLBACK_UNIFORM1D_MAX_THREADS_PER_BLOCK = 1024
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return bool(default)
+    return raw not in ("0", "false", "False", "OFF", "off", "no", "No")
+
+
+def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return max(int(min_value), int(default))
+    try:
+        return max(int(min_value), int(raw))
+    except ValueError:
+        return max(int(min_value), int(default))
+
+
+def _runtime_device_properties():
+    try:
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(torch.cuda.current_device())
+    except BaseException:
+        pass
+    return None
+
+
+def _runtime_register_file_regs_per_sm() -> int:
+    """Return total 32-bit register-file capacity per SM/CU from runtime API."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("regs_per_multiprocessor", "regsPerMultiprocessor"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_UNIFORM1D_REGISTER_FILE_REGS_PER_SM
+
+
+def _runtime_warp_size() -> int:
+    """Return backend warp/wavefront size from runtime API."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("warp_size", "warpSize"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_UNIFORM1D_WARP_SIZE
+
+
+def _runtime_max_threads_per_block() -> int:
+    """Return max block size from runtime API, used to cap generated warp candidates."""
+    props = _runtime_device_properties()
+    if props is not None:
+        for attr in ("max_threads_per_block", "maxThreadsPerBlock"):
+            value = getattr(props, attr, None)
+            if value is not None and int(value) > 0:
+                return int(value)
+    return _FALLBACK_UNIFORM1D_MAX_THREADS_PER_BLOCK
+
+
+def _autowarp_runtime_policy() -> Tuple[int, int, int]:
+    """Return (regs_per_sm, warp_size, max_threads_per_block) from runtime API.
+
+    The compiler-reported register count parsed from ptxas/hipcc is already the
+    per-thread number of 32-bit register words for the current dtype and target.
+    Therefore dtype does not appear in the occupancy-style warp candidate formula.
+    """
+    regs_per_sm = _runtime_register_file_regs_per_sm()
+    warp_size = _runtime_warp_size()
+    max_threads_per_block = _runtime_max_threads_per_block()
+    return regs_per_sm, warp_size, max_threads_per_block
 
 def _sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
@@ -140,17 +234,19 @@ def _normalize_codegen_candidates(codegen_out: Any) -> List[Tuple[str, str]]:
 
 
 def _get_fwd_tune_params() -> Tuple[bool, int, int]:
-    enabled = os.environ.get("FASTEQ_UNIFORM1D_FWD_TUNE", "1") != "0"
-    warmup = int(os.environ.get("FASTEQ_UNIFORM1D_FWD_TUNE_WARMUP", "3"))
-    repeat = int(os.environ.get("FASTEQ_UNIFORM1D_FWD_TUNE_REPEAT", "10"))
-    return enabled, max(0, warmup), max(1, repeat)
+    return (
+        _env_bool("FASTEQ_UNIFORM1D_FWD_TUNE", _DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED),
+        _env_int("FASTEQ_UNIFORM1D_FWD_TUNE_WARMUP", _DEFAULT_UNIFORM1D_TUNE_WARMUP, min_value=0),
+        _env_int("FASTEQ_UNIFORM1D_FWD_TUNE_REPEAT", _DEFAULT_UNIFORM1D_TUNE_REPEAT, min_value=1),
+    )
 
 
 def _get_bwd_tune_params() -> Tuple[bool, int, int]:
-    enabled = os.environ.get("FASTEQ_UNIFORM1D_BWD_TUNE", "1") != "0"
-    warmup = int(os.environ.get("FASTEQ_UNIFORM1D_BWD_TUNE_WARMUP", "3"))
-    repeat = int(os.environ.get("FASTEQ_UNIFORM1D_BWD_TUNE_REPEAT", "10"))
-    return enabled, max(0, warmup), max(1, repeat)
+    return (
+        _env_bool("FASTEQ_UNIFORM1D_BWD_TUNE", _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED),
+        _env_int("FASTEQ_UNIFORM1D_BWD_TUNE_WARMUP", _DEFAULT_UNIFORM1D_TUNE_WARMUP, min_value=0),
+        _env_int("FASTEQ_UNIFORM1D_BWD_TUNE_REPEAT", _DEFAULT_UNIFORM1D_TUNE_REPEAT, min_value=1),
+    )
 
 
 def _ensure_dir(p: Path):
@@ -163,11 +259,6 @@ def _find_fasteq_root(start: Path) -> Path:
         if p.name == "fasteq":
             return p
     raise RuntimeError("Cannot find fasteq project root from __file__")
-
-
-
-from pathlib import Path
-import torch
 
 
 def _detect_gpu_backend() -> str:
@@ -216,6 +307,132 @@ def _write_code_file(code: str, build_dir: Path, module_name: str) -> Path:
     return cu_path
 
 
+
+def _parse_register_count_from_build_log(log: str) -> Optional[int]:
+    """Parse ptxas/hipcc register usage from a torch extension build log."""
+    if not log:
+        return None
+    patterns = [
+        r"Used\s+(\d+)\s+registers",
+        r"used\s+(\d+)\s+registers",
+        r"SGPRs?:\s*(\d+).*?VGPRs?:\s*(\d+)",
+        r"vgpr_count\s*[:=]\s*(\d+)",
+    ]
+    best = None
+    for pat in patterns:
+        for m in re.finditer(pat, log, flags=re.IGNORECASE | re.DOTALL):
+            if len(m.groups()) >= 2:
+                val = max(int(m.group(1)), int(m.group(2)))
+            else:
+                val = int(m.group(1))
+            best = val if best is None else max(best, val)
+    return best
+
+
+def _register_meta_path(build_dir: Path, module_name: str) -> Path:
+    return build_dir / f"{module_name}.registers.json"
+
+
+def _store_register_metadata(build_dir: Path, module_name: str, registers: Optional[int], build_log: str = "") -> None:
+    if registers is None:
+        return
+    try:
+        _register_meta_path(build_dir, module_name).write_text(
+            json.dumps({"registers_per_thread": int(registers)}, indent=2),
+            encoding="utf-8",
+        )
+        if build_log:
+            (build_dir / f"{module_name}.build.log").write_text(build_log, encoding="utf-8", errors="ignore")
+    except BaseException:
+        pass
+
+
+def _load_register_metadata(build_dir: Path, module_name: str) -> Optional[int]:
+    try:
+        meta_path = _register_meta_path(build_dir, module_name)
+        if not meta_path.exists():
+            return None
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        value = meta.get("registers_per_thread")
+        return None if value is None else int(value)
+    except BaseException:
+        return None
+
+
+def _attach_register_metadata(mod: object, build_dir: Path, module_name: str, registers: Optional[int]) -> None:
+    if registers is None:
+        registers = _load_register_metadata(build_dir, module_name)
+    try:
+        setattr(mod, "__fasteq_registers_per_thread__", None if registers is None else int(registers))
+    except BaseException:
+        pass
+
+
+def _warp_candidates_from_registers(registers: Optional[int], *, u_dim: int) -> List[int]:
+    """Return candidate warps/block using the agreed register-capacity rule.
+
+    Definitions:
+      - block_size = warps_per_block * warp_size
+      - nvcc_reg is compiler-reported registers/thread from the 1-warp build
+      - regs_per_sm and warp_size come from torch.cuda.get_device_properties()
+
+    The register bound is:
+
+        block_size * nvcc_reg <= regs_per_sm
+
+    equivalently:
+
+        max_warps_by_regs = regs_per_sm // (warp_size * nvcc_reg)
+
+    Because these kernels split work by U tiles, testing more warps than
+    ceil(U / warp_size) only creates idle warps, so U also caps candidates.
+    """
+    regs_per_sm, warp_size, max_threads_per_block = _autowarp_runtime_policy()
+    warp_size = max(1, int(warp_size))
+    max_warps_by_block = max(1, int(max_threads_per_block) // warp_size)
+    max_warps_by_u = max(1, (int(u_dim) + warp_size - 1) // warp_size)
+
+    if registers is None or int(registers) <= 0:
+        n = min(max_warps_by_block, max_warps_by_u)
+        return list(range(1, max(1, n) + 1))
+
+    nvcc_reg = max(1, int(registers))
+    max_warps_by_regs = max(1, int(regs_per_sm) // max(1, warp_size * nvcc_reg))
+    n = max(1, min(max_warps_by_regs, max_warps_by_block, max_warps_by_u))
+    return list(range(1, n + 1))
+
+def _make_multiwarp_cuda_source(code: str, warps_per_block: int, *, warp_size: Optional[int] = None) -> str:
+    """Convert a 1-warp U-tile kernel source into a multi-warp U-tile variant."""
+    warp_size = max(1, int(warp_size if warp_size is not None else _runtime_warp_size()))
+    warps = max(1, int(warps_per_block))
+    block_size = warp_size * warps
+    out = str(code)
+
+    multiwarp_header = (
+        f"const int lane = tid % {warp_size};\n"
+        f"    const int warp_id = tid / {warp_size};\n"
+        f"    const int warp_count = blockDim.x / {warp_size};"
+    )
+
+    out = out.replace(
+        "const int lane = tid & 31;\n    if (tid >= 32) return;",
+        multiwarp_header,
+    )
+    out = out.replace(
+        "const int lane = tid & 31;\n    const int warp_id = tid >> 5;\n    const int warp_count = blockDim.x >> 5;",
+        multiwarp_header,
+    )
+    out = out.replace(
+        "for (int u_base = 0; u_base < U; u_base += 32)",
+        f"for (int u_base = warp_id * {warp_size}; u_base < U; u_base += warp_count * {warp_size})",
+    )
+    out = out.replace(
+        "for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32)",
+        f"for (int u_base = warp_id * {warp_size}; u_base < U; u_base += warp_count * {warp_size})",
+    )
+    out = re.sub(r"dim3 block\(\d+\);", f"dim3 block({block_size});", out)
+    return out
+
 def _load_jit_module(
     *,
     module_name: str,
@@ -252,24 +469,31 @@ def _load_jit_module(
             f"JIT source file does not exist for module {module_name}: {cu_path}"
         )
 
-    mod = load(
-        name=module_name,
-        sources=[str(cu_path)],
-        extra_cflags=extra_cflags or ["-O3"],
-        extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--ptxas-options=-v"],
-        #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
-        #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
-        extra_include_paths=[str(src_dir)],
-        build_directory=str(build_dir),
-        verbose=True,
-        with_cuda=True,
-    )
+    log_buf = io.StringIO()
+    mod = None
+    with contextlib.redirect_stdout(log_buf), contextlib.redirect_stderr(log_buf):
+        mod = load(
+            name=module_name,
+            sources=[str(cu_path)],
+            extra_cflags=extra_cflags or ["-O3"],
+            extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--ptxas-options=-v"],
+            #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
+            #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
+            extra_include_paths=[str(src_dir)],
+            build_directory=str(build_dir),
+            verbose=True,
+            with_cuda=True,
+        )
+
+    build_log = log_buf.getvalue()
+    print(build_log, end="")
+    registers = _parse_register_count_from_build_log(build_log)
+    _store_register_metadata(build_dir, module_name, registers, build_log)
+    _attach_register_metadata(mod, build_dir, module_name, registers)
+    print(f"[JIT][{module_name}] registers_per_thread={registers}")
 
     cache[module_name] = mod
     return mod
-
-
-
 
 # -----------------------------------------------------------------------------
 # Prebuilt JIT module discovery / direct loading
@@ -282,7 +506,8 @@ def _env_flag(name: str, default: str = "1") -> bool:
 def _jit_cache_log_enabled() -> bool:
     # Cache hit prints are useful for debugging, but printing on every autograd
     # call can easily dominate millisecond-level kernels.
-    return _env_flag("FASTEQ_UNIFORM1D_JIT_CACHE_LOG", "0")
+    #return _env_flag("FASTEQ_UNIFORM1D_JIT_CACHE_LOG", "0")
+    return True
 
 
 def _tensor_runtime_identity(x: Any) -> Tuple[Any, ...]:
@@ -453,6 +678,11 @@ def _load_prebuilt_jit_module(
     spec.loader.exec_module(mod)
 
     cache[module_name] = mod
+    try:
+        build_dir = _default_build_root() / module_name
+        _attach_register_metadata(mod, build_dir, module_name, None)
+    except BaseException:
+        pass
     print(f"[JIT][{kind}] loaded prebuilt extension: {module_name}")
     return mod
 
@@ -490,8 +720,6 @@ def _discover_prebuilt_jit_candidates(
     This is the key fast path: it avoids calling codegen_fn(), so scheduler
     search/LARS scheduling and CUDA source regeneration are skipped entirely.
     """
-    if not _env_flag("FASTEQ_UNIFORM1D_LOAD_PREBUILT", "1"):
-        return []
 
     build_root = _default_build_root()
     if not build_root.exists():
@@ -563,8 +791,6 @@ def _load_persistent_best_candidate(
     When this hits, callers can skip candidate generation/scheduling/compilation
     and also skip runtime benchmarking.
     """
-    if not _env_flag("FASTEQ_UNIFORM1D_PERSIST_BEST", "1"):
-        return None
 
     meta_path = _best_candidate_meta_path(kind, tune_key)
     if not meta_path.exists():
@@ -606,8 +832,6 @@ def _store_persistent_best_candidate(
     mod: object,
     best_ms: float,
 ) -> None:
-    if not _env_flag("FASTEQ_UNIFORM1D_PERSIST_BEST", "1"):
-        return
 
     module_name = getattr(mod, "__name__", None)
     if not module_name:
@@ -804,119 +1028,69 @@ def _build_jit_candidates_from_sources(
     raw_candidates: List[Tuple[str, str]],
     cache: Dict[str, object],
     kind: str,
+    u_dim: int,
 ) -> List[Tuple[str, object]]:
-    """
-    Build all generated candidate CUDA sources.
+    """Build warp-count candidate CUDA sources.
 
-    The old implementation built candidates serially in the main process.  This
-    helper compiles candidates in multiple spawned child processes and then
-    loads successful modules back in the parent process, preserving candidate
-    order for runtime tuning.
+    For each scheduler candidate, compile the 1-warp variant first, parse the
+    compiler-reported register count, derive a safe set of warps/block from the
+    register capacity, then compile all allowed warp variants. Runtime tuning
+    later benchmarks these compiled modules and caches the fastest one.
     """
-    candidate_infos = _candidate_infos_from_sources(
+    base_infos = _candidate_infos_from_sources(
         tune_key=tune_key,
         raw_candidates=raw_candidates,
     )
-    if not candidate_infos:
+    if not base_infos:
         return []
 
-    workers = _get_candidate_compile_workers(kind, len(candidate_infos))
+    modules: List[Tuple[str, object]] = []
+    errors: List[Tuple[str, BaseException]] = []
 
-    def _build_one_in_parent(cand_idx: int, safe_tag: str, module_name: str, code: str):
-        mod = _build_jit_module_common(
-            module_name=module_name,
-            cache=cache,
-            kind=f"{kind}:{safe_tag}",
-            codegen_fn=lambda code=code: code,
-        )
-        return cand_idx, safe_tag, mod
+    for cand_idx, safe_tag, _base_module_name, code in base_infos:
+        try:
+            warp_size = _runtime_warp_size()
+            base_code = _make_multiwarp_cuda_source(code, 1, warp_size=warp_size)
+            base_hash = _sha1_text(base_code)
+            base_tag = f"{safe_tag}_w1"
+            base_module_name = f"{tune_key}_{base_tag}_{base_hash}"
+            base_mod = _build_jit_module_common(
+                module_name=base_module_name,
+                cache=cache,
+                kind=f"{kind}:{base_tag}",
+                codegen_fn=lambda base_code=base_code: base_code,
+            )
+            modules.append((base_tag, base_mod))
 
-    # Keep the original serial behavior when disabled or when there is only one
-    # candidate.  This path also serves as a safe fallback if process creation is
-    # not available in the current environment.
-    if workers <= 1:
-        modules: List[Tuple[str, object]] = []
-        errors: List[Tuple[str, BaseException]] = []
-        for cand_idx, safe_tag, module_name, code in candidate_infos:
-            try:
-                _, tag, mod = _build_one_in_parent(cand_idx, safe_tag, module_name, code)
-                modules.append((tag, mod))
-            except BaseException as exc:
-                errors.append((safe_tag, exc))
-                print(f"[JIT][{kind}] candidate {safe_tag} failed to build: {exc}")
+            registers = getattr(base_mod, "__fasteq_registers_per_thread__", None)
+            warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
+            print(
+                f"[JIT][{kind}] candidate={safe_tag} regs32/thread={registers} "
+                f"warp_size={warp_size} regs_per_sm={_runtime_register_file_regs_per_sm()} "
+                f"u_tiles={(int(u_dim) + max(1, int(warp_size)) - 1) // max(1, int(warp_size))} "
+                f"warp_candidates={warp_candidates}"
+            )
 
-        if not modules:
-            details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
-            raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}")
-        return modules
+            for warps in warp_candidates:
+                if int(warps) == 1:
+                    continue
+                code_w = _make_multiwarp_cuda_source(code, int(warps), warp_size=warp_size)
+                tag_w = f"{safe_tag}_w{int(warps)}"
+                module_name_w = f"{tune_key}_{tag_w}_{_sha1_text(code_w)}"
+                mod_w = _build_jit_module_common(
+                    module_name=module_name_w,
+                    cache=cache,
+                    kind=f"{kind}:{tag_w}",
+                    codegen_fn=lambda code_w=code_w: code_w,
+                )
+                modules.append((tag_w, mod_w))
+        except BaseException as exc:
+            errors.append((safe_tag, exc))
+            print(f"[JIT][{kind}] candidate {safe_tag} failed to build autowarp variants: {exc}")
 
-    print(
-        f"[JIT][{kind}] parallel compile {len(candidate_infos)} candidates "
-        f"with {workers} workers "
-        f"(set FASTEQ_UNIFORM1D_{kind}_COMPILE_WORKERS or "
-        f"FASTEQ_UNIFORM1D_PARALLEL_COMPILE=0 to control)"
-    )
-
-    modules_by_idx: Dict[int, Tuple[str, object]] = {}
-    errors: List[Tuple[str, str]] = []
-    tasks = [
-        (cand_idx, safe_tag, module_name, code, kind)
-        for cand_idx, safe_tag, module_name, code in candidate_infos
-        if module_name not in cache
-    ]
-
-    # Already-loaded modules can be inserted directly without spawning work.
-    for cand_idx, safe_tag, module_name, _code in candidate_infos:
-        if module_name in cache:
-            modules_by_idx[cand_idx] = (safe_tag, cache[module_name])
-
-    try:
-        if tasks:
-            ctx = mp.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as executor:
-                for result in executor.map(_compile_jit_candidate_worker, tasks):
-                    idx = int(result["idx"])
-                    safe_tag = str(result["tag"])
-                    module_name = str(result["module_name"])
-                    if result.get("ok"):
-                        try:
-                            mod = _load_jit_module(
-                                module_name=module_name,
-                                code=None,
-                                cache=cache,
-                            )
-                            modules_by_idx[idx] = (safe_tag, mod)
-                            print(f"[JIT][{kind}] candidate {safe_tag} compiled and loaded")
-                        except BaseException as exc:
-                            errors.append((safe_tag, repr(exc)))
-                            print(f"[JIT][{kind}] candidate {safe_tag} built but failed to load in parent: {exc}")
-                    else:
-                        err = str(result.get("error", ""))
-                        errors.append((safe_tag, err))
-                        print(f"[JIT][{kind}] candidate {safe_tag} failed to build in worker:\n{err}")
-    except BaseException as pool_exc:
-        # Process creation can fail under certain launch modes.  Do not break
-        # correctness; fall back to the serial build path in the parent process.
-        print(f"[JIT][{kind}] parallel compile failed, fallback to serial build: {pool_exc}")
-        modules: List[Tuple[str, object]] = []
-        serial_errors: List[Tuple[str, BaseException]] = []
-        for cand_idx, safe_tag, module_name, code in candidate_infos:
-            try:
-                _, tag, mod = _build_one_in_parent(cand_idx, safe_tag, module_name, code)
-                modules.append((tag, mod))
-            except BaseException as exc:
-                serial_errors.append((safe_tag, exc))
-                print(f"[JIT][{kind}] candidate {safe_tag} failed to build: {exc}")
-        if not modules:
-            details = "; ".join(f"{tag}: {exc}" for tag, exc in serial_errors)
-            raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}") from pool_exc
-        return modules
-
-    modules = [modules_by_idx[idx] for idx in sorted(modules_by_idx)]
     if not modules:
-        details = "; ".join(f"{tag}: {err}" for tag, err in errors)
-        raise RuntimeError(f"all {kind.lower()} candidates failed to build: {details}")
-
+        details = "; ".join(f"{tag}: {exc}" for tag, exc in errors)
+        raise RuntimeError(f"all {kind.lower()} autowarp candidates failed to build: {details}")
     return modules
 
 
@@ -1233,6 +1407,7 @@ def _build_fwd_jit_candidates(
         raw_candidates=raw_candidates,
         cache=_FWD_JIT_CACHE,
         kind="FWD",
+        u_dim=int(u_dim),
     )
 
     return tune_key, modules
@@ -1461,6 +1636,7 @@ def _build_bwd_jit_candidates(
         raw_candidates=raw_candidates,
         cache=_BWD_JIT_CACHE,
         kind="BWD",
+        u_dim=int(u_dim),
     )
 
     return tune_key, modules
