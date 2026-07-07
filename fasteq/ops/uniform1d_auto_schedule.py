@@ -1451,8 +1451,8 @@ class LARSUniform1DScheduler:
             release_after = self._best_fireable_release_after_load(lab)
             key = (
                 fire_after,
-                release_after,
                 lab_score,
+                #release_after,
                 str(lab),
             )
             if best_key is None or key > best_key:

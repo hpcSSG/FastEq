@@ -649,8 +649,8 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         num_out_segments: int,
         pad_value: int = STC_PAD_VALUE,
     ):
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         x0_g = x0[i0]
         U = int(x1.size(2))
@@ -695,9 +695,9 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
 
         out = out.view(out.shape[0], -1)
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        print(f"<< fasteq stc uniform1d-lars forward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #print(f"<< fasteq stc uniform1d-lars forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor)
         ctx.num_out_segments = int(num_out_segments)
@@ -706,8 +706,8 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
         bwd_key = _make_stc_bwd_tune_key(
@@ -738,9 +738,9 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             int(ctx.num_out_segments),
         )
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        print(f"<< fasteq stc uniform1d-lars backward cost: {end_time - start_time:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #print(f"<< fasteq stc uniform1d-lars backward cost: {end_time - start_time:.3f} ms >>")
         return grad_x1, None, None, None, None, None, None, None
 
 

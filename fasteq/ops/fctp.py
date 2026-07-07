@@ -275,8 +275,8 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         #print(f"cg_val_all shape:{cg_val_all.shape}, I_total:{I_total}, path_num:{path_num}")
         #print(f"K_per_path:{K_per_path}")
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000
+        #torch.cuda.synchronize()
+        #start_time = time.perf_counter() * 1000
 
         if path_num == 1 and nnz0 == 1 and I_total == 1:
             # use torch is better when open MPS
@@ -300,10 +300,10 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
             output = triton_fused_fctp_fwd(x, vstar, w, p_for_k, i_for_k, val_for_k, cg_val, K_total,
                                                         BK=8, BW=64, BU=32, num_warps=4)
         
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000
-        execution_time_ms = end_time - start_time
-        print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
+        #torch.cuda.synchronize()
+        #end_time = time.perf_counter() * 1000
+        #execution_time_ms = end_time - start_time
+        #print(f"<< fasteq fctp forward cost: {execution_time_ms:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.meta = meta
