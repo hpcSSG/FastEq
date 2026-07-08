@@ -869,7 +869,7 @@ def _discover_prebuilt_jit_candidates(
 def _best_candidate_meta_path(kind: str, tune_key: str) -> Path:
     meta_dir = _default_build_root() / "_uniform1d_jit_best"
     _ensure_dir(meta_dir)
-    return meta_dir / f"{kind.lower()}_{_sha1_text(tune_key)}.json"
+    return meta_dir / f"uniform1d_{kind.lower()}_{_sha1_text(tune_key)}.json"
 
 
 def _load_persistent_best_candidate(

@@ -387,7 +387,11 @@ def _make_stc_fwd_tune_key(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_filejit_{key}"
+    if dtype == torch.float32:
+        dtype_str = "float"
+    if dtype == torch.float64:
+        dtype_str = "double"
+    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_jit_{key}"
 
 
 def _make_stc_bwd_tune_key(
@@ -409,7 +413,11 @@ def _make_stc_bwd_tune_key(
         path_lens=path_lens,
         pad_value=pad_value,
     )
-    return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_filejit_{key}"
+    if dtype == torch.float32:
+        dtype_str = "float"
+    if dtype == torch.float64:
+        dtype_str = "double"
+    return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_{dtype_str}_jit_{key}"
 
 def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: Path, verbose: bool = False):
     if load is None:

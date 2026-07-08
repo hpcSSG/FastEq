@@ -333,7 +333,6 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     ap("    TORCH_CHECK((int)x0.size(0) == B, \"x0 batch mismatch\");")
     ap("    TORCH_CHECK((int)x0.size(2) == U, \"x0 U mismatch\");")
     ap("    TORCH_CHECK(V > 0, \"V must be > 0\");")
-    ap("    TORCH_CHECK((U % 32) == 0, \"U must be a multiple of 32\");")
     ap("    auto out = torch::zeros({B, V, U}, x1.options());")
     ap("    GPU_Guard device_guard(x1.device());")
     ap("    gpuStream_t stream = getCurrentGPUStream(x1.device().index());")
@@ -802,7 +801,6 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    TORCH_CHECK((int)x0.size(0) == B, \"x0 batch mismatch\");")
     ap("    TORCH_CHECK((int)x0.size(2) == U, \"x0 U mismatch\");")
     ap("    TORCH_CHECK(V > 0, \"V must be > 0\");")
-    ap("    TORCH_CHECK((U % 32) == 0, \"U must be a multiple of 32\");")
     ap("    TORCH_CHECK(grad_out.numel() == (int64_t)B * (int64_t)V * (int64_t)U, \"grad_out numel mismatch; expected B*V*U\");")
     if u_dim is not None:
         ap(f"    TORCH_CHECK(U == {int(u_dim)}, \"U mismatch for generated STC backward kernel\");")
@@ -2035,7 +2033,6 @@ torch::Tensor launcher_{bundle_name}(
 
     {y_check_u}
 
-    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
 {src_numel_check}
 {dst_numel_check}
 
@@ -3492,7 +3489,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     {y_check_u}
     TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
     TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
-    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
 {src_numel_check}
 {dst_numel_check}
 
@@ -4304,7 +4300,6 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     {y_check_u}
     TORCH_CHECK((int)grad_out.size(1) == V, "grad_out V mismatch");
     TORCH_CHECK((int)grad_out.size(2) == U, "grad_out U mismatch");
-    TORCH_CHECK((U % 32) == 0, "U must be a multiple of 32");
 {src_numel_check}
 {dst_numel_check}
 
