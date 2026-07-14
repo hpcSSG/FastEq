@@ -5,6 +5,11 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Optional, Union, Iterable, Set, Sequence
 from time import perf_counter
 from pathlib import Path
+import csv
+import hashlib
+import json
+import os
+import re
 import torch
 
 
@@ -16,6 +21,315 @@ import torch
 
 Label = Tuple[str, int]  # ('x0', i), ('x1', j), ('o', v)
 STC_PAD_VALUE = -1
+
+
+
+# =============================================================================
+# Unified schedule statistics: Uniform1D/STC forward and backward
+# =============================================================================
+#
+# Per-label metrics:
+#   count    : number of scheduled paths that reference the label.  Repeated
+#              occurrences of the same label inside one path are counted once,
+#              matching one live value/register for that path.
+#   lifetime : inclusive scheduled-path span from the label's first use to its
+#              last use: last_use - first_use + 1.
+#   max_live : maximum number of simultaneously-live labels while this label is
+#              live.  All input and accumulator labels participate.
+#
+# The report is intentionally independent of LARSPlacementConfig and is emitted
+# from the original path order selected by the scheduler, before placement
+# rewrites the instruction stream.
+_SCHEDULE_STATS_DUMPED: Set[Tuple[str, str, str]] = set()
+_DEFAULT_SCHEDULE_STATS_ENABLED = True
+
+
+def _schedule_stats_enabled() -> bool:
+    raw = os.environ.get(
+        "FASTEQ_SCHEDULE_STATS",
+        os.environ.get("FASTEQ_UNIFORM1D_FWD_SCHEDULE_STATS"),
+    )
+    if raw is None:
+        return bool(_DEFAULT_SCHEDULE_STATS_ENABLED)
+    return str(raw).strip() not in (
+        "0", "false", "False", "OFF", "off", "no", "No"
+    )
+
+
+def _dump_schedule_stats_dir() -> Path:
+    """Return the common dump directory for all four scheduler directions."""
+    raw = os.environ.get("FASTEQ_SCHEDULE_STATS_DIR", "").strip()
+    if not raw:
+        # Backward compatibility with the old Uniform1D-forward-only switch.
+        raw = os.environ.get(
+            "FASTEQ_UNIFORM1D_FWD_SCHEDULE_STATS_DIR", ""
+        ).strip()
+
+    if raw:
+        path = Path(raw).expanduser().resolve()
+    else:
+        try:
+            path = Path(__file__).resolve().parent / "_schedule_stats"
+        except NameError:
+            path = Path.cwd() / "_schedule_stats"
+
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _schedule_stats_safe_tag(value: Any) -> str:
+    tag = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(value)).strip("_.-")
+    return (tag or "schedule")[:96]
+
+
+def _schedule_stats_sha1(value: Any) -> str:
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _build_schedule_label_stats(
+    *,
+    path_order: Sequence[int],
+    labels_by_path: Sequence[Sequence[str]],
+) -> List[Dict[str, Any]]:
+    """Return label/count/lifetime/max_live rows for one scheduled path stream."""
+    path_count = len(labels_by_path)
+    order = [int(pid) for pid in path_order]
+    if len(order) != path_count:
+        raise RuntimeError(
+            f"schedule path_order has {len(order)} entries, expected {path_count}"
+        )
+    if sorted(order) != list(range(path_count)):
+        raise RuntimeError(
+            "schedule path_order must contain every dense path id exactly once"
+        )
+
+    positions: Dict[str, List[int]] = defaultdict(list)
+    for scheduled_pos, pid in enumerate(order):
+        # A label is one live state even if STC uses it multiple times in the
+        # same product, e.g. x1[i] * x1[i].
+        seen: Set[str] = set()
+        for label in labels_by_path[pid]:
+            label = str(label)
+            if label in seen:
+                continue
+            seen.add(label)
+            positions[label].append(int(scheduled_pos))
+
+    if not positions:
+        return []
+
+    intervals: Dict[str, Tuple[int, int]] = {
+        label: (int(pos[0]), int(pos[-1]))
+        for label, pos in positions.items()
+    }
+
+    # Number of all live labels at each scheduled path position.
+    diff = [0] * (path_count + 1)
+    for first, last in intervals.values():
+        diff[first] += 1
+        if last + 1 < len(diff):
+            diff[last + 1] -= 1
+
+    live_by_pos: List[int] = []
+    live = 0
+    for pos in range(path_count):
+        live += diff[pos]
+        live_by_pos.append(int(live))
+
+    def label_sort_key(label: str) -> Tuple[str, int, str]:
+        match = re.match(r"^([^\[]+)\[(-?\d+)\]$", label)
+        if match:
+            return (match.group(1), int(match.group(2)), label)
+        return (label, -1, label)
+
+    rows: List[Dict[str, Any]] = []
+    for label in sorted(positions, key=label_sort_key):
+        pos_list = positions[label]
+        first, last = intervals[label]
+        lifetime = int(last - first + 1)
+        count = int(len(pos_list))
+        rows.append({
+            "label": label,
+            "count": count,
+            "lifetime": lifetime,
+            "max_live": int(max(live_by_pos[first:last + 1], default=0)),
+        })
+    return rows
+
+
+def _dump_and_print_schedule_label_stats(
+    *,
+    operation: str,
+    candidate_tag: str,
+    path_order: Sequence[int],
+    labels_by_path: Sequence[Sequence[str]],
+) -> None:
+    """Dump compact per-label schedule statistics as JSON and CSV."""
+    if not _schedule_stats_enabled():
+        return
+
+    operation = _schedule_stats_safe_tag(operation).lower()
+    candidate = _schedule_stats_safe_tag(candidate_tag)
+    order = [int(pid) for pid in path_order]
+    labels_normalized = [
+        [str(label) for label in labels] for labels in labels_by_path
+    ]
+    signature = _schedule_stats_sha1({
+        "operation": operation,
+        "candidate": candidate,
+        "path_order": order,
+        "labels_by_path": labels_normalized,
+    })
+    dump_key = (operation, candidate, signature)
+    if dump_key in _SCHEDULE_STATS_DUMPED:
+        return
+
+    rows = _build_schedule_label_stats(
+        path_order=order,
+        labels_by_path=labels_normalized,
+    )
+    payload = {
+        "operation": operation,
+        "candidate": candidate,
+        "path_count": len(order),
+        "definitions": {
+            "count": "number of scheduled paths referencing the label",
+            "lifetime": (
+                "last scheduled use - first scheduled use + 1; "
+                "scheduled positions are zero-based"
+            ),
+            "max_live": (
+                "maximum number of simultaneously-live input/accumulator labels "
+                "during this label's live interval"
+            ),
+        },
+        "variables": rows,
+    }
+
+    dump_dir = _dump_schedule_stats_dir()
+    stem = f"{operation}_{candidate}_{signature}"
+    json_path = dump_dir / f"{stem}.json"
+    csv_path = dump_dir / f"{stem}.csv"
+
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["label", "count", "lifetime", "max_live"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(
+        f"[ScheduleStats][{operation}] candidate={candidate} "
+        f"paths={len(order)} labels={len(rows)}",
+        flush=True,
+    )
+    print(f"[ScheduleStats][{operation}] JSON: {json_path}", flush=True)
+    print(f"[ScheduleStats][{operation}] CSV : {csv_path}", flush=True)
+    print(
+        f"[ScheduleStats][{operation}] "
+        f"{'label':>20s} {'count':>8s} {'lifetime':>10s} "
+        f"{'max_live':>10s}",
+        flush=True,
+    )
+    for row in rows:
+        print(
+            f"[ScheduleStats][{operation}] "
+            f"{row['label']:>20s} {row['count']:8d} "
+            f"{row['lifetime']:10d} {row['max_live']:10d} ",
+            flush=True,
+        )
+
+    _SCHEDULE_STATS_DUMPED.add(dump_key)
+
+
+def _stats_labels_stc_fwd(paths: Sequence[Any]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for path in paths:
+        labels = [f"x1[{int(idx)}]" for idx in path.x1_indices]
+        labels.extend([
+            f"x0[{int(path.x0_index)}]",
+            f"out[{int(path.v)}]",
+        ])
+        rows.append(labels)
+    return rows
+
+
+def _stats_labels_stc_bwd(paths: Sequence[Any]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for path in paths:
+        labels = [
+            f"grad_out[{int(path.v)}]",
+            f"x0[{int(path.x0_index)}]",
+        ]
+        labels.extend(f"x1[{int(idx)}]" for idx in path.x1_indices)
+        labels.extend(f"grad_x1[{int(idx)}]" for idx in path.x1_indices)
+        rows.append(labels)
+    return rows
+
+
+def _stats_labels_uniform1d_fwd(paths: Sequence[Any]) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for path in paths:
+        rows.append([
+            f"x[{int(path.i)}]",
+            f"y[{int(path.j)}]",
+            f"w[{int(path.k)}]",
+            f"out[{int(path.v)}]",
+        ])
+    return rows
+
+
+def _stats_labels_uniform1d_bwd_fused(
+    paths: Sequence[Any],
+    *,
+    need_grad_w: bool,
+) -> List[List[str]]:
+    rows: List[List[str]] = []
+    for path in paths:
+        labels = [
+            f"w[{int(path.i)}]",
+            f"x[{int(path.j)}]",
+            f"y[{int(path.k)}]",
+            f"grad_out[{int(path.v)}]",
+        ]
+        if need_grad_w:
+            labels.append(f"grad_w[{int(path.i)}]")
+        labels.extend([
+            f"grad_x[{int(path.j)}]",
+            f"grad_y[{int(path.k)}]",
+        ])
+        rows.append(labels)
+    return rows
+
+
+def _stats_labels_uniform1d_bwd_split(
+    paths: Sequence[Any],
+    *,
+    grad_kind: str,
+) -> List[List[str]]:
+    target_name = {
+        "gw": "grad_w",
+        "gx": "grad_x",
+        "gy": "grad_y",
+    }[str(grad_kind)]
+
+    rows: List[List[str]] = []
+    for path in paths:
+        labels: List[str] = []
+        for kind, idx in path.labels:
+            name = "grad_out" if str(kind) == "go" else str(kind)
+            labels.append(f"{name}[{int(idx)}]")
+        labels.append(f"{target_name}[{int(path.target_index)}]")
+        rows.append(labels)
+    return rows
+
 
 
 
@@ -43,6 +357,9 @@ class ScheduleResult:
     reloads: int
     final_reg_map: Dict[Label, str]
     profile: Dict[str, Any] = field(default_factory=dict)
+    variable_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    placement_summary: Dict[str, Any] = field(default_factory=dict)
+    shared_slots: int = 0
 
 
 @dataclass(frozen=True)
@@ -124,6 +441,23 @@ def _parse_label_ref(ref: str) -> Label:
     return kind, idx
 
 
+def _parse_stc_placement_ref(ref: str) -> Tuple[str, int]:
+    """Parse STC placement refs used by forward and x1-only backward."""
+    if not isinstance(ref, str) or "[" not in ref or not ref.endswith("]"):
+        raise ValueError(f"Bad STC placement ref: {ref!r}")
+    kind, rest = ref.split("[", 1)
+    idx = int(rest[:-1])
+    aliases = {
+        "out": "o",
+        "grad_out": "go",
+        "grad_x1": "gx1",
+    }
+    kind = aliases.get(kind, kind)
+    if kind not in ("x0", "x1", "o", "go", "gx1"):
+        raise ValueError(f"Bad STC placement kind: {kind!r}")
+    return kind, idx
+
+
 def _fmt_float(x: float) -> str:
     return repr(float(x))
 
@@ -173,21 +507,81 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     v_dim: Optional[int] = None,
     block_size: int = 32,
 ) -> str:
+    """Emit STC forward code from either a legacy or lifetime-placed schedule."""
     block_size = int(block_size)
     if block_size < 32 or block_size % 32 != 0:
         raise ValueError("block_size must be a positive multiple of 32")
 
     reg_count = _max_reg_count_any(schedule_result)
-    resident_out_indices = sorted({int(inst.args[0]) for inst in schedule_result.instructions if inst.op == "mul_stc_resident"})
-    direct_out_indices = sorted({int(inst.args[0]) for inst in schedule_result.instructions if inst.op == "mul_stc_direct"})
+    shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    has_placed = any(
+        inst.op == "mul_stc_placed" for inst in schedule_result.instructions
+    )
+
+    resident_out_indices = [] if has_placed else sorted({
+        int(inst.args[0])
+        for inst in schedule_result.instructions
+        if inst.op == "mul_stc_resident"
+    })
+    direct_out_indices = [] if has_placed else sorted({
+        int(inst.args[0])
+        for inst in schedule_result.instructions
+        if inst.op == "mul_stc_direct"
+    })
 
     lines: List[str] = []
 
     def ap(line: str = "") -> None:
         lines.append(line)
 
+    def shared_expr(token: str) -> str:
+        if not isinstance(token, str) or not token.startswith("s"):
+            raise ValueError(f"Bad STC shared token: {token!r}")
+        slot = int(token[1:])
+        return (
+            f"lars_smem[(size_t){slot} * (size_t)blockDim.x + "
+            f"(size_t)tid]"
+        )
+
+    def direct_input_expr(ref: str) -> str:
+        kind, idx = _parse_stc_placement_ref(ref)
+        if kind not in ("x0", "x1"):
+            raise ValueError(f"STC forward direct input expects x0/x1, got {ref!r}")
+        expr = _index_expr(
+            kind, idx,
+            u_dim=u_dim,
+            x0_dim=x0_dim,
+            x1_dim=x1_dim,
+            v_dim=v_dim,
+        )
+        return f"{kind}[{expr}]"
+
+    def operand_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        if token.startswith("d:"):
+            return direct_input_expr(token[2:])
+        raise ValueError(f"Bad STC forward operand token: {token!r}")
+
+    def acc_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        raise ValueError(f"Bad STC forward accumulator token: {token!r}")
+
     def emit_out_write(idx: int, value_expr: str) -> None:
-        expr = _index_expr("o", int(idx), u_dim=u_dim, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+        expr = _index_expr(
+            "o", int(idx),
+            u_dim=u_dim,
+            x0_dim=x0_dim,
+            x1_dim=x1_dim,
+            v_dim=v_dim,
+        )
         ap(f"            out[{expr}] += {value_expr};")
 
     ap("#include <stdint.h>")
@@ -227,6 +621,9 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     ap("    const int lane = tid & 31;")
     ap("    const int warp_id = tid >> 5;")
     ap("    const int warp_count = blockDim.x >> 5;")
+    if shared_slots:
+        ap("    extern __shared__ unsigned char lars_smem_raw[];")
+        ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
     ap("    const index_t x1_base = (index_t)b * (index_t)X1 * (index_t)U;")
     ap("    const index_t x0_base = (index_t)b * (index_t)X0 * (index_t)U;")
     ap("    const index_t out_base = (index_t)b * (index_t)V * (index_t)U;")
@@ -242,7 +639,10 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     if resident_out_indices:
         ap("")
     if direct_out_indices:
-        ap(f"            // direct single-use output writeback enabled for {len(direct_out_indices)} out accumulator(s)")
+        ap(
+            f"            // direct single-use output writeback enabled for "
+            f"{len(direct_out_indices)} out accumulator(s)"
+        )
         ap("")
 
     for inst_id, inst in enumerate(schedule_result.instructions):
@@ -251,24 +651,64 @@ def emit_stc_fwd_kernel_from_lars_schedule(
         if comment:
             prefix += f" | {comment}"
         ap(prefix)
-        if inst.op == "load":
-            reg, ref = inst.args
-            kind, idx = _parse_label_ref(ref)
-            if kind == "o":
-                raise ValueError("load must not target output labels")
-            expr = _index_expr(kind, idx, u_dim=u_dim, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
-            base = "x0" if kind == "x0" else "x1"
-            ap(f"            {reg} = {base}[{expr}];")
+
+        if inst.op in ("load", "load_shared"):
+            token, ref = inst.args
+            kind, idx = _parse_stc_placement_ref(str(ref))
+            if kind not in ("x0", "x1"):
+                raise ValueError("STC forward input load must target x0/x1")
+            expr = _index_expr(
+                kind, idx,
+                u_dim=u_dim,
+                x0_dim=x0_dim,
+                x1_dim=x1_dim,
+                v_dim=v_dim,
+            )
+            lhs = str(token) if inst.op == "load" else shared_expr(str(token))
+            ap(f"            {lhs} = {kind}[{expr}];")
+
+        elif inst.op == "init_acc":
+            token, ref = inst.args
+            kind, _idx = _parse_stc_placement_ref(str(ref))
+            if kind != "o":
+                raise ValueError("STC forward init_acc expects out[]")
+            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+
+        elif inst.op == "mul_stc_placed":
+            out_idx, out_token, operand_tokens, coeff = inst.args
+            product = _product_expr(
+                tuple(operand_expr(str(tok)) for tok in operand_tokens),
+                float(coeff),
+            )
+            if str(out_token).startswith("d:"):
+                emit_out_write(int(out_idx), product)
+            else:
+                ap(f"            {acc_expr(str(out_token))} += {product};")
+
+        elif inst.op == "store_acc_placed":
+            ref, token = inst.args
+            kind, idx = _parse_stc_placement_ref(str(ref))
+            if kind != "o":
+                raise ValueError("STC forward store_acc_placed expects out[]")
+            emit_out_write(int(idx), acc_expr(str(token)))
+
         elif inst.op == "mul_stc_resident":
             out_idx, regs, coeff = inst.args
-            ap(f"            out_acc_v_{int(out_idx)} += {_product_expr(tuple(regs), float(coeff))};")
+            ap(
+                f"            out_acc_v_{int(out_idx)} += "
+                f"{_product_expr(tuple(regs), float(coeff))};"
+            )
+
         elif inst.op == "mul_stc_direct":
             out_idx, regs, coeff = inst.args
-            emit_out_write(int(out_idx), _product_expr(tuple(regs), float(coeff)))
-        elif inst.op == "release":
+            emit_out_write(
+                int(out_idx), _product_expr(tuple(regs), float(coeff))
+            )
+
+        elif inst.op in ("release", "release_shared"):
             pass
         else:
-            raise ValueError(f"Unsupported STC instruction op: {inst.op}")
+            raise ValueError(f"Unsupported STC forward instruction op: {inst.op}")
 
     if resident_out_indices:
         ap("")
@@ -300,7 +740,14 @@ def emit_stc_fwd_kernel_from_lars_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(x1, x0, out, B, X1, X0, V, U);")
+    ap(
+        f"    size_t lars_shared_bytes = (size_t){shared_slots} * "
+        f"(size_t)block.x * sizeof(scalar_t);"
+    )
+    ap(
+        f"    {kernel_name}<scalar_t, index_t><<<grid, block, "
+        f"lars_shared_bytes, stream>>>(x1, x0, out, B, X1, X0, V, U);"
+    )
     ap("}")
     ap("")
 
@@ -550,8 +997,11 @@ def generate_code_stc_fwd_with_scheduler(
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ) -> Any:
-    paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
+    paths = make_stc_paths_from_padded_lists(
+        idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value
+    )
     scheduler = LARSUniform1DScheduler(
         paths,
         path_kind="stc",
@@ -564,13 +1014,37 @@ def generate_code_stc_fwd_with_scheduler(
         profile_print=profile_print,
     )
     schedule_result = scheduler.schedule()
+    _dump_and_print_schedule_label_stats(
+        operation="stc_fwd",
+        candidate_tag="stc_lars_all_inputs",
+        path_order=schedule_result.path_order,
+        labels_by_path=_stats_labels_stc_fwd(paths),
+    )
+    resolved_placement = _resolve_lars_placement_config(placement_config)
+    schedule_result = apply_lars_lifetime_placement(
+        schedule_result,
+        schedule_kind="stc_fwd",
+        config=resolved_placement,
+    )
+    dump_lars_variable_stats(
+        schedule_result,
+        print_stats=resolved_placement.stats_print,
+        out_path=resolved_placement.stats_path,
+    )
 
-    idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list, path_lens=path_lens)
+    idx_norm = _normalize_stc_padded_paths(
+        idx_lists, coeff_list=coeff_list, path_lens=path_lens
+    )
     if path_lens is None:
-        inferred_lens = infer_stc_path_lens_from_padded(idx_norm, coeff_list, pad_value=pad_value)
+        inferred_lens = infer_stc_path_lens_from_padded(
+            idx_norm, coeff_list, pad_value=pad_value
+        )
     else:
         inferred_lens = path_lens.detach().cpu().to(torch.int64).reshape(-1)
-    base_kernel_name = f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_maxlen{int(inferred_lens.max().item())}"
+    base_kernel_name = (
+        f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_"
+        f"maxlen{int(inferred_lens.max().item())}"
+    )
     code = emit_stc_fwd_kernel_from_lars_schedule(
         schedule_result,
         kernel_name=base_kernel_name,
@@ -590,9 +1064,9 @@ def generate_code_stc_fwd_with_scheduler(
             "schedule": schedule_result,
             "num_paths": len(paths),
             "max_live": schedule_result.max_live,
+            "profile": schedule_result.profile,
         }
     return code
-
 
 
 def _check_stc_path_bounds_for_bwd(
@@ -631,11 +1105,44 @@ def _stc_bwd_grad_expr(base_expr: str, other_x1_indices: Sequence[int]) -> str:
     return expr
 
 
+def _make_stc_bwd_logical_schedule(
+    paths: Sequence[STCPath],
+    base_schedule: ScheduleResult,
+) -> ScheduleResult:
+    """Convert the STC LARS path order into backward placement records."""
+    by_pid = {int(p.pid): p for p in paths}
+    instructions: List[Inst] = []
+    for pid in base_schedule.path_order:
+        p = by_pid[int(pid)]
+        instructions.append(
+            Inst(
+                "stc_bwd_path",
+                (
+                    tuple(int(v) for v in p.x1_indices),
+                    int(p.x0_index),
+                    int(p.v),
+                    float(p.c),
+                ),
+                f"path#{p.pid}: STC grad_x1",
+            )
+        )
+    return ScheduleResult(
+        instructions=instructions,
+        path_order=list(base_schedule.path_order),
+        max_live=int(base_schedule.max_live),
+        spills=int(base_schedule.spills),
+        reloads=int(base_schedule.reloads),
+        final_reg_map={},
+        profile=dict(base_schedule.profile),
+    )
+
+
 def emit_stc_bwd_kernel_from_paths(
     paths: Sequence[STCPath],
     *,
     kernel_name: str,
     path_order: Optional[Sequence[int]] = None,
+    schedule_result: Optional[ScheduleResult] = None,
     u_dim: Optional[int] = None,
     x0_dim: Optional[int] = None,
     x1_dim: Optional[int] = None,
@@ -643,12 +1150,12 @@ def emit_stc_bwd_kernel_from_paths(
     tile_u: int = 32,
     block_size: int = 32,
 ) -> str:
-    """Emit STC backward CUDA code that computes only grad_x1.
+    """Emit x1-only STC backward with optional lifetime placement.
 
-    Each CUDA block owns one batch row.  Each thread computes one ``u`` lane at a
-    time, accumulates the touched grad_x1 segments in scalar locals, and writes
-    those segments directly to global memory.  Path computation is statically
-    unrolled and does not allocate dynamic per-block scratch storage.
+    When ``schedule_result`` is supplied, it may contain ``stc_bwd_placed``
+    instructions produced by :func:`apply_lars_lifetime_placement`.  Without a
+    placed schedule, the function preserves the previous all-accumulator-local
+    implementation.
     """
     if int(tile_u) != 32:
         raise ValueError(f"STC backward currently assumes tile_u=32, got {tile_u}")
@@ -657,20 +1164,118 @@ def emit_stc_bwd_kernel_from_paths(
         raise ValueError("block_size must be a positive multiple of 32")
 
     path_list = list(paths)
-    if path_order is None:
-        ordered_paths = path_list
+    by_pid = {int(p.pid): p for p in path_list}
+    if schedule_result is None:
+        order = list(path_order) if path_order is not None else [int(p.pid) for p in path_list]
+        ordered_paths = [by_pid[int(pid)] for pid in order]
+        legacy_insts = [
+            Inst(
+                "stc_bwd_path",
+                (
+                    tuple(int(v) for v in p.x1_indices),
+                    int(p.x0_index),
+                    int(p.v),
+                    float(p.c),
+                ),
+                f"path#{p.pid}: STC grad_x1",
+            )
+            for p in ordered_paths
+        ]
+        schedule_result = ScheduleResult(
+            instructions=legacy_insts,
+            path_order=order,
+            max_live=0,
+            spills=0,
+            reloads=0,
+            final_reg_map={},
+        )
     else:
-        by_pid = {int(p.pid): p for p in path_list}
-        ordered_paths = [by_pid[int(pid)] for pid in path_order]
+        ordered_paths = [by_pid[int(pid)] for pid in schedule_result.path_order]
 
-    _check_stc_path_bounds_for_bwd(ordered_paths, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim)
+    _check_stc_path_bounds_for_bwd(
+        ordered_paths, x0_dim=x0_dim, x1_dim=x1_dim, v_dim=v_dim
+    )
 
-    touched_x1_indices = sorted({int(idx) for p in ordered_paths for idx in p.x1_indices})
+    has_placed = any(
+        inst.op == "stc_bwd_placed" for inst in schedule_result.instructions
+    )
+    reg_count = _max_reg_count_any(schedule_result)
+    shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    touched_x1_indices = sorted({
+        int(idx) for p in ordered_paths for idx in p.x1_indices
+    })
 
     lines: List[str] = []
 
     def ap(line: str = "") -> None:
         lines.append(line)
+
+    def shared_expr(token: str) -> str:
+        if not isinstance(token, str) or not token.startswith("s"):
+            raise ValueError(f"Bad STC backward shared token: {token!r}")
+        slot = int(token[1:])
+        return (
+            f"lars_smem[(size_t){slot} * (size_t)blockDim.x + "
+            f"(size_t)tid]"
+        )
+
+    def input_index_expr(kind: str, idx: int) -> str:
+        if kind == "x1":
+            return (
+                f"((index_t)b * (index_t)X1 + (index_t){int(idx)}) * "
+                f"(index_t)U + (index_t)u"
+            )
+        if kind == "x0":
+            return (
+                f"((index_t)b * (index_t)X0 + (index_t){int(idx)}) * "
+                f"(index_t)U + (index_t)u"
+            )
+        if kind == "go":
+            return (
+                f"((index_t)b * (index_t)V + (index_t){int(idx)}) * "
+                f"(index_t)U + (index_t)u"
+            )
+        raise ValueError(f"Bad STC backward input kind: {kind}")
+
+    def direct_input_expr(ref: str) -> str:
+        kind, idx = _parse_stc_placement_ref(ref)
+        if kind not in ("x1", "x0", "go"):
+            raise ValueError(f"Bad STC backward direct input ref: {ref!r}")
+        arr = "grad_out" if kind == "go" else kind
+        return f"{arr}[{input_index_expr(kind, idx)}]"
+
+    def operand_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        if token.startswith("d:"):
+            return direct_input_expr(token[2:])
+        raise ValueError(f"Bad STC backward operand token: {token!r}")
+
+    def acc_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        raise ValueError(f"Bad STC backward accumulator token: {token!r}")
+
+    def grad_x1_index_expr(idx: int) -> str:
+        return (
+            f"((index_t)b * (index_t)X1 + (index_t){int(idx)}) * "
+            f"(index_t)U + (index_t)u"
+        )
+
+    def emit_grad_x1_write(idx: int, value_expr: str) -> None:
+        ap(f"            grad_x1[{grad_x1_index_expr(idx)}] = {value_expr};")
+
+    def product_from_tokens(base_expr: str, tokens: Sequence[str]) -> str:
+        expr = str(base_expr)
+        for token in tokens:
+            expr = f"({expr} * {operand_expr(str(token))})"
+        return expr
 
     ap("#include <stdint.h>")
     ap("#include <torch/extension.h>")
@@ -710,42 +1315,110 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    const int lane = tid & 31;")
     ap("    const int warp_id = tid >> 5;")
     ap("    const int warp_count = blockDim.x >> 5;")
+    if shared_slots:
+        ap("    extern __shared__ unsigned char lars_smem_raw[];")
+        ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
     ap("")
     ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
-    for x1_idx in touched_x1_indices:
-        ap(f"            scalar_t {_stc_grad_x1_acc_name(x1_idx)} = scalar_t(0);")
-    if touched_x1_indices:
+    for rid in range(reg_count):
+        ap(f"            scalar_t r{rid};")
+    if reg_count:
         ap("")
+    if not has_placed:
+        for x1_idx in touched_x1_indices:
+            ap(f"            scalar_t {_stc_grad_x1_acc_name(x1_idx)} = scalar_t(0);")
+        if touched_x1_indices:
+            ap("")
 
-    for inst_id, p in enumerate(ordered_paths):
-        x1s = tuple(int(v) for v in p.x1_indices)
-        x0_idx = int(p.x0_index)
-        out_v = int(p.v)
-        coeff = float(p.c)
-        base_name = f"base_{inst_id}"
-        comment = _sanitize_cuda_comment(
-            f"path#{p.pid}: grad_x1 for out[{out_v}] += coeff * grad_out * x0[{x0_idx}]"
-        )
-        ap(f"            // bwd inst {inst_id}: {comment}")
-        ap(
-            f"            const scalar_t {base_name} = "
-            f"grad_out[((index_t)b * (index_t)V + (index_t){out_v}) * (index_t)U + (index_t)u] "
-            f"* scalar_t({_fmt_float(coeff)}) "
-            f"* x0[((index_t)b * (index_t)X0 + (index_t){x0_idx}) * (index_t)U + (index_t)u];"
-        )
-        for pos, target_x1 in enumerate(x1s):
-            other = [idx for q, idx in enumerate(x1s) if q != pos]
-            grad_expr = _stc_bwd_grad_expr(base_name, other)
-            ap(f"            {_stc_grad_x1_acc_name(target_x1)} += {grad_expr};")
-        ap("")
+    for inst_id, inst in enumerate(schedule_result.instructions):
+        comment = _sanitize_cuda_comment(inst.comment)
+        prefix = f"            // bwd inst {inst_id}: {inst.op}"
+        if comment:
+            prefix += f" | {comment}"
+        ap(prefix)
 
-    for x1_idx in touched_x1_indices:
-        ap(
-            f"            grad_x1[((index_t)b * (index_t)X1 + (index_t){int(x1_idx)}) "
-            f"* (index_t)U + (index_t)u] = {_stc_grad_x1_acc_name(x1_idx)};"
-        )
+        if inst.op in ("load", "load_shared"):
+            token, ref = inst.args
+            kind, idx = _parse_stc_placement_ref(str(ref))
+            if kind not in ("x1", "x0", "go"):
+                raise ValueError("STC backward input load expects x1/x0/grad_out")
+            arr = "grad_out" if kind == "go" else kind
+            lhs = str(token) if inst.op == "load" else shared_expr(str(token))
+            ap(f"            {lhs} = {arr}[{input_index_expr(kind, idx)}];")
+
+        elif inst.op == "init_acc":
+            token, ref = inst.args
+            kind, _idx = _parse_stc_placement_ref(str(ref))
+            if kind != "gx1":
+                raise ValueError("STC backward init_acc expects grad_x1[]")
+            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+
+        elif inst.op == "stc_bwd_placed":
+            (
+                x1_indices,
+                target_tokens,
+                go_token,
+                x0_token,
+                x1_tokens,
+                coeff,
+            ) = inst.args
+            x1_indices = tuple(int(v) for v in x1_indices)
+            target_tokens = tuple(str(v) for v in target_tokens)
+            x1_tokens = tuple(str(v) for v in x1_tokens)
+            base_expr = (
+                f"scalar_t({_fmt_float(float(coeff))}) * "
+                f"{operand_expr(str(go_token))} * {operand_expr(str(x0_token))}"
+            )
+            for pos, target_idx in enumerate(x1_indices):
+                other_tokens = [
+                    x1_tokens[q]
+                    for q in range(len(x1_indices))
+                    if q != pos
+                ]
+                value = product_from_tokens(base_expr, other_tokens)
+                target_token = target_tokens[pos]
+                if target_token.startswith("d:"):
+                    emit_grad_x1_write(int(target_idx), value)
+                else:
+                    ap(f"            {acc_expr(target_token)} += {value};")
+
+        elif inst.op == "store_acc_placed":
+            ref, token = inst.args
+            kind, idx = _parse_stc_placement_ref(str(ref))
+            if kind != "gx1":
+                raise ValueError("STC backward store_acc_placed expects grad_x1[]")
+            emit_grad_x1_write(int(idx), acc_expr(str(token)))
+
+        elif inst.op == "stc_bwd_path":
+            x1_indices, x0_idx, out_v, coeff = inst.args
+            x1_indices = tuple(int(v) for v in x1_indices)
+            base_name = f"base_{inst_id}"
+            ap(
+                f"            const scalar_t {base_name} = "
+                f"grad_out[{input_index_expr('go', int(out_v))}] * "
+                f"scalar_t({_fmt_float(float(coeff))}) * "
+                f"x0[{input_index_expr('x0', int(x0_idx))}];"
+            )
+            for pos, target_x1 in enumerate(x1_indices):
+                other = [idx for q, idx in enumerate(x1_indices) if q != pos]
+                grad_expr = _stc_bwd_grad_expr(base_name, other)
+                ap(
+                    f"            {_stc_grad_x1_acc_name(target_x1)} += "
+                    f"{grad_expr};"
+                )
+
+        elif inst.op in ("release", "release_shared"):
+            pass
+        else:
+            raise ValueError(f"Unsupported STC backward instruction op: {inst.op}")
+
+    if not has_placed:
+        for x1_idx in touched_x1_indices:
+            emit_grad_x1_write(
+                int(x1_idx), _stc_grad_x1_acc_name(int(x1_idx))
+            )
 
     ap("        }")
     ap("    }")
@@ -769,7 +1442,11 @@ def emit_stc_bwd_kernel_from_paths(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap(
+        f"    size_t lars_shared_bytes = (size_t){shared_slots} * "
+        f"(size_t)block.x * sizeof(scalar_t);"
+    )
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, lars_shared_bytes, stream>>>(")
     ap("        grad_out, x1, x0, grad_x1, B, X1, X0, V, U);")
     ap("}")
     ap("")
@@ -850,15 +1527,12 @@ def generate_code_stc_bwd_with_scheduler(
     topk_candidates: Optional[int] = 128,
     tile_u: int = 32,
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ) -> Any:
-    """Generate STC backward code for grad_x1 only.
-
-    This uses the same LARSUniform1DScheduler(path_kind="stc") to choose a
-    static path order, but the emitted kernel follows the tiled STC backward
-    computation: iterate paths in static order and write a single [B, X1, U]
-    gradient tensor without dynamic per-block scratch storage.
-    """
-    paths = make_stc_paths_from_padded_lists(idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value)
+    """Generate x1-only STC backward with LARS lifetime placement."""
+    paths = make_stc_paths_from_padded_lists(
+        idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value
+    )
     scheduler = LARSUniform1DScheduler(
         paths,
         path_kind="stc",
@@ -870,18 +1544,43 @@ def generate_code_stc_bwd_with_scheduler(
         profile_seconds=profile_seconds,
         profile_print=profile_print,
     )
-    schedule_result = scheduler.schedule()
+    path_schedule = scheduler.schedule()
+    _dump_and_print_schedule_label_stats(
+        operation="stc_bwd",
+        candidate_tag="stc_lars_bwd_x1_only",
+        path_order=path_schedule.path_order,
+        labels_by_path=_stats_labels_stc_bwd(paths),
+    )
+    schedule_result = _make_stc_bwd_logical_schedule(paths, path_schedule)
+    resolved_placement = _resolve_lars_placement_config(placement_config)
+    schedule_result = apply_lars_lifetime_placement(
+        schedule_result,
+        schedule_kind="stc_bwd",
+        config=resolved_placement,
+    )
+    dump_lars_variable_stats(
+        schedule_result,
+        print_stats=resolved_placement.stats_print,
+        out_path=resolved_placement.stats_path,
+    )
 
-    idx_norm = _normalize_stc_padded_paths(idx_lists, coeff_list=coeff_list, path_lens=path_lens)
+    idx_norm = _normalize_stc_padded_paths(
+        idx_lists, coeff_list=coeff_list, path_lens=path_lens
+    )
     if path_lens is None:
-        inferred_lens = infer_stc_path_lens_from_padded(idx_norm, coeff_list, pad_value=pad_value)
+        inferred_lens = infer_stc_path_lens_from_padded(
+            idx_norm, coeff_list, pad_value=pad_value
+        )
     else:
         inferred_lens = path_lens.detach().cpu().to(torch.int64).reshape(-1)
-    base_kernel_name = f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_maxlen{int(inferred_lens.max().item())}"
+    base_kernel_name = (
+        f"{kernel_name}_u{int(u_dim)}_path{len(paths)}_"
+        f"maxlen{int(inferred_lens.max().item())}"
+    )
 
     code = emit_stc_bwd_kernel_from_paths(
         paths,
-        path_order=schedule_result.path_order,
+        schedule_result=schedule_result,
         kernel_name=base_kernel_name,
         u_dim=int(u_dim),
         x0_dim=x0_dim,
@@ -900,15 +1599,10 @@ def generate_code_stc_bwd_with_scheduler(
             "schedule": schedule_result,
             "num_paths": len(paths),
             "max_live": schedule_result.max_live,
+            "profile": schedule_result.profile,
         }
     return code
 
-
-# =============================================================================
-# LARS scheduler integration
-# =============================================================================
-
-Label = Tuple[str, int]  # ('x', i), ('y', j), ('w', k), ('o', v)
 
 def _to_int_list(x: torch.Tensor) -> List[int]:
     return [int(v) for v in x.detach().cpu().tolist()]
@@ -960,6 +1654,640 @@ class ScheduleResult:
     reloads: int
     final_reg_map: Dict[Label, str]
     profile: Dict[str, Any] = field(default_factory=dict)
+    variable_stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    placement_summary: Dict[str, Any] = field(default_factory=dict)
+    shared_slots: int = 0
+
+
+@dataclass(frozen=True)
+class LARSPlacementConfig:
+    """Post-schedule storage placement policy.
+
+    The defaults intentionally target only clearly low-frequency, long-lived
+    values.  They are conservative starting points and are exposed so JIT
+    candidate generation can tune them later.
+    """
+
+    enabled: bool = True
+    direct_use_threshold: int = 1
+    input_low_freq_threshold: int = 1000
+    input_long_lifetime_threshold: int = 10
+    accumulator_low_freq_threshold: int = 2
+    accumulator_long_lifetime_threshold: int = 32
+    max_shared_slots: Optional[int] = 16
+    stats_print: bool = False
+    stats_path: Optional[str] = None
+
+
+def _resolve_lars_placement_config(
+    config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]],
+) -> LARSPlacementConfig:
+    if config is None:
+        return LARSPlacementConfig()
+    if isinstance(config, LARSPlacementConfig):
+        return config
+    if isinstance(config, dict):
+        return LARSPlacementConfig(**dict(config))
+    raise TypeError(
+        "placement_config must be None, LARSPlacementConfig, or a dict"
+    )
+
+
+def _placement_ref_parts(ref: str) -> Tuple[str, int]:
+    if not isinstance(ref, str) or "[" not in ref or not ref.endswith("]"):
+        raise ValueError(f"Bad placement reference: {ref!r}")
+    kind, tail = ref.split("[", 1)
+    return kind, int(tail[:-1])
+
+
+def _placement_peak_live(intervals: Sequence[Tuple[int, int]]) -> int:
+    if not intervals:
+        return 0
+    events: Dict[int, int] = defaultdict(int)
+    for first, last in intervals:
+        events[int(first)] += 1
+        events[int(last) + 1] -= 1
+    live = 0
+    peak = 0
+    for pos in sorted(events):
+        live += events[pos]
+        peak = max(peak, live)
+    return int(peak)
+
+
+def _placement_assign_tokens(
+    variables: List[Dict[str, Any]],
+    *,
+    placement: str,
+    prefix: str,
+) -> int:
+    """Linear-scan color intervals and return the number of required tokens."""
+    selected = [v for v in variables if v["placement"] == placement]
+    selected.sort(key=lambda v: (v["first_use"], v["last_use"], v["name"]))
+    active: List[Tuple[int, int]] = []  # (last_use, token_id)
+    free_ids: List[int] = []
+    next_id = 0
+    for var in selected:
+        first = int(var["first_use"])
+        still_active: List[Tuple[int, int]] = []
+        for last, token_id in active:
+            if int(last) < first:
+                free_ids.append(int(token_id))
+            else:
+                still_active.append((int(last), int(token_id)))
+        active = still_active
+        free_ids.sort()
+        if free_ids:
+            token_id = free_ids.pop(0)
+        else:
+            token_id = next_id
+            next_id += 1
+        var["token"] = f"{prefix}{token_id}"
+        active.append((int(var["last_use"]), int(token_id)))
+    return int(next_id)
+
+
+def _extract_lars_compute_records(
+    schedule_result: ScheduleResult,
+    *,
+    schedule_kind: str,
+) -> List[Dict[str, Any]]:
+    """Recover label-level operands from the original logical instruction stream."""
+    reg_to_ref: Dict[str, str] = {}
+    records: List[Dict[str, Any]] = []
+
+    def ref_of(reg: str) -> str:
+        if not reg:
+            return ""
+        if reg not in reg_to_ref:
+            raise RuntimeError(
+                f"Cannot recover label for register {reg!r}; schedule_kind={schedule_kind}"
+            )
+        return reg_to_ref[reg]
+
+    for inst in schedule_result.instructions:
+        if inst.op == "load":
+            reg, ref = inst.args
+            reg_to_ref[str(reg)] = str(ref)
+            continue
+        if inst.op == "release":
+            reg = str(inst.args[0])
+            reg_to_ref.pop(reg, None)
+            continue
+
+        if schedule_kind == "fwd" and inst.op in (
+            "fma_u1d_resident", "fma_u1d_direct"
+        ):
+            out_idx, rx, ry, rw, coeff = inst.args
+            records.append({
+                "kind": "fwd",
+                "input_refs": [ref_of(str(rx)), ref_of(str(ry)), ref_of(str(rw))],
+                "input_weights": [1, 1, 1],
+                "acc_refs": [f"out[{int(out_idx)}]"],
+                "out_idx": int(out_idx),
+                "coeff": float(coeff),
+                "comment": inst.comment,
+            })
+            continue
+
+        if schedule_kind == "stc_fwd" and inst.op in (
+            "mul_stc_resident", "mul_stc_direct"
+        ):
+            out_idx, regs, coeff = inst.args
+            refs = [ref_of(str(reg)) for reg in regs]
+            records.append({
+                "kind": "stc_fwd",
+                # Duplicate refs intentionally preserve squares/cubes.  The
+                # placement statistics count each expression occurrence while
+                # path_use_count is deduplicated later per path.
+                "input_refs": refs,
+                "input_weights": [1] * len(refs),
+                "acc_refs": [f"out[{int(out_idx)}]"],
+                "out_idx": int(out_idx),
+                "coeff": float(coeff),
+                "comment": inst.comment,
+            })
+            continue
+
+        if schedule_kind == "stc_bwd" and inst.op == "stc_bwd_path":
+            x1_indices, x0_idx, out_v, coeff = inst.args
+            x1_indices = tuple(int(v) for v in x1_indices)
+            arity = len(x1_indices)
+            input_refs: List[str] = [
+                f"grad_out[{int(out_v)}]",
+                f"x0[{int(x0_idx)}]",
+            ]
+            input_weights: List[int] = [arity, arity]
+            # Each x1 occurrence participates in every derivative expression
+            # except the one targeting that same occurrence.
+            multiplicity = Counter(x1_indices)
+            for idx in sorted(multiplicity):
+                weight = int(multiplicity[idx]) * max(0, arity - 1)
+                if weight > 0:
+                    input_refs.append(f"x1[{int(idx)}]")
+                    input_weights.append(weight)
+            records.append({
+                "kind": "stc_bwd",
+                "input_refs": input_refs,
+                "input_weights": input_weights,
+                # Keep one accumulator occurrence per derivative position so
+                # duplicate x1 indices correctly increase accumulator use_count.
+                "acc_refs": [f"grad_x1[{int(idx)}]" for idx in x1_indices],
+                "x1_indices": x1_indices,
+                "x0_idx": int(x0_idx),
+                "out_v": int(out_v),
+                "coeff": float(coeff),
+                "comment": inst.comment,
+            })
+            continue
+
+        if schedule_kind == "bwd_fused" and inst.op == "bwd_fma_resident":
+            wi, xj, yk, rw, rx, ry, rgo, coeff, need_grad_w = inst.args
+            acc_refs = []
+            if bool(need_grad_w):
+                acc_refs.append(f"grad_w[{int(wi)}]")
+            acc_refs.extend([f"grad_x[{int(xj)}]", f"grad_y[{int(yk)}]"])
+            records.append({
+                "kind": "bwd_fused",
+                "input_refs": [
+                    ref_of(str(rw)), ref_of(str(rx)), ref_of(str(ry)), ref_of(str(rgo))
+                ],
+                "input_weights": (
+                    [2, 2, 2, 3] if bool(need_grad_w) else [2, 1, 1, 2]
+                ),
+                "acc_refs": acc_refs,
+                "wi": int(wi),
+                "xj": int(xj),
+                "yk": int(yk),
+                "coeff": float(coeff),
+                "need_grad_w": bool(need_grad_w),
+                "comment": inst.comment,
+            })
+            continue
+
+        if schedule_kind.startswith("bwd_split:") and inst.op == "bwd_split_fma_resident":
+            grad_kind, target_idx, rw, rx, ry, rgo, coeff = inst.args
+            expected_kind = schedule_kind.split(":", 1)[1]
+            if str(grad_kind) != expected_kind:
+                raise ValueError(
+                    f"split schedule kind mismatch: {grad_kind!r} vs {expected_kind!r}"
+                )
+            kind_to_ref = {"gw": "grad_w", "gx": "grad_x", "gy": "grad_y"}
+            refs = [ref_of(str(r)) for r in (rw, rx, ry, rgo) if str(r)]
+            records.append({
+                "kind": "bwd_split",
+                "grad_kind": str(grad_kind),
+                "input_refs": refs,
+                "input_weights": [1] * len(refs),
+                "input_regs_present": tuple(bool(str(r)) for r in (rw, rx, ry, rgo)),
+                "acc_refs": [f"{kind_to_ref[str(grad_kind)]}[{int(target_idx)}]"],
+                "target_idx": int(target_idx),
+                "coeff": float(coeff),
+                "comment": inst.comment,
+            })
+            continue
+
+    if len(records) != len(schedule_result.path_order):
+        raise RuntimeError(
+            f"Recovered {len(records)} compute records for {len(schedule_result.path_order)} "
+            f"scheduled paths ({schedule_kind})"
+        )
+    return records
+
+
+def apply_lars_lifetime_placement(
+    schedule_result: ScheduleResult,
+    *,
+    schedule_kind: str,
+    config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+) -> ScheduleResult:
+    """Analyze use/lifetime and rewrite a LARS schedule with tiered placement.
+
+    Policy:
+      * use_count <= direct_use_threshold: inline global read/direct writeback;
+      * low-frequency and long-lived: one private shared-memory slot per thread;
+      * everything else: a linear-scan reused scalar register.
+    """
+    cfg = _resolve_lars_placement_config(config)
+    if not cfg.enabled:
+        return schedule_result
+
+    records = _extract_lars_compute_records(
+        schedule_result, schedule_kind=schedule_kind
+    )
+    variables_by_key: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    for pos, rec in enumerate(records):
+        input_weights = rec.get("input_weights", [1] * len(rec["input_refs"]))
+        seen_input_refs: Set[str] = set()
+        for ref, weight in zip(rec["input_refs"], input_weights):
+            ref = str(ref)
+            key = ("input", ref)
+            var = variables_by_key.setdefault(key, {
+                "role": "input",
+                "name": ref,
+                "use_count": 0,
+                "path_use_count": 0,
+                "first_use": int(pos),
+                "last_use": int(pos),
+            })
+            var["use_count"] += int(weight)
+            if ref not in seen_input_refs:
+                var["path_use_count"] += 1
+                seen_input_refs.add(ref)
+            var["last_use"] = int(pos)
+        seen_acc_refs: Set[str] = set()
+        for ref in rec["acc_refs"]:
+            ref = str(ref)
+            key = ("accumulator", ref)
+            var = variables_by_key.setdefault(key, {
+                "role": "accumulator",
+                "name": ref,
+                "use_count": 0,
+                "path_use_count": 0,
+                "first_use": int(pos),
+                "last_use": int(pos),
+            })
+            var["use_count"] += 1
+            if ref not in seen_acc_refs:
+                var["path_use_count"] += 1
+                seen_acc_refs.add(ref)
+            var["last_use"] = int(pos)
+
+    variables = list(variables_by_key.values())
+    for var in variables:
+        var["lifetime"] = int(var["last_use"] - var["first_use"] + 1)
+        kind, idx = _placement_ref_parts(var["name"])
+        var["kind"] = kind
+        var["index"] = int(idx)
+        accesses = int(var["use_count"])
+        path_uses = int(var.get("path_use_count", accesses))
+        lifetime = int(var["lifetime"])
+        # Direct placement is based on actual expression references.  Shared
+        # classification uses scheduled path frequency, because one fused
+        # backward path may reference the same loaded operand in 2-3 gradient
+        # expressions without requiring additional lifetime state.
+        if accesses <= int(cfg.direct_use_threshold):
+            var["placement"] = "direct"
+        else:
+            if var["role"] == "input":
+                low_freq = path_uses <= int(cfg.input_low_freq_threshold)
+                long_lived = lifetime >= int(cfg.input_long_lifetime_threshold)
+            else:
+                low_freq = path_uses <= int(cfg.accumulator_low_freq_threshold)
+                long_lived = lifetime >= int(cfg.accumulator_long_lifetime_threshold)
+            var["placement"] = "shared" if (low_freq and long_lived) else "register"
+
+    # Respect the shared-slot cap by selecting the highest pressure-relief value
+    # first.  A candidate is retained only when the peak interval overlap remains
+    # within the configured cap.
+    shared_candidates = [v for v in variables if v["placement"] == "shared"]
+    cap = cfg.max_shared_slots
+    if cap is not None:
+        cap = max(0, int(cap))
+        selected: List[Dict[str, Any]] = []
+        shared_candidates.sort(
+            key=lambda v: (
+                float(v["lifetime"]) / max(1, int(v.get("path_use_count", v["use_count"]))),
+                int(v["lifetime"]),
+                1 if v["role"] == "accumulator" else 0,
+                -int(v.get("path_use_count", v["use_count"])),
+                v["name"],
+            ),
+            reverse=True,
+        )
+        for cand in shared_candidates:
+            trial = selected + [cand]
+            peak = _placement_peak_live([
+                (int(v["first_use"]), int(v["last_use"])) for v in trial
+            ])
+            if peak <= cap:
+                selected.append(cand)
+            else:
+                cand["placement"] = "register"
+
+    shared_slots = _placement_assign_tokens(
+        variables, placement="shared", prefix="s"
+    )
+    register_slots = _placement_assign_tokens(
+        variables, placement="register", prefix="r"
+    )
+    for var in variables:
+        if var["placement"] == "direct":
+            var["token"] = f"d:{var['name']}"
+
+    input_by_ref = {
+        v["name"]: v for v in variables if v["role"] == "input"
+    }
+    acc_by_ref = {
+        v["name"]: v for v in variables if v["role"] == "accumulator"
+    }
+    input_first: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    input_last: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    acc_first: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    acc_last: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for var in variables:
+        if var["role"] == "input":
+            input_first[int(var["first_use"])].append(var)
+            input_last[int(var["last_use"])].append(var)
+        else:
+            acc_first[int(var["first_use"])].append(var)
+            acc_last[int(var["last_use"])].append(var)
+
+    rewritten: List[Inst] = []
+    for pos, rec in enumerate(records):
+        for var in sorted(input_first[pos], key=lambda v: v["name"]):
+            if var["placement"] == "register":
+                rewritten.append(Inst(
+                    "load", (var["token"], var["name"]),
+                    f"placement=register accesses={var['use_count']} paths={var.get('path_use_count', var['use_count'])} lifetime={var['lifetime']}",
+                ))
+            elif var["placement"] == "shared":
+                rewritten.append(Inst(
+                    "load_shared", (var["token"], var["name"]),
+                    f"placement=shared accesses={var['use_count']} paths={var.get('path_use_count', var['use_count'])} lifetime={var['lifetime']}",
+                ))
+        for var in sorted(acc_first[pos], key=lambda v: v["name"]):
+            if var["placement"] in ("register", "shared"):
+                rewritten.append(Inst(
+                    "init_acc", (var["token"], var["name"]),
+                    f"placement={var['placement']} accesses={var['use_count']} paths={var.get('path_use_count', var['use_count'])} lifetime={var['lifetime']}",
+                ))
+
+        input_tokens = [input_by_ref[ref]["token"] for ref in rec["input_refs"]]
+        acc_tokens = [acc_by_ref[ref]["token"] for ref in rec["acc_refs"]]
+        if rec["kind"] == "fwd":
+            rewritten.append(Inst(
+                "fma_u1d_placed",
+                (
+                    int(rec["out_idx"]), acc_tokens[0],
+                    input_tokens[0], input_tokens[1], input_tokens[2],
+                    float(rec["coeff"]),
+                ),
+                rec["comment"],
+            ))
+        elif rec["kind"] == "stc_fwd":
+            rewritten.append(Inst(
+                "mul_stc_placed",
+                (
+                    int(rec["out_idx"]), acc_tokens[0],
+                    tuple(input_tokens), float(rec["coeff"]),
+                ),
+                rec["comment"],
+            ))
+        elif rec["kind"] == "stc_bwd":
+            token_by_ref = {
+                str(ref): str(token)
+                for ref, token in zip(rec["input_refs"], input_tokens)
+            }
+            x1_indices = tuple(int(v) for v in rec["x1_indices"])
+            x1_tokens = tuple(
+                token_by_ref.get(f"x1[{int(idx)}]", "")
+                for idx in x1_indices
+            )
+            rewritten.append(Inst(
+                "stc_bwd_placed",
+                (
+                    x1_indices, tuple(acc_tokens),
+                    token_by_ref[f"grad_out[{int(rec['out_v'])}]"],
+                    token_by_ref[f"x0[{int(rec['x0_idx'])}]"],
+                    x1_tokens, float(rec["coeff"]),
+                ),
+                rec["comment"],
+            ))
+        elif rec["kind"] == "bwd_fused":
+            acc_iter = iter(acc_tokens)
+            gw_token = next(acc_iter) if rec["need_grad_w"] else ""
+            gx_token = next(acc_iter)
+            gy_token = next(acc_iter)
+            rewritten.append(Inst(
+                "bwd_fma_placed",
+                (
+                    int(rec["wi"]), int(rec["xj"]), int(rec["yk"]),
+                    gw_token, gx_token, gy_token,
+                    input_tokens[0], input_tokens[1], input_tokens[2], input_tokens[3],
+                    float(rec["coeff"]), bool(rec["need_grad_w"]),
+                ),
+                rec["comment"],
+            ))
+        elif rec["kind"] == "bwd_split":
+            present = rec["input_regs_present"]
+            token_iter = iter(input_tokens)
+            operand_tokens = [next(token_iter) if flag else "" for flag in present]
+            rewritten.append(Inst(
+                "bwd_split_fma_placed",
+                (
+                    rec["grad_kind"], int(rec["target_idx"]), acc_tokens[0],
+                    operand_tokens[0], operand_tokens[1], operand_tokens[2], operand_tokens[3],
+                    float(rec["coeff"]),
+                ),
+                rec["comment"],
+            ))
+        else:
+            raise ValueError(f"Unsupported placement record kind: {rec['kind']}")
+
+        for var in sorted(acc_last[pos], key=lambda v: v["name"]):
+            if var["placement"] in ("register", "shared"):
+                rewritten.append(Inst(
+                    "store_acc_placed", (var["name"], var["token"]),
+                    f"last use at scheduled path position {pos}",
+                ))
+        for var in sorted(input_last[pos], key=lambda v: v["name"]):
+            if var["placement"] == "register":
+                rewritten.append(Inst(
+                    "release", (var["token"], var["name"]),
+                    f"last use at scheduled path position {pos}",
+                ))
+            elif var["placement"] == "shared":
+                rewritten.append(Inst(
+                    "release_shared", (var["token"], var["name"]),
+                    f"last use at scheduled path position {pos}",
+                ))
+
+    reg_intervals = [
+        (int(v["first_use"]), int(v["last_use"]))
+        for v in variables if v["placement"] == "register"
+    ]
+    shared_intervals = [
+        (int(v["first_use"]), int(v["last_use"]))
+        for v in variables if v["placement"] == "shared"
+    ]
+    state_intervals = reg_intervals + shared_intervals
+    reg_peak = _placement_peak_live(reg_intervals)
+    shared_peak = _placement_peak_live(shared_intervals)
+    total_peak = _placement_peak_live(state_intervals)
+
+    reg_live_by_pos = [
+        sum(
+            1 for v in variables
+            if v["placement"] == "register"
+            and int(v["first_use"]) <= pos <= int(v["last_use"])
+        )
+        for pos in range(len(records))
+    ]
+    shared_live_by_pos = [
+        sum(
+            1 for v in variables
+            if v["placement"] == "shared"
+            and int(v["first_use"]) <= pos <= int(v["last_use"])
+        )
+        for pos in range(len(records))
+    ]
+
+    variable_stats: Dict[str, Dict[str, Any]] = {}
+    role_counts: Dict[str, Counter[str]] = {
+        "input": Counter(), "accumulator": Counter()
+    }
+    for var in sorted(variables, key=lambda v: (v["role"], v["kind"], v["index"])):
+        role_counts[var["role"]][var["placement"]] += 1
+        variable_stats[f"{var['role']}:{var['name']}"] = {
+            "role": var["role"],
+            "name": var["name"],
+            "kind": var["kind"],
+            "index": int(var["index"]),
+            "use_count": int(var["use_count"]),
+            "path_use_count": int(var.get("path_use_count", var["use_count"])),
+            "first_use": int(var["first_use"]),
+            "last_use": int(var["last_use"]),
+            "lifetime": int(var["lifetime"]),
+            "max_live_register_during_lifetime": int(max(
+                reg_live_by_pos[int(var["first_use"]): int(var["last_use"]) + 1],
+                default=0,
+            )),
+            "max_live_shared_during_lifetime": int(max(
+                shared_live_by_pos[int(var["first_use"]): int(var["last_use"]) + 1],
+                default=0,
+            )),
+            "max_live_total_during_lifetime": int(max(
+                [
+                    reg_live_by_pos[pos] + shared_live_by_pos[pos]
+                    for pos in range(int(var["first_use"]), int(var["last_use"]) + 1)
+                ],
+                default=0,
+            )),
+            "placement": var["placement"],
+            "token": var["token"],
+        }
+
+    summary = {
+        "schedule_kind": schedule_kind,
+        "path_count": len(records),
+        "original_max_live_inputs": int(schedule_result.max_live),
+        "max_live_register_state": int(reg_peak),
+        "max_live_shared_state": int(shared_peak),
+        "max_live_total_state": int(total_peak),
+        "register_slots": int(register_slots),
+        "shared_slots": int(shared_slots),
+        "input_counts": dict(role_counts["input"]),
+        "accumulator_counts": dict(role_counts["accumulator"]),
+        "config": {
+            "direct_use_threshold": int(cfg.direct_use_threshold),
+            "input_low_freq_threshold": int(cfg.input_low_freq_threshold),
+            "input_long_lifetime_threshold": int(cfg.input_long_lifetime_threshold),
+            "accumulator_low_freq_threshold": int(cfg.accumulator_low_freq_threshold),
+            "accumulator_long_lifetime_threshold": int(cfg.accumulator_long_lifetime_threshold),
+            "max_shared_slots": cfg.max_shared_slots,
+        },
+    }
+    profile = dict(schedule_result.profile)
+    profile["placement"] = summary
+    profile["variable_stats"] = variable_stats
+
+    return ScheduleResult(
+        instructions=rewritten,
+        path_order=list(schedule_result.path_order),
+        max_live=int(reg_peak),
+        spills=int(schedule_result.spills),
+        reloads=sum(1 for inst in rewritten if inst.op in ("load", "load_shared")),
+        final_reg_map={},
+        profile=profile,
+        variable_stats=variable_stats,
+        placement_summary=summary,
+        shared_slots=int(shared_slots),
+    )
+
+
+def dump_lars_variable_stats(
+    schedule_result: ScheduleResult,
+    *,
+    print_stats: bool = False,
+    out_path: Optional[str] = None,
+) -> None:
+    """Print and/or dump per-variable use count, lifetime and placement."""
+    summary = dict(getattr(schedule_result, "placement_summary", {}) or {})
+    stats = dict(getattr(schedule_result, "variable_stats", {}) or {})
+    if print_stats:
+        print(
+            "[LARS][placement] "
+            f"kind={summary.get('schedule_kind')} paths={summary.get('path_count')} "
+            f"max_live(original/register/shared/total)="
+            f"{summary.get('original_max_live_inputs')}/"
+            f"{summary.get('max_live_register_state')}/"
+            f"{summary.get('max_live_shared_state')}/"
+            f"{summary.get('max_live_total_state')} "
+            f"slots(reg/shared)={summary.get('register_slots')}/"
+            f"{summary.get('shared_slots')}",
+            flush=True,
+        )
+        for item in stats.values():
+            print(
+                "[LARS][variable] "
+                f"role={item['role']:<11s} name={item['name']:<18s} "
+                f"uses={item['use_count']:<4d} paths={item['path_use_count']:<4d} "
+                f"first={item['first_use']:<4d} last={item['last_use']:<4d} "
+                f"lifetime={item['lifetime']:<4d} "
+                f"max_live(reg/shared/total)="
+                f"{item['max_live_register_during_lifetime']}/"
+                f"{item['max_live_shared_during_lifetime']}/"
+                f"{item['max_live_total_during_lifetime']} "
+                f"placement={item['placement']:<8s} token={item['token']}",
+                flush=True,
+            )
+    if out_path:
+        payload = {"summary": summary, "variables": list(stats.values())}
+        Path(out_path).write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
 
 
 class LARSUniform1DScheduler:
@@ -2106,19 +3434,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     v_dim: Optional[int] = None,
     block_size: int = 32,
 ) -> str:
-    """
-    Emit CUDA/HIP-compatible forward code directly from LARS instruction order.
-
-    Supported logical ops:
-      - load / release
-      - fma_u1d_resident: accumulate into full-resident out_acc_v_<idx>
-      - fma_u1d_direct: direct writeback for single-use out[v]
-      - fma_u1d / load_acc / store_acc are kept only for old ScheduleResult
-        compatibility.
-
-    LARS-native path semantics:
-        out[v] += x[i] * y[j] * w[k] * c
-    """
+    """Emit forward code from either a legacy or lifetime-placed schedule."""
     block_size = int(block_size)
     if block_size < 32 or block_size % 32 != 0:
         raise ValueError("block_size must be a positive multiple of 32")
@@ -2127,13 +3443,17 @@ def emit_fused_fwd_kernel_from_lars_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
+    shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    has_placed = any(
+        inst.op == "fma_u1d_placed" for inst in schedule_result.instructions
+    )
 
-    resident_out_indices = sorted({
+    resident_out_indices = [] if has_placed else sorted({
         int(inst.args[0])
         for inst in schedule_result.instructions
         if inst.op == "fma_u1d_resident"
     })
-    direct_out_indices = sorted({
+    direct_out_indices = [] if has_placed else sorted({
         int(inst.args[0])
         for inst in schedule_result.instructions
         if inst.op == "fma_u1d_direct"
@@ -2143,6 +3463,45 @@ def emit_fused_fwd_kernel_from_lars_schedule(
 
     def ap(line: str = ""):
         lines.append(line)
+
+    def shared_expr(token: str) -> str:
+        if not isinstance(token, str) or not token.startswith("s"):
+            raise ValueError(f"Bad shared token: {token!r}")
+        slot = int(token[1:])
+        return f"lars_smem[(size_t){slot} * (size_t)blockDim.x + (size_t)tid]"
+
+    def direct_input_expr(ref: str) -> str:
+        kind, idx = _parse_lars_label_ref(ref)
+        if kind == "o":
+            raise ValueError("output cannot be used as a direct input")
+        expr = _lars_label_index_expr(
+            kind, idx,
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            x_dim=x_dim,
+            y_dim=y_dim,
+            w_dim=w_dim,
+            v_dim=v_dim,
+        )
+        return f"{kind}[{expr}]"
+
+    def operand_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        if token.startswith("d:"):
+            return direct_input_expr(token[2:])
+        raise ValueError(f"Bad forward operand token: {token!r}")
+
+    def acc_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        raise ValueError(f"Bad forward accumulator token: {token!r}")
 
     def emit_out_write(idx: int, value_expr: str) -> None:
         expr = _lars_label_index_expr(
@@ -2200,6 +3559,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    const int lane = tid & 31;")
     ap("    const int warp_id = tid >> 5;")
     ap("    const int warp_count = blockDim.x >> 5;")
+    if shared_slots:
+        ap("    extern __shared__ unsigned char lars_smem_raw[];")
+        ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
     ap("")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
@@ -2208,18 +3570,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    const int e_orig = e_local;")
     ap("    const int w_row  = (WB == 1 ? 0 : e_orig);")
     ap("")
-    if use_x_src:
-        ap("    const int x_row = src_idx[e_orig];")
-    else:
-        ap("    const int x_row = e_local;")
-    if use_y_src:
-        ap("    const int y_row = src_idx[e_orig];")
-    else:
-        ap("    const int y_row = e_orig;")
-    if use_scatter:
-        ap("    const int out_row = dst_idx[e_orig];")
-    else:
-        ap("    const int out_row = e_orig;")
+    ap("    const int x_row = " + ("src_idx[e_orig];" if use_x_src else "e_local;"))
+    ap("    const int y_row = " + ("src_idx[e_orig];" if use_y_src else "e_orig;"))
+    ap("    const int out_row = " + ("dst_idx[e_orig];" if use_scatter else "e_orig;"))
     ap("")
     ap("    const index_t w_base = (index_t)w_row * (index_t)Iw * (index_t)U;")
     ap("    const index_t x_base = (index_t)x_row * (index_t)Ix * (index_t)U;")
@@ -2252,11 +3605,11 @@ def emit_fused_fwd_kernel_from_lars_schedule(
             prefix += f" | {comment}"
         ap(prefix)
 
-        if inst.op == "load":
-            reg, ref = inst.args
+        if inst.op in ("load", "load_shared"):
+            token, ref = inst.args
             kind, idx = _parse_lars_label_ref(ref)
             if kind == "o":
-                raise ValueError("load must not be used for output labels")
+                raise ValueError("input load must not target output labels")
             expr = _lars_label_index_expr(
                 kind, idx,
                 mode_scalar_y=mode_scalar_y,
@@ -2266,7 +3619,34 @@ def emit_fused_fwd_kernel_from_lars_schedule(
                 w_dim=w_dim,
                 v_dim=v_dim,
             )
-            ap(f"            {reg} = {kind}[{expr}];")
+            lhs = str(token) if inst.op == "load" else shared_expr(str(token))
+            ap(f"            {lhs} = {kind}[{expr}];")
+
+        elif inst.op == "init_acc":
+            token, ref = inst.args
+            kind, _idx = _parse_lars_label_ref(ref)
+            if kind != "o":
+                raise ValueError("forward init_acc expects out[]")
+            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+
+        elif inst.op == "fma_u1d_placed":
+            out_idx, out_token, rx, ry, rw, coeff = inst.args
+            c = _fmt_lars_float(float(coeff))
+            value = (
+                f"scalar_t({c}) * ({operand_expr(str(rw))} * "
+                f"{operand_expr(str(rx))}) * {operand_expr(str(ry))}"
+            )
+            if str(out_token).startswith("d:"):
+                emit_out_write(int(out_idx), value)
+            else:
+                ap(f"            {acc_expr(str(out_token))} += {value};")
+
+        elif inst.op == "store_acc_placed":
+            ref, token = inst.args
+            kind, idx = _parse_lars_label_ref(ref)
+            if kind != "o":
+                raise ValueError("forward store_acc_placed expects out[]")
+            emit_out_write(int(idx), acc_expr(str(token)))
 
         elif inst.op == "load_acc":
             reg, ref = inst.args
@@ -2283,10 +3663,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         elif inst.op == "fma_u1d_direct":
             out_idx, rx, ry, rw, coeff = inst.args
             c = _fmt_lars_float(float(coeff))
-            emit_out_write(
-                int(out_idx),
-                f"scalar_t({c}) * ({rw} * {rx}) * {ry}",
-            )
+            emit_out_write(int(out_idx), f"scalar_t({c}) * ({rw} * {rx}) * {ry}")
 
         elif inst.op == "fma_u1d":
             ro, rx, ry, rw, coeff = inst.args
@@ -2300,7 +3677,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
                 raise ValueError("store_acc expects an output label")
             emit_out_write(int(idx), str(reg))
 
-        elif inst.op == "release":
+        elif inst.op in ("release", "release_shared"):
             pass
         else:
             raise ValueError(f"Unsupported LARS instruction op: {inst.op}")
@@ -2357,7 +3734,8 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap(f"    size_t lars_shared_bytes = (size_t){shared_slots} * (size_t)block.x * sizeof(scalar_t);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, lars_shared_bytes, stream>>>(")
     ap("        w, x, y, out,")
     ap("        src_idx, dst_idx,")
     ap("        B, WB, Iw, Ix, Ky, V, U, S);")
@@ -2465,6 +3843,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ):
     """
     Generate one LARS forward CUDA implementation.
@@ -2511,6 +3890,23 @@ def generate_code_uniform1d_fwd_with_scheduler(
         profile_print=profile_print,
     )
     schedule_result = scheduler.schedule()
+    _dump_and_print_schedule_label_stats(
+        operation="uniform1d_fwd",
+        candidate_tag=cand_name,
+        path_order=schedule_result.path_order,
+        labels_by_path=_stats_labels_uniform1d_fwd(scheduler.paths),
+    )
+    resolved_placement = _resolve_lars_placement_config(placement_config)
+    schedule_result = apply_lars_lifetime_placement(
+        schedule_result,
+        schedule_kind="fwd",
+        config=resolved_placement,
+    )
+    dump_lars_variable_stats(
+        schedule_result,
+        print_stats=resolved_placement.stats_print,
+        out_path=resolved_placement.stats_path,
+    )
 
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
@@ -2907,6 +4303,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
+    shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
 
     # ------------------------------------------------------------------
     # Mixed accumulator placement for backward gradients.
@@ -2999,6 +4396,77 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     def ap(line: str = ""):
         lines.append(line)
 
+    def shared_expr(token: str) -> str:
+        if not isinstance(token, str) or not token.startswith("s"):
+            raise ValueError(f"Bad shared token: {token!r}")
+        slot = int(token[1:])
+        return f"lars_smem[(size_t){slot} * (size_t)blockDim.x + (size_t)tid]"
+
+    def operand_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        if token.startswith("d:"):
+            kind, idx = _parse_bwd_lars_label_ref(token[2:])
+            if kind in BWD_OUTPUT_KINDS:
+                raise ValueError("backward output cannot be a direct input")
+            expr = _bwd_label_index_expr(
+                kind, idx,
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            arr = "grad_out" if kind == "go" else kind
+            return f"{arr}[{expr}]"
+        raise ValueError(f"Bad backward operand token: {token!r}")
+
+    def acc_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        raise ValueError(f"Bad backward accumulator token: {token!r}")
+
+    def emit_grad_writeback(kind: str, idx: int, value_expr: str, suffix: str) -> None:
+        expr = _bwd_label_index_expr(
+            kind, int(idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        if kind == "gw":
+            if not need_grad_w:
+                raise ValueError("grad_w writeback requested with need_grad_w=False")
+            ap(f"            grad_w[{expr}] = {value_expr};")
+        elif kind == "gx":
+            ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
+        elif kind == "gy":
+            if mode_scalar_y:
+                safe = str(suffix).replace("-", "m").replace(":", "_")
+                ap(f"            scalar_t gy_sum_{safe} = warp_sum_xor_lars_bwd({value_expr});")
+                ap("            if (lane == 0) {")
+                ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_{safe});")
+                ap("            }")
+            else:
+                ap(f"            atomicAdd(&grad_y[{expr}], {value_expr});")
+        else:
+            raise ValueError(f"Bad backward accumulator kind: {kind}")
+
+    def emit_placed_update(kind: str, idx: int, token: str, value_expr: str, suffix: str) -> None:
+        if str(token).startswith("d:"):
+            emit_grad_writeback(kind, idx, value_expr, suffix)
+        else:
+            ap(f"            {acc_expr(str(token))} += {value_expr};")
+
     ap("#include <stdint.h>")
     ap("#include <torch/extension.h>")
     ap("#include <vector>")
@@ -3056,6 +4524,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    const int lane = tid & 31;")
     ap("    const int warp_id = tid >> 5;")
     ap("    const int warp_count = blockDim.x >> 5;")
+    if shared_slots:
+        ap("    extern __shared__ unsigned char lars_smem_raw[];")
+        ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -3132,11 +4603,11 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             prefix += f" | {comment}"
         ap(prefix)
 
-        if inst.op == "load":
-            reg, ref = inst.args
+        if inst.op in ("load", "load_shared"):
+            token, ref = inst.args
             kind, idx = _parse_bwd_lars_label_ref(ref)
             if kind in BWD_OUTPUT_KINDS:
-                raise ValueError("load must not be used for backward output labels")
+                raise ValueError("input load must not target backward output labels")
             expr = _bwd_label_index_expr(
                 kind, idx,
                 mode_scalar_y=mode_scalar_y,
@@ -3147,7 +4618,48 @@ def emit_fused_bwd_kernel_from_lars_schedule(
                 v_dim=v_dim,
             )
             arr = "grad_out" if kind == "go" else kind
-            ap(f"            {reg} = {arr}[{expr}];")
+            lhs = str(token) if inst.op == "load" else shared_expr(str(token))
+            ap(f"            {lhs} = {arr}[{expr}];")
+
+        elif inst.op == "init_acc":
+            token, ref = inst.args
+            kind, _idx = _parse_bwd_lars_label_ref(ref)
+            if kind not in BWD_OUTPUT_KINDS:
+                raise ValueError("backward init_acc expects grad_w/grad_x/grad_y")
+            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+
+        elif inst.op == "bwd_fma_placed":
+            wi, xj, yk, gw_token, gx_token, gy_token, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
+            c = _fmt_lars_float(float(coeff))
+            rw_e = operand_expr(str(rw))
+            rx_e = operand_expr(str(rx))
+            ry_e = operand_expr(str(ry))
+            rgo_e = operand_expr(str(rgo))
+            if bool(inst_need_grad_w):
+                emit_placed_update(
+                    "gw", int(wi), str(gw_token),
+                    f"scalar_t({c}) * {rgo_e} * {rx_e} * {ry_e}",
+                    f"direct_gw_{inst_id}",
+                )
+            emit_placed_update(
+                "gx", int(xj), str(gx_token),
+                f"scalar_t({c}) * ({rw_e} * {rgo_e}) * {ry_e}",
+                f"direct_gx_{inst_id}",
+            )
+            emit_placed_update(
+                "gy", int(yk), str(gy_token),
+                f"scalar_t({c}) * ({rw_e} * {rgo_e}) * {rx_e}",
+                f"direct_gy_{inst_id}",
+            )
+
+        elif inst.op == "store_acc_placed":
+            ref, token = inst.args
+            kind, idx = _parse_bwd_lars_label_ref(ref)
+            if kind not in BWD_OUTPUT_KINDS:
+                raise ValueError("store_acc_placed expects a backward output label")
+            emit_grad_writeback(
+                kind, int(idx), acc_expr(str(token)), f"placed_{kind}_{idx}_{inst_id}"
+            )
 
         elif inst.op == "load_acc":
             reg, ref = inst.args
@@ -3206,7 +4718,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             else:
                 raise ValueError("store_acc expects a backward output label")
 
-        elif inst.op == "release":
+        elif inst.op in ("release", "release_shared"):
             pass
         else:
             raise ValueError(f"Unsupported backward LARS instruction op: {inst.op}")
@@ -3306,7 +4818,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap(f"    size_t lars_shared_bytes = (size_t){shared_slots} * (size_t)block.x * sizeof(scalar_t);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, lars_shared_bytes, stream>>>(")
     if need_grad_w:
         ap("        w, x, y, grad_out, grad_w, grad_x, grad_y,")
     else:
@@ -3844,6 +5357,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
 
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
+    shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
 
     target_use: Counter[int] = Counter()
     first_seen: Dict[int, int] = {}
@@ -3876,6 +5390,68 @@ def emit_lars_bwd_split_kernel_from_schedule(
     def ap(line: str = ""):
         lines.append(line)
 
+    def shared_expr(token: str) -> str:
+        if not isinstance(token, str) or not token.startswith("s"):
+            raise ValueError(f"Bad shared token: {token!r}")
+        slot = int(token[1:])
+        return f"lars_smem[(size_t){slot} * (size_t)blockDim.x + (size_t)tid]"
+
+    def operand_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        if token.startswith("d:"):
+            kind, idx = _parse_bwd_lars_label_ref(token[2:])
+            if kind in BWD_OUTPUT_KINDS:
+                raise ValueError("split backward output cannot be a direct input")
+            expr = _bwd_label_index_expr(
+                kind, idx,
+                mode_scalar_y=mode_scalar_y,
+                u_dim=u_dim,
+                iw_dim=iw_dim,
+                ix_dim=ix_dim,
+                ky_dim=ky_dim,
+                v_dim=v_dim,
+            )
+            arr = "grad_out" if kind == "go" else kind
+            return f"{arr}[{expr}]"
+        raise ValueError(f"Bad split backward operand token: {token!r}")
+
+    def acc_expr(token: str) -> str:
+        token = str(token)
+        if token.startswith("r"):
+            return token
+        if token.startswith("s"):
+            return shared_expr(token)
+        raise ValueError(f"Bad split backward accumulator token: {token!r}")
+
+    def emit_placed_writeback(idx: int, value_expr: str, suffix: str) -> None:
+        out_kind = {"gw": "gw", "gx": "gx", "gy": "gy"}[grad_kind]
+        expr = _bwd_label_index_expr(
+            out_kind, int(idx),
+            mode_scalar_y=mode_scalar_y,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+        )
+        if grad_kind == "gw":
+            ap(f"            grad_w[{expr}] = {value_expr};")
+        elif grad_kind == "gx":
+            ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
+        else:
+            if mode_scalar_y:
+                safe = str(suffix).replace("-", "m").replace(":", "_")
+                ap(f"            scalar_t gy_sum_{safe} = warp_sum_xor_lars_bwd_split({value_expr});")
+                ap("            if (lane == 0) {")
+                ap(f"                atomicAdd(&grad_y[{expr}], gy_sum_{safe});")
+                ap("            }")
+            else:
+                ap(f"            atomicAdd(&grad_y[{expr}], {value_expr});")
+
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
     ap("    const scalar_t* __restrict__ w,")
@@ -3899,6 +5475,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("    const int lane = tid & 31;")
     ap("    const int warp_id = tid >> 5;")
     ap("    const int warp_count = blockDim.x >> 5;")
+    if shared_slots:
+        ap("    extern __shared__ unsigned char lars_smem_raw[];")
+        ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
     if u_dim is not None:
         ap(f"    constexpr int U_CONST = {int(u_dim)};")
         ap("    (void)U_CONST;")
@@ -3976,11 +5555,11 @@ def emit_lars_bwd_split_kernel_from_schedule(
             prefix += f" | {comment}"
         ap(prefix)
 
-        if inst.op == "load":
-            reg, ref = inst.args
+        if inst.op in ("load", "load_shared"):
+            token, ref = inst.args
             kind, idx = _parse_bwd_lars_label_ref(ref)
             if kind in BWD_OUTPUT_KINDS:
-                raise ValueError("load must not be used for backward output labels")
+                raise ValueError("input load must not target backward output labels")
             expr = _bwd_label_index_expr(
                 kind, idx,
                 mode_scalar_y=mode_scalar_y,
@@ -3991,7 +5570,42 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 v_dim=v_dim,
             )
             arr = "grad_out" if kind == "go" else kind
-            ap(f"            {reg} = {arr}[{expr}];")
+            lhs = str(token) if inst.op == "load" else shared_expr(str(token))
+            ap(f"            {lhs} = {arr}[{expr}];")
+
+        elif inst.op == "init_acc":
+            token, ref = inst.args
+            kind, _idx = _parse_bwd_lars_label_ref(ref)
+            expected = {"gw": "gw", "gx": "gx", "gy": "gy"}[grad_kind]
+            if kind != expected:
+                raise ValueError(f"split init_acc expects {expected}, got {kind}")
+            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+
+        elif inst.op == "bwd_split_fma_placed":
+            ikind, target_idx, target_token, rw, rx, ry, rgo, coeff = inst.args
+            if ikind != grad_kind:
+                raise ValueError(f"schedule contains {ikind}, but emitter grad_kind is {grad_kind}")
+            c = _fmt_lars_float(float(coeff))
+            if grad_kind == "gw":
+                value = f"scalar_t({c}) * {operand_expr(str(rgo))} * {operand_expr(str(rx))} * {operand_expr(str(ry))}"
+            elif grad_kind == "gx":
+                value = f"scalar_t({c}) * ({operand_expr(str(rw))} * {operand_expr(str(rgo))}) * {operand_expr(str(ry))}"
+            else:
+                value = f"scalar_t({c}) * ({operand_expr(str(rw))} * {operand_expr(str(rgo))}) * {operand_expr(str(rx))}"
+            if str(target_token).startswith("d:"):
+                emit_placed_writeback(int(target_idx), value, f"direct_{grad_kind}_{inst_id}")
+            else:
+                ap(f"            {acc_expr(str(target_token))} += {value};")
+
+        elif inst.op == "store_acc_placed":
+            ref, token = inst.args
+            kind, idx = _parse_bwd_lars_label_ref(ref)
+            expected = {"gw": "gw", "gx": "gx", "gy": "gy"}[grad_kind]
+            if kind != expected:
+                raise ValueError(f"split store expects {expected}, got {kind}")
+            emit_placed_writeback(
+                int(idx), acc_expr(str(token)), f"placed_{grad_kind}_{idx}_{inst_id}"
+            )
 
         elif inst.op == "bwd_split_fma_resident":
             ikind, target_idx, rw, rx, ry, rgo, coeff = inst.args
@@ -4008,7 +5622,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
             else:
                 raise ValueError(f"Bad grad_kind: {grad_kind}")
 
-        elif inst.op == "release":
+        elif inst.op in ("release", "release_shared"):
             pass
         else:
             raise ValueError(f"Unsupported split backward LARS instruction op: {inst.op}")
@@ -4087,7 +5701,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
-    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
+    ap(f"    size_t lars_shared_bytes = (size_t){shared_slots} * (size_t)block.x * sizeof(scalar_t);")
+    ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, lars_shared_bytes, stream>>>(")
     if grad_kind == "gw":
         ap("        w, x, y, grad_out, grad_w,")
     elif grad_kind == "gx":
@@ -4509,10 +6124,12 @@ def _generate_code_uniform1d_bwd_split_from_context(
     enable_secondary_affinity: bool,
     topk_candidates: Optional[int],
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ):
     """Internal split-backward implementation.  The public entry is the unified wrapper."""
-    # One split candidate is emitted, with all input labels and all accumulators
-    # resident.  The legacy arguments are retained for caller compatibility.
+    resolved_placement = _resolve_lars_placement_config(placement_config)
+    # One split candidate is emitted.  Lifetime placement is applied independently
+    # to each gradient kernel after LARS chooses its path order.
     configs: List[Dict[str, Any]] = [{
         "name": "lars_bwd_split_all_inputs_accall",
     }]
@@ -4557,6 +6174,30 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 profile_print=bool(cfg.get("profile_print", profile_print)),
             )
             schedule_result = scheduler.schedule()
+            _dump_and_print_schedule_label_stats(
+                operation=f"uniform1d_bwd_split_{gkind}",
+                candidate_tag=cand_name,
+                path_order=schedule_result.path_order,
+                labels_by_path=_stats_labels_uniform1d_bwd_split(
+                    scheduler.paths,
+                    grad_kind=gkind,
+                ),
+            )
+            schedule_result = apply_lars_lifetime_placement(
+                schedule_result,
+                schedule_kind=f"bwd_split:{gkind}",
+                config=resolved_placement,
+            )
+            stats_path = None
+            if resolved_placement.stats_path:
+                stats_p = Path(resolved_placement.stats_path)
+                suffix = stats_p.suffix or ".json"
+                stats_path = str(stats_p.with_name(f"{stats_p.stem}_{gkind}{suffix}"))
+            dump_lars_variable_stats(
+                schedule_result,
+                print_stats=resolved_placement.stats_print,
+                out_path=stats_path,
+            )
             schedules[gkind] = schedule_result
             profiles[gkind] = schedule_result.profile
             split_kernel_name = f"{base_kernel_name}_{gkind}"
@@ -4637,6 +6278,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     enable_secondary_affinity: bool,
     topk_candidates: Optional[int],
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ):
     """
     Generate one fused backward LARS candidate.
@@ -4660,6 +6302,26 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         profile_print=profile_print,
     )
     schedule_result = scheduler.schedule()
+    _dump_and_print_schedule_label_stats(
+        operation="uniform1d_bwd_fused",
+        candidate_tag=cand_name,
+        path_order=schedule_result.path_order,
+        labels_by_path=_stats_labels_uniform1d_bwd_fused(
+            scheduler.paths,
+            need_grad_w=need_grad_w,
+        ),
+    )
+    resolved_placement = _resolve_lars_placement_config(placement_config)
+    schedule_result = apply_lars_lifetime_placement(
+        schedule_result,
+        schedule_kind="bwd_fused",
+        config=resolved_placement,
+    )
+    dump_lars_variable_stats(
+        schedule_result,
+        print_stats=resolved_placement.stats_print,
+        out_path=resolved_placement.stats_path,
+    )
 
     base_kernel_name = _bwd_base_kernel_name(
         kernel_name=kernel_name,
@@ -4745,6 +6407,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
     profile_print: bool = True,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ):
     """
     Backward-compatible wrapper.  New code should call
@@ -4778,6 +6441,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         split_backward=True,
+        placement_config=placement_config,
     )
 
 
@@ -4810,6 +6474,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
     split_backward: Union[bool, str] = "auto",
     split_path_threshold: int = 256,
     block_size: int = 32,
+    placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ):
     """
     Unified LARS backward code generator.
@@ -4856,6 +6521,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         block_size=int(block_size),
+        placement_config=placement_config,
     )
 
     if use_split_backward:

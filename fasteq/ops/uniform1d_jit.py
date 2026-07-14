@@ -65,6 +65,8 @@ _DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = True
 _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = True
 _DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
 _DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
+# Generate and benchmark w2/w3/... candidates in addition to the mandatory w1 candidate.
+_DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED = True
 
 # Fallbacks are used only when importing or smoke-testing without a visible GPU.
 # Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
@@ -88,6 +90,21 @@ def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
         return max(int(min_value), int(raw))
     except ValueError:
         return max(int(min_value), int(default))
+
+
+def _resolve_multiwarp_candidates_enabled(value: Optional[bool]) -> bool:
+    """Resolve the per-call multi-warp candidate switch.
+
+    A non-None function argument has priority.  When it is None, the environment
+    variable keeps command-line experimentation convenient without changing the
+    operator call site.
+    """
+    if value is not None:
+        return bool(value)
+    return _env_bool(
+        "FASTEQ_UNIFORM1D_MULTI_WARP_CANDIDATES",
+        _DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED,
+    )
 
 
 def _runtime_device_properties():
@@ -235,6 +252,7 @@ def _sanitize_module_tag(tag: Any) -> str:
             out.append("_")
     s = "".join(out).strip("_")
     return s[:48] if s else "cand"
+
 
 
 def _normalize_codegen_candidates(codegen_out: Any) -> List[Tuple[str, str]]:
@@ -671,6 +689,7 @@ def _make_candidate_fast_key(
     mode: str,
     dtype_str: str,
     grad_w: Optional[bool] = None,
+    use_multiwarp_candidates: bool = True,
 ) -> Tuple[Any, ...]:
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
@@ -692,6 +711,7 @@ def _make_candidate_fast_key(
         str(mode),
         str(dtype_str),
         None if grad_w is None else bool(grad_w),
+        bool(use_multiwarp_candidates),
         bool(use_x_src),
         bool(use_y_src),
         bool(use_scatter),
@@ -1147,18 +1167,21 @@ def _build_jit_candidates_from_sources(
     cache: Dict[str, object],
     kind: str,
     u_dim: int,
+    use_multiwarp_candidates: bool = True,
 ) -> List[Tuple[str, object]]:
-    """Build scheduler candidates plus auto-warp variants.
+    """Build scheduler candidates plus optional auto-warp variants.
 
     The build order is intentionally two-stage:
       1. Compile each scheduler candidate's w1 variant in the parent process.
          The w1 build gives compiler-reported registers/thread.
-      2. Derive legal warps/block from the w1 register count and compile the
-         remaining warp variants concurrently in child processes.
+      2. When ``use_multiwarp_candidates`` is true, derive legal warps/block
+         from the w1 register count and compile the remaining warp variants
+         concurrently in child processes.  When false, return only w1.
 
     This function is shared by Uniform1D and STC.  STC passes one raw CUDA
     source, while Uniform1D may pass multiple scheduler/codegen candidates.
     """
+    use_multiwarp_candidates = bool(use_multiwarp_candidates)
     base_infos = _candidate_infos_from_sources(
         tune_key=tune_key,
         raw_candidates=raw_candidates,
@@ -1187,11 +1210,15 @@ def _build_jit_candidates_from_sources(
             modules.append((tag_w1, mod_w1))
 
             registers = getattr(mod_w1, "__fasteq_registers_per_thread__", None)
-            warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
+            if use_multiwarp_candidates:
+                warp_candidates = _warp_candidates_from_registers(registers, u_dim=int(u_dim))
+            else:
+                warp_candidates = [1]
             print(
                 f"[JIT][{kind}] candidate={safe_tag} regs32/thread={registers} "
                 f"warp_size={warp_size} regs_per_sm={_runtime_register_file_regs_per_sm()} "
                 f"u_tiles={(int(u_dim) + max(1, int(warp_size)) - 1) // max(1, int(warp_size))} "
+                f"multiwarp={int(use_multiwarp_candidates)} "
                 f"warp_candidates={warp_candidates}"
             )
 
@@ -1306,6 +1333,7 @@ def _make_fwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
+    use_multiwarp_candidates: bool = True,
 ) -> str:
     # Include all code-affecting fields in the hash.  The previous version did
     # not include layout flags or coeff_list, which can accidentally reuse a
@@ -1313,6 +1341,7 @@ def _make_fwd_module_name(
     # x/y indirection, scatter mode, or constants.
     sig = repr((
         P, u_dim, dtype_str, mode, layout_tag,
+        bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
         tuple(float(c) for c in coeff_list),
@@ -1320,7 +1349,8 @@ def _make_fwd_module_name(
     h = _sha1_text(sig)
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
-    return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_{layout_tag}_jit_{dtype_str}_{h}"
+    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 def _make_bwd_module_name(
     *,
@@ -1339,6 +1369,7 @@ def _make_bwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
+    use_multiwarp_candidates: bool = True,
 ) -> str:
     # Scheduler backward replaces the previous fused/split backward codegen.
     # Include layout and optional static dimensions in the signature so disk
@@ -1347,6 +1378,7 @@ def _make_bwd_module_name(
     sig = repr((
         "scheduler_bwd",
         P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
         tuple(float(c) for c in coeff_list),
@@ -1355,7 +1387,8 @@ def _make_bwd_module_name(
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
     gw_tag = "gradw" if grad_w else "nogradw"
-    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_jit_{dtype_str}_{h}"
+    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
 def _get_scalar_t_str(t: torch.Tensor) -> str:
@@ -1430,6 +1463,7 @@ def _build_fwd_jit_candidates(
     v_dim: Optional[int] = None,
     mode: str,
     dtype_str: str,
+    use_multiwarp_candidates: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     """
     Generate/build all forward candidate modules for one Uniform1D signature.
@@ -1442,6 +1476,9 @@ def _build_fwd_jit_candidates(
     """
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
 
     fast_key = _make_candidate_fast_key(
         kind="FWD",
@@ -1459,6 +1496,7 @@ def _build_fwd_jit_candidates(
         v_dim=v_dim,
         mode=mode,
         dtype_str=dtype_str,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     cached_tune_key = _FWD_TUNE_KEY_FAST_CACHE.get(fast_key)
     if cached_tune_key is not None:
@@ -1517,6 +1555,7 @@ def _build_fwd_jit_candidates(
             ix_dim=ix_dim,
             ky_dim=ky_dim,
             v_dim=v_dim,
+            use_multiwarp_candidates=use_multiwarp_candidates,
         )
         _FWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
@@ -1571,9 +1610,11 @@ def _build_fwd_jit_candidates(
             path_semantics="wxy",
         ) """
     print(f"[JIT][FWD] generate candidates for: {tune_key}")
-    raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
+    codegen_out = _codegen_candidates()
+    raw_candidates = _normalize_codegen_candidates(codegen_out)
     if not raw_candidates:
         raise RuntimeError("forward codegen returned zero candidates")
+
 
     modules = _build_jit_candidates_from_sources(
         tune_key=tune_key,
@@ -1581,6 +1622,7 @@ def _build_fwd_jit_candidates(
         cache=_FWD_JIT_CACHE,
         kind="FWD",
         u_dim=int(u_dim),
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
     return tune_key, modules
@@ -1602,6 +1644,7 @@ def _build_fwd_jit_module(
     v_dim: Optional[int] = None,
     mode: str,
     dtype_str: str,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
     # Backward-compatible wrapper: build candidates and return the first one.
     # Runtime auto-tuning is performed in _run_fwd, where real tensor inputs are
@@ -1621,6 +1664,7 @@ def _build_fwd_jit_module(
         v_dim=v_dim,
         mode=mode,
         dtype_str=dtype_str,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     return modules[0][1]
 
@@ -1641,6 +1685,7 @@ def _build_bwd_jit_candidates(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    use_multiwarp_candidates: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     """
     Generate/build all backward scheduler candidates for one Uniform1D signature.
@@ -1653,6 +1698,9 @@ def _build_bwd_jit_candidates(
     """
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
 
     fast_key = _make_candidate_fast_key(
         kind="BWD",
@@ -1671,6 +1719,7 @@ def _build_bwd_jit_candidates(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     cached_tune_key = _BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
     if cached_tune_key is not None:
@@ -1727,6 +1776,7 @@ def _build_bwd_jit_candidates(
             ix_dim=ix_dim,
             ky_dim=ky_dim,
             v_dim=v_dim,
+            use_multiwarp_candidates=use_multiwarp_candidates,
         )
         _BWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
 
@@ -1798,6 +1848,7 @@ def _build_bwd_jit_candidates(
         cache=_BWD_JIT_CACHE,
         kind="BWD",
         u_dim=int(u_dim),
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
     return tune_key, modules
@@ -1820,6 +1871,7 @@ def _build_bwd_jit_module(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
     # Backward-compatible wrapper: build candidates and return the first one.
     # Runtime auto-tuning is performed in _run_bwd, where real tensor inputs are
@@ -1840,6 +1892,7 @@ def _build_bwd_jit_module(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     return modules[0][1]
 
@@ -2056,8 +2109,12 @@ def _run_fwd(
     out_seg_num,
     u_dim,
     mode,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
     dtype_str = _get_scalar_t_str(w)
     iw_dim = int(w.size(1))
     ix_dim = int(x.size(1))
@@ -2079,6 +2136,7 @@ def _run_fwd(
         output_indices=output_indices,
         dtype_str=dtype_str,
         mode=mode,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
     use_x_src = 1 in input_indices
@@ -2138,8 +2196,12 @@ def _run_bwd(
     v_dim: Optional[int] = None,
     mode,
     grad_w,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
     dtype_str = _get_scalar_t_str(w)
     tune_key, candidates = _build_bwd_jit_candidates(
         i_list=i_list,
@@ -2157,6 +2219,7 @@ def _run_bwd(
         dtype_str=dtype_str,
         mode=mode,
         grad_w=grad_w,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
     use_x_src = 1 in input_indices
@@ -2204,7 +2267,16 @@ def _run_bwd(
 
 class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, w, x, y, input_indices, output_indices, meta):
+    def forward(
+        ctx,
+        w,
+        x,
+        y,
+        input_indices,
+        output_indices,
+        meta,
+        use_multiwarp_candidates,
+    ):
 
         i_list = _as_int32_meta_tensor(meta["i_list"])
         j_list = _as_int32_meta_tensor(meta["j_list"])
@@ -2217,6 +2289,14 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         x_seg_num = meta["x_seg_num"]
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
+        # The public fast_uniform1d_jit() argument is the source of truth.
+        # Previously this value was read only from meta, while the wrapper did
+        # not pass its use_multiwarp_candidates argument into autograd.apply().
+        # Consequently False was ignored and None fell back to the global
+        # multi-warp default.
+        use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+            use_multiwarp_candidates
+        )
 
         
         w_irreps =  int(meta["size_list"][0] / w_seg_num)
@@ -2258,6 +2338,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             out_seg_num=out_seg_num,
             u_dim=u_dim,
             mode=mode,
+            use_multiwarp_candidates=use_multiwarp_candidates,
         )
 
         out = out.view(-1, out_seg_num * u_dim)
@@ -2282,6 +2363,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         ctx.u_dim = u_dim
         ctx.P = P
         ctx.mode = mode
+        ctx.use_multiwarp_candidates = use_multiwarp_candidates
         ctx.input_indices=input_indices
         ctx.output_indices=output_indices
 
@@ -2317,6 +2399,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 v_dim=ctx.out_seg_num,
                 mode=ctx.mode,
                 grad_w=w.requires_grad,
+                use_multiwarp_candidates=ctx.use_multiwarp_candidates,
             )
 
             grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.w_irreps)
@@ -2343,6 +2426,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
                 v_dim=ctx.out_seg_num,
                 mode=ctx.mode,
                 grad_w=w.requires_grad,
+                use_multiwarp_candidates=ctx.use_multiwarp_candidates,
             )
 
             grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
@@ -2353,9 +2437,27 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         #end_time = time.perf_counter() * 1000.0
         #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
 
-        return grad_w, grad_x, grad_y, None, None, None
+        # One gradient entry is required for every argument passed to
+        # FastUniform1dJITFunction.apply().  The final flag is non-differentiable.
+        return grad_w, grad_x, grad_y, None, None, None, None
 
-def fast_uniform1d_jit(w, x, y, input_indices, output_indices, meta):
+def fast_uniform1d_jit(
+    w,
+    x,
+    y,
+    input_indices,
+    output_indices,
+    meta,
+    use_multiwarp_candidates: Optional[bool] = False,
+):
+    """Run Uniform1D JIT with optional multi-warp candidate generation.
+    """
     return FastUniform1dJITFunction.apply(
-        w, x, y, input_indices, output_indices, meta
+        w,
+        x,
+        y,
+        input_indices,
+        output_indices,
+        meta,
+        True,
     )

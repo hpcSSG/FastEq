@@ -347,6 +347,7 @@ def _stable_meta_hash(
     dtype: torch.dtype,
     path_lens: Optional[torch.Tensor] = None,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     h = hashlib.sha1()
     tensors = [idx_lists.detach().cpu().contiguous()]
@@ -362,8 +363,9 @@ def _stable_meta_hash(
     h.update(str(int(U)).encode())
     h.update(str(dtype).encode())
     h.update(str(int(pad_value)).encode())
-    # v5 drops external path_lens_tensor when paths are sentinel-padded.
-    h.update(b"stc-filejit-v6-sentinel-padding-fwd-bwd-x1-only")
+    h.update(b"autowarp" if bool(use_multiwarp_candidates) else b"w1only")
+    # v7 separates single-warp and multi-warp candidate caches.
+    h.update(b"stc-filejit-v7-sentinel-padding-fwd-bwd-x1-only")
     return h.hexdigest()[:16]
 
 
@@ -377,6 +379,7 @@ def _make_stc_fwd_tune_key(
     dtype: torch.dtype,
     path_lens: Optional[torch.Tensor] = None,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     key = _stable_meta_hash(
         idx_lists,
@@ -386,12 +389,14 @@ def _make_stc_fwd_tune_key(
         dtype=dtype,
         path_lens=path_lens,
         pad_value=pad_value,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     if dtype == torch.float32:
         dtype_str = "float"
     if dtype == torch.float64:
         dtype_str = "double"
-    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_jit_{key}"
+    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
 
 def _make_stc_bwd_tune_key(
@@ -403,6 +408,7 @@ def _make_stc_bwd_tune_key(
     dtype: torch.dtype,
     path_lens: Optional[torch.Tensor] = None,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     key = _stable_meta_hash(
         idx_lists,
@@ -412,12 +418,14 @@ def _make_stc_bwd_tune_key(
         dtype=dtype,
         path_lens=path_lens,
         pad_value=pad_value,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     if dtype == torch.float32:
         dtype_str = "float"
     if dtype == torch.float64:
         dtype_str = "double"
-    return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_{dtype_str}_jit_{key}"
+    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
 def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: Path, verbose: bool = False):
     if load is None:
@@ -468,6 +476,7 @@ def _build_stc_candidate_modules(
     kind: str,
     dtype: Any,
     u_dim: int,
+    use_multiwarp_candidates: bool = False,
     verbose: bool = False,
 ) -> list[tuple[str, Any]]:
     """Build STC candidates through Uniform1D's shared JIT candidate layer."""
@@ -478,6 +487,7 @@ def _build_stc_candidate_modules(
         cache=_MODULE_CACHE,
         kind=f"STC_{kind.upper()}",
         u_dim=int(u_dim),
+        use_multiwarp_candidates=bool(use_multiwarp_candidates),
     )
 
 def _get_or_build_module_candidates(
@@ -489,6 +499,7 @@ def _get_or_build_module_candidates(
     dtype: torch.dtype,
     path_lens: Optional[torch.Tensor] = None,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
     verbose: bool = False,
 ):
     base_name = _make_stc_fwd_tune_key(
@@ -499,6 +510,7 @@ def _get_or_build_module_candidates(
         dtype=dtype,
         path_lens=path_lens,
         pad_value=pad_value,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     if base_name in _FWD_BEST_CANDIDATE_CACHE:
         best_tag, best_mod, _best_ms = _FWD_BEST_CANDIDATE_CACHE[base_name]
@@ -542,7 +554,15 @@ def _get_or_build_module_candidates(
         out_path="",
         kernel_name=base_name,
     )
-    return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="fwd", dtype=dtype, u_dim=int(U), verbose=verbose)
+    return _build_stc_candidate_modules(
+        base_name=base_name,
+        base_code=code,
+        kind="fwd",
+        dtype=dtype,
+        u_dim=int(U),
+        use_multiwarp_candidates=use_multiwarp_candidates,
+        verbose=verbose,
+    )
 
 def _get_or_build_module(*args, **kwargs):
     # Backward-compatible helper: return the first built candidate.
@@ -559,6 +579,7 @@ def _get_or_build_bwd_module_candidates(
     dtype: torch.dtype,
     path_lens: Optional[torch.Tensor] = None,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
     verbose: bool = False,
 ):
     base_name = _make_stc_bwd_tune_key(
@@ -569,6 +590,7 @@ def _get_or_build_bwd_module_candidates(
         dtype=dtype,
         path_lens=path_lens,
         pad_value=pad_value,
+        use_multiwarp_candidates=use_multiwarp_candidates,
     )
     if base_name in _BWD_BEST_CANDIDATE_CACHE:
         best_tag, best_mod, _best_ms = _BWD_BEST_CANDIDATE_CACHE[base_name]
@@ -603,7 +625,15 @@ def _get_or_build_bwd_module_candidates(
         kernel_name=base_name,
         tile_u=32,
     )
-    return _build_stc_candidate_modules(base_name=base_name, base_code=code, kind="bwd", dtype=dtype, u_dim=int(U), verbose=verbose)
+    return _build_stc_candidate_modules(
+        base_name=base_name,
+        base_code=code,
+        kind="bwd",
+        dtype=dtype,
+        u_dim=int(U),
+        use_multiwarp_candidates=use_multiwarp_candidates,
+        verbose=verbose,
+    )
 
 def _get_or_build_bwd_module(*args, **kwargs):
     return _get_or_build_bwd_module_candidates(*args, **kwargs)[0][1]
@@ -656,6 +686,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         idx_lists_tensor,
         num_out_segments: int,
         pad_value: int = STC_PAD_VALUE,
+        use_multiwarp_candidates: bool = False,
     ):
         #torch.cuda.synchronize()
         #start_time = time.perf_counter() * 1000
@@ -686,6 +717,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             dtype=x1.dtype,
             path_lens=None,
             pad_value=int(pad_value),
+            use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
         candidates = _get_or_build_module_candidates(
             idx_lists_tensor,
@@ -695,6 +727,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             V=int(num_out_segments),
             U=U,
             dtype=x1.dtype,
+            use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
         best_tag, mod, _best_ms = _select_best_stc_fwd_module(
             fwd_key, candidates, x1.contiguous(), x0_g.contiguous(), int(num_out_segments)
@@ -710,6 +743,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor)
         ctx.num_out_segments = int(num_out_segments)
         ctx.pad_value = int(pad_value)
+        ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
         return out
 
     @staticmethod
@@ -726,6 +760,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             dtype=x1.dtype,
             path_lens=None,
             pad_value=int(ctx.pad_value),
+            use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
         candidates = _get_or_build_bwd_module_candidates(
             idx_lists_tensor,
@@ -735,6 +770,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             V=int(ctx.num_out_segments),
             U=int(x1.size(2)),
             dtype=x1.dtype,
+            use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
         best_tag, mod, _best_ms = _select_best_stc_bwd_module(
             bwd_key, candidates, grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(ctx.num_out_segments)
@@ -749,7 +785,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         #torch.cuda.synchronize()
         #end_time = time.perf_counter() * 1000
         #print(f"<< fasteq stc uniform1d-lars backward cost: {end_time - start_time:.3f} ms >>")
-        return grad_x1, None, None, None, None, None, None, None
+        return grad_x1, None, None, None, None, None, None, None, None
 
 
 def fast_stc_uniform1d_jit(
@@ -762,6 +798,7 @@ def fast_stc_uniform1d_jit(
     num_out_segments: int,
     *,
     pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
 ):
     """Run preprocessed STC Uniform1D JIT.
 
@@ -772,6 +809,10 @@ def fast_stc_uniform1d_jit(
 
     ``path_lens_tensor`` and variable-argument parsing are intentionally not
     accepted here; preprocessing is the single source of metadata layout.
+
+    ``use_multiwarp_candidates=False`` builds and uses only the one-warp
+    candidate. Set it to ``True`` to generate, benchmark and select from legal
+    multi-warp variants. Forward and backward always use the same setting.
     """
     return FastSymmetricTensorContractionUniform1dFunction.apply(
         x1,
@@ -782,4 +823,5 @@ def fast_stc_uniform1d_jit(
         idx_lists_tensor,
         int(num_out_segments),
         int(pad_value),
+        bool(use_multiwarp_candidates),
     )
