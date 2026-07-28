@@ -10,8 +10,10 @@ from sevenn.calculator import SevenNetCalculator
 
 cutoff = 4.0
 
-_atoms = bulk("NaCl", "rocksalt", a=4.00) * (8, 8, 8)
+_atoms = bulk("NaCl", "rocksalt", a=4.00) * (16, 8, 8)
 _atoms.rattle()
+
+print(f"_atoms number: {len(_atoms)}")
 
 
 def assert_atoms(atoms1, atoms2, rtol=1e-5, atol=1e-6):
@@ -50,7 +52,7 @@ def singlepoint(atoms):
     通常 energy 触发一次计算，forces/stress 读缓存。
     """
     e = atoms.get_potential_energy()
-    #f = atoms.get_forces()
+    # f = atoms.get_forces()
     #s = atoms.get_stress(voigt=False)
     #return e, f, s
     return e
@@ -146,6 +148,9 @@ def main():
     warmup = 5
     iters = 10
     t_cueq = bench_atoms_cuda_event(atoms_cueq, warmup=warmup, iters=iters, label="cueq")
+
+    print(f"get_potential_energy:{atoms_cueq.get_potential_energy()}")
+    print(f"get_forces: {atoms_cueq.get_forces()}")
 
     '''
     print(f"\n[2] Benchmark: singlepoint (energy->forces->stress), warmup={warmup}, iters={iters}")
