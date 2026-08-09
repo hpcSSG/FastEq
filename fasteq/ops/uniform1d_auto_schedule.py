@@ -41,7 +41,7 @@ STC_PAD_VALUE = -1
 # from the original path order selected by the scheduler, before placement
 # rewrites the instruction stream.
 _SCHEDULE_STATS_DUMPED: Set[Tuple[str, str, str]] = set()
-_DEFAULT_SCHEDULE_STATS_ENABLED = True
+_DEFAULT_SCHEDULE_STATS_ENABLED = False
 
 
 def _schedule_stats_enabled() -> bool:
@@ -68,10 +68,13 @@ def _dump_schedule_stats_dir() -> Path:
     if raw:
         path = Path(raw).expanduser().resolve()
     else:
-        try:
-            path = Path(__file__).resolve().parent / "_schedule_stats"
-        except NameError:
-            path = Path.cwd() / "_schedule_stats"
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+        cache_root = (
+            Path(xdg_cache_home).expanduser()
+            if xdg_cache_home
+            else Path.home() / ".cache"
+        ) / "fasteq"
+        path = cache_root / "schedule_stats"
 
     path.mkdir(parents=True, exist_ok=True)
     return path

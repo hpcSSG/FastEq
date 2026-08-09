@@ -30,6 +30,19 @@ The operators implemented in FastEq include:
    pip install -e . --no-build-isolation 
    ```
    We recommend using Virtualenv or Conda to manage the dependencies.
+
+### Runtime JIT cache
+
+FastEq stores generated kernels, compiled extensions, and autotuning metadata
+outside the source tree. By default the cache is placed under
+`$XDG_CACHE_HOME/fasteq` or `~/.cache/fasteq`. Set `FASTEQ_JIT_CACHE_DIR` to
+override the cache root. The legacy `FASTEQ_STC_JIT_CACHE_DIR` variable remains
+supported for the STC cache.
+
+Scheduler statistics are disabled by default. Set `FASTEQ_SCHEDULE_STATS=1` to
+enable them and optionally set `FASTEQ_SCHEDULE_STATS_DIR` to choose their
+output directory.
+
 4. Install patched MACE
    ```bash
    cd 3rdpatry/mace

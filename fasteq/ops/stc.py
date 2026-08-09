@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
 import time
 import re
 import io
@@ -169,13 +168,31 @@ def _find_fasteq_root(start: Path) -> Optional[Path]:
 def _default_build_root() -> Path:
     env_root = os.environ.get("FASTEQ_STC_JIT_CACHE_DIR")
     if env_root:
-        root = Path(env_root)
+        root = Path(env_root).expanduser()
     else:
-        fasteq_root = _find_fasteq_root(Path(__file__).parent)
-        if fasteq_root is not None:
-            root = fasteq_root / _detect_gpu_backend() / "src" / "uniform1d_jit_codegen"
+        backend = _detect_gpu_backend()
+        env_root = os.environ.get("FASTEQ_JIT_CACHE_DIR", "").strip()
+        if env_root:
+            cache_root = Path(env_root).expanduser()
         else:
-            root = Path(tempfile.gettempdir()) / "fasteq_uniform1d_jit_codegen"
+            xdg_cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+            cache_root = (
+                Path(xdg_cache_home).expanduser()
+                if xdg_cache_home
+                else Path.home() / ".cache"
+            ) / "fasteq"
+
+        runtime_version = (
+            getattr(torch.version, "hip", None)
+            or getattr(torch.version, "cuda", None)
+            or "unknown"
+        )
+        runtime_version = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(runtime_version))
+        abi_key = (
+            f"py{sys.version_info.major}{sys.version_info.minor}_"
+            f"{backend}{runtime_version}"
+        )
+        root = cache_root / abi_key / "uniform1d_jit_codegen"
     _ensure_dir(root)
     return root
 
