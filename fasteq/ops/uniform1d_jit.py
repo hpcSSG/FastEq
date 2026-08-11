@@ -1606,6 +1606,7 @@ def _build_fwd_jit_candidates(
             ky_dim=ky_dim,
             v_dim=v_dim,
             mode=mode,
+            unroll_size=min(256,len(i_list)),
             out_path="generated_uniform1d_fwd_baseline_unrolled.cu",
             path_semantics="wxy",
         ) """
@@ -1833,6 +1834,7 @@ def _build_bwd_jit_candidates(
             v_dim=v_dim,
             mode=mode,
             need_grad_w=grad_w,
+            unroll_size=min(256,len(i_list)),
             out_path="generated_uniform1d_bwd_baseline_unrolled.cu",
             path_semantics="wxy",
         ) """
@@ -2260,6 +2262,147 @@ def _run_bwd(
     
     return out
 
+@torch.no_grad()
+def _print_index_reuse_stats(
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    print_details: bool = True,
+) -> None:
+    """
+    统计路径索引的重复情况。
+
+    指标定义：
+      total:
+          索引总出现次数，即路径数量 P。
+
+      unique:
+          不同索引值的数量。
+
+      repeated_values:
+          出现次数大于 1 的不同索引值数量。
+
+      repeated_occurrences:
+          所有重复索引值对应的总出现次数。
+          例如 [0, 0, 0, 1, 2, 2] 中为 3 + 2 = 5。
+
+      reusable:
+          除第一次出现之外的重复出现次数，即理论可复用次数：
+              sum(count - 1) = total - unique
+
+      reuse_ratio:
+          reusable / total。
+
+      adjacent_reuse:
+          当前调度顺序下，相邻路径使用相同索引的次数。
+          该指标比全局 reusable 更能反映直接连续复用。
+    """
+
+    index_lists = {
+        "i": i_list,
+        "j": j_list,
+        "k": k_list,
+        "v": v_list,
+    }
+
+    print("\n[index reuse statistics]")
+    print(
+        f"{'index':<8}"
+        f"{'total':>10}"
+        f"{'unique':>10}"
+        f"{'repeat val':>12}"
+        f"{'repeat occ':>12}"
+        f"{'reusable':>12}"
+        f"{'reuse ratio':>14}"
+        f"{'adjacent':>12}"
+    )
+
+    for name, tensor in index_lists.items():
+        # 调试统计放到 CPU 上执行，避免后续 Python 格式化处理 GPU Tensor。
+        values_cpu = tensor.detach().reshape(-1).to(
+            device="cpu",
+            dtype=torch.int64,
+        )
+
+        total = values_cpu.numel()
+
+        if total == 0:
+            print(
+                f"{name:<8}"
+                f"{0:>10}"
+                f"{0:>10}"
+                f"{0:>12}"
+                f"{0:>12}"
+                f"{0:>12}"
+                f"{0.0:>13.2%}"
+                f"{0:>12}"
+            )
+            continue
+
+        unique_values, counts = torch.unique(
+            values_cpu,
+            sorted=True,
+            return_counts=True,
+        )
+
+        repeated_mask = counts > 1
+
+        unique_count = unique_values.numel()
+        repeated_value_count = int(repeated_mask.sum().item())
+
+        repeated_occurrences = int(
+            counts[repeated_mask].sum().item()
+        )
+
+        # 每个索引第一次出现不算复用，后续出现均算潜在复用。
+        reusable_counts = torch.clamp(counts - 1, min=0)
+        reusable_count = int(reusable_counts.sum().item())
+
+        reuse_ratio = reusable_count / total
+
+        # 当前路径顺序中，相邻两条路径使用同一索引的次数。
+        adjacent_reuse_count = int(
+            (values_cpu[1:] == values_cpu[:-1]).sum().item()
+        )
+
+        print(
+            f"{name:<8}"
+            f"{total:>10}"
+            f"{unique_count:>10}"
+            f"{repeated_value_count:>12}"
+            f"{repeated_occurrences:>12}"
+            f"{reusable_count:>12}"
+            f"{reuse_ratio:>13.2%}"
+            f"{adjacent_reuse_count:>12}"
+        )
+
+        if print_details and repeated_value_count > 0:
+            repeated_values = unique_values[repeated_mask]
+            repeated_counts = counts[repeated_mask]
+
+            details = [
+                (
+                    int(value.item()),
+                    int(count.item()),
+                    int(count.item()) - 1,
+                )
+                for value, count in zip(
+                    repeated_values,
+                    repeated_counts,
+                )
+            ]
+
+            # 优先展示出现次数最多的索引。
+            details.sort(key=lambda item: (-item[1], item[0]))
+
+            detail_text = ", ".join(
+                f"{name}[{value}]: count={count}, reuse={reuse}"
+                for value, count, reuse in details
+            )
+            print(f"  repeated {name}: {detail_text}")
+
+    print()
 
 # -----------------------------------------------------------------------------
 # autograd function
@@ -2298,6 +2441,13 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             use_multiwarp_candidates
         )
 
+        """ _print_index_reuse_stats(
+            i_list=i_list,
+            j_list=j_list,
+            k_list=k_list,
+            v_list=v_list,
+            print_details=True,
+        ) """
         
         w_irreps =  int(meta["size_list"][0] / w_seg_num)
         x_irreps =  int(meta["size_list"][1] / x_seg_num)
@@ -2436,6 +2586,12 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         #torch.cuda.synchronize()
         #end_time = time.perf_counter() * 1000.0
         #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
+
+        #print(f"grad_w:{grad_w}")
+        #print(f"grad_x:{grad_x}")
+        #print(f"input_indices:{ctx.input_indices}")
+        #print(f"grad_y:{grad_y}")
+        
 
         # One gradient entry is required for every argument passed to
         # FastUniform1dJITFunction.apply().  The final flag is non-differentiable.

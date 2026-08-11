@@ -80,8 +80,6 @@ class CuEquivarianceContracter(Contracter):
             # self.w3j is of `model_dtype`
             math_dtype=self.w3j.dtype,
         )
-
-        print("======= algo call fasteq ==========")
         
         self.fast_sp = cuet.FastEqSegmentedPolynomial(
             allegro_tp_desc(
@@ -133,7 +131,6 @@ class CuEquivarianceContracter(Contracter):
                 empty_dict,  # output shapes
                 empty_dict,  # output indices
             )[0] """
-            print("======= algo call fasteq ==========")
             cue_out_edges = self.fast_sp(
                 [
                     weights,
