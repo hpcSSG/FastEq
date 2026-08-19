@@ -257,7 +257,7 @@ def main():
     
     setup(
         name="fasteq",
-        version="0.2.0",
+        version="0.3.0",
         description=config["description"],
         python_requires=">=3.10",
         packages=find_packages(where="."),
