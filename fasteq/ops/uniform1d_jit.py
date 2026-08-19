@@ -23,6 +23,7 @@ from torch.utils.cpp_extension import load
 from .uniform1d_auto_schedule import (
     generate_code_uniform1d_fwd_with_scheduler,
     generate_code_uniform1d_bwd_with_scheduler,
+    generate_code_uniform1d_double_bwd_with_scheduler,
     generate_code_uniform1d_fwd_baseline_unrolled,
     generate_code_uniform1d_bwd_baseline_unrolled,
 
@@ -34,16 +35,19 @@ from .uniform1d_auto_schedule import (
 
 _FWD_JIT_CACHE: Dict[str, object] = {}
 _BWD_JIT_CACHE: Dict[str, object] = {}
+_DOUBLE_BWD_JIT_CACHE: Dict[str, object] = {}
 
 # For each Uniform1D forward/backward signature, remember the fastest candidate
 # module selected by the first runtime microbenchmark in this Python process.
 _FWD_BEST_CANDIDATE_CACHE: Dict[str, Tuple[str, object, float]] = {}
 _BWD_BEST_CANDIDATE_CACHE: Dict[str, Tuple[str, object, float]] = {}
+_DOUBLE_BWD_BEST_CANDIDATE_CACHE: Dict[str, Tuple[str, object, float]] = {}
 
 # Fast hot-path mapping from runtime metadata identity to the final tune_key.
 # This avoids rebuilding the expensive content-hash tune_key on every call.
 _FWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
 _BWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
+_DOUBLE_BWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
 
 # Avoid repeating expensive disk cleanup / source pruning on every hot-path call.
 _JIT_PRUNE_DONE_CACHE: Set[Tuple[str, str, str]] = set()
@@ -1391,6 +1395,44 @@ def _make_bwd_module_name(
     return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
+def _make_double_bwd_module_name(
+    *,
+    P: int,
+    u_dim: int,
+    mode: str,
+    i_list,
+    j_list,
+    k_list,
+    v_list,
+    coeff_list,
+    dtype_str: str,
+    grad_w: bool,
+    layout_tag: str = "dense",
+    iw_dim: Optional[int] = None,
+    ix_dim: Optional[int] = None,
+    ky_dim: Optional[int] = None,
+    v_dim: Optional[int] = None,
+    use_multiwarp_candidates: bool = True,
+) -> str:
+    sig = repr((
+        "scheduler_double_bwd_v1",
+        P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        bool(use_multiwarp_candidates),
+        iw_dim, ix_dim, ky_dim, v_dim,
+        tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
+        tuple(float(c) for c in coeff_list),
+    ))
+    h = _sha1_text(sig)
+    mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
+    layout_tag = _sanitize_module_tag(layout_tag)
+    gw_tag = "gradw" if grad_w else "nogradw"
+    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    return (
+        f"uniform1d_double_bwd_sched_{mode_str}_u{u_dim}_path{P}_"
+        f"{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
+    )
+
+
 def _get_scalar_t_str(t: torch.Tensor) -> str:
     if t.dtype == torch.float32:
         return "float"
@@ -1899,6 +1941,106 @@ def _build_bwd_jit_module(
     return modules[0][1]
 
 
+def _build_double_bwd_jit_candidates(
+    *,
+    i_list: torch.Tensor,
+    j_list: torch.Tensor,
+    k_list: torch.Tensor,
+    v_list: torch.Tensor,
+    coeff_list: torch.Tensor,
+    input_indices: Optional[Dict[int, Any]] = None,
+    output_indices: Optional[Dict[int, Any]] = None,
+    u_dim: int,
+    iw_dim: Optional[int],
+    ix_dim: Optional[int],
+    ky_dim: Optional[int],
+    v_dim: Optional[int],
+    mode: str,
+    dtype_str: str,
+    grad_w: bool,
+    use_multiwarp_candidates: Optional[bool] = None,
+) -> Tuple[str, List[Tuple[str, object]]]:
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
+
+    fast_key = _make_candidate_fast_key(
+        kind="DOUBLE_BWD",
+        i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices, output_indices=output_indices,
+        u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
+        mode=mode, dtype_str=dtype_str, grad_w=grad_w,
+        use_multiwarp_candidates=use_multiwarp_candidates,
+    )
+    tune_key = _DOUBLE_BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
+    if tune_key is None:
+        i_cpu = _tensor_to_cpu_list(i_list)
+        j_cpu = _tensor_to_cpu_list(j_list)
+        k_cpu = _tensor_to_cpu_list(k_list)
+        v_cpu = _tensor_to_cpu_list(v_list)
+        coeff_cpu = _tensor_to_cpu_list(coeff_list)
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        use_scatter = 0 in output_indices
+        layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+        tune_key = _make_double_bwd_module_name(
+            P=len(i_cpu), u_dim=u_dim, mode=mode,
+            i_list=i_cpu, j_list=j_cpu, k_list=k_cpu, v_list=v_cpu,
+            coeff_list=coeff_cpu, dtype_str=dtype_str, grad_w=grad_w,
+            layout_tag=layout_tag, iw_dim=iw_dim, ix_dim=ix_dim,
+            ky_dim=ky_dim, v_dim=v_dim,
+            use_multiwarp_candidates=use_multiwarp_candidates,
+        )
+        _DOUBLE_BWD_TUNE_KEY_FAST_CACHE[fast_key] = tune_key
+
+    cached_best = _DOUBLE_BWD_BEST_CANDIDATE_CACHE.get(tune_key)
+    if cached_best is not None:
+        return tune_key, [(cached_best[0], cached_best[1])]
+
+    persistent_best = _load_persistent_best_candidate(
+        tune_key=tune_key,
+        cache=_DOUBLE_BWD_JIT_CACHE,
+        kind="DOUBLE_BWD",
+    )
+    if persistent_best is not None:
+        tag, mod, ms = persistent_best
+        _DOUBLE_BWD_BEST_CANDIDATE_CACHE[tune_key] = (tag, mod, ms)
+        return tune_key, [(tag, mod)]
+
+    prebuilt = _discover_prebuilt_jit_candidates(
+        tune_key=tune_key,
+        cache=_DOUBLE_BWD_JIT_CACHE,
+        kind="DOUBLE_BWD",
+    )
+    if prebuilt:
+        return tune_key, prebuilt
+
+    print(f"[JIT][DOUBLE_BWD] generate candidates for: {tune_key}")
+    codegen_out = generate_code_uniform1d_double_bwd_with_scheduler(
+        i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices, output_indices=output_indices,
+        u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
+        mode=mode, need_grad_w=grad_w,
+        out_path="", profile=False, profile_print=False,
+    )
+    raw_candidates = _normalize_codegen_candidates(codegen_out)
+    if not raw_candidates:
+        raise RuntimeError("double backward codegen returned zero candidates")
+    modules = _build_jit_candidates_from_sources(
+        tune_key=tune_key,
+        raw_candidates=raw_candidates,
+        cache=_DOUBLE_BWD_JIT_CACHE,
+        kind="DOUBLE_BWD",
+        u_dim=int(u_dim),
+        use_multiwarp_candidates=use_multiwarp_candidates,
+    )
+    return tune_key, modules
+
+
 # -----------------------------------------------------------------------------
 # runtime dispatch
 # -----------------------------------------------------------------------------
@@ -1935,6 +2077,37 @@ def _call_bwd_module(
         return mod.run(w, x, y, grad_out, src_idx, dst_idx, out_seg_num)
     return mod.run(w, x, y, grad_out, src_idx, out_seg_num)
 
+
+
+
+
+def _call_double_bwd_module(
+    mod,
+    *,
+    w,
+    x,
+    y,
+    grad_out,
+    grad_grad_w,
+    grad_grad_x,
+    grad_grad_y,
+    src_idx,
+    dst_idx,
+    out_seg_num,
+    use_src: bool,
+    fused_scatter: bool,
+    need_grad_w: bool,
+):
+    args = [w, x, y, grad_out]
+    if need_grad_w:
+        args.append(grad_grad_w)
+    args.extend([grad_grad_x, grad_grad_y])
+    if use_src:
+        args.append(src_idx)
+    if fused_scatter:
+        args.append(dst_idx)
+    args.append(int(out_seg_num))
+    return mod.run(*args)
 
 
 def _benchmark_and_select_best_jit_candidate(
@@ -2093,6 +2266,57 @@ def _select_best_bwd_module(
             dst_idx=dst_idx,
             out_seg_num=out_seg_num,
             fused_scatter=fused_scatter,
+        ),
+    )
+
+
+def _select_best_double_bwd_module(
+    *,
+    tune_key: str,
+    candidates: List[Tuple[str, object]],
+    w, x, y, grad_out,
+    grad_grad_w, grad_grad_x, grad_grad_y,
+    src_idx, dst_idx,
+    out_seg_num,
+    use_src: bool,
+    fused_scatter: bool,
+    need_grad_w: bool,
+) -> Tuple[str, object, float]:
+    # Double backward uses its own env controls when present and otherwise
+    # inherits the regular backward tuning policy.
+    tune_enabled = _env_bool(
+        "FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE",
+        _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED,
+    )
+    warmup = _env_int(
+        "FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_WARMUP",
+        _DEFAULT_UNIFORM1D_TUNE_WARMUP,
+        min_value=0,
+    )
+    repeat = _env_int(
+        "FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_REPEAT",
+        _DEFAULT_UNIFORM1D_TUNE_REPEAT,
+        min_value=1,
+    )
+    return _benchmark_and_select_best_jit_candidate(
+        tune_key=tune_key,
+        candidates=candidates,
+        best_cache=_DOUBLE_BWD_BEST_CANDIDATE_CACHE,
+        kind="DOUBLE_BWD",
+        tune_enabled=tune_enabled,
+        warmup=warmup,
+        repeat=repeat,
+        call_fn=lambda mod: _call_double_bwd_module(
+            mod,
+            w=w, x=x, y=y, grad_out=grad_out,
+            grad_grad_w=grad_grad_w,
+            grad_grad_x=grad_grad_x,
+            grad_grad_y=grad_grad_y,
+            src_idx=src_idx, dst_idx=dst_idx,
+            out_seg_num=out_seg_num,
+            use_src=use_src,
+            fused_scatter=fused_scatter,
+            need_grad_w=need_grad_w,
         ),
     )
 
@@ -2262,6 +2486,104 @@ def _run_bwd(
     
     return out
 
+
+def _run_double_bwd(
+    *,
+    grad_out,
+    w,
+    x,
+    y,
+    grad_grad_w,
+    grad_grad_x,
+    grad_grad_y,
+    i_list,
+    j_list,
+    k_list,
+    v_list,
+    coeff_list,
+    input_indices,
+    output_indices,
+    out_seg_num,
+    u_dim,
+    iw_dim,
+    ix_dim,
+    ky_dim,
+    v_dim,
+    mode,
+    grad_w,
+    use_multiwarp_candidates: Optional[bool] = None,
+):
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
+        use_multiwarp_candidates
+    )
+    dtype_str = _get_scalar_t_str(w)
+    tune_key, candidates = _build_double_bwd_jit_candidates(
+        i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
+        coeff_list=coeff_list,
+        input_indices=input_indices, output_indices=output_indices,
+        u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
+        mode=mode, dtype_str=dtype_str, grad_w=bool(grad_w),
+        use_multiwarp_candidates=use_multiwarp_candidates,
+    )
+
+    use_x_src = 1 in input_indices
+    use_y_src = 2 in input_indices
+    use_src = use_x_src or use_y_src
+    fused_scatter = 0 in output_indices
+    if use_x_src:
+        src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+    elif use_y_src:
+        src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+    else:
+        src_idx = None
+    dst_idx = (
+        _as_int32_meta_tensor(output_indices[0]).contiguous()
+        if fused_scatter else None
+    )
+
+    grad_out = grad_out.view(-1, out_seg_num, u_dim).contiguous()
+    # None means that the outer loss did not consume this first-gradient output.
+    # Materializing zero cotangents preserves the exact VJP while keeping all
+    # mathematical double-backward work inside the generated CUDA/HIP kernel.
+    if bool(grad_w):
+        if grad_grad_w is None:
+            grad_grad_w = torch.zeros_like(w)
+        else:
+            grad_grad_w = grad_grad_w.contiguous()
+    if grad_grad_x is None:
+        grad_grad_x = torch.zeros_like(x)
+    else:
+        grad_grad_x = grad_grad_x.contiguous()
+    if grad_grad_y is None:
+        grad_grad_y = torch.zeros_like(y)
+    else:
+        grad_grad_y = grad_grad_y.contiguous()
+
+    _tag, mod, _ms = _select_best_double_bwd_module(
+        tune_key=tune_key, candidates=candidates,
+        w=w, x=x, y=y, grad_out=grad_out,
+        grad_grad_w=grad_grad_w,
+        grad_grad_x=grad_grad_x,
+        grad_grad_y=grad_grad_y,
+        src_idx=src_idx, dst_idx=dst_idx,
+        out_seg_num=out_seg_num,
+        use_src=use_src,
+        fused_scatter=fused_scatter,
+        need_grad_w=bool(grad_w),
+    )
+    return _call_double_bwd_module(
+        mod,
+        w=w, x=x, y=y, grad_out=grad_out,
+        grad_grad_w=grad_grad_w,
+        grad_grad_x=grad_grad_x,
+        grad_grad_y=grad_grad_y,
+        src_idx=src_idx, dst_idx=dst_idx,
+        out_seg_num=out_seg_num,
+        use_src=use_src,
+        fused_scatter=fused_scatter,
+        need_grad_w=bool(grad_w),
+    )
+
 @torch.no_grad()
 def _print_index_reuse_stats(
     i_list: torch.Tensor,
@@ -2404,6 +2726,80 @@ def _print_index_reuse_stats(
 
     print()
 
+
+# -----------------------------------------------------------------------------
+# Differentiable first backward / generated CUDA double backward
+# -----------------------------------------------------------------------------
+
+class FastUniform1dBackwardFunction(torch.autograd.Function):
+    """First backward uses JIT BWD; its backward uses JIT DOUBLE_BWD."""
+
+    @staticmethod
+    def forward(ctx, grad_out, w, x, y, i_list, j_list, k_list, v_list,
+                coeff_list, input_indices, output_indices, out_seg_num, u_dim,
+                iw_dim, ix_dim, ky_dim, v_dim, mode, need_grad_w,
+                use_multiwarp_candidates):
+        result = _run_bwd(
+            grad_out=grad_out, w=w, x=x, y=y,
+            i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
+            coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, out_seg_num=int(out_seg_num),
+            u_dim=int(u_dim), iw_dim=int(iw_dim), ix_dim=int(ix_dim),
+            ky_dim=int(ky_dim), v_dim=int(v_dim), mode=mode,
+            grad_w=bool(need_grad_w),
+            use_multiwarp_candidates=bool(use_multiwarp_candidates),
+        )
+        if bool(need_grad_w):
+            gw, gx, gy = result
+        else:
+            gx, gy = result
+            gw = w.new_empty((0,))
+
+        ctx.save_for_backward(
+            grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list
+        )
+        ctx.input_indices = input_indices
+        ctx.output_indices = output_indices
+        ctx.out_seg_num = int(out_seg_num)
+        ctx.u_dim = int(u_dim)
+        ctx.iw_dim = int(iw_dim)
+        ctx.ix_dim = int(ix_dim)
+        ctx.ky_dim = int(ky_dim)
+        ctx.v_dim = int(v_dim)
+        ctx.mode = mode
+        ctx.need_grad_w = bool(need_grad_w)
+        ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
+        return gw, gx, gy
+
+    @staticmethod
+    def backward(ctx, grad_grad_w, grad_grad_x, grad_grad_y):
+        grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
+        d_go, d_w, d_x, d_y = _run_double_bwd(
+            grad_out=grad_out,
+            w=w, x=x, y=y,
+            grad_grad_w=grad_grad_w if ctx.need_grad_w else None,
+            grad_grad_x=grad_grad_x,
+            grad_grad_y=grad_grad_y,
+            i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
+            coeff_list=coeff_list,
+            input_indices=ctx.input_indices,
+            output_indices=ctx.output_indices,
+            out_seg_num=ctx.out_seg_num,
+            u_dim=ctx.u_dim,
+            iw_dim=ctx.iw_dim,
+            ix_dim=ctx.ix_dim,
+            ky_dim=ctx.ky_dim,
+            v_dim=ctx.v_dim,
+            mode=ctx.mode,
+            grad_w=ctx.need_grad_w,
+            use_multiwarp_candidates=ctx.use_multiwarp_candidates,
+        )
+        return (
+            d_go, d_w, d_x, d_y,
+            None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
+        )
+
 # -----------------------------------------------------------------------------
 # autograd function
 # -----------------------------------------------------------------------------
@@ -2522,79 +2918,19 @@ class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         w, x, y = ctx.saved_tensors
-
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000.0
-
-        if w.requires_grad:
-            grad_w, grad_x, grad_y = _run_bwd(
-                grad_out=grad_out,
-                w=w,
-                x=x,
-                y=y,
-                i_list=ctx.i_list,
-                j_list=ctx.j_list,
-                k_list=ctx.k_list,
-                v_list=ctx.v_list,
-                coeff_list=ctx.coeff_list,
-                input_indices=ctx.input_indices,
-                output_indices=ctx.output_indices,
-                out_seg_num=ctx.out_seg_num,
-                u_dim=ctx.u_dim,
-                iw_dim=ctx.w_seg_num,
-                ix_dim=ctx.x_seg_num,
-                ky_dim=ctx.y_seg_num,
-                v_dim=ctx.out_seg_num,
-                mode=ctx.mode,
-                grad_w=w.requires_grad,
-                use_multiwarp_candidates=ctx.use_multiwarp_candidates,
-            )
-
-            grad_w = grad_w.view(-1, ctx.w_seg_num * ctx.w_irreps)
-            grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
-            grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
-        else:
-            grad_x, grad_y = _run_bwd(
-                grad_out=grad_out,
-                w=w,
-                x=x,
-                y=y,
-                i_list=ctx.i_list,
-                j_list=ctx.j_list,
-                k_list=ctx.k_list,
-                v_list=ctx.v_list,
-                coeff_list=ctx.coeff_list,
-                input_indices=ctx.input_indices,
-                output_indices=ctx.output_indices,
-                out_seg_num=ctx.out_seg_num,
-                u_dim=ctx.u_dim,
-                iw_dim=ctx.w_seg_num,
-                ix_dim=ctx.x_seg_num,
-                ky_dim=ctx.y_seg_num,
-                v_dim=ctx.out_seg_num,
-                mode=ctx.mode,
-                grad_w=w.requires_grad,
-                use_multiwarp_candidates=ctx.use_multiwarp_candidates,
-            )
-
-            grad_x = grad_x.view(-1, ctx.x_seg_num * ctx.x_irreps)
-            grad_y = grad_y.view(-1, ctx.y_seg_num * ctx.y_irreps)
-            grad_w = None
-
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000.0
-        #print(f"<< fasteq uniform1d path:{ctx.P} backward cost: {end_time - start_time:.3f} ms >>")
-
-        #print(f"grad_w:{grad_w}")
-        #print(f"grad_x:{grad_x}")
-        #print(f"input_indices:{ctx.input_indices}")
-        #print(f"grad_y:{grad_y}")
-        
-
-        # One gradient entry is required for every argument passed to
-        # FastUniform1dJITFunction.apply().  The final flag is non-differentiable.
+        gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(
+            grad_out, w, x, y,
+            ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
+            ctx.input_indices, ctx.output_indices,
+            ctx.out_seg_num, ctx.u_dim,
+            ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num,
+            ctx.mode, bool(w.requires_grad), bool(ctx.use_multiwarp_candidates),
+        )
+        grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if w.requires_grad else None
+        grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps)
+        grad_y = gy3.view(-1, ctx.y_seg_num * ctx.y_irreps)
         return grad_w, grad_x, grad_y, None, None, None, None
 
 def fast_uniform1d_jit(
@@ -2615,5 +2951,5 @@ def fast_uniform1d_jit(
         input_indices,
         output_indices,
         meta,
-        True,
+        use_multiwarp_candidates,
     )

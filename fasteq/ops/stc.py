@@ -22,40 +22,23 @@ import importlib.machinery
 import importlib.util
 import sys
 
-try:
-    from .uniform1d_auto_schedule import (
-        STC_PAD_VALUE,
-        generate_code_stc_fwd_with_scheduler,
-        generate_code_stc_bwd_with_scheduler,
-        _normalize_stc_padded_paths,
-        infer_stc_path_lens_from_padded,
-        _infer_stc_path_lens_tensor_from_padded,
-    )
-except ImportError:  # Allows direct local testing when this file is not imported as a package module.
-    from uniform1d_auto_schedule import (
-        STC_PAD_VALUE,
-        generate_code_stc_fwd_with_scheduler,
-        generate_code_stc_bwd_with_scheduler,
-        _normalize_stc_padded_paths,
-        infer_stc_path_lens_from_padded,
-        _infer_stc_path_lens_tensor_from_padded,
-    )
+from .uniform1d_auto_schedule import (
+    STC_PAD_VALUE,
+    generate_code_stc_fwd_with_scheduler,
+    generate_code_stc_bwd_with_scheduler,
+    generate_code_stc_double_bwd_with_scheduler,
+    _normalize_stc_padded_paths,
+    infer_stc_path_lens_from_padded,
+    _infer_stc_path_lens_tensor_from_padded,
+)
 
+from .uniform1d_jit import (
+    _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
+    _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
+    _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
+    _benchmark_and_select_best_jit_candidate as _u1d_benchmark_and_select_best_jit_candidate,
+)
 
-try:
-    from .uniform1d_jit import (
-        _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
-        _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
-        _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
-        _benchmark_and_select_best_jit_candidate as _u1d_benchmark_and_select_best_jit_candidate,
-    )
-except ImportError:  # Allows direct local testing when this file is not imported as a package module.
-    from uniform1d import (
-        _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
-        _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
-        _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
-        _benchmark_and_select_best_jit_candidate as _u1d_benchmark_and_select_best_jit_candidate,
-    )
 
 _MODULE_CACHE: Dict[str, Any] = {}
 
@@ -69,6 +52,7 @@ _MODULE_CACHE: Dict[str, Any] = {}
 # 1-warp candidate and parsing its compiler-reported registers/thread.
 _DEFAULT_STC_FWD_TUNE_ENABLED = True
 _DEFAULT_STC_BWD_TUNE_ENABLED = True
+_DEFAULT_STC_DOUBLE_BWD_TUNE_ENABLED = True
 _DEFAULT_STC_TUNE_WARMUP = 3
 _DEFAULT_STC_TUNE_REPEAT = 10
 
@@ -144,6 +128,7 @@ def _autowarp_runtime_policy() -> tuple[int, int, int]:
 
 _FWD_BEST_CANDIDATE_CACHE: Dict[str, Any] = {}
 _BWD_BEST_CANDIDATE_CACHE: Dict[str, Any] = {}
+_DOUBLE_BWD_BEST_CANDIDATE_CACHE: Dict[str, Any] = {}
 
 
 def _ensure_dir(p: Path) -> None:
@@ -307,8 +292,17 @@ def _sha1_text(s: str) -> str:
 
 
 def _get_tune_params(kind: str) -> tuple[bool, int, int]:
-    prefix = "FASTEQ_STC_FWD" if kind == "fwd" else "FASTEQ_STC_BWD"
-    default_enabled = _DEFAULT_STC_FWD_TUNE_ENABLED if kind == "fwd" else _DEFAULT_STC_BWD_TUNE_ENABLED
+    if kind == "fwd":
+        prefix = "FASTEQ_STC_FWD"
+        default_enabled = _DEFAULT_STC_FWD_TUNE_ENABLED
+    elif kind == "bwd":
+        prefix = "FASTEQ_STC_BWD"
+        default_enabled = _DEFAULT_STC_BWD_TUNE_ENABLED
+    elif kind == "double_bwd":
+        prefix = "FASTEQ_STC_DOUBLE_BWD"
+        default_enabled = _DEFAULT_STC_DOUBLE_BWD_TUNE_ENABLED
+    else:
+        raise ValueError(f"unknown STC tune kind: {kind}")
     return (
         _env_flag(f"{prefix}_TUNE", "1" if default_enabled else "0"),
         _env_int(f"{prefix}_TUNE_WARMUP", _DEFAULT_STC_TUNE_WARMUP, min_value=0),
@@ -365,7 +359,7 @@ def _stable_meta_hash(
     h.update(str(int(pad_value)).encode())
     h.update(b"autowarp" if bool(use_multiwarp_candidates) else b"w1only")
     # v7 separates single-warp and multi-warp candidate caches.
-    h.update(b"stc-filejit-v7-sentinel-padding-fwd-bwd-x1-only")
+    h.update(b"stc-filejit-v8-sentinel-padding-fwd-bwd-double-bwd-x1-only")
     return h.hexdigest()[:16]
 
 
@@ -426,6 +420,31 @@ def _make_stc_bwd_tune_key(
         dtype_str = "double"
     warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
     return f"stc_u1d_bwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
+
+def _make_stc_double_bwd_tune_key(
+    idx_lists: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    V: int,
+    U: int,
+    dtype: torch.dtype,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
+) -> str:
+    key = _stable_meta_hash(
+        idx_lists, coeffs, V=V, U=U, dtype=dtype, path_lens=path_lens,
+        pad_value=pad_value, use_multiwarp_candidates=use_multiwarp_candidates,
+    )
+    if dtype == torch.float32:
+        dtype_str = "float"
+    elif dtype == torch.float64:
+        dtype_str = "double"
+    else:
+        raise TypeError(f"Unsupported dtype for STC double backward JIT: {dtype}")
+    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    return f"stc_u1d_double_bwd_x0gather_v2_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
+
 
 def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: Path, verbose: bool = False):
     if load is None:
@@ -639,6 +658,56 @@ def _get_or_build_bwd_module(*args, **kwargs):
     return _get_or_build_bwd_module_candidates(*args, **kwargs)[0][1]
 
 
+def _get_or_build_double_bwd_module_candidates(
+    idx_lists: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    V: int,
+    U: int,
+    dtype: torch.dtype,
+    path_lens: Optional[torch.Tensor] = None,
+    pad_value: int = STC_PAD_VALUE,
+    use_multiwarp_candidates: bool = False,
+    verbose: bool = False,
+):
+    base_name = _make_stc_double_bwd_tune_key(
+        idx_lists, coeffs, V=V, U=U, dtype=dtype, path_lens=path_lens,
+        pad_value=pad_value, use_multiwarp_candidates=use_multiwarp_candidates,
+    )
+    if base_name in _DOUBLE_BWD_BEST_CANDIDATE_CACHE:
+        tag, mod, _ms = _DOUBLE_BWD_BEST_CANDIDATE_CACHE[base_name]
+        return [(tag, mod)]
+
+    persistent_best = _u1d_load_persistent_best_candidate(
+        tune_key=base_name, cache=_MODULE_CACHE, kind="STC_DOUBLE_BWD",
+    )
+    if persistent_best is not None:
+        tag, mod, ms = persistent_best
+        _DOUBLE_BWD_BEST_CANDIDATE_CACHE[base_name] = (tag, mod, ms)
+        return [(tag, mod)]
+
+    prebuilt_modules = _u1d_discover_prebuilt_jit_candidates(
+        tune_key=base_name, cache=_MODULE_CACHE, kind="STC_DOUBLE_BWD",
+    )
+    if prebuilt_modules:
+        return prebuilt_modules
+
+    code = generate_code_stc_double_bwd_with_scheduler(
+        idx_lists, coeffs, path_lens=path_lens, pad_value=pad_value,
+        num_out_segments=int(V), u_dim=int(U), out_path="",
+        kernel_name=base_name,
+    )
+    return _build_stc_candidate_modules(
+        base_name=base_name, base_code=code, kind="double_bwd", dtype=dtype,
+        u_dim=int(U), use_multiwarp_candidates=use_multiwarp_candidates,
+        verbose=verbose,
+    )
+
+
+def _get_or_build_double_bwd_module(*args, **kwargs):
+    return _get_or_build_double_bwd_module_candidates(*args, **kwargs)[0][1]
+
+
 def _select_best_stc_fwd_module(base_key: str, candidates: list[tuple[str, Any]], x1, x0_g, V: int):
     tune_enabled, warmup, repeat = _get_tune_params("fwd")
     return _u1d_benchmark_and_select_best_jit_candidate(
@@ -664,6 +733,137 @@ def _select_best_stc_bwd_module(base_key: str, candidates: list[tuple[str, Any]]
         repeat=repeat,
         call_fn=lambda mod: mod.run(grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(V)),
     )
+
+
+def _select_best_stc_double_bwd_module(
+    base_key: str, candidates: list[tuple[str, Any]],
+    grad_out, x1, x0, i0, grad_grad_x1, V: int,
+):
+    tune_enabled, warmup, repeat = _get_tune_params("double_bwd")
+    return _u1d_benchmark_and_select_best_jit_candidate(
+        tune_key=base_key, candidates=candidates,
+        best_cache=_DOUBLE_BWD_BEST_CANDIDATE_CACHE, kind="STC_DOUBLE_BWD",
+        tune_enabled=tune_enabled, warmup=warmup, repeat=repeat,
+        call_fn=lambda mod: mod.run(
+            grad_out.contiguous(), x1.contiguous(), x0.contiguous(),
+            i0.contiguous(), grad_grad_x1.contiguous(), int(V),
+        ),
+    )
+
+
+
+# -----------------------------------------------------------------------------
+# Differentiable STC backward / training double backward
+# -----------------------------------------------------------------------------
+
+class FastSTCBackwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, grad_out, x1, x0, i0, coeffs_tensor, idx_lists_tensor,
+                num_out_segments, pad_value, use_multiwarp_candidates):
+        # The public STC forward returns [B, V * U].  Generated kernels use
+        # [B, V, U] internally.  x0 is intentionally kept in its ORIGINAL
+        # ungathered shape; the first backward uses x0_g=x0[i0], while the
+        # CUDA double backward reduces d_x0_g back to d_x0 through i0.
+        B = int(x1.size(0))
+        U = int(x1.size(2))
+        V = int(num_out_segments)
+        expected_grad_out_numel = B * V * U
+        if int(grad_out.numel()) != expected_grad_out_numel:
+            raise RuntimeError(
+                f"STC grad_out numel mismatch: got shape={tuple(grad_out.shape)} "
+                f"numel={grad_out.numel()}, expected B*V*U={B}*{V}*{U}="
+                f"{expected_grad_out_numel}"
+            )
+
+        grad_out_shape = tuple(int(v) for v in grad_out.shape)
+        grad_out_3d = grad_out.reshape(B, V, U).contiguous()
+
+        # Generated double-bwd ABI uses int64 i0.  Keep this tensor in ctx so
+        # tuning and the final launch see exactly the same contiguous metadata.
+        i0_i64 = i0.to(device=x1.device, dtype=torch.int64).reshape(-1).contiguous()
+        if int(i0_i64.numel()) != B:
+            raise RuntimeError(
+                f"STC i0 length mismatch: got {i0_i64.numel()}, expected B={B}"
+            )
+
+        # First backward is still the existing x1-only JIT kernel and consumes
+        # the gathered x0_g layout [B, X0, U].
+        x0_g = x0[i0_i64].contiguous()
+
+        key = _make_stc_bwd_tune_key(
+            idx_lists_tensor, coeffs_tensor, V=V, U=U,
+            dtype=x1.dtype, path_lens=None, pad_value=int(pad_value),
+            use_multiwarp_candidates=bool(use_multiwarp_candidates))
+        candidates = _get_or_build_bwd_module_candidates(
+            idx_lists_tensor, coeffs_tensor, path_lens=None, pad_value=int(pad_value),
+            V=V, U=U, dtype=x1.dtype,
+            use_multiwarp_candidates=bool(use_multiwarp_candidates))
+        _tag, mod, _ms = _select_best_stc_bwd_module(
+            key, candidates, grad_out_3d, x1.contiguous(), x0_g, V)
+        gx1 = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
+
+        ctx.save_for_backward(
+            grad_out_3d, x1, x0, i0_i64, coeffs_tensor, idx_lists_tensor
+        )
+        ctx.grad_out_shape = grad_out_shape
+        ctx.num_out_segments = V
+        ctx.pad_value = int(pad_value)
+        ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
+        return gx1
+
+    @staticmethod
+    def backward(ctx, grad_grad_x1):
+        (
+            grad_out_3d, x1, x0, i0_i64, coeffs_tensor, idx_lists_tensor
+        ) = ctx.saved_tensors
+        if grad_grad_x1 is None:
+            return None, None, None, None, None, None, None, None, None
+
+        if int(grad_grad_x1.numel()) != int(x1.numel()):
+            raise RuntimeError(
+                f"STC grad_grad_x1 numel mismatch: got shape={tuple(grad_grad_x1.shape)} "
+                f"numel={grad_grad_x1.numel()}, expected x1 shape={tuple(x1.shape)} "
+                f"numel={x1.numel()}"
+            )
+        grad_grad_x1_3d = grad_grad_x1.reshape_as(x1).contiguous()
+
+        key = _make_stc_double_bwd_tune_key(
+            idx_lists_tensor, coeffs_tensor,
+            V=int(ctx.num_out_segments), U=int(x1.size(2)), dtype=x1.dtype,
+            path_lens=None, pad_value=int(ctx.pad_value),
+            use_multiwarp_candidates=bool(ctx.use_multiwarp_candidates),
+        )
+        candidates = _get_or_build_double_bwd_module_candidates(
+            idx_lists_tensor, coeffs_tensor, path_lens=None,
+            pad_value=int(ctx.pad_value), V=int(ctx.num_out_segments),
+            U=int(x1.size(2)), dtype=x1.dtype,
+            use_multiwarp_candidates=bool(ctx.use_multiwarp_candidates),
+        )
+        _tag, mod, _ms = _select_best_stc_double_bwd_module(
+            key, candidates, grad_out_3d, x1, x0, i0_i64,
+            grad_grad_x1_3d, int(ctx.num_out_segments),
+        )
+        d_go_3d, d_x1, d_x0 = mod.run(
+            grad_out_3d, x1.contiguous(), x0.contiguous(),
+            i0_i64, grad_grad_x1_3d, int(ctx.num_out_segments),
+        )
+
+        # The CUDA kernel already performs gather-backward reduction:
+        # d_x0.shape == x0.shape, even when B != x0.size(0).
+        if tuple(d_x0.shape) != tuple(x0.shape):
+            raise RuntimeError(
+                f"STC double backward d_x0 shape mismatch: got {tuple(d_x0.shape)}, "
+                f"expected original x0 shape {tuple(x0.shape)}"
+            )
+
+        d_go = d_go_3d.reshape(ctx.grad_out_shape)
+        d_x1_reshaped = d_x1.reshape(d_x1.shape[0], -1)
+        d_x0_reshaped = d_x0.reshape(d_x0.shape[0], -1)
+        print(f"d_go shape:{d_go.shape}, data:{d_go.data}")
+        print(f"d_x1_reshaped shape:{d_x1_reshaped.shape}, data:{d_x1_reshaped.data}")
+        print(f"d_x0_reshaped shape:{d_x0_reshaped.shape}, data:{d_x0_reshaped.data}")
+        return d_go, d_x1, d_x0, None, None, None, None, None, None
+
 
 class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
     """Forward uses generated STC-LARS code with preprocessed STC metadata.
@@ -740,7 +940,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         #end_time = time.perf_counter() * 1000
         #print(f"<< fasteq stc uniform1d-lars forward cost: {end_time - start_time:.3f} ms >>")
 
-        ctx.save_for_backward(x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor)
+        ctx.save_for_backward(x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor)
         ctx.num_out_segments = int(num_out_segments)
         ctx.pad_value = int(pad_value)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
@@ -748,43 +948,11 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
-
-        x1, x0_g, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
-        bwd_key = _make_stc_bwd_tune_key(
-            idx_lists_tensor,
-            coeffs_tensor,
-            V=int(ctx.num_out_segments),
-            U=int(x1.size(2)),
-            dtype=x1.dtype,
-            path_lens=None,
-            pad_value=int(ctx.pad_value),
-            use_multiwarp_candidates=ctx.use_multiwarp_candidates,
+        x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
+        grad_x1 = FastSTCBackwardFunction.apply(
+            grad_out.contiguous(), x1, x0, i0, coeffs_tensor, idx_lists_tensor,
+            int(ctx.num_out_segments), int(ctx.pad_value), bool(ctx.use_multiwarp_candidates),
         )
-        candidates = _get_or_build_bwd_module_candidates(
-            idx_lists_tensor,
-            coeffs_tensor,
-            path_lens=None,
-            pad_value=int(ctx.pad_value),
-            V=int(ctx.num_out_segments),
-            U=int(x1.size(2)),
-            dtype=x1.dtype,
-            use_multiwarp_candidates=ctx.use_multiwarp_candidates,
-        )
-        best_tag, mod, _best_ms = _select_best_stc_bwd_module(
-            bwd_key, candidates, grad_out.contiguous(), x1.contiguous(), x0_g.contiguous(), int(ctx.num_out_segments)
-        )
-        grad_x1 = mod.run(
-            grad_out.contiguous(),
-            x1.contiguous(),
-            x0_g.contiguous(),
-            int(ctx.num_out_segments),
-        )
-
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #print(f"<< fasteq stc uniform1d-lars backward cost: {end_time - start_time:.3f} ms >>")
         return grad_x1, None, None, None, None, None, None, None, None
 
 

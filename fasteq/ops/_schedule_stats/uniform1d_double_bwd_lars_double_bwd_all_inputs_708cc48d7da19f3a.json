@@ -1,0 +1,360 @@
+{
+  "operation": "uniform1d_double_bwd",
+  "candidate": "lars_double_bwd_all_inputs",
+  "path_count": 16,
+  "definitions": {
+    "count": "number of scheduled paths referencing the label",
+    "lifetime": "last scheduled use - first scheduled use + 1; scheduled positions are zero-based",
+    "max_live": "maximum number of simultaneously-live input/accumulator labels during this label's live interval"
+  },
+  "variables": [
+    {
+      "label": "grad_grad_w[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_grad_w[1]",
+      "count": 3,
+      "lifetime": 9,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_w[2]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_w[3]",
+      "count": 7,
+      "lifetime": 14,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_x[0]",
+      "count": 16,
+      "lifetime": 16,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_grad_y[1]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_grad_y[2]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[4]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[5]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[6]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[7]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[8]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[9]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_grad_y[10]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[11]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[12]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[13]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[14]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_grad_y[15]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_out[1]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_out[2]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[4]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[5]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[6]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[7]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[8]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[9]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "grad_out[10]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[11]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[12]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[13]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[14]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "grad_out[15]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "w[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "w[1]",
+      "count": 3,
+      "lifetime": 9,
+      "max_live": 9
+    },
+    {
+      "label": "w[2]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 9
+    },
+    {
+      "label": "w[3]",
+      "count": 7,
+      "lifetime": 14,
+      "max_live": 9
+    },
+    {
+      "label": "x[0]",
+      "count": 16,
+      "lifetime": 16,
+      "max_live": 9
+    },
+    {
+      "label": "y[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "y[1]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "y[2]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[4]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[5]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[6]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[7]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[8]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[9]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "y[10]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[11]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[12]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[13]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[14]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "y[15]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    }
+  ]
+}

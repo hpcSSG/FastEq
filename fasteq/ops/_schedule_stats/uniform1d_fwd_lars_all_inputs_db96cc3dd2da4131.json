@@ -1,0 +1,78 @@
+{
+  "operation": "uniform1d_fwd",
+  "candidate": "lars_all_inputs",
+  "path_count": 4,
+  "definitions": {
+    "count": "number of scheduled paths referencing the label",
+    "lifetime": "last scheduled use - first scheduled use + 1; scheduled positions are zero-based",
+    "max_live": "maximum number of simultaneously-live input/accumulator labels during this label's live interval"
+  },
+  "variables": [
+    {
+      "label": "out[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "out[1]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "out[2]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "out[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "w[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "w[1]",
+      "count": 3,
+      "lifetime": 3,
+      "max_live": 4
+    },
+    {
+      "label": "x[0]",
+      "count": 4,
+      "lifetime": 4,
+      "max_live": 4
+    },
+    {
+      "label": "y[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "y[1]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "y[2]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "y[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    }
+  ]
+}

@@ -1,0 +1,690 @@
+{
+  "operation": "uniform1d_fwd",
+  "candidate": "lars_all_inputs",
+  "path_count": 215,
+  "definitions": {
+    "count": "number of scheduled paths referencing the label",
+    "lifetime": "last scheduled use - first scheduled use + 1; scheduled positions are zero-based",
+    "max_live": "maximum number of simultaneously-live input/accumulator labels during this label's live interval"
+  },
+  "variables": [
+    {
+      "label": "out[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "out[1]",
+      "count": 3,
+      "lifetime": 3,
+      "max_live": 9
+    },
+    {
+      "label": "out[2]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 21
+    },
+    {
+      "label": "out[3]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 19
+    },
+    {
+      "label": "out[4]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 19
+    },
+    {
+      "label": "out[5]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 19
+    },
+    {
+      "label": "out[6]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 6
+    },
+    {
+      "label": "out[7]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 5
+    },
+    {
+      "label": "out[8]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "out[9]",
+      "count": 4,
+      "lifetime": 10,
+      "max_live": 15
+    },
+    {
+      "label": "out[10]",
+      "count": 3,
+      "lifetime": 5,
+      "max_live": 15
+    },
+    {
+      "label": "out[11]",
+      "count": 4,
+      "lifetime": 9,
+      "max_live": 15
+    },
+    {
+      "label": "out[12]",
+      "count": 4,
+      "lifetime": 11,
+      "max_live": 32
+    },
+    {
+      "label": "out[13]",
+      "count": 3,
+      "lifetime": 10,
+      "max_live": 32
+    },
+    {
+      "label": "out[14]",
+      "count": 4,
+      "lifetime": 9,
+      "max_live": 32
+    },
+    {
+      "label": "out[15]",
+      "count": 8,
+      "lifetime": 35,
+      "max_live": 24
+    },
+    {
+      "label": "out[16]",
+      "count": 5,
+      "lifetime": 40,
+      "max_live": 24
+    },
+    {
+      "label": "out[17]",
+      "count": 8,
+      "lifetime": 36,
+      "max_live": 24
+    },
+    {
+      "label": "out[18]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 21
+    },
+    {
+      "label": "out[19]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 21
+    },
+    {
+      "label": "out[20]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 21
+    },
+    {
+      "label": "out[21]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 21
+    },
+    {
+      "label": "out[22]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 21
+    },
+    {
+      "label": "out[23]",
+      "count": 2,
+      "lifetime": 2,
+      "max_live": 14
+    },
+    {
+      "label": "out[24]",
+      "count": 2,
+      "lifetime": 3,
+      "max_live": 15
+    },
+    {
+      "label": "out[25]",
+      "count": 3,
+      "lifetime": 8,
+      "max_live": 15
+    },
+    {
+      "label": "out[26]",
+      "count": 2,
+      "lifetime": 2,
+      "max_live": 15
+    },
+    {
+      "label": "out[27]",
+      "count": 2,
+      "lifetime": 2,
+      "max_live": 15
+    },
+    {
+      "label": "out[28]",
+      "count": 5,
+      "lifetime": 17,
+      "max_live": 29
+    },
+    {
+      "label": "out[29]",
+      "count": 4,
+      "lifetime": 16,
+      "max_live": 29
+    },
+    {
+      "label": "out[30]",
+      "count": 3,
+      "lifetime": 14,
+      "max_live": 29
+    },
+    {
+      "label": "out[31]",
+      "count": 4,
+      "lifetime": 11,
+      "max_live": 29
+    },
+    {
+      "label": "out[32]",
+      "count": 5,
+      "lifetime": 13,
+      "max_live": 29
+    },
+    {
+      "label": "out[33]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 16
+    },
+    {
+      "label": "out[34]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 16
+    },
+    {
+      "label": "out[35]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 16
+    },
+    {
+      "label": "out[36]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 16
+    },
+    {
+      "label": "out[37]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 16
+    },
+    {
+      "label": "out[38]",
+      "count": 4,
+      "lifetime": 23,
+      "max_live": 24
+    },
+    {
+      "label": "out[39]",
+      "count": 6,
+      "lifetime": 22,
+      "max_live": 24
+    },
+    {
+      "label": "out[40]",
+      "count": 5,
+      "lifetime": 21,
+      "max_live": 24
+    },
+    {
+      "label": "out[41]",
+      "count": 6,
+      "lifetime": 22,
+      "max_live": 24
+    },
+    {
+      "label": "out[42]",
+      "count": 4,
+      "lifetime": 16,
+      "max_live": 24
+    },
+    {
+      "label": "out[43]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 7
+    },
+    {
+      "label": "out[44]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 6
+    },
+    {
+      "label": "out[45]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 10
+    },
+    {
+      "label": "out[46]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 11
+    },
+    {
+      "label": "out[47]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 9
+    },
+    {
+      "label": "out[48]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 5
+    },
+    {
+      "label": "out[49]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 8
+    },
+    {
+      "label": "out[50]",
+      "count": 2,
+      "lifetime": 9,
+      "max_live": 26
+    },
+    {
+      "label": "out[51]",
+      "count": 3,
+      "lifetime": 37,
+      "max_live": 29
+    },
+    {
+      "label": "out[52]",
+      "count": 4,
+      "lifetime": 37,
+      "max_live": 29
+    },
+    {
+      "label": "out[53]",
+      "count": 3,
+      "lifetime": 34,
+      "max_live": 29
+    },
+    {
+      "label": "out[54]",
+      "count": 4,
+      "lifetime": 40,
+      "max_live": 29
+    },
+    {
+      "label": "out[55]",
+      "count": 3,
+      "lifetime": 35,
+      "max_live": 29
+    },
+    {
+      "label": "out[56]",
+      "count": 2,
+      "lifetime": 10,
+      "max_live": 26
+    },
+    {
+      "label": "out[57]",
+      "count": 2,
+      "lifetime": 9,
+      "max_live": 29
+    },
+    {
+      "label": "out[58]",
+      "count": 3,
+      "lifetime": 23,
+      "max_live": 32
+    },
+    {
+      "label": "out[59]",
+      "count": 4,
+      "lifetime": 25,
+      "max_live": 32
+    },
+    {
+      "label": "out[60]",
+      "count": 3,
+      "lifetime": 27,
+      "max_live": 32
+    },
+    {
+      "label": "out[61]",
+      "count": 4,
+      "lifetime": 31,
+      "max_live": 32
+    },
+    {
+      "label": "out[62]",
+      "count": 3,
+      "lifetime": 19,
+      "max_live": 32
+    },
+    {
+      "label": "out[63]",
+      "count": 2,
+      "lifetime": 10,
+      "max_live": 29
+    },
+    {
+      "label": "out[64]",
+      "count": 5,
+      "lifetime": 58,
+      "max_live": 24
+    },
+    {
+      "label": "out[65]",
+      "count": 5,
+      "lifetime": 47,
+      "max_live": 24
+    },
+    {
+      "label": "out[66]",
+      "count": 8,
+      "lifetime": 49,
+      "max_live": 24
+    },
+    {
+      "label": "out[67]",
+      "count": 5,
+      "lifetime": 57,
+      "max_live": 24
+    },
+    {
+      "label": "out[68]",
+      "count": 8,
+      "lifetime": 52,
+      "max_live": 24
+    },
+    {
+      "label": "out[69]",
+      "count": 5,
+      "lifetime": 35,
+      "max_live": 24
+    },
+    {
+      "label": "out[70]",
+      "count": 5,
+      "lifetime": 55,
+      "max_live": 24
+    },
+    {
+      "label": "w[0]",
+      "count": 1,
+      "lifetime": 1,
+      "max_live": 4
+    },
+    {
+      "label": "w[1]",
+      "count": 3,
+      "lifetime": 3,
+      "max_live": 9
+    },
+    {
+      "label": "w[2]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 21
+    },
+    {
+      "label": "w[3]",
+      "count": 3,
+      "lifetime": 3,
+      "max_live": 19
+    },
+    {
+      "label": "w[4]",
+      "count": 3,
+      "lifetime": 3,
+      "max_live": 6
+    },
+    {
+      "label": "w[5]",
+      "count": 11,
+      "lifetime": 11,
+      "max_live": 15
+    },
+    {
+      "label": "w[6]",
+      "count": 11,
+      "lifetime": 14,
+      "max_live": 32
+    },
+    {
+      "label": "w[7]",
+      "count": 21,
+      "lifetime": 40,
+      "max_live": 24
+    },
+    {
+      "label": "w[8]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 21
+    },
+    {
+      "label": "w[9]",
+      "count": 11,
+      "lifetime": 11,
+      "max_live": 15
+    },
+    {
+      "label": "w[10]",
+      "count": 21,
+      "lifetime": 21,
+      "max_live": 29
+    },
+    {
+      "label": "w[11]",
+      "count": 5,
+      "lifetime": 5,
+      "max_live": 16
+    },
+    {
+      "label": "w[12]",
+      "count": 25,
+      "lifetime": 25,
+      "max_live": 24
+    },
+    {
+      "label": "w[13]",
+      "count": 7,
+      "lifetime": 7,
+      "max_live": 11
+    },
+    {
+      "label": "w[14]",
+      "count": 21,
+      "lifetime": 42,
+      "max_live": 29
+    },
+    {
+      "label": "w[15]",
+      "count": 21,
+      "lifetime": 32,
+      "max_live": 32
+    },
+    {
+      "label": "w[16]",
+      "count": 41,
+      "lifetime": 62,
+      "max_live": 24
+    },
+    {
+      "label": "x[0]",
+      "count": 16,
+      "lifetime": 145,
+      "max_live": 32
+    },
+    {
+      "label": "x[1]",
+      "count": 26,
+      "lifetime": 60,
+      "max_live": 29
+    },
+    {
+      "label": "x[2]",
+      "count": 18,
+      "lifetime": 37,
+      "max_live": 29
+    },
+    {
+      "label": "x[3]",
+      "count": 26,
+      "lifetime": 70,
+      "max_live": 29
+    },
+    {
+      "label": "x[4]",
+      "count": 26,
+      "lifetime": 86,
+      "max_live": 32
+    },
+    {
+      "label": "x[5]",
+      "count": 28,
+      "lifetime": 120,
+      "max_live": 32
+    },
+    {
+      "label": "x[6]",
+      "count": 21,
+      "lifetime": 79,
+      "max_live": 32
+    },
+    {
+      "label": "x[7]",
+      "count": 28,
+      "lifetime": 134,
+      "max_live": 32
+    },
+    {
+      "label": "x[8]",
+      "count": 26,
+      "lifetime": 100,
+      "max_live": 32
+    },
+    {
+      "label": "y[0]",
+      "count": 9,
+      "lifetime": 215,
+      "max_live": 32
+    },
+    {
+      "label": "y[1]",
+      "count": 18,
+      "lifetime": 92,
+      "max_live": 32
+    },
+    {
+      "label": "y[2]",
+      "count": 13,
+      "lifetime": 77,
+      "max_live": 32
+    },
+    {
+      "label": "y[3]",
+      "count": 18,
+      "lifetime": 102,
+      "max_live": 32
+    },
+    {
+      "label": "y[4]",
+      "count": 13,
+      "lifetime": 105,
+      "max_live": 32
+    },
+    {
+      "label": "y[5]",
+      "count": 14,
+      "lifetime": 122,
+      "max_live": 32
+    },
+    {
+      "label": "y[6]",
+      "count": 13,
+      "lifetime": 120,
+      "max_live": 32
+    },
+    {
+      "label": "y[7]",
+      "count": 14,
+      "lifetime": 130,
+      "max_live": 32
+    },
+    {
+      "label": "y[8]",
+      "count": 13,
+      "lifetime": 117,
+      "max_live": 32
+    },
+    {
+      "label": "y[9]",
+      "count": 10,
+      "lifetime": 167,
+      "max_live": 32
+    },
+    {
+      "label": "y[10]",
+      "count": 12,
+      "lifetime": 176,
+      "max_live": 32
+    },
+    {
+      "label": "y[11]",
+      "count": 17,
+      "lifetime": 173,
+      "max_live": 32
+    },
+    {
+      "label": "y[12]",
+      "count": 12,
+      "lifetime": 173,
+      "max_live": 32
+    },
+    {
+      "label": "y[13]",
+      "count": 17,
+      "lifetime": 176,
+      "max_live": 32
+    },
+    {
+      "label": "y[14]",
+      "count": 12,
+      "lifetime": 181,
+      "max_live": 32
+    },
+    {
+      "label": "y[15]",
+      "count": 10,
+      "lifetime": 169,
+      "max_live": 32
+    }
+  ]
+}
