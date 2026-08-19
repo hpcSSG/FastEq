@@ -43,3 +43,5 @@ dist/
 build/
 */build/
 *.csv
+
+fasteq/ops/_schedule_stats

@@ -41,7 +41,7 @@ STC_PAD_VALUE = -1
 # from the original path order selected by the scheduler, before placement
 # rewrites the instruction stream.
 _SCHEDULE_STATS_DUMPED: Set[Tuple[str, str, str]] = set()
-_DEFAULT_SCHEDULE_STATS_ENABLED = True
+_DEFAULT_SCHEDULE_STATS_ENABLED = False
 
 
 def _schedule_stats_enabled() -> bool:
