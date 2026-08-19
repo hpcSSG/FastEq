@@ -84,10 +84,12 @@ environment file when reproducing the final paper results.
 
 ### 1. Clone the repository
 
+```bash
 git clone -b v0.3.0 https://github.com/malixian/FastEq.git
 git clone -b fasteq https://github.com/malixian/cuEquivariance_torch.git
 git clone -b fasteq https://github.com/malixian/mace.git
 git clone -b fasteq https://github.com/malixian/SevenNet.git
+```
 
 
 ### 2. Create an isolated environment
