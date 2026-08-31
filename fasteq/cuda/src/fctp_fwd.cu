@@ -365,11 +365,11 @@ at::Tensor launch_fused_multipath_fctp(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -379,7 +379,6 @@ at::Tensor launch_fused_multipath_fctp(
                 cg_val_all.scalar_type() == dtype,
                 "dtypes must match");
 
-    // c10::cuda::CUDAGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
     TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
@@ -424,15 +423,16 @@ at::Tensor launch_fused_multipath_fctp(
     size_t shmem_elems = (size_t)W * U_pad + (size_t)nnz_max * U_pad;
     size_t shmem_bytes = shmem_elems * a_all.element_size();
     //std::cout<<"fast fctp launch param, P:"<<P<<" B:"<<B<<" shmem_byte:"<<shmem_bytes<<std::endl;
-
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    
+    c10::cuda::CUDAGuard device_guard(a_all.get_device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream(a_all.get_device());
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_forward_multipath_concat", [&] {
         using scalar_t_ = scalar_t;
-        cudaFuncSetAttribute(
+        /* cudaFuncSetAttribute(
             fused_fctp_kernel_fwd_multipath<scalar_t_>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)shmem_bytes);
+            (int)shmem_bytes); */
 
         fused_fctp_kernel_fwd_multipath<scalar_t_>
             <<<grid, block, (int)shmem_bytes, stream>>>(
@@ -476,11 +476,11 @@ at::Tensor launch_fused_multipath_fctp_tile(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(a_all.is_cuda() && b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = a_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -490,7 +490,7 @@ at::Tensor launch_fused_multipath_fctp_tile(
                 cg_val_all.scalar_type() == dtype,
                 "dtypes must match");
 
-    // c10::cuda::CUDAGuard device_guard(a_all.get_device());
+    //c10::cuda::CUDAGuard device_guard(a_all.get_device());
 
     const int B       = (int)a_all.size(0);
     TORCH_CHECK(a_all.size(1) % U == 0, "a_all.size(1) must be divisible by U");
@@ -501,7 +501,7 @@ at::Tensor launch_fused_multipath_fctp_tile(
     b_all = b_all.view({B, 1, V});
     w_all = w_all.view({P, U, V, W});
 
-    a_all        = a_all.contiguous();
+    /* a_all        = a_all.contiguous();
     b_all        = b_all.contiguous();
     w_all        = w_all.contiguous();
     cg_i_all     = cg_i_all.contiguous();
@@ -510,7 +510,7 @@ at::Tensor launch_fused_multipath_fctp_tile(
     cg_val_all   = cg_val_all.contiguous();
     nnz_per_path = nnz_per_path.contiguous();
     K_per_path   = K_per_path.contiguous();
-    path_offset  = path_offset.contiguous();
+    path_offset  = path_offset.contiguous(); */
     
     const int nnz_max = (int)cg_i_all.size(1);
     int K_max = nnz_max;
@@ -568,7 +568,6 @@ at::Tensor launch_fused_multipath_fctp_tile(
     return out;
 }
 
-
-TORCH_LIBRARY(fctp_fused_multipath_fwd, m) {
+TORCH_LIBRARY(fctp_fwd, m) {
     m.def("forward", &launch_fused_multipath_fctp_tile);
 }

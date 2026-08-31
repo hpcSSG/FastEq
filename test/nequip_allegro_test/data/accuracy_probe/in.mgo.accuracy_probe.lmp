@@ -1,0 +1,22 @@
+units          metal
+atom_style     atomic
+boundary       p p p
+atom_modify    map yes
+newton         on
+
+read_data      /tmp/placeholder.data
+
+neighbor       1.0 bin
+neigh_modify   every 1 delay 0 check yes
+
+pair_style     mliap unified /tmp/placeholder.pt 0
+pair_coeff     * * Mg O
+
+thermo         1
+thermo_style   custom step pe etotal press pxx pyy pzz pxy pxz pyz fnorm vol atoms
+timestep       0.001
+
+dump           1 all custom 1 __DUMPFILE__ id type x y z fx fy fz
+dump_modify    1 sort id format line "%d %d %.16e %.16e %.16e %.16e %.16e %.16e"
+
+run            0

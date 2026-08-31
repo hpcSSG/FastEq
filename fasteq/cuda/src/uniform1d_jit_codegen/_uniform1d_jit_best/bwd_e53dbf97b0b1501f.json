@@ -1,0 +1,8 @@
+{
+  "best_ms": NaN,
+  "kind": "BWD",
+  "module_name": "uniform1d_bwd_sched_uu_u_u224_path215_xsrc1_ysrc0_scatter1_gradw_jit_double_7686639c58228119_cand0_e5fa6dcc4569a93b",
+  "tag": "cand0",
+  "time": 1782982617.8770497,
+  "tune_key": "uniform1d_bwd_sched_uu_u_u224_path215_xsrc1_ysrc0_scatter1_gradw_jit_double_7686639c58228119"
+}

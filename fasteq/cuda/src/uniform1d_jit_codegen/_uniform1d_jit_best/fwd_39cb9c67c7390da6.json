@@ -1,0 +1,8 @@
+{
+  "best_ms": NaN,
+  "kind": "FWD",
+  "module_name": "uniform1d_fwd_uu_u_u224_path16_xsrc1_ysrc0_scatter1_jit_double_75064d4efb579da9_cand0_b9174c765ab28125",
+  "tag": "cand0",
+  "time": 1782981435.0280683,
+  "tune_key": "uniform1d_fwd_uu_u_u224_path16_xsrc1_ysrc0_scatter1_jit_double_75064d4efb579da9"
+}

@@ -8,8 +8,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Hopper H100
-set(CMAKE_CUDA_ARCHITECTURES 90-real)
+set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
@@ -27,21 +29,52 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
-find_package(CUDAToolkit REQUIRED)
+if(NOT TARGET CUDA::nvToolsExt)
+    add_library(CUDA::nvToolsExt INTERFACE IMPORTED GLOBAL)
+endif()
 
+# ---- Find CUDA runtime shipped with PyTorch (pip wheel) ----
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}" -c
+    "import os, torch; \
+p=os.path.join(os.path.dirname(torch.__file__),'..','nvidia','cuda_runtime','lib'); \
+print(os.path.abspath(p))"
+  OUTPUT_VARIABLE TORCH_CUDA_RUNTIME_LIBDIR
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
+  message(STATUS "Using PyTorch CUDA runtime libdir: ${TORCH_CUDA_RUNTIME_LIBDIR}")
+else()
+  message(WARNING "PyTorch CUDA runtime libdir not found: ${TORCH_CUDA_RUNTIME_LIBDIR} (libcudart.so.12 missing)")
+endif()
+
+add_library(fasteq_deps INTERFACE)
+target_include_directories(fasteq_deps INTERFACE
+  ${Python3_INCLUDE_DIRS}
+  ${TORCH_INCLUDE_DIRS}
+)
+target_link_libraries(fasteq_deps INTERFACE
+  Python3::Module
+  ${TORCH_LIBRARIES}
+)
+target_compile_options(fasteq_deps INTERFACE
+  $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  $<$<COMPILE_LANGUAGE:CUDA>:-O3>
+  $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
+  $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
+)
+
+include_directories(src)
 # ---- sources (use absolute paths to avoid empty/invalid lists) ----
 set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/stc_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/cwtp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_fwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/mptp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/spherical_harmonics.cu"
 )
+
+add_subdirectory(src/equi_linear_kernels)
+add_subdirectory(src/atombit)
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
 foreach(_f IN LISTS CUDA_SRCS)
@@ -50,11 +83,26 @@ foreach(_f IN LISTS CUDA_SRCS)
   endif()
 endforeach()
 
-add_library(_cuda MODULE ${CUDA_SRCS})
+add_library(_cuda MODULE
+  ${CUDA_SRCS}
+  $<TARGET_OBJECTS:equi_kernels_obj>
+  $<TARGET_OBJECTS:atombit_obj>
+)
+
+
+# Prefer PyTorch-shipped CUDA runtime at runtime
+if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
+  set_target_properties(_cuda PROPERTIES
+    BUILD_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
+    INSTALL_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
+  )
+endif()
 
 target_include_directories(_cuda PRIVATE
   ${Python3_INCLUDE_DIRS}
   ${TORCH_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear_kernels
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/atombit
 )
 
 target_compile_options(_cuda PRIVATE
@@ -63,14 +111,17 @@ target_compile_options(_cuda PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>
   $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=--maxrregcount=128>
-  $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
+  #$<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-warn-spills>
 )
 
 target_link_libraries(_cuda PRIVATE
   Python3::Module
   ${TORCH_LIBRARIES}
-  CUDA::cudart
+)
+
+target_compile_options(_cuda PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:--gpu-architecture=sm_90a>
 )
 
 set_target_properties(_cuda PROPERTIES

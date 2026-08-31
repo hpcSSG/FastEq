@@ -40,7 +40,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath(
     const int*     __restrict__ path_offset,   // [P]
     int nnz_max,
     int P, int B, int I_total, int U, int V, int W,
-    int K_max, int K_total,
+    int K_total,
     const scalar_t* __restrict__ grad_out,     // [B,K_total,W]
     scalar_t*       __restrict__ grad_a        // [B,I_total,U]
 )
@@ -183,12 +183,12 @@ at::Tensor launch_fused_multipath_fctp_backward(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda()
              && grad_out.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -241,14 +241,6 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     auto grad_a = at::zeros({B, I_total, U}, b_all.options());
 
-    // K_max 目前只是为了接口对齐（kernel 里没实际用它做线程分配）
-    auto K_per_path_cpu = K_per_path.to(at::kCPU);
-    int K_max = 0;
-    for (int p = 0; p < P; ++p) {
-        int Kp = K_per_path_cpu[p].item<int>();
-        if (Kp > K_max) K_max = Kp;
-    }
-
     const int tx = (int)U;   // 每个线程负责一个 u
     const int ty = 1;
     dim3 block(tx, ty, 1);
@@ -263,10 +255,10 @@ at::Tensor launch_fused_multipath_fctp_backward(
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath", [&] {
         using scalar_t_ = scalar_t;
-        cudaFuncSetAttribute(
+        /* cudaFuncSetAttribute(
             fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
-            (int)shmem_bytes);
+            (int)shmem_bytes); */
 
         fused_fctp_kernel_bwd_grad_a_multipath<scalar_t_>
             <<<grid, block, (int)shmem_bytes, stream>>>(
@@ -281,7 +273,7 @@ at::Tensor launch_fused_multipath_fctp_backward(
                 path_offset.data_ptr<int>(),
                 nnz_max,
                 P, B, I_total, (int)U, (int)V, (int)W,
-                K_max, (int)K_total,
+                (int)K_total,
                 grad_out.data_ptr<scalar_t_>(),
                 grad_a.data_ptr<scalar_t_>());
     });
@@ -305,7 +297,7 @@ __global__ void fused_fctp_kernel_bwd_grad_a_multipath_tiledU(
     const int*     __restrict__ path_offset,   // [P]
     int nnz_max,
     int P, int B, int I_total, int U, int V, int W,
-    int K_max, int K_total,
+    int K_total,
     const scalar_t* __restrict__ grad_out,     // [B,K_total,W]
     scalar_t*       __restrict__ grad_a        // [B,I_total,U]
 )
@@ -450,12 +442,12 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     const int64_t K_total
 )
 {
-    TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
+    /* TORCH_CHECK(b_all.is_cuda() && w_all.is_cuda()
              && cg_i_all.is_cuda() && cg_j_all.is_cuda() && cg_k_all.is_cuda()
              && cg_val_all.is_cuda() && nnz_per_path.is_cuda()
              && K_per_path.is_cuda() && path_offset.is_cuda()
              && grad_out.is_cuda(),
-             "all tensors must be CUDA");
+             "all tensors must be CUDA"); */
 
     auto dtype = b_all.scalar_type();
     TORCH_CHECK(dtype == at::kFloat || dtype == at::kDouble,
@@ -506,17 +498,17 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     TORCH_CHECK(nnz_max <= 7, "nnz_max<=7 required");
     TORCH_CHECK(W % 4 == 0, "W%4==0 required for Vec4 loads");
 
-    auto grad_a = at::zeros({B, I_total, U}, b_all.options());
-
-    // K_max 目前只是为了接口对齐
-    auto K_per_path_cpu = K_per_path.to(at::kCPU);
-    int K_max = 0;
-    for (int p = 0; p < P; ++p) {
-        int Kp = K_per_path_cpu[p].item<int>();
-        if (Kp > K_max) K_max = Kp;
-    }
+    //auto grad_a = at::zeros({B, I_total, U}, b_all.options());
+    auto grad_a = at::empty({B, I_total, U}, b_all.options());
 
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    cudaMemsetAsync(
+        grad_a.data_ptr(),
+        0,
+        grad_a.numel() * grad_a.element_size(),
+        stream
+    );
 
     AT_DISPATCH_FLOATING_TYPES(dtype, "fused_fctp_backward_grad_a_multipath_tiledU", [&] {
         using scalar_t_ = scalar_t;
@@ -544,7 +536,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
                     path_offset.data_ptr<int>(),
                     nnz_max,
                     P, B, I_total, (int)U, (int)V, (int)W,
-                    K_max, (int)K_total,
+                    (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
         } else {
@@ -570,7 +562,7 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
                     path_offset.data_ptr<int>(),
                     nnz_max,
                     P, B, I_total, (int)U, (int)V, (int)W,
-                    K_max, (int)K_total,
+                    (int)K_total,
                     grad_out.data_ptr<scalar_t_>(),
                     grad_a.data_ptr<scalar_t_>());
             }
@@ -582,8 +574,6 @@ at::Tensor launch_fused_multipath_fctp_tiled_backward(
     return grad_a;
 }
 
-
-
-TORCH_LIBRARY(fctp_fused_multipath_bwd, m) {
+TORCH_LIBRARY(fctp_bwd, m) {
     m.def("backward", &launch_fused_multipath_fctp_tiled_backward);
 }
