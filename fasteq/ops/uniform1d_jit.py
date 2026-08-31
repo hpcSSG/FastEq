@@ -4,7 +4,6 @@ import json
 import sys
 import shutil
 import hashlib
-import tempfile
 import traceback
 import re
 import io
@@ -392,12 +391,28 @@ def _detect_gpu_backend() -> str:
 def _default_build_root() -> Path:
     backend = _detect_gpu_backend()
 
-    root = (
-        _find_fasteq_root(Path(__file__).parent)
-        / backend
-        / "src"
-        / "uniform1d_jit_codegen"
+    env_root = os.environ.get("FASTEQ_JIT_CACHE_DIR", "").strip()
+    if env_root:
+        cache_root = Path(env_root).expanduser()
+    else:
+        xdg_cache_home = os.environ.get("XDG_CACHE_HOME", "").strip()
+        cache_root = (
+            Path(xdg_cache_home).expanduser()
+            if xdg_cache_home
+            else Path.home() / ".cache"
+        ) / "fasteq"
+
+    runtime_version = (
+        getattr(torch.version, "hip", None)
+        or getattr(torch.version, "cuda", None)
+        or "unknown"
     )
+    runtime_version = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(runtime_version))
+    abi_key = (
+        f"py{sys.version_info.major}{sys.version_info.minor}_"
+        f"{backend}{runtime_version}"
+    )
+    root = cache_root / abi_key / "uniform1d_jit_codegen"
 
     _ensure_dir(root)
     return root

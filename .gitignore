@@ -45,3 +45,11 @@ build/
 *.csv
 
 fasteq/ops/_schedule_stats
+# Runtime JIT, autotuning, and scheduler artifacts
+.ninja_deps
+.ninja_log
+fasteq/cuda/src/uniform1d_jit_codegen/
+fasteq/hip/src/uniform1d_jit_codegen/
+fasteq/cuda/src/uniform1d_jit_codegen.baseline/
+fasteq/cuda/src/uniform1d_jit_codegen.unroll/
+fasteq/ops/_schedule_stats/
