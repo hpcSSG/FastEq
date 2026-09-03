@@ -2741,6 +2741,39 @@ def _print_index_reuse_stats(
 
     print()
 
+from datetime import datetime
+from pathlib import Path
+def dump_tensor(
+    tensor: torch.Tensor,
+    file_path: str,
+    *,
+    to_cpu: bool = True,
+) -> None:
+    """
+    将 Tensor 保存到磁盘。
+
+    Args:
+        tensor: 要保存的 Tensor。
+        file_path: 输出路径，例如 "./dump/stc_d_x0.pt"。
+        to_cpu: 是否先转移到 CPU，建议开启。
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = Path(file_path) / timestamp
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    value = tensor.detach()
+    if to_cpu:
+        value = value.cpu()
+
+    # clone 避免底层存储包含无关数据
+    value = value.contiguous().clone()
+    torch.save(value, path)
+
+    print(
+        f"Dumped tensor: {path}, "
+        f"shape={tuple(value.shape)}, "
+        f"dtype={value.dtype}"
+    )
 
 # -----------------------------------------------------------------------------
 # Differentiable first backward / generated CUDA double backward
@@ -2809,6 +2842,14 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             grad_w=ctx.need_grad_w,
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
+        """ print(f"uniform1d_jit d_go shape:{d_go.shape}: {d_go.sum()}")
+        print(f"uniform1d_jit d_w shape:{d_w.shape}: {d_w.sum()}")
+        print(f"uniform1d_jit d_x shape:{d_x.shape}: {d_x.sum()}")
+        print(f"uniform1d_jit d_y shape:{d_y.shape}: {d_y.sum()}")
+        dump_tensor(d_go, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_go.shape[0]}_{d_go.shape[1]}.pt")
+        dump_tensor(d_w, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_w.shape[0]}_{d_w.shape[1]}.pt")
+        dump_tensor(d_x, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_x.shape[0]}_{d_x.shape[1]}.pt")
+        dump_tensor(d_y, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_y.shape[0]}_{d_y.shape[1]}.pt") """
         return (
             d_go, d_w, d_x, d_y,
             None, None, None, None, None,
@@ -2882,8 +2923,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         P = i_list.numel()
         #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000.0
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
 
         out = _run_fwd(
             w=w,
@@ -2904,9 +2945,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         out = out.view(-1, out_seg_num * u_dim)
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000.0
-        #print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(w, x, y)
         ctx.i_list = i_list

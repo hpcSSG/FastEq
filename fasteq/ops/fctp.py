@@ -273,6 +273,136 @@ def triton_fused_fctp_bwd(
     return grad_x.view(B, -1)
 
 
+@triton.jit
+def fused_onehot_wpuvw_bwd_dw_kernel(
+    grad_out_ptr,     # *fp32/fp64, [B,K,W]
+    x_ptr,            # *fp32/fp64, [B,I,U]
+    vstar_ptr,        # *int32, [B]
+    p_for_k_ptr,      # *int32, [K]
+    i_for_k_ptr,      # *int32, [K]
+    val_for_k_ptr,    # *fp32/fp64, [K]
+    grad_w_ptr,       # *fp32/fp64, [P,U,V,W]
+    B: tl.constexpr, I: tl.constexpr, K: tl.constexpr, U: tl.constexpr,
+    P: tl.constexpr, V: tl.constexpr, W: tl.constexpr,
+    alpha: tl.constexpr,
+    BU: tl.constexpr, BW: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+):
+    """Fuse the outer product and index_add reduction used by grad_w.
+
+    Each program handles one (batch,k) pair and directly scatters its [BU,BW]
+    outer-product tile into grad_w.  atomic_add performs the former index_add
+    reduction without materializing a [B,K,U,W] contribution tensor.
+    """
+    pid_r = tl.program_id(0)
+    pid_u = tl.program_id(1)
+    pid_w = tl.program_id(2)
+
+    b = pid_r // K
+    k = pid_r - b * K
+    u_ids = pid_u * BU + tl.arange(0, BU)
+    w_ids = pid_w * BW + tl.arange(0, BW)
+    mu = u_ids < U
+    mw = w_ids < W
+
+    p = tl.load(p_for_k_ptr + k).to(tl.int32)
+    i = tl.load(i_for_k_ptr + k).to(tl.int32)
+    v = tl.load(vstar_ptr + b).to(tl.int32)
+    val = tl.load(val_for_k_ptr + k).to(ACC_DTYPE)
+    valid = (i >= 0) & (p >= 0) & (p < P) & (v >= 0) & (v < V)
+
+    x_off = (b * I + i) * U + u_ids
+    x_val = tl.load(
+        x_ptr + x_off,
+        mask=valid & mu,
+        other=0.0,
+    ).to(ACC_DTYPE)
+
+    go_off = (b * K + k) * W + w_ids
+    go = tl.load(
+        grad_out_ptr + go_off,
+        mask=valid & mw,
+        other=0.0,
+    ).to(ACC_DTYPE)
+
+    contribution = (
+        x_val[:, None]
+        * go[None, :]
+        * val
+        * tl.full((), alpha, ACC_DTYPE)
+    )
+    out_off = (((p * U + u_ids)[:, None] * V + v) * W
+               + w_ids[None, :])
+    tl.atomic_add(
+        grad_w_ptr + out_off,
+        contribution,
+        mask=valid & mu[:, None] & mw[None, :],
+    )
+
+
+@torch.no_grad()
+def triton_fused_fctp_bwd_w(
+    grad_out: torch.Tensor,  # [B,K,W]
+    x: torch.Tensor,         # [B,I,U]
+    vstar: torch.Tensor,
+    p_for_k: torch.Tensor,
+    i_for_k: torch.Tensor,
+    val_for_k: torch.Tensor,
+    P: int,
+    V: int,
+    alpha,
+    BU=16,
+    BW=16,
+    num_warps=4,
+):
+    """Triton grad_w with fused contraction and sparse index reduction."""
+    if grad_out.ndim != 3 or x.ndim != 3:
+        raise ValueError("expected grad_out [B,K,W] and x [B,I,U]")
+    if not grad_out.is_cuda or not x.is_cuda:
+        raise ValueError("Triton grad_w expects CUDA/ROCm tensors")
+    if grad_out.dtype not in (torch.float32, torch.float64):
+        raise TypeError("Triton grad_w supports fp32/fp64 only")
+    if x.dtype != grad_out.dtype or val_for_k.dtype != grad_out.dtype:
+        raise TypeError("x, grad_out, and val_for_k must have the same dtype")
+
+    B, K, W = grad_out.shape
+    B_x, I, U = x.shape
+    if B_x != B:
+        raise ValueError(f"x batch {B_x} does not match grad_out batch {B}")
+    if p_for_k.numel() != K or i_for_k.numel() != K:
+        raise ValueError("p_for_k and i_for_k must contain K entries")
+    if val_for_k.numel() != K or vstar.numel() != B:
+        raise ValueError("val_for_k must contain K entries and vstar B entries")
+
+    # Required because multiple (batch,k) programs atomically accumulate into
+    # the same (path,u,v,w) output entries.
+    grad_w = torch.zeros((P, U, V, W), device=x.device, dtype=x.dtype)
+    acc_dtype = tl.float64 if x.dtype == torch.float64 else tl.float32
+    grid = (B * K, triton.cdiv(U, BU), triton.cdiv(W, BW))
+    fused_onehot_wpuvw_bwd_dw_kernel[grid](
+        grad_out,
+        x,
+        vstar,
+        p_for_k,
+        i_for_k,
+        val_for_k,
+        grad_w,
+        B=B,
+        I=I,
+        K=K,
+        U=U,
+        P=P,
+        V=V,
+        W=W,
+        alpha=alpha,
+        BU=BU,
+        BW=BW,
+        ACC_DTYPE=acc_dtype,
+        num_warps=num_warps,
+    )
+    return grad_w
+
+
 @torch.no_grad()
 def pad_p_for_k(
     p_for_k: torch.Tensor,
@@ -329,79 +459,185 @@ def pad_p_for_k(
     return padded
 
 
-def differentiable_fctp_bwd_x(
-    grad_out: torch.Tensor,
-    w: torch.Tensor,
-    vstar: torch.Tensor,
-    p_for_k: torch.Tensor,
-    i_for_k: torch.Tensor,
-    val_for_k: torch.Tensor,
-    I: int,
-    alpha,
-) -> torch.Tensor:
-    """Compute ``grad_x`` with differentiable PyTorch operations.
+class _FCTPGradXWithDoubleBackward(torch.autograd.Function):
+    """First backward for x, with an explicit fused second backward."""
 
-    This implements the same one-hot-y contraction as the Triton backward, but
-    deliberately remains in PyTorch's autograd graph.  It is used when the
-    caller requests ``create_graph=True`` so a subsequent double backward can
-    differentiate ``grad_x`` with respect to ``grad_out`` and ``w``.
-    """
-    if grad_out.ndim != 3 or w.ndim != 4:
-        raise ValueError("expected grad_out [B,K,W] and w [P,U,V,W]")
+    @staticmethod
+    def forward(
+        ctx,
+        grad_out,
+        w,
+        vstar,
+        p_for_k,
+        i_for_k,
+        val_for_k,
+        I,
+        alpha,
+        can_use_empty_grad_x,
+    ):
+        B, K, W = grad_out.shape
+        P, U, V, W_weight = w.shape
+        if W_weight != W:
+            raise ValueError("grad_out and w have different W dimensions")
 
-    B, K, W_out = grad_out.shape
-    P, U, V, W = w.shape
-    if W_out != W:
-        raise ValueError(f"grad_out W={W_out} does not match weight W={W}")
-    if p_for_k.numel() != K or i_for_k.numel() != K:
-        raise ValueError("p_for_k and i_for_k must contain K entries")
-    if val_for_k.numel() != K:
-        raise ValueError("val_for_k must contain K entries")
+        ctx.save_for_backward(
+            grad_out, w, vstar, p_for_k, i_for_k, val_for_k
+        )
+        ctx.I = I
+        ctx.alpha = alpha
+        ctx.can_use_empty_grad_x = can_use_empty_grad_x
 
-    valid_k = torch.nonzero(i_for_k >= 0, as_tuple=False).flatten()
-    if valid_k.numel() == 0:
-        # Keep a zero-valued dependency on grad_out and w.  Without it, the
-        # returned tensor would not require grad and double backward would fail
-        # for descriptors whose output components are all structurally zero.
-        zero = grad_out.sum() * 0 + w.sum() * 0
-        return torch.zeros(
-            (B, I * U), device=grad_out.device, dtype=grad_out.dtype
-        ) + zero
+        grad_x = triton_fused_fctp_bwd(
+            grad_out,
+            w,
+            vstar,
+            p_for_k,
+            i_for_k,
+            val_for_k,
+            I,
+            alpha,
+            can_use_empty_grad_x,
+            BK=8,
+            BW=32,
+            BU=32,
+            num_warps=4,
+        )
+        return grad_x.view(B, I, U)
 
-    p_idx = p_for_k.index_select(0, valid_k).to(torch.long)
-    i_idx = i_for_k.index_select(0, valid_k).to(torch.long)
-    scale = val_for_k.index_select(0, valid_k) * alpha
+    @staticmethod
+    def backward(ctx, grad_grad_x):
+        grad_out, w, vstar, p_for_k, i_for_k, val_for_k = ctx.saved_tensors
+        if grad_grad_x is None:
+            return (None,) * 9
 
-    if torch.any((p_idx < 0) | (p_idx >= P)).item():
-        raise ValueError("p_for_k contains an out-of-range path index")
-    if torch.any((i_idx < 0) | (i_idx >= I)).item():
-        raise ValueError("i_for_k contains an out-of-range input index")
-    if vstar.numel() != B:
-        raise ValueError(f"vstar has {vstar.numel()} entries, expected B={B}")
+        grad_grad_x = grad_grad_x.contiguous()
+        B, K, W = grad_out.shape
+        P, U, V, _ = w.shape
 
-    # Arrange the weight as [P*V,U,W].  For every (batch, valid-k), select
-    # weight[p_for_k[k], :, vstar[b], :].
-    w_pvuw = w.permute(0, 2, 1, 3).reshape(P * V, U, W)
-    pv_idx = (
-        p_idx.unsqueeze(0) * V + vstar.to(torch.long).unsqueeze(1)
-    ).reshape(-1)
-    w_selected = w_pvuw.index_select(0, pv_idx).view(
-        B, valid_k.numel(), U, W
-    )
+        # d(grad_x)/d(grad_out): same contraction as FCTP forward, with
+        # grad_grad_x replacing x.
+        grad_grad_out = None
+        if ctx.needs_input_grad[0]:
+            grad_grad_out = triton_fused_fctp_fwd(
+                grad_grad_x,
+                vstar,
+                w,
+                p_for_k,
+                i_for_k,
+                val_for_k,
+                ctx.alpha,
+                K,
+                BK=8,
+                BW=64,
+                BU=32,
+                num_warps=4,
+            ).view_as(grad_out)
 
-    go = grad_out.index_select(1, valid_k)
-    contribution = torch.einsum(
-        "bqw,bquw,q->bqu", go, w_selected, scale
-    )
+        # d(grad_x)/d(w): same fused outer-product/reduction primitive used to
+        # generate grad_w, with grad_grad_x replacing x.
+        grad_w = None
+        if ctx.needs_input_grad[1]:
+            grad_w = triton_fused_fctp_bwd_w(
+                grad_out,
+                grad_grad_x,
+                vstar,
+                p_for_k,
+                i_for_k,
+                val_for_k,
+                P,
+                V,
+                ctx.alpha,
+            )
 
-    # Multiple output k values may contribute to the same input i.  index_add
-    # performs the required reduction and, unlike the direct-store Triton fast
-    # path, remains correct for duplicate i_idx values.
-    grad_x = torch.zeros(
-        (B, I, U), device=grad_out.device, dtype=grad_out.dtype
-    )
-    grad_x = grad_x.index_add(1, i_idx, contribution)
-    return grad_x.reshape(B, I * U)
+        return grad_grad_out, grad_w, None, None, None, None, None, None, None
+
+
+class _FCTPGradWWithDoubleBackward(torch.autograd.Function):
+    """First backward for w, with an explicit fused second backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        grad_out,
+        x,
+        vstar,
+        p_for_k,
+        i_for_k,
+        val_for_k,
+        P,
+        V,
+        alpha,
+        can_use_empty_grad_x,
+    ):
+        ctx.save_for_backward(
+            grad_out, x, vstar, p_for_k, i_for_k, val_for_k
+        )
+        ctx.P = P
+        ctx.V = V
+        ctx.alpha = alpha
+        ctx.can_use_empty_grad_x = can_use_empty_grad_x
+
+        return triton_fused_fctp_bwd_w(
+            grad_out,
+            x,
+            vstar,
+            p_for_k,
+            i_for_k,
+            val_for_k,
+            P,
+            V,
+            alpha,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_grad_w):
+        grad_out, x, vstar, p_for_k, i_for_k, val_for_k = ctx.saved_tensors
+        if grad_grad_w is None:
+            return (None,) * 10
+
+        grad_grad_w = grad_grad_w.contiguous()
+        B, K, W = grad_out.shape
+        _, I, U = x.shape
+
+        # d(grad_w)/d(grad_out): FCTP forward with grad_grad_w as its weight.
+        grad_grad_out = None
+        if ctx.needs_input_grad[0]:
+            grad_grad_out = triton_fused_fctp_fwd(
+                x,
+                vstar,
+                grad_grad_w,
+                p_for_k,
+                i_for_k,
+                val_for_k,
+                ctx.alpha,
+                K,
+                BK=8,
+                BW=64,
+                BU=32,
+                num_warps=4,
+            ).view_as(grad_out)
+
+        # d(grad_w)/d(x): the existing fused grad_x contraction with
+        # grad_grad_w replacing w.
+        grad_x = None
+        if ctx.needs_input_grad[1]:
+            grad_x = triton_fused_fctp_bwd(
+                grad_out,
+                grad_grad_w,
+                vstar,
+                p_for_k,
+                i_for_k,
+                val_for_k,
+                I,
+                ctx.alpha,
+                ctx.can_use_empty_grad_x,
+                BK=8,
+                BW=32,
+                BU=32,
+                num_warps=4,
+            ).view_as(x)
+
+        return grad_grad_out, grad_x, None, None, None, None, None, None, None, None
 
 
 class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
@@ -446,6 +682,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
             # use torch is better when open MPS
             # ====================== torch Implementation ======================
             vstar = torch.argmax(y, dim=1)
+            ctx.vstar = vstar.to(torch.int32).contiguous()
             w = w.view(U, V, W)
             w_selected = w[:, vstar, :].permute(1, 0, 2).contiguous()
 
@@ -467,7 +704,6 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         #torch.cuda.synchronize()
         #end_time = time.perf_counter() * 1000
         #execution_time_ms = end_time - start_time
-        #print(f"triton_fused_fctp_fwd output shape: {output.shape}")
 
         ctx.save_for_backward(w_input, x_input, y_input)
         ctx.meta = meta
@@ -482,7 +718,39 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
 
         w, x, y = ctx.saved_tensors
 
-        if not x.requires_grad:
+        # ``ctx.needs_input_grad`` records which original forward inputs need
+        # gradients.  When grad mode is enabled inside backward, the caller is
+        # using create_graph=True and is therefore constructing a graph for a
+        # subsequent double backward.  Print the actual runtime requirements
+        # here instead of inferring them only from the model configuration.
+        needs_w_grad, needs_x_grad, needs_y_grad, _ = ctx.needs_input_grad
+        if torch.is_grad_enabled():
+            print(
+                "[FastEq FCTP double-backward requirements] "
+                f"w={needs_w_grad}, x={needs_x_grad}, y={needs_y_grad}; "
+                f"grad_out.requires_grad={grad_out.requires_grad}"
+            )
+
+            dependencies = []
+            if needs_x_grad:
+                # grad_x = grad_out * w, so differentiating grad_x again needs
+                # the differentiable dependency on both grad_out and w.
+                dependencies.append("grad_x -> {grad_out, w}")
+            if needs_w_grad:
+                # grad_w = grad_out * x, so its double backward must retain
+                # the differentiable dependency on both grad_out and x.
+                dependencies.append("grad_w -> {grad_out, x}")
+            if needs_y_grad:
+                # y is converted to a discrete index by argmax in forward;
+                # there is no mathematical gradient through that selection.
+                dependencies.append("grad_y -> argmax(y) [NON-DIFFERENTIABLE]")
+
+            print(
+                "[FastEq FCTP double-backward dependencies] "
+                + (", ".join(dependencies) if dependencies else "none")
+            )
+
+        if not needs_x_grad and not needs_w_grad:
             return None, None, None, None
 
         meta = ctx.meta
@@ -504,60 +772,107 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         nnz0 = meta["nnz0"]
         can_use_empty_grad_x = meta["can_use_empty_grad_x"]
 
-        grad_out = grad_out.view(B, K_total, W)
-        w = w.view(path_num, U, V, W)
+        grad_out_3d = grad_out.view(B, K_total, W)
+        w_4d = w.view(path_num, U, V, W)
+        x_3d = x.view(B, I_total, U)
 
-        if path_num == 1 and nnz0 == 1 and I_total == 1 and K_total == 1:
-            #================ Path = 1, torch ===============
-            # vstar: [B]
-            vstar = torch.argmax(y, dim=1)
+        # The single-path torch forward multiplies only by cg_val.  The Triton
+        # forward multiplies by both val_for_k and cg_val.  Select the matching
+        # per-k scale here so both backward branches exactly mirror forward.
+        is_single_torch_path = (
+            path_num == 1 and nnz0 == 1 and I_total == 1 and K_total == 1
+        )
+        backward_val_for_k = (
+            torch.ones_like(val_for_k) if is_single_torch_path else val_for_k
+        )
 
-            w = w.view(U, V, W)
-            grad_out = grad_out.view(B, -1)
-            w_selected = w[:, vstar, :].permute(1, 0, 2).contiguous()
+        grad_x = None
+        grad_w = None
 
-            # grad_x[b, u] = cg_val * sum_w grad_out[b, w] * w_selected[b, u, w]
-            grad_x = torch.einsum("bw,buw->bu", grad_out, w_selected)
-            grad_x = grad_x * cg_val
-
-        else:
-            if torch.is_grad_enabled():
-                # create_graph=True: keep the first backward differentiable so
-                # PyTorch can construct and execute the double-backward graph.
-                grad_x = differentiable_fctp_bwd_x(
-                    grad_out,
-                    w,
+        if torch.is_grad_enabled():
+            # create_graph=True: create two explicit first-backward nodes.
+            # Their custom backward methods invoke fused Triton primitives for
+            # the two mixed second-derivative paths, without materializing the
+            # einsum result consumed by index_add.
+            if needs_x_grad:
+                grad_x = _FCTPGradXWithDoubleBackward.apply(
+                    grad_out_3d,
+                    w_4d,
                     ctx.vstar,
                     p_for_k,
                     i_for_k,
-                    val_for_k,
-                    I_total,
-                    cg_val,
-                )
-            else:
-                # Standard first backward: retain the faster Triton kernel.
-                grad_x = triton_fused_fctp_bwd(
-                    grad_out,
-                    w,
-                    ctx.vstar,
-                    p_for_k,
-                    i_for_k,
-                    val_for_k,
+                    backward_val_for_k,
                     I_total,
                     cg_val,
                     can_use_empty_grad_x,
-                    BK=8,
-                    BW=32,
-                    BU=32,
-                    num_warps=4,
-                )
+                ).reshape_as(x)
+            if needs_w_grad:
+                grad_w = _FCTPGradWWithDoubleBackward.apply(
+                    grad_out_3d,
+                    x_3d,
+                    ctx.vstar,
+                    p_for_k,
+                    i_for_k,
+                    backward_val_for_k,
+                    path_num,
+                    V,
+                    cg_val,
+                    can_use_empty_grad_x,
+                ).reshape_as(w)
+        else:
+            # Standard first backward: retain the fast existing grad_x path.
+            if needs_x_grad:
+                if is_single_torch_path:
+                    vstar = ctx.vstar.to(torch.long)
+                    w_single = w_4d.view(U, V, W)
+                    go_single = grad_out_3d.view(B, W)
+                    w_selected = w_single[:, vstar, :].permute(1, 0, 2)
+                    grad_x = (
+                        torch.einsum("bw,buw->bu", go_single, w_selected)
+                        * cg_val
+                    ).reshape_as(x)
+                else:
+                    grad_x = triton_fused_fctp_bwd(
+                        grad_out_3d,
+                        w_4d,
+                        ctx.vstar,
+                        p_for_k,
+                        i_for_k,
+                        val_for_k,
+                        I_total,
+                        cg_val,
+                        can_use_empty_grad_x,
+                        BK=8,
+                        BW=32,
+                        BU=32,
+                        num_warps=4,
+                    ).reshape_as(x)
+
+            # Fuse the former einsum + index_add grad_w path into one Triton
+            # reduction kernel.  Each program exclusively owns an output tile,
+            # avoiding both the large contribution tensor and atomics.
+            if needs_w_grad:
+                grad_w = triton_fused_fctp_bwd_w(
+                    grad_out_3d,
+                    x_3d,
+                    ctx.vstar,
+                    p_for_k,
+                    i_for_k,
+                    backward_val_for_k,
+                    path_num,
+                    V,
+                    cg_val,
+                ).reshape_as(w)
         
         torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
-        print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
+        if torch.is_grad_enabled():
+            print(f"<<<<< fasteq fctp double backward cost {execution_time_ms:.3f} ms >>>>>")
+        else:
+            print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
 
-        return None, grad_x, None, None  # None for w, y, meta gradients
+        return grad_w, grad_x, None, None  # y uses argmax; meta is non-Tensor
 
 def fast_fctp(w, x, y, meta):
     return FastFullyConnectedTensorProductPathFused.apply(w, x, y, meta)

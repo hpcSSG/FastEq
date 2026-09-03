@@ -273,6 +273,7 @@ def _stats_labels_stc_bwd(paths: Sequence[Any]) -> List[List[str]]:
         ]
         labels.extend(f"x1[{int(idx)}]" for idx in path.x1_indices)
         labels.extend(f"grad_x1[{int(idx)}]" for idx in path.x1_indices)
+        labels.append(f"grad_x0[{int(path.x0_index)}]")
         rows.append(labels)
     return rows
 
@@ -445,7 +446,7 @@ def _parse_label_ref(ref: str) -> Label:
 
 
 def _parse_stc_placement_ref(ref: str) -> Tuple[str, int]:
-    """Parse STC placement refs used by forward and x1-only backward."""
+    """Parse STC placement refs used by forward and full x1/x0 backward."""
     if not isinstance(ref, str) or "[" not in ref or not ref.endswith("]"):
         raise ValueError(f"Bad STC placement ref: {ref!r}")
     kind, rest = ref.split("[", 1)
@@ -454,9 +455,10 @@ def _parse_stc_placement_ref(ref: str) -> Tuple[str, int]:
         "out": "o",
         "grad_out": "go",
         "grad_x1": "gx1",
+        "grad_x0": "gx0",
     }
     kind = aliases.get(kind, kind)
-    if kind not in ("x0", "x1", "o", "go", "gx1"):
+    if kind not in ("x0", "x1", "o", "go", "gx1", "gx0"):
         raise ValueError(f"Bad STC placement kind: {kind!r}")
     return kind, idx
 
@@ -1101,6 +1103,10 @@ def _stc_grad_x1_acc_name(x1_idx: int) -> str:
     return f"gx1_acc_a_{int(x1_idx)}"
 
 
+def _stc_grad_x0_acc_name(x0_idx: int) -> str:
+    return f"gx0_acc_d_{int(x0_idx)}"
+
+
 def _stc_bwd_grad_expr(base_expr: str, other_x1_indices: Sequence[int]) -> str:
     expr = base_expr
     for x1_idx in other_x1_indices:
@@ -1153,7 +1159,7 @@ def emit_stc_bwd_kernel_from_paths(
     tile_u: int = 32,
     block_size: int = 32,
 ) -> str:
-    """Emit x1-only STC backward with optional lifetime placement.
+    """Emit STC backward for both x1 and gathered x0.
 
     When ``schedule_result`` is supplied, it may contain ``stc_bwd_placed``
     instructions produced by :func:`apply_lars_lifetime_placement`.  Without a
@@ -1207,6 +1213,7 @@ def emit_stc_bwd_kernel_from_paths(
     touched_x1_indices = sorted({
         int(idx) for p in ordered_paths for idx in p.x1_indices
     })
+    touched_x0_indices = sorted({int(p.x0_index) for p in ordered_paths})
 
     lines: List[str] = []
 
@@ -1271,8 +1278,17 @@ def emit_stc_bwd_kernel_from_paths(
             f"(index_t)U + (index_t)u"
         )
 
+    def grad_x0_index_expr(idx: int) -> str:
+        return (
+            f"((index_t)b * (index_t)X0 + (index_t){int(idx)}) * "
+            f"(index_t)U + (index_t)u"
+        )
+
     def emit_grad_x1_write(idx: int, value_expr: str) -> None:
         ap(f"            grad_x1[{grad_x1_index_expr(idx)}] = {value_expr};")
+
+    def emit_grad_x0_write(idx: int, value_expr: str) -> None:
+        ap(f"            grad_x0[{grad_x0_index_expr(idx)}] = {value_expr};")
 
     def product_from_tokens(base_expr: str, tokens: Sequence[str]) -> str:
         expr = str(base_expr)
@@ -1309,6 +1325,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("    const scalar_t* __restrict__ x1,")
     ap("    const scalar_t* __restrict__ x0,")
     ap("    scalar_t* __restrict__ grad_x1,")
+    ap("    scalar_t* __restrict__ grad_x0,")
     ap("    int B, int X1, int X0, int V, int U)")
     ap("{")
     ap("    const int b = (int)blockIdx.x;")
@@ -1332,7 +1349,9 @@ def emit_stc_bwd_kernel_from_paths(
     if not has_placed:
         for x1_idx in touched_x1_indices:
             ap(f"            scalar_t {_stc_grad_x1_acc_name(x1_idx)} = scalar_t(0);")
-        if touched_x1_indices:
+        for x0_idx in touched_x0_indices:
+            ap(f"            scalar_t {_stc_grad_x0_acc_name(x0_idx)} = scalar_t(0);")
+        if touched_x1_indices or touched_x0_indices:
             ap("")
 
     for inst_id, inst in enumerate(schedule_result.instructions):
@@ -1354,14 +1373,15 @@ def emit_stc_bwd_kernel_from_paths(
         elif inst.op == "init_acc":
             token, ref = inst.args
             kind, _idx = _parse_stc_placement_ref(str(ref))
-            if kind != "gx1":
-                raise ValueError("STC backward init_acc expects grad_x1[]")
+            if kind not in ("gx1", "gx0"):
+                raise ValueError("STC backward init_acc expects grad_x1[]/grad_x0[]")
             ap(f"            {acc_expr(str(token))} = scalar_t(0);")
 
         elif inst.op == "stc_bwd_placed":
             (
                 x1_indices,
                 target_tokens,
+                x0_target_token,
                 go_token,
                 x0_token,
                 x1_tokens,
@@ -1386,13 +1406,24 @@ def emit_stc_bwd_kernel_from_paths(
                     emit_grad_x1_write(int(target_idx), value)
                 else:
                     ap(f"            {acc_expr(target_token)} += {value};")
+            gx0_value = product_from_tokens(
+                f"scalar_t({_fmt_float(float(coeff))}) * {operand_expr(str(go_token))}",
+                x1_tokens,
+            )
+            if str(x0_target_token).startswith("d:"):
+                emit_grad_x0_write(int(_parse_stc_placement_ref(str(x0_target_token)[2:])[1]), gx0_value)
+            else:
+                ap(f"            {acc_expr(str(x0_target_token))} += {gx0_value};")
 
         elif inst.op == "store_acc_placed":
             ref, token = inst.args
             kind, idx = _parse_stc_placement_ref(str(ref))
-            if kind != "gx1":
-                raise ValueError("STC backward store_acc_placed expects grad_x1[]")
-            emit_grad_x1_write(int(idx), acc_expr(str(token)))
+            if kind == "gx1":
+                emit_grad_x1_write(int(idx), acc_expr(str(token)))
+            elif kind == "gx0":
+                emit_grad_x0_write(int(idx), acc_expr(str(token)))
+            else:
+                raise ValueError("STC backward store_acc_placed expects grad_x1[]/grad_x0[]")
 
         elif inst.op == "stc_bwd_path":
             x1_indices, x0_idx, out_v, coeff = inst.args
@@ -1411,6 +1442,14 @@ def emit_stc_bwd_kernel_from_paths(
                     f"            {_stc_grad_x1_acc_name(target_x1)} += "
                     f"{grad_expr};"
                 )
+            gx0_expr = _stc_bwd_grad_expr(
+                f"grad_out[{input_index_expr('go', int(out_v))}] * scalar_t({_fmt_float(float(coeff))})",
+                x1_indices,
+            )
+            ap(
+                f"            {_stc_grad_x0_acc_name(int(x0_idx))} += "
+                f"{gx0_expr};"
+            )
 
         elif inst.op in ("release", "release_shared"):
             pass
@@ -1421,6 +1460,10 @@ def emit_stc_bwd_kernel_from_paths(
         for x1_idx in touched_x1_indices:
             emit_grad_x1_write(
                 int(x1_idx), _stc_grad_x1_acc_name(int(x1_idx))
+            )
+        for x0_idx in touched_x0_indices:
+            emit_grad_x0_write(
+                int(x0_idx), _stc_grad_x0_acc_name(int(x0_idx))
             )
 
     ap("        }")
@@ -1440,7 +1483,7 @@ def emit_stc_bwd_kernel_from_paths(
     ap("")
     ap("template <typename scalar_t, typename index_t>")
     ap(f"void launch_{kernel_name}_typed(")
-    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
+    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1, scalar_t* grad_x0,")
     ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
     ap(f"    dim3 block({block_size});")
@@ -1450,25 +1493,25 @@ def emit_stc_bwd_kernel_from_paths(
         f"(size_t)block.x * sizeof(scalar_t);"
     )
     ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, lars_shared_bytes, stream>>>(")
-    ap("        grad_out, x1, x0, grad_x1, B, X1, X0, V, U);")
+    ap("        grad_out, x1, x0, grad_x1, grad_x0, B, X1, X0, V, U);")
     ap("}")
     ap("")
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
-    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1,")
+    ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, scalar_t* grad_x1, scalar_t* grad_x0,")
     ap("    int B, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
     ap("    bool use_i32 = mul3_fits_int32((int64_t)B, (int64_t)X1, (int64_t)U) &&")
     ap("                   mul3_fits_int32((int64_t)B, (int64_t)X0, (int64_t)U) &&")
     ap("                   mul3_fits_int32((int64_t)B, (int64_t)V,  (int64_t)U);")
     ap("    if (use_i32) {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(grad_out, x1, x0, grad_x1, grad_x0, B, X1, X0, V, U, stream);")
     ap("    } else {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(grad_out, x1, x0, grad_x1, B, X1, X0, V, U, stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(grad_out, x1, x0, grad_x1, grad_x0, B, X1, X0, V, U, stream);")
     ap("    }")
     ap("}")
     ap("")
-    ap(f"torch::Tensor launcher_{kernel_name}(torch::Tensor grad_out, torch::Tensor x1, torch::Tensor x0, int64_t V64) {{")
+    ap(f"std::vector<torch::Tensor> launcher_{kernel_name}(torch::Tensor grad_out, torch::Tensor x1, torch::Tensor x0, int64_t V64) {{")
     ap("    TORCH_CHECK(grad_out.is_cuda() && x1.is_cuda() && x0.is_cuda(), \"grad_out/x1/x0 must be CUDA/HIP\");")
     ap("    TORCH_CHECK(grad_out.is_contiguous() && x1.is_contiguous() && x0.is_contiguous(), \"grad_out/x1/x0 must be contiguous\");")
     ap("    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3, \"x1/x0 must be [B,S,U]\");")
@@ -1491,20 +1534,22 @@ def emit_stc_bwd_kernel_from_paths(
     if v_dim is not None:
         ap(f"    TORCH_CHECK(V == {int(v_dim)}, \"V mismatch for generated STC backward kernel\");")
     ap("    auto grad_x1 = torch::zeros_like(x1);")
+    ap("    auto grad_x0 = torch::zeros_like(x0);")
     ap("    GPU_Guard device_guard(x1.device());")
     ap("    gpuStream_t stream = getCurrentGPUStream(x1.device().index());")
     ap(f"    AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), \"{kernel_name}\", [&] {{")
     ap(f"        launch_{kernel_name}<scalar_t>((const scalar_t*)grad_out.data_ptr<scalar_t>(),")
     ap("            (const scalar_t*)x1.data_ptr<scalar_t>(),")
     ap("            (const scalar_t*)x0.data_ptr<scalar_t>(),")
-    ap("            (scalar_t*)grad_x1.data_ptr<scalar_t>(), B, X1, X0, V, U, stream);")
+    ap("            (scalar_t*)grad_x1.data_ptr<scalar_t>(),")
+    ap("            (scalar_t*)grad_x0.data_ptr<scalar_t>(), B, X1, X0, V, U, stream);")
     ap("    });")
     ap("    GPU_KERNEL_LAUNCH_CHECK();")
-    ap("    return grad_x1;")
+    ap("    return {grad_x1, grad_x0};")
     ap("}")
     ap("")
     ap("PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {")
-    ap(f"    m.def(\"run\", &launcher_{kernel_name}, \"{kernel_name} STC backward x1-only jit impl\");")
+    ap(f"    m.def(\"run\", &launcher_{kernel_name}, \"{kernel_name} STC backward x1/x0 jit impl\");")
     ap("}")
     return "\n".join(lines)
 
@@ -1532,7 +1577,7 @@ def generate_code_stc_bwd_with_scheduler(
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
 ) -> Any:
-    """Generate x1-only STC backward with LARS lifetime placement."""
+    """Generate STC backward for x1 and gathered x0 with LARS placement."""
     paths = make_stc_paths_from_padded_lists(
         idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value
     )
@@ -1542,7 +1587,7 @@ def generate_code_stc_bwd_with_scheduler(
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         profile=profile,
-        profile_name="stc_lars_bwd_x1_only",
+        profile_name="stc_lars_bwd_x1_x0",
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
         profile_print=profile_print,
@@ -1550,7 +1595,7 @@ def generate_code_stc_bwd_with_scheduler(
     path_schedule = scheduler.schedule()
     _dump_and_print_schedule_label_stats(
         operation="stc_bwd",
-        candidate_tag="stc_lars_bwd_x1_only",
+        candidate_tag="stc_lars_bwd_x1_x0",
         path_order=path_schedule.path_order,
         labels_by_path=_stats_labels_stc_bwd(paths),
     )
@@ -1596,7 +1641,7 @@ def generate_code_stc_bwd_with_scheduler(
         Path(out_path).write_text(code, encoding="utf-8")
     if return_schedule:
         return {
-            "name": "stc_lars_bwd_x1_only",
+            "name": "stc_lars_bwd_x1_x0",
             "code": code,
             "kernel_name": base_kernel_name,
             "schedule": schedule_result,
@@ -1820,12 +1865,14 @@ def _extract_lars_compute_records(
                 f"grad_out[{int(out_v)}]",
                 f"x0[{int(x0_idx)}]",
             ]
-            input_weights: List[int] = [arity, arity]
-            # Each x1 occurrence participates in every derivative expression
-            # except the one targeting that same occurrence.
+            # grad_out is used by every gx1 derivative and once by gx0; x0 is
+            # used only by the gx1 derivatives.
+            input_weights: List[int] = [arity + 1, arity]
+            # Each x1 occurrence participates in arity-1 gx1 derivative
+            # expressions and once in gx0, for arity total references.
             multiplicity = Counter(x1_indices)
             for idx in sorted(multiplicity):
-                weight = int(multiplicity[idx]) * max(0, arity - 1)
+                weight = int(multiplicity[idx]) * arity
                 if weight > 0:
                     input_refs.append(f"x1[{int(idx)}]")
                     input_weights.append(weight)
@@ -1835,7 +1882,10 @@ def _extract_lars_compute_records(
                 "input_weights": input_weights,
                 # Keep one accumulator occurrence per derivative position so
                 # duplicate x1 indices correctly increase accumulator use_count.
-                "acc_refs": [f"grad_x1[{int(idx)}]" for idx in x1_indices],
+                "acc_refs": (
+                    [f"grad_x1[{int(idx)}]" for idx in x1_indices]
+                    + [f"grad_x0[{int(x0_idx)}]"]
+                ),
                 "x1_indices": x1_indices,
                 "x0_idx": int(x0_idx),
                 "out_v": int(out_v),
@@ -2091,7 +2141,7 @@ def apply_lars_lifetime_placement(
             rewritten.append(Inst(
                 "stc_bwd_placed",
                 (
-                    x1_indices, tuple(acc_tokens),
+                    x1_indices, tuple(acc_tokens[:-1]), acc_tokens[-1],
                     token_by_ref[f"grad_out[{int(rec['out_v'])}]"],
                     token_by_ref[f"x0[{int(rec['x0_idx'])}]"],
                     x1_tokens, float(rec["coeff"]),
@@ -7142,8 +7192,9 @@ def generate_code_uniform1d_double_bwd_with_scheduler(
 class STCDoubleBwdPath:
     """One logical STC double-backward path.
 
-    First backward computes only grad_x1.  Given h=grad_grad_x1, double
-    backward returns gradients with respect to (grad_out, x1, x0_g).
+    First backward computes grad_x1 and grad_x0.  Given upstream gradients
+    grad_grad_x1 and grad_grad_x0, double backward returns gradients with
+    respect to (grad_out, x1, x0).
 
     Accumulator labels (dgo/dx1/dx0) are part of the LARS live set, so their
     lifetimes are scheduled together with read-only operands instead of being
@@ -7157,7 +7208,11 @@ class STCDoubleBwdPath:
 
     @property
     def labels(self) -> Tuple[Label, ...]:
-        labs: List[Label] = [("go", int(self.v)), ("x0", int(self.x0_index))]
+        labs: List[Label] = [
+            ("go", int(self.v)),
+            ("x0", int(self.x0_index)),
+            ("ggx0", int(self.x0_index)),
+        ]
         seen: Set[Label] = set(labs)
         for idx in self.x1_indices:
             lab = ("x1", int(idx))
@@ -7170,11 +7225,12 @@ class STCDoubleBwdPath:
         for lab in (("dgo", int(self.v)), ("dx0", int(self.x0_index))):
             if lab not in seen:
                 labs.append(lab); seen.add(lab)
-        if len(self.x1_indices) > 1:
-            for idx in self.x1_indices:
-                lab = ("dx1", int(idx))
-                if lab not in seen:
-                    labs.append(lab); seen.add(lab)
+        # grad_x0 depends on every x1 factor, so its upstream gradient creates
+        # a d_x1 contribution even for degree-1 paths.
+        for idx in self.x1_indices:
+            lab = ("dx1", int(idx))
+            if lab not in seen:
+                labs.append(lab); seen.add(lab)
         return tuple(labs)
 
 
@@ -7228,6 +7284,7 @@ class LARSSTCDoubleBwdScheduler(LARSUniform1DScheduler):
         kind, idx = lab
         names = {
             "go": "grad_out",
+            "ggx0": "grad_grad_x0",
             "ggx1": "grad_grad_x1",
             "dgo": "d_grad_out",
             "dx0": "d_x0",
@@ -7299,20 +7356,18 @@ class LARSSTCDoubleBwdScheduler(LARSUniform1DScheduler):
         reg = self.reg_of
         rgo = reg[("go", int(p.v))]
         rx0 = reg[("x0", int(p.x0_index))]
+        rggx0 = reg[("ggx0", int(p.x0_index))]
         rx1 = tuple(reg[("x1", int(idx))] for idx in p.x1_indices)
         rgg = tuple(reg[("ggx1", int(idx))] for idx in p.x1_indices)
         rdgo = reg[("dgo", int(p.v))]
         rdx0 = reg[("dx0", int(p.x0_index))]
-        rdx1 = tuple(
-            reg[("dx1", int(idx))] if len(p.x1_indices) > 1 else ""
-            for idx in p.x1_indices
-        )
+        rdx1 = tuple(reg[("dx1", int(idx))] for idx in p.x1_indices)
         self.instructions.append(Inst(
             "stc_double_bwd_path",
             (
                 tuple(int(v) for v in p.x1_indices),
                 int(p.x0_index), int(p.v), float(p.c),
-                rgo, rx0, rx1, rgg, rdgo, rdx0, rdx1,
+                rgo, rx0, rggx0, rx1, rgg, rdgo, rdx0, rdx1,
             ),
             f"path#{pid}: STC double backward",
         ))
@@ -7331,12 +7386,15 @@ class LARSSTCDoubleBwdScheduler(LARSUniform1DScheduler):
 def _stats_labels_stc_double_bwd(paths: Sequence[STCDoubleBwdPath]) -> List[List[str]]:
     rows: List[List[str]] = []
     for p in paths:
-        labels = [f"grad_out[{p.v}]", f"x0[{p.x0_index}]"]
+        labels = [
+            f"grad_out[{p.v}]",
+            f"x0[{p.x0_index}]",
+            f"grad_grad_x0[{p.x0_index}]",
+        ]
         labels.extend(f"x1[{int(idx)}]" for idx in p.x1_indices)
         labels.extend(f"grad_grad_x1[{int(idx)}]" for idx in p.x1_indices)
         labels.extend([f"d_grad_out[{p.v}]", f"d_x0[{p.x0_index}]"])
-        if len(p.x1_indices) > 1:
-            labels.extend(f"d_x1[{int(idx)}]" for idx in p.x1_indices)
+        labels.extend(f"d_x1[{int(idx)}]" for idx in p.x1_indices)
         rows.append(labels)
     return rows
 
@@ -7367,7 +7425,8 @@ def emit_stc_double_bwd_kernel_from_lars_schedule(
         kind, tail = ref.split("[", 1)
         idx = int(tail[:-1])
         aliases = {
-            "grad_out": "go", "grad_grad_x1": "ggx1",
+            "grad_out": "go", "grad_grad_x0": "ggx0",
+            "grad_grad_x1": "ggx1",
             "d_grad_out": "dgo", "d_x0": "dx0", "d_x1": "dx1",
         }
         return aliases.get(kind, kind), idx
@@ -7384,6 +7443,7 @@ def emit_stc_double_bwd_kernel_from_lars_schedule(
         if kind == "go": return f"grad_out[{base_index('V', idx)}]"
         if kind == "x0": return f"x0[{x0_base_index(idx)}]"
         if kind == "x1": return f"x1[{base_index('X1', idx)}]"
+        if kind == "ggx0": return f"grad_grad_x0[{x0_base_index(idx)}]"
         if kind == "ggx1": return f"grad_grad_x1[{base_index('X1', idx)}]"
         raise ValueError(f"Bad STC double backward input kind: {kind}")
 
@@ -7430,6 +7490,7 @@ def emit_stc_double_bwd_kernel_from_lars_schedule(
     ap("    const scalar_t* __restrict__ x1,")
     ap("    const scalar_t* __restrict__ x0,")
     ap("    const int64_t* __restrict__ i0,")
+    ap("    const scalar_t* __restrict__ grad_grad_x0,")
     ap("    const scalar_t* __restrict__ grad_grad_x1,")
     ap("    scalar_t* __restrict__ d_grad_out,")
     ap("    scalar_t* __restrict__ d_x1,")
@@ -7464,12 +7525,19 @@ def emit_stc_double_bwd_kernel_from_lars_schedule(
             reg, _ref = inst.args
             ap(f"            {reg} = scalar_t(0);")
         elif inst.op == "stc_double_bwd_path":
-            x1_indices, x0_idx, ov, coeff, rgo, rx0, rx1, rgg, rdgo, rdx0, rdx1 = inst.args
+            x1_indices, x0_idx, ov, coeff, rgo, rx0, rggx0, rx1, rgg, rdgo, rdx0, rdx1 = inst.args
             xs = tuple(int(v) for v in x1_indices)
             rx1 = tuple(str(v) for v in rx1)
             rgg = tuple(str(v) for v in rgg)
             rdx1 = tuple(str(v) for v in rdx1)
             c = _fmt_lars_float(float(coeff))
+            prod_all = mul_terms(rx1)
+            ap(f"            {rdgo} += scalar_t({c}) * {rggx0} * {prod_all};")
+            for r in range(len(xs)):
+                prod_except_r = mul_terms([
+                    rx1[q] for q in range(len(xs)) if q != r
+                ])
+                ap(f"            {rdx1[r]} += scalar_t({c}) * {rggx0} * {rgo} * {prod_except_r};")
             for t in range(len(xs)):
                 prod_except_t = mul_terms([rx1[q] for q in range(len(xs)) if q != t])
                 ap(f"            {rdgo} += scalar_t({c}) * {rgg[t]} * {rx0} * {prod_except_t};")
@@ -7510,26 +7578,28 @@ def emit_stc_double_bwd_kernel_from_lars_schedule(
     ap("template <typename scalar_t, typename index_t>")
     ap(f"void launch_{kernel_name}_typed(")
     ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, const int64_t* i0,")
-    ap("    const scalar_t* grad_grad_x1, scalar_t* d_grad_out, scalar_t* d_x1, scalar_t* d_x0,")
+    ap("    const scalar_t* grad_grad_x0, const scalar_t* grad_grad_x1,")
+    ap("    scalar_t* d_grad_out, scalar_t* d_x1, scalar_t* d_x0,")
     ap("    int B, int B0, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
     ap(f"    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>(")
-    ap("        grad_out, x1, x0, i0, grad_grad_x1, d_grad_out, d_x1, d_x0, B, B0, X1, X0, V, U);")
+    ap("        grad_out, x1, x0, i0, grad_grad_x0, grad_grad_x1, d_grad_out, d_x1, d_x0, B, B0, X1, X0, V, U);")
     ap("}")
     ap("")
     ap("template <typename scalar_t>")
     ap(f"void launch_{kernel_name}(")
     ap("    const scalar_t* grad_out, const scalar_t* x1, const scalar_t* x0, const int64_t* i0,")
-    ap("    const scalar_t* grad_grad_x1, scalar_t* d_grad_out, scalar_t* d_x1, scalar_t* d_x0,")
+    ap("    const scalar_t* grad_grad_x0, const scalar_t* grad_grad_x1,")
+    ap("    scalar_t* d_grad_out, scalar_t* d_x1, scalar_t* d_x0,")
     ap("    int B, int B0, int X1, int X0, int V, int U, gpuStream_t stream)")
     ap("{")
     ap("    bool use_i32 = stc_db_mul3_fits_i32(B, X1, U) && stc_db_mul3_fits_i32(B0, X0, U) && stc_db_mul3_fits_i32(B, V, U);")
     ap("    if (use_i32) {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(grad_out,x1,x0,i0,grad_grad_x1,d_grad_out,d_x1,d_x0,B,B0,X1,X0,V,U,stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int32_t>(grad_out,x1,x0,i0,grad_grad_x0,grad_grad_x1,d_grad_out,d_x1,d_x0,B,B0,X1,X0,V,U,stream);")
     ap("    } else {")
-    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(grad_out,x1,x0,i0,grad_grad_x1,d_grad_out,d_x1,d_x0,B,B0,X1,X0,V,U,stream);")
+    ap(f"        launch_{kernel_name}_typed<scalar_t, int64_t>(grad_out,x1,x0,i0,grad_grad_x0,grad_grad_x1,d_grad_out,d_x1,d_x0,B,B0,X1,X0,V,U,stream);")
     ap("    }")
     ap("}")
     return "\n".join(lines)
@@ -7552,15 +7622,17 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
     torch::Tensor x1,
     torch::Tensor x0,
     torch::Tensor i0,
+    torch::Tensor grad_grad_x0,
     torch::Tensor grad_grad_x1,
     int64_t V64)
 {{
-    TORCH_CHECK(grad_out.is_cuda() && x1.is_cuda() && x0.is_cuda() && i0.is_cuda() && grad_grad_x1.is_cuda(), "all tensors must be CUDA/HIP");
-    TORCH_CHECK(grad_out.is_contiguous() && x1.is_contiguous() && x0.is_contiguous() && i0.is_contiguous() && grad_grad_x1.is_contiguous(), "all tensors must be contiguous");
-    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3 && grad_out.dim() == 3 && grad_grad_x1.dim() == 3, "floating tensors must be 3D");
+    TORCH_CHECK(grad_out.is_cuda() && x1.is_cuda() && x0.is_cuda() && i0.is_cuda() && grad_grad_x0.is_cuda() && grad_grad_x1.is_cuda(), "all tensors must be CUDA/HIP");
+    TORCH_CHECK(grad_out.is_contiguous() && x1.is_contiguous() && x0.is_contiguous() && i0.is_contiguous() && grad_grad_x0.is_contiguous() && grad_grad_x1.is_contiguous(), "all tensors must be contiguous");
+    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3 && grad_out.dim() == 3 && grad_grad_x0.dim() == 3 && grad_grad_x1.dim() == 3, "floating tensors must be 3D");
     TORCH_CHECK(i0.dim() == 1, "i0 must be 1D");
     TORCH_CHECK(i0.scalar_type() == torch::kInt64, "i0 must be int64");
-    TORCH_CHECK(grad_out.scalar_type() == x1.scalar_type() && x1.scalar_type() == x0.scalar_type() && x1.scalar_type() == grad_grad_x1.scalar_type(), "dtype mismatch");
+    TORCH_CHECK(grad_out.scalar_type() == x1.scalar_type() && x1.scalar_type() == x0.scalar_type() && x1.scalar_type() == grad_grad_x0.scalar_type() && x1.scalar_type() == grad_grad_x1.scalar_type(), "dtype mismatch");
+    TORCH_CHECK(grad_grad_x0.sizes() == x0.sizes(), "grad_grad_x0 shape must match x0");
     TORCH_CHECK(grad_grad_x1.sizes() == x1.sizes(), "grad_grad_x1 shape must match x1");
     int B = (int)x1.size(0);
     int B0 = (int)x0.size(0);
@@ -7583,6 +7655,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
             (const scalar_t*)x1.data_ptr<scalar_t>(),
             (const scalar_t*)x0.data_ptr<scalar_t>(),
             (const int64_t*)i0.data_ptr<int64_t>(),
+            (const scalar_t*)grad_grad_x0.data_ptr<scalar_t>(),
             (const scalar_t*)grad_grad_x1.data_ptr<scalar_t>(),
             (scalar_t*)d_grad_out.data_ptr<scalar_t>(),
             (scalar_t*)d_x1.data_ptr<scalar_t>(),

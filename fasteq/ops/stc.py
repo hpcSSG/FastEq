@@ -375,8 +375,9 @@ def _stable_meta_hash(
     h.update(str(dtype).encode())
     h.update(str(int(pad_value)).encode())
     h.update(b"autowarp" if bool(use_multiwarp_candidates) else b"w1only")
-    # v7 separates single-warp and multi-warp candidate caches.
-    h.update(b"stc-filejit-v8-sentinel-padding-fwd-bwd-double-bwd-x1-only")
+    # Keep generated-module caches ABI-safe.  v9 changes STC backward from an
+    # x1-only result to (grad_x1, grad_x0), and double backward gains ggx0.
+    h.update(b"stc-filejit-v9-sentinel-padding-fwd-bwd-x1-x0-double-bwd-ggx0")
     return h.hexdigest()[:16]
 
 
@@ -460,7 +461,7 @@ def _make_stc_double_bwd_tune_key(
     else:
         raise TypeError(f"Unsupported dtype for STC double backward JIT: {dtype}")
     warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
-    return f"stc_u1d_double_bwd_x0gather_v2_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
+    return f"stc_u1d_double_bwd_x0gather_v3_ggx0_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
 
 def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: Path, verbose: bool = False):
@@ -754,7 +755,7 @@ def _select_best_stc_bwd_module(base_key: str, candidates: list[tuple[str, Any]]
 
 def _select_best_stc_double_bwd_module(
     base_key: str, candidates: list[tuple[str, Any]],
-    grad_out, x1, x0, i0, grad_grad_x1, V: int,
+    grad_out, x1, x0, i0, grad_grad_x0, grad_grad_x1, V: int,
 ):
     tune_enabled, warmup, repeat = _get_tune_params("double_bwd")
     return _u1d_benchmark_and_select_best_jit_candidate(
@@ -763,10 +764,46 @@ def _select_best_stc_double_bwd_module(
         tune_enabled=tune_enabled, warmup=warmup, repeat=repeat,
         call_fn=lambda mod: mod.run(
             grad_out.contiguous(), x1.contiguous(), x0.contiguous(),
-            i0.contiguous(), grad_grad_x1.contiguous(), int(V),
+            i0.contiguous(), grad_grad_x0.contiguous(),
+            grad_grad_x1.contiguous(), int(V),
         ),
     )
 
+
+
+from datetime import datetime
+from pathlib import Path
+def dump_tensor(
+    tensor: torch.Tensor,
+    file_path: str,
+    *,
+    to_cpu: bool = True,
+) -> None:
+    """
+    将 Tensor 保存到磁盘。
+
+    Args:
+        tensor: 要保存的 Tensor。
+        file_path: 输出路径，例如 "./dump/stc_d_x0.pt"。
+        to_cpu: 是否先转移到 CPU，建议开启。
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = Path(file_path) / timestamp
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    value = tensor.detach()
+    if to_cpu:
+        value = value.cpu()
+
+    # clone 避免底层存储包含无关数据
+    value = value.contiguous().clone()
+    torch.save(value, path)
+
+    print(
+        f"Dumped tensor: {path}, "
+        f"shape={tuple(value.shape)}, "
+        f"dtype={value.dtype}"
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -791,6 +828,8 @@ class FastSTCBackwardFunction(torch.autograd.Function):
                 f"numel={grad_out.numel()}, expected B*V*U={B}*{V}*{U}="
                 f"{expected_grad_out_numel}"
             )
+        
+        print(f"fasteq stc x1 require grad: {x1.requires_grad}, x0 require grad: {x0.requires_grad}")
 
         grad_out_shape = tuple(int(v) for v in grad_out.shape)
         grad_out_3d = grad_out.reshape(B, V, U).contiguous()
@@ -803,8 +842,9 @@ class FastSTCBackwardFunction(torch.autograd.Function):
                 f"STC i0 length mismatch: got {i0_i64.numel()}, expected B={B}"
             )
 
-        # First backward is still the existing x1-only JIT kernel and consumes
-        # the gathered x0_g layout [B, X0, U].
+        # The generated first-backward kernel returns gradients for x1 and the
+        # gathered x0_g layout [B, X0, U].  Reduce gx0_g through the gather map
+        # to recover a gradient matching the original x0 shape.
         x0_g = x0[i0_i64].contiguous()
 
         key = _make_stc_bwd_tune_key(
@@ -817,7 +857,19 @@ class FastSTCBackwardFunction(torch.autograd.Function):
             use_multiwarp_candidates=bool(use_multiwarp_candidates))
         _tag, mod, _ms = _select_best_stc_bwd_module(
             key, candidates, grad_out_3d, x1.contiguous(), x0_g, V)
-        gx1 = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
+        gx1, gx0_g = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
+        if tuple(gx1.shape) != tuple(x1.shape):
+            raise RuntimeError(
+                f"STC backward gx1 shape mismatch: got {tuple(gx1.shape)}, "
+                f"expected {tuple(x1.shape)}"
+            )
+        if tuple(gx0_g.shape) != tuple(x0_g.shape):
+            raise RuntimeError(
+                f"STC backward gathered gx0 shape mismatch: got {tuple(gx0_g.shape)}, "
+                f"expected {tuple(x0_g.shape)}"
+            )
+        gx0 = torch.zeros_like(x0)
+        gx0.index_add_(0, i0_i64, gx0_g)
 
         ctx.save_for_backward(
             grad_out_3d, x1, x0, i0_i64, coeffs_tensor, idx_lists_tensor
@@ -826,23 +878,38 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         ctx.num_out_segments = V
         ctx.pad_value = int(pad_value)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
-        return gx1
+
+        print(
+            f"fasteq stc bwd gx1 shape:{gx1.shape}: {gx1.sum()}, "
+            f"gx0 shape:{gx0.shape}: {gx0.sum()}"
+        )
+        return gx1, gx0
 
     @staticmethod
-    def backward(ctx, grad_grad_x1):
+    def backward(ctx, grad_grad_x1, grad_grad_x0):
         (
             grad_out_3d, x1, x0, i0_i64, coeffs_tensor, idx_lists_tensor
         ) = ctx.saved_tensors
-        if grad_grad_x1 is None:
+        if grad_grad_x1 is None and grad_grad_x0 is None:
             return None, None, None, None, None, None, None, None, None
 
-        if int(grad_grad_x1.numel()) != int(x1.numel()):
+        if grad_grad_x1 is None:
+            grad_grad_x1 = torch.zeros_like(x1)
+        if grad_grad_x0 is None:
+            grad_grad_x0 = torch.zeros_like(x0)
+
+        if tuple(grad_grad_x1.shape) != tuple(x1.shape):
             raise RuntimeError(
-                f"STC grad_grad_x1 numel mismatch: got shape={tuple(grad_grad_x1.shape)} "
-                f"numel={grad_grad_x1.numel()}, expected x1 shape={tuple(x1.shape)} "
-                f"numel={x1.numel()}"
+                f"STC grad_grad_x1 shape mismatch: got {tuple(grad_grad_x1.shape)}, "
+                f"expected {tuple(x1.shape)}"
+            )
+        if tuple(grad_grad_x0.shape) != tuple(x0.shape):
+            raise RuntimeError(
+                f"STC grad_grad_x0 shape mismatch: got {tuple(grad_grad_x0.shape)}, "
+                f"expected {tuple(x0.shape)}"
             )
         grad_grad_x1_3d = grad_grad_x1.reshape_as(x1).contiguous()
+        grad_grad_x0_3d = grad_grad_x0.reshape_as(x0).contiguous()
 
         key = _make_stc_double_bwd_tune_key(
             idx_lists_tensor, coeffs_tensor,
@@ -858,11 +925,12 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         )
         _tag, mod, _ms = _select_best_stc_double_bwd_module(
             key, candidates, grad_out_3d, x1, x0, i0_i64,
-            grad_grad_x1_3d, int(ctx.num_out_segments),
+            grad_grad_x0_3d, grad_grad_x1_3d, int(ctx.num_out_segments),
         )
         d_go_3d, d_x1, d_x0 = mod.run(
             grad_out_3d, x1.contiguous(), x0.contiguous(),
-            i0_i64, grad_grad_x1_3d, int(ctx.num_out_segments),
+            i0_i64, grad_grad_x0_3d, grad_grad_x1_3d,
+            int(ctx.num_out_segments),
         )
 
         # The CUDA kernel already performs gather-backward reduction:
@@ -876,6 +944,14 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         d_go = d_go_3d.reshape(ctx.grad_out_shape)
         d_x1_reshaped = d_x1.reshape(d_x1.shape[0], -1)
         d_x0_reshaped = d_x0.reshape(d_x0.shape[0], -1)
+       
+        """ print(f"stc d_x0 shape:{d_x0_reshaped.shape}: {d_x0_reshaped.sum()}")
+        print(f"stc d_x1 shape:{d_x1_reshaped.shape}: {d_x1_reshaped.sum()}")
+        print(f"stc d_go shape:{d_go.shape}: {d_go.sum()}")
+        dump_tensor(d_x0_reshaped, f"/home/malixian/repos/FastEq/test/dump/stc_{d_x0_reshaped.shape[0]}_{d_x0_reshaped.shape[1]}.pt")
+        dump_tensor(d_x1_reshaped, f"/home/malixian/repos/FastEq/test/dump/stc_{d_x1_reshaped.shape[0]}_{d_x1_reshaped.shape[1]}.pt")
+        dump_tensor(d_go, f"/home/malixian/repos/FastEq/test/dump/stc_{d_go.shape[0]}_{d_go.shape[1]}.pt") """
+
         return d_go, d_x1, d_x0, None, None, None, None, None, None
 
 
@@ -963,11 +1039,11 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor = ctx.saved_tensors
-        grad_x1 = FastSTCBackwardFunction.apply(
+        grad_x1, grad_x0 = FastSTCBackwardFunction.apply(
             grad_out.contiguous(), x1, x0, i0, coeffs_tensor, idx_lists_tensor,
             int(ctx.num_out_segments), int(ctx.pad_value), bool(ctx.use_multiwarp_candidates),
         )
-        return grad_x1, None, None, None, None, None, None, None, None
+        return grad_x1, grad_x0, None, None, None, None, None, None, None
 
 
 def fast_stc_uniform1d_jit(
