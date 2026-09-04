@@ -724,31 +724,6 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         # subsequent double backward.  Print the actual runtime requirements
         # here instead of inferring them only from the model configuration.
         needs_w_grad, needs_x_grad, needs_y_grad, _ = ctx.needs_input_grad
-        if torch.is_grad_enabled():
-            print(
-                "[FastEq FCTP double-backward requirements] "
-                f"w={needs_w_grad}, x={needs_x_grad}, y={needs_y_grad}; "
-                f"grad_out.requires_grad={grad_out.requires_grad}"
-            )
-
-            dependencies = []
-            if needs_x_grad:
-                # grad_x = grad_out * w, so differentiating grad_x again needs
-                # the differentiable dependency on both grad_out and w.
-                dependencies.append("grad_x -> {grad_out, w}")
-            if needs_w_grad:
-                # grad_w = grad_out * x, so its double backward must retain
-                # the differentiable dependency on both grad_out and x.
-                dependencies.append("grad_w -> {grad_out, x}")
-            if needs_y_grad:
-                # y is converted to a discrete index by argmax in forward;
-                # there is no mathematical gradient through that selection.
-                dependencies.append("grad_y -> argmax(y) [NON-DIFFERENTIABLE]")
-
-            print(
-                "[FastEq FCTP double-backward dependencies] "
-                + (", ".join(dependencies) if dependencies else "none")
-            )
 
         if not needs_x_grad and not needs_w_grad:
             return None, None, None, None
@@ -868,7 +843,7 @@ class FastFullyConnectedTensorProductPathFused(torch.autograd.Function):
         end_time = time.perf_counter() * 1000
         execution_time_ms = end_time - start_time
         if torch.is_grad_enabled():
-            print(f"<<<<< fasteq fctp double backward cost {execution_time_ms:.3f} ms >>>>>")
+            print(f"<< fasteq fctp double backward cost {execution_time_ms:.3f} ms >>")
         else:
             print(f"<< fasteq fctp backward cost: {execution_time_ms:.3f} ms >>")
 

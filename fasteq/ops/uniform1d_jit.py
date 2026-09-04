@@ -708,6 +708,8 @@ def _make_candidate_fast_key(
     mode: str,
     dtype_str: str,
     grad_w: Optional[bool] = None,
+    grad_x: Optional[bool] = None,
+    grad_y: Optional[bool] = None,
     use_multiwarp_candidates: bool = True,
 ) -> Tuple[Any, ...]:
     input_indices = {} if input_indices is None else input_indices
@@ -730,6 +732,8 @@ def _make_candidate_fast_key(
         str(mode),
         str(dtype_str),
         None if grad_w is None else bool(grad_w),
+        None if grad_x is None else bool(grad_x),
+        None if grad_y is None else bool(grad_y),
         bool(use_multiwarp_candidates),
         bool(use_x_src),
         bool(use_y_src),
@@ -1383,6 +1387,8 @@ def _make_bwd_module_name(
     coeff_list,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     layout_tag: str = "dense",
     iw_dim: Optional[int] = None,
     ix_dim: Optional[int] = None,
@@ -1396,7 +1402,7 @@ def _make_bwd_module_name(
     # old split/combine paths or by a different scatter/source layout.
     sig = repr((
         "scheduler_bwd",
-        P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        P, u_dim, dtype_str, mode, grad_w, grad_x, grad_y, layout_tag,
         bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
@@ -1406,8 +1412,10 @@ def _make_bwd_module_name(
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
     gw_tag = "gradw" if grad_w else "nogradw"
+    gx_tag = "gradx" if grad_x else "nogradx"
+    gy_tag = "grady" if grad_y else "nogrady"
     warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
-    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
+    return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
 def _make_double_bwd_module_name(
@@ -1422,6 +1430,8 @@ def _make_double_bwd_module_name(
     coeff_list,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     layout_tag: str = "dense",
     iw_dim: Optional[int] = None,
     ix_dim: Optional[int] = None,
@@ -1431,7 +1441,7 @@ def _make_double_bwd_module_name(
 ) -> str:
     sig = repr((
         "scheduler_double_bwd_v1",
-        P, u_dim, dtype_str, mode, grad_w, layout_tag,
+        P, u_dim, dtype_str, mode, grad_w, grad_x, grad_y, layout_tag,
         bool(use_multiwarp_candidates),
         iw_dim, ix_dim, ky_dim, v_dim,
         tuple(i_list), tuple(j_list), tuple(k_list), tuple(v_list),
@@ -1441,10 +1451,12 @@ def _make_double_bwd_module_name(
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
     gw_tag = "gradw" if grad_w else "nogradw"
+    gx_tag = "gradx" if grad_x else "nogradx"
+    gy_tag = "grady" if grad_y else "nogrady"
     warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
     return (
         f"uniform1d_double_bwd_sched_{mode_str}_u{u_dim}_path{P}_"
-        f"{layout_tag}_{gw_tag}_{warp_tag}_jit_{dtype_str}_{h}"
+        f"{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
     )
 
 
@@ -1743,6 +1755,8 @@ def _build_bwd_jit_candidates(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     """
@@ -1777,6 +1791,8 @@ def _build_bwd_jit_candidates(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     cached_tune_key = _BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
@@ -1829,6 +1845,8 @@ def _build_bwd_jit_candidates(
             coeff_list=coeff_cpu,
             dtype_str=dtype_str,
             grad_w=grad_w,
+            grad_x=grad_x,
+            grad_y=grad_y,
             layout_tag=layout_tag,
             iw_dim=iw_dim,
             ix_dim=ix_dim,
@@ -1878,6 +1896,8 @@ def _build_bwd_jit_candidates(
             v_dim=v_dim,
             mode=mode,
             need_grad_w=grad_w,
+            need_grad_x=grad_x,
+            need_grad_y=grad_y,
         )
 
         """ return generate_code_uniform1d_bwd_baseline_unrolled(
@@ -1930,6 +1950,8 @@ def _build_bwd_jit_module(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
     # Backward-compatible wrapper: build candidates and return the first one.
@@ -1951,6 +1973,8 @@ def _build_bwd_jit_module(
         mode=mode,
         dtype_str=dtype_str,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     return modules[0][1]
@@ -1973,6 +1997,8 @@ def _build_double_bwd_jit_candidates(
     mode: str,
     dtype_str: str,
     grad_w: bool,
+    grad_x: bool,
+    grad_y: bool,
     use_multiwarp_candidates: Optional[bool] = None,
 ) -> Tuple[str, List[Tuple[str, object]]]:
     input_indices = {} if input_indices is None else input_indices
@@ -1987,7 +2013,8 @@ def _build_double_bwd_jit_candidates(
         coeff_list=coeff_list,
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
-        mode=mode, dtype_str=dtype_str, grad_w=grad_w,
+        mode=mode, dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
     tune_key = _DOUBLE_BWD_TUNE_KEY_FAST_CACHE.get(fast_key)
@@ -2004,7 +2031,8 @@ def _build_double_bwd_jit_candidates(
         tune_key = _make_double_bwd_module_name(
             P=len(i_cpu), u_dim=u_dim, mode=mode,
             i_list=i_cpu, j_list=j_cpu, k_list=k_cpu, v_list=v_cpu,
-            coeff_list=coeff_cpu, dtype_str=dtype_str, grad_w=grad_w,
+            coeff_list=coeff_cpu, dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x,
+            grad_y=grad_y,
             layout_tag=layout_tag, iw_dim=iw_dim, ix_dim=ix_dim,
             ky_dim=ky_dim, v_dim=v_dim,
             use_multiwarp_candidates=use_multiwarp_candidates,
@@ -2039,7 +2067,7 @@ def _build_double_bwd_jit_candidates(
         coeff_list=coeff_list,
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
-        mode=mode, need_grad_w=grad_w,
+        mode=mode, need_grad_w=grad_w, need_grad_x=grad_x, need_grad_y=grad_y,
         out_path="", profile=False, profile_print=False,
     )
     raw_candidates = _normalize_codegen_candidates(codegen_out)
@@ -2112,11 +2140,16 @@ def _call_double_bwd_module(
     use_src: bool,
     fused_scatter: bool,
     need_grad_w: bool,
+    need_grad_x: bool,
+    need_grad_y: bool,
 ):
     args = [w, x, y, grad_out]
     if need_grad_w:
         args.append(grad_grad_w)
-    args.extend([grad_grad_x, grad_grad_y])
+    if need_grad_x:
+        args.append(grad_grad_x)
+    if need_grad_y:
+        args.append(grad_grad_y)
     if use_src:
         args.append(src_idx)
     if fused_scatter:
@@ -2296,6 +2329,8 @@ def _select_best_double_bwd_module(
     use_src: bool,
     fused_scatter: bool,
     need_grad_w: bool,
+    need_grad_x: bool,
+    need_grad_y: bool,
 ) -> Tuple[str, object, float]:
     # Double backward uses its own env controls when present and otherwise
     # inherits the regular backward tuning policy.
@@ -2332,6 +2367,8 @@ def _select_best_double_bwd_module(
             use_src=use_src,
             fused_scatter=fused_scatter,
             need_grad_w=need_grad_w,
+            need_grad_x=need_grad_x,
+            need_grad_y=need_grad_y,
         ),
     )
 
@@ -2437,6 +2474,8 @@ def _run_bwd(
     v_dim: Optional[int] = None,
     mode,
     grad_w,
+    grad_x,
+    grad_y,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
@@ -2460,6 +2499,8 @@ def _run_bwd(
         dtype_str=dtype_str,
         mode=mode,
         grad_w=grad_w,
+        grad_x=grad_x,
+        grad_y=grad_y,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
@@ -2526,6 +2567,8 @@ def _run_double_bwd(
     v_dim,
     mode,
     grad_w,
+    grad_x,
+    grad_y,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
@@ -2538,6 +2581,7 @@ def _run_double_bwd(
         input_indices=input_indices, output_indices=output_indices,
         u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim,
         mode=mode, dtype_str=dtype_str, grad_w=bool(grad_w),
+        grad_x=bool(grad_x), grad_y=bool(grad_y),
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
 
@@ -2565,14 +2609,16 @@ def _run_double_bwd(
             grad_grad_w = torch.zeros_like(w)
         else:
             grad_grad_w = grad_grad_w.contiguous()
-    if grad_grad_x is None:
-        grad_grad_x = torch.zeros_like(x)
-    else:
-        grad_grad_x = grad_grad_x.contiguous()
-    if grad_grad_y is None:
-        grad_grad_y = torch.zeros_like(y)
-    else:
-        grad_grad_y = grad_grad_y.contiguous()
+    if bool(grad_x):
+        if grad_grad_x is None:
+            grad_grad_x = torch.zeros_like(x)
+        else:
+            grad_grad_x = grad_grad_x.contiguous()
+    if bool(grad_y):
+        if grad_grad_y is None:
+            grad_grad_y = torch.zeros_like(y)
+        else:
+            grad_grad_y = grad_grad_y.contiguous()
 
     _tag, mod, _ms = _select_best_double_bwd_module(
         tune_key=tune_key, candidates=candidates,
@@ -2585,6 +2631,8 @@ def _run_double_bwd(
         use_src=use_src,
         fused_scatter=fused_scatter,
         need_grad_w=bool(grad_w),
+        need_grad_x=bool(grad_x),
+        need_grad_y=bool(grad_y),
     )
     return _call_double_bwd_module(
         mod,
@@ -2597,6 +2645,8 @@ def _run_double_bwd(
         use_src=use_src,
         fused_scatter=fused_scatter,
         need_grad_w=bool(grad_w),
+        need_grad_x=bool(grad_x),
+        need_grad_y=bool(grad_y),
     )
 
 @torch.no_grad()
@@ -2786,6 +2836,8 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
     def forward(ctx, grad_out, w, x, y, i_list, j_list, k_list, v_list,
                 coeff_list, input_indices, output_indices, out_seg_num, u_dim,
                 iw_dim, ix_dim, ky_dim, v_dim, mode, need_grad_w,
+                need_grad_x,
+                need_grad_y,
                 use_multiwarp_candidates):
         result = _run_bwd(
             grad_out=grad_out, w=w, x=x, y=y,
@@ -2795,13 +2847,14 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             u_dim=int(u_dim), iw_dim=int(iw_dim), ix_dim=int(ix_dim),
             ky_dim=int(ky_dim), v_dim=int(v_dim), mode=mode,
             grad_w=bool(need_grad_w),
+            grad_x=bool(need_grad_x),
+            grad_y=bool(need_grad_y),
             use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
-        if bool(need_grad_w):
-            gw, gx, gy = result
-        else:
-            gx, gy = result
-            gw = w.new_empty((0,))
+        result_iter = iter(result)
+        gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
+        gx = next(result_iter) if bool(need_grad_x) else x.new_empty((0,))
+        gy = next(result_iter) if bool(need_grad_y) else y.new_empty((0,))
 
         ctx.save_for_backward(
             grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list
@@ -2816,16 +2869,20 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         ctx.v_dim = int(v_dim)
         ctx.mode = mode
         ctx.need_grad_w = bool(need_grad_w)
+        ctx.need_grad_x = bool(need_grad_x)
+        ctx.need_grad_y = bool(need_grad_y)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
         print(f"fasteq uniform1d_jit gw shape:{gw.shape}: {gw.sum()}")
-        print(f"fasteq uniform1d_jit gx shape:{gx.shape}: {gx.sum()}")
-        print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}")
+        if ctx.need_grad_x:
+            print(f"fasteq uniform1d_jit gx shape:{gx.shape}: {gx.sum()}")
+        if ctx.need_grad_y:
+            print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}")
         return gw, gx, gy
 
     @staticmethod
     def backward(ctx, grad_grad_w, grad_grad_x, grad_grad_y):
         grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
-        d_go, d_w, d_x, d_y = _run_double_bwd(
+        result = _run_double_bwd(
             grad_out=grad_out,
             w=w, x=x, y=y,
             grad_grad_w=grad_grad_w if ctx.need_grad_w else None,
@@ -2843,6 +2900,8 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             v_dim=ctx.v_dim,
             mode=ctx.mode,
             grad_w=ctx.need_grad_w,
+            grad_x=ctx.need_grad_x,
+            grad_y=ctx.need_grad_y,
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
         """ print(f"uniform1d_jit d_go shape:{d_go.shape}: {d_go.sum()}")
@@ -2853,10 +2912,15 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         dump_tensor(d_w, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_w.shape[0]}_{d_w.shape[1]}.pt")
         dump_tensor(d_x, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_x.shape[0]}_{d_x.shape[1]}.pt")
         dump_tensor(d_y, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_y.shape[0]}_{d_y.shape[1]}.pt") """
+        result_iter = iter(result)
+        d_go = next(result_iter)
+        d_w = next(result_iter) if ctx.need_grad_w else None
+        d_x = next(result_iter) if ctx.need_grad_x else None
+        d_y = next(result_iter) if ctx.need_grad_y else None
         return (
             d_go, d_w, d_x, d_y,
             None, None, None, None, None,
-            None, None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None, None, None,
         )
 
 # -----------------------------------------------------------------------------
@@ -2875,6 +2939,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         meta,
         use_multiwarp_candidates,
     ):
+        # Capture the public input's autograd requirement before reshaping.
+        # This flag is part of both backward and double-backward JIT signatures.
+        need_grad_w = bool(ctx.needs_input_grad[0])
+        need_grad_x = bool(ctx.needs_input_grad[1])
+        need_grad_y = bool(ctx.needs_input_grad[2])
 
         i_list = _as_int32_meta_tensor(meta["i_list"])
         j_list = _as_int32_meta_tensor(meta["j_list"])
@@ -2971,6 +3040,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         ctx.use_multiwarp_candidates = use_multiwarp_candidates
         ctx.input_indices=input_indices
         ctx.output_indices=output_indices
+        ctx.need_grad_w = need_grad_w
+        ctx.need_grad_x = need_grad_x
+        ctx.need_grad_y = need_grad_y
 
         return out
 
@@ -2985,11 +3057,12 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             ctx.input_indices, ctx.output_indices,
             ctx.out_seg_num, ctx.u_dim,
             ctx.w_seg_num, ctx.x_seg_num, ctx.y_seg_num, ctx.out_seg_num,
-            ctx.mode, bool(w.requires_grad), bool(ctx.use_multiwarp_candidates),
+            ctx.mode, ctx.need_grad_w, ctx.need_grad_x, ctx.need_grad_y,
+            bool(ctx.use_multiwarp_candidates),
         )
-        grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if w.requires_grad else None
-        grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps)
-        grad_y = gy3.view(-1, ctx.y_seg_num * ctx.y_irreps)
+        grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if ctx.need_grad_w else None
+        grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps) if ctx.need_grad_x else None
+        grad_y = gy3.view(-1, ctx.y_seg_num * ctx.y_irreps) if ctx.need_grad_y else None
         return grad_w, grad_x, grad_y, None, None, None, None
 
 def fast_uniform1d_jit(
