@@ -2817,6 +2817,9 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         ctx.mode = mode
         ctx.need_grad_w = bool(need_grad_w)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
+        print(f"fasteq uniform1d_jit gw shape:{gw.shape}: {gw.sum()}")
+        print(f"fasteq uniform1d_jit gx shape:{gx.shape}: {gx.sum()}")
+        print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}")
         return gw, gx, gy
 
     @staticmethod
