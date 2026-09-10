@@ -12,6 +12,9 @@ FastEq currently supports:
   `scatter_sum`
 - **SymmetricContraction (STC)**
 - **EquivariantLinear(equi-linear)** 
+- **Equivariant LayerNorm**, with shared Triton v0/v1 implementations for
+  per-degree, merged, and scalar/high-degree normalization (FP32 inference).
+  See [the Triton interface and tests](fasteq/triton/README.md).
 
 FastEq uses hardware-aware JIT compilation, static path specialization,
 path scheduling, data placement, and candidate benchmarking to generate
