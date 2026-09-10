@@ -13,12 +13,6 @@ import re
 import torch
 
 
-# =============================================================================
-# STC LARS scheduler and CUDA code generation
-# Moved from stc_uniform1d_jit.py so the STC runtime wrapper only keeps
-# forward/backward dispatch and file-based JIT loading.
-# =============================================================================
-
 Label = Tuple[str, int]  # ('x0', i), ('x1', j), ('o', v)
 STC_PAD_VALUE = -1
 

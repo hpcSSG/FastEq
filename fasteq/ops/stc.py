@@ -45,13 +45,9 @@ _MODULE_CACHE: Dict[str, Any] = {}
 # -----------------------------------------------------------------------------
 # Default auto-warp tuning policy
 # -----------------------------------------------------------------------------
-# Normal callers do not need to set warp/register-capacity environment variables.
-# Warp size and register-file capacity are read from torch CUDA/HIP runtime device
-# properties.  The maximum tested warps/block is derived after compiling the
-# 1-warp candidate and parsing its compiler-reported registers/thread.
-_DEFAULT_STC_FWD_TUNE_ENABLED = True
-_DEFAULT_STC_BWD_TUNE_ENABLED = True
-_DEFAULT_STC_DOUBLE_BWD_TUNE_ENABLED = True
+_DEFAULT_STC_FWD_TUNE_ENABLED = False
+_DEFAULT_STC_BWD_TUNE_ENABLED = False
+_DEFAULT_STC_DOUBLE_BWD_TUNE_ENABLED = False
 _DEFAULT_STC_TUNE_WARMUP = 3
 _DEFAULT_STC_TUNE_REPEAT = 10
 
@@ -774,43 +770,6 @@ def _select_best_stc_double_bwd_module(
         ),
     )
 
-
-
-from datetime import datetime
-from pathlib import Path
-def dump_tensor(
-    tensor: torch.Tensor,
-    file_path: str,
-    *,
-    to_cpu: bool = True,
-) -> None:
-    """
-    将 Tensor 保存到磁盘。
-
-    Args:
-        tensor: 要保存的 Tensor。
-        file_path: 输出路径，例如 "./dump/stc_d_x0.pt"。
-        to_cpu: 是否先转移到 CPU，建议开启。
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = Path(file_path) / timestamp
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    value = tensor.detach()
-    if to_cpu:
-        value = value.cpu()
-
-    # clone 避免底层存储包含无关数据
-    value = value.contiguous().clone()
-    torch.save(value, path)
-
-    print(
-        f"Dumped tensor: {path}, "
-        f"shape={tuple(value.shape)}, "
-        f"dtype={value.dtype}"
-    )
-
-
 # -----------------------------------------------------------------------------
 # Differentiable STC backward / training double backward
 # -----------------------------------------------------------------------------
@@ -835,8 +794,6 @@ class FastSTCBackwardFunction(torch.autograd.Function):
                 f"{expected_grad_out_numel}"
             )
         
-        print(f"fasteq stc x1 require grad: {x1.requires_grad}, x0 require grad: {x0.requires_grad}")
-
         grad_out_shape = tuple(int(v) for v in grad_out.shape)
         grad_out_3d = grad_out.reshape(B, V, U).contiguous()
 
@@ -960,13 +917,6 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         d_go = d_go_3d.reshape(ctx.grad_out_shape)
         d_x1_reshaped = d_x1.reshape(d_x1.shape[0], -1)
         d_x0_reshaped = d_x0.reshape(d_x0.shape[0], -1)
-       
-        """ print(f"stc d_x0 shape:{d_x0_reshaped.shape}: {d_x0_reshaped.sum()}")
-        print(f"stc d_x1 shape:{d_x1_reshaped.shape}: {d_x1_reshaped.sum()}")
-        print(f"stc d_go shape:{d_go.shape}: {d_go.sum()}")
-        dump_tensor(d_x0_reshaped, f"/home/malixian/repos/FastEq/test/dump/stc_{d_x0_reshaped.shape[0]}_{d_x0_reshaped.shape[1]}.pt")
-        dump_tensor(d_x1_reshaped, f"/home/malixian/repos/FastEq/test/dump/stc_{d_x1_reshaped.shape[0]}_{d_x1_reshaped.shape[1]}.pt")
-        dump_tensor(d_go, f"/home/malixian/repos/FastEq/test/dump/stc_{d_go.shape[0]}_{d_go.shape[1]}.pt") """
 
         return d_go, d_x1, d_x0, None, None, None, None, None, None, None
 

@@ -19,6 +19,7 @@ import torch
 import torch._dynamo
 from torch.utils.cpp_extension import load
 
+
 from .uniform1d_auto_schedule import (
     generate_code_uniform1d_fwd_with_scheduler,
     generate_code_uniform1d_bwd_with_scheduler,
@@ -51,25 +52,17 @@ _DOUBLE_BWD_TUNE_KEY_FAST_CACHE: Dict[Tuple[Any, ...], str] = {}
 # Avoid repeating expensive disk cleanup / source pruning on every hot-path call.
 _JIT_PRUNE_DONE_CACHE: Set[Tuple[str, str, str]] = set()
 
-# Cache int32 copies of immutable path metadata tensors.  If meta stores int64
-# tensors, calling .to(torch.int32) in every forward creates fresh tensors and
-# breaks the fast build-cache identity key.
 _META_INT32_TENSOR_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 
 
 # -----------------------------------------------------------------------------
 # Default auto-warp tuning policy
 # -----------------------------------------------------------------------------
-# Normal callers do not need to set warp/register-capacity environment variables.
-# Warp size and register-file capacity are read from torch CUDA/HIP runtime device
-# properties.  The maximum tested warps/block is derived after compiling the
-# 1-warp candidate and parsing its compiler-reported registers/thread.
-_DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = True
-_DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = True
+_DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = False
+_DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = False
 _DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
 _DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
-# Generate and benchmark w2/w3/... candidates in addition to the mandatory w1 candidate.
-_DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED = True
+_DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED = False
 
 # Fallbacks are used only when importing or smoke-testing without a visible GPU.
 # Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
@@ -166,18 +159,6 @@ def _autowarp_runtime_policy() -> Tuple[int, int, int]:
 
 
 def _format_cuda_arch_list_from_runtime() -> Optional[str]:
-    """Return a TORCH_CUDA_ARCH_LIST string using the parent process runtime.
-
-    torch.utils.cpp_extension.load() calls _get_cuda_arch_flags().  When
-    TORCH_CUDA_ARCH_LIST is unset, PyTorch queries torch.cuda.get_device_capability()
-    inside the process that performs compilation.  That is unsafe in a forked
-    worker after the parent has initialized CUDA and causes:
-
-        RuntimeError: Cannot re-initialize CUDA in forked subprocess
-
-    Therefore the parent process should materialize the arch list once and pass
-    it to compile workers through the environment.
-    """
     try:
         if not torch.cuda.is_available():
             return None
@@ -357,11 +338,6 @@ def _find_fasteq_root(start: Path) -> Path:
     raise RuntimeError("Cannot find fasteq project root from __file__")
 
 
-
-from pathlib import Path
-import torch
-
-
 def _detect_gpu_backend() -> str:
     """Return the build backend without forcing CUDA/HIP runtime init.
 
@@ -375,8 +351,6 @@ def _detect_gpu_backend() -> str:
     if getattr(torch.version, "cuda", None):
         return "cuda"
 
-    # Last-resort fallback for unusual builds.  This branch may initialize the
-    # runtime, so normal CUDA/HIP builds should not reach it.
     if not torch.cuda.is_available():
         raise RuntimeError("No CUDA/HIP GPU is available.")
 
@@ -710,7 +684,7 @@ def _make_candidate_fast_key(
     grad_w: Optional[bool] = None,
     grad_x: Optional[bool] = None,
     grad_y: Optional[bool] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> Tuple[Any, ...]:
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
@@ -1190,7 +1164,7 @@ def _build_jit_candidates_from_sources(
     cache: Dict[str, object],
     kind: str,
     u_dim: int,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> List[Tuple[str, object]]:
     """Build scheduler candidates plus optional auto-warp variants.
 
@@ -1356,7 +1330,7 @@ def _make_fwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     # Include all code-affecting fields in the hash.  The previous version did
     # not include layout flags or coeff_list, which can accidentally reuse a
@@ -1394,7 +1368,7 @@ def _make_bwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     # Scheduler backward replaces the previous fused/split backward codegen.
     # Include layout and optional static dimensions in the signature so disk
@@ -1437,7 +1411,7 @@ def _make_double_bwd_module_name(
     ix_dim: Optional[int] = None,
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
-    use_multiwarp_candidates: bool = True,
+    use_multiwarp_candidates: bool = False,
 ) -> str:
     sig = repr((
         "scheduler_double_bwd_v1",
@@ -2649,182 +2623,6 @@ def _run_double_bwd(
         need_grad_y=bool(grad_y),
     )
 
-@torch.no_grad()
-def _print_index_reuse_stats(
-    i_list: torch.Tensor,
-    j_list: torch.Tensor,
-    k_list: torch.Tensor,
-    v_list: torch.Tensor,
-    print_details: bool = True,
-) -> None:
-    """
-    统计路径索引的重复情况。
-
-    指标定义：
-      total:
-          索引总出现次数，即路径数量 P。
-
-      unique:
-          不同索引值的数量。
-
-      repeated_values:
-          出现次数大于 1 的不同索引值数量。
-
-      repeated_occurrences:
-          所有重复索引值对应的总出现次数。
-          例如 [0, 0, 0, 1, 2, 2] 中为 3 + 2 = 5。
-
-      reusable:
-          除第一次出现之外的重复出现次数，即理论可复用次数：
-              sum(count - 1) = total - unique
-
-      reuse_ratio:
-          reusable / total。
-
-      adjacent_reuse:
-          当前调度顺序下，相邻路径使用相同索引的次数。
-          该指标比全局 reusable 更能反映直接连续复用。
-    """
-
-    index_lists = {
-        "i": i_list,
-        "j": j_list,
-        "k": k_list,
-        "v": v_list,
-    }
-
-    print("\n[index reuse statistics]")
-    print(
-        f"{'index':<8}"
-        f"{'total':>10}"
-        f"{'unique':>10}"
-        f"{'repeat val':>12}"
-        f"{'repeat occ':>12}"
-        f"{'reusable':>12}"
-        f"{'reuse ratio':>14}"
-        f"{'adjacent':>12}"
-    )
-
-    for name, tensor in index_lists.items():
-        # 调试统计放到 CPU 上执行，避免后续 Python 格式化处理 GPU Tensor。
-        values_cpu = tensor.detach().reshape(-1).to(
-            device="cpu",
-            dtype=torch.int64,
-        )
-
-        total = values_cpu.numel()
-
-        if total == 0:
-            print(
-                f"{name:<8}"
-                f"{0:>10}"
-                f"{0:>10}"
-                f"{0:>12}"
-                f"{0:>12}"
-                f"{0:>12}"
-                f"{0.0:>13.2%}"
-                f"{0:>12}"
-            )
-            continue
-
-        unique_values, counts = torch.unique(
-            values_cpu,
-            sorted=True,
-            return_counts=True,
-        )
-
-        repeated_mask = counts > 1
-
-        unique_count = unique_values.numel()
-        repeated_value_count = int(repeated_mask.sum().item())
-
-        repeated_occurrences = int(
-            counts[repeated_mask].sum().item()
-        )
-
-        # 每个索引第一次出现不算复用，后续出现均算潜在复用。
-        reusable_counts = torch.clamp(counts - 1, min=0)
-        reusable_count = int(reusable_counts.sum().item())
-
-        reuse_ratio = reusable_count / total
-
-        # 当前路径顺序中，相邻两条路径使用同一索引的次数。
-        adjacent_reuse_count = int(
-            (values_cpu[1:] == values_cpu[:-1]).sum().item()
-        )
-
-        print(
-            f"{name:<8}"
-            f"{total:>10}"
-            f"{unique_count:>10}"
-            f"{repeated_value_count:>12}"
-            f"{repeated_occurrences:>12}"
-            f"{reusable_count:>12}"
-            f"{reuse_ratio:>13.2%}"
-            f"{adjacent_reuse_count:>12}"
-        )
-
-        if print_details and repeated_value_count > 0:
-            repeated_values = unique_values[repeated_mask]
-            repeated_counts = counts[repeated_mask]
-
-            details = [
-                (
-                    int(value.item()),
-                    int(count.item()),
-                    int(count.item()) - 1,
-                )
-                for value, count in zip(
-                    repeated_values,
-                    repeated_counts,
-                )
-            ]
-
-            # 优先展示出现次数最多的索引。
-            details.sort(key=lambda item: (-item[1], item[0]))
-
-            detail_text = ", ".join(
-                f"{name}[{value}]: count={count}, reuse={reuse}"
-                for value, count, reuse in details
-            )
-            print(f"  repeated {name}: {detail_text}")
-
-    print()
-
-from datetime import datetime
-from pathlib import Path
-def dump_tensor(
-    tensor: torch.Tensor,
-    file_path: str,
-    *,
-    to_cpu: bool = True,
-) -> None:
-    """
-    将 Tensor 保存到磁盘。
-
-    Args:
-        tensor: 要保存的 Tensor。
-        file_path: 输出路径，例如 "./dump/stc_d_x0.pt"。
-        to_cpu: 是否先转移到 CPU，建议开启。
-    """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    path = Path(file_path) / timestamp
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    value = tensor.detach()
-    if to_cpu:
-        value = value.cpu()
-
-    # clone 避免底层存储包含无关数据
-    value = value.contiguous().clone()
-    torch.save(value, path)
-
-    print(
-        f"Dumped tensor: {path}, "
-        f"shape={tuple(value.shape)}, "
-        f"dtype={value.dtype}"
-    )
-
 # -----------------------------------------------------------------------------
 # Differentiable first backward / generated CUDA double backward
 # -----------------------------------------------------------------------------
@@ -2872,11 +2670,11 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         ctx.need_grad_x = bool(need_grad_x)
         ctx.need_grad_y = bool(need_grad_y)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
-        print(f"fasteq uniform1d_jit gw shape:{gw.shape}: {gw.sum()}")
+        """ print(f"fasteq uniform1d_jit gw shape:{gw.shape}: {gw.sum()}")
         if ctx.need_grad_x:
             print(f"fasteq uniform1d_jit gx shape:{gx.shape}: {gx.sum()}")
         if ctx.need_grad_y:
-            print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}")
+            print(f"fasteq uniform1d_jit gy shape:{gy.shape}: {gy.sum()}") """
         return gw, gx, gy
 
     @staticmethod
@@ -2904,14 +2702,7 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             grad_y=ctx.need_grad_y,
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
-        """ print(f"uniform1d_jit d_go shape:{d_go.shape}: {d_go.sum()}")
-        print(f"uniform1d_jit d_w shape:{d_w.shape}: {d_w.sum()}")
-        print(f"uniform1d_jit d_x shape:{d_x.shape}: {d_x.sum()}")
-        print(f"uniform1d_jit d_y shape:{d_y.shape}: {d_y.sum()}")
-        dump_tensor(d_go, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_go.shape[0]}_{d_go.shape[1]}.pt")
-        dump_tensor(d_w, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_w.shape[0]}_{d_w.shape[1]}.pt")
-        dump_tensor(d_x, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_x.shape[0]}_{d_x.shape[1]}.pt")
-        dump_tensor(d_y, f"/home/malixian/repos/FastEq/test/dump/uniform1d_jit_{d_y.shape[0]}_{d_y.shape[1]}.pt") """
+        
         result_iter = iter(result)
         d_go = next(result_iter)
         d_w = next(result_iter) if ctx.need_grad_w else None
@@ -2956,29 +2747,16 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         x_seg_num = meta["x_seg_num"]
         y_seg_num = meta["y_seg_num"]
         u_dim = meta["u_dim"]
-        # The public fast_uniform1d_jit() argument is the source of truth.
-        # Previously this value was read only from meta, while the wrapper did
-        # not pass its use_multiwarp_candidates argument into autograd.apply().
-        # Consequently False was ignored and None fell back to the global
-        # multi-warp default.
+        
         use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
             use_multiwarp_candidates
         )
-
-        """ _print_index_reuse_stats(
-            i_list=i_list,
-            j_list=j_list,
-            k_list=k_list,
-            v_list=v_list,
-            print_details=True,
-        ) """
         
         w_irreps =  int(meta["size_list"][0] / w_seg_num)
         x_irreps =  int(meta["size_list"][1] / x_seg_num)
         y_irreps =  int(meta["size_list"][2] / y_seg_num)
         out_irreps = int(meta["size_list"][3] / out_seg_num)
 
-        
 
         w = w.view(-1, w_seg_num, w_irreps)
         x = x.view(-1, x_seg_num, x_irreps) # [node_num, x_seg_num, u_dim]
