@@ -61,17 +61,6 @@ FastEq supports the second-order derivatives required during training through sp
 
 For atomistic models, energy inference, force inference, and force training have different differentiation requirements. Verify the complete operator path before using an inference-oriented implementation for training. Force evaluation requires coordinate gradients even when model parameters are not being optimized.
 
-## Integration
-
-FastEq targets compatibility with e3nn and cuEquivariance operator semantics while allowing specialized internal layouts and execution strategies. Integration must preserve:
-
-- Irreducible-representation ordering, multiplicities, and parity conventions.
-- Tensor-product paths, coefficient normalization, and weight layout.
-- Rotation conventions and spherical harmonic normalization.
-- Input/output shapes, numerical precision, and required gradients.
-
-Installation commands and executable API examples will be documented alongside the packaged release and model adapters. Python entry points and supported dependency versions are still being consolidated.
-
 ## Backends
 
 FastEq combines Triton-based kernels with generated tensor-product implementations. Backend development includes CUDA/HIP paths and adaptation toward domestic AI accelerators through FlagOS. Support is operator-specific; cross-platform execution and performance must be validated on the target hardware.
