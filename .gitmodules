@@ -1,12 +1,4 @@
-[submodule "3rdparty/mace"]
-	path = 3rdparty/mace
-	url = git@github.com:malixian/mace.git
-	branch = fasteq
 [submodule "3rdparty/cuequivariance_torch"]
 	path = 3rdparty/cuequivariance_torch
 	url = git@github.com:malixian/cuEquivariance.git
-	branch = fasteq
-[submodule "3rdparty/SevenNet"]
-	path = 3rdparty/SevenNet
-	url = git@github.com:malixian/SevenNet.git
 	branch = fasteq
