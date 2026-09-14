@@ -19,20 +19,21 @@ The project combines structure-aware kernel generation with Triton-based operato
 
 Model associations below follow the project operator inventory. Exact usage depends on the model variant and implementation. Operator names are descriptive catalog names and do not imply a stable Python import path.
 
-| Category | Operator | Function | Relevant model families |
-| --- | --- | --- | --- |
-| Geometric encoding | `SphericalHarmonics` | Encode directions as spherical harmonic features. | Allegro, EquFlash, EquFlashV2, MACE, NequIP, SevenNet, TACE/TECE |
-| Rotations and representation transforms | `FusedSO3Rotation` | Apply SO(3) rotations using Wigner-D matrices, with fusion of compatible surrounding operations. | EquiformerV3, EquiformerV2 |
-| Rotations and representation transforms | `FusedSO3Grid` | Transform between spherical harmonic coefficients and spherical grid signals. | EquiformerV3, EquiformerV2, eSEN |
-| Tensor products and higher-order coupling | `ChannelwiseTensorProduct` | Couple equivariant representations through channelwise Clebsch–Gordan tensor products. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE |
-| Tensor products and higher-order coupling | `FullyConnectedTensorProduct` | Mix channels across allowed irreducible-representation coupling paths. | MACE, NequIP, SevenNet |
-| Tensor products and higher-order coupling | `SymmetricContraction` | Construct higher-order equivariant features through symmetric contractions. | MACE, TACE, TECE |
-| Equivariant linear maps | `SO3Linear` | Apply channel mixing between matching irreducible representations. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE, EquiformerV3, EquiformerV2, eSEN |
-| Equivariant linear maps | `SO2Linear` | Apply SO(2)-equivariant channel mixing in local coordinate frames. | EquiformerV3, TACE/TECE |
-| Graph attention | `FusedGraphSoftmax` | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets |
-| Equivariant feature modulation | `FusedEquivariantGate` | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants |
-| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3 |
-| Equivariant regularization | `FusedEquivariantDropout` | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 |
+| Category | Operator | Function | Relevant model families | Feature | 
+| --- | --- | --- | --- | --- |
+| Geometric encoding | `SphericalHarmonics` | Encode directions as spherical harmonic features. | Allegro, EquFlash, EquFlashV2, MACE, NequIP, SevenNet, TACE/TECE | Fused SphericalHarmonics |
+| Rotations and representation transforms | `FusedSO3Rotation` | Apply SO(3) rotations using Wigner-D matrices, with fusion of compatible surrounding operations. | EquiformerV3, EquiformerV2 | Fused pattern: Gather + Merge + SO3_Rotate |
+| Rotations and representation transforms | `FusedSO3Grid` | Transform between spherical harmonic coefficients and spherical grid signals. | EquiformerV3, EquiformerV2, eSEN | Fused pattern:  so3_grid.to_grid + activation + so3_grid.from_grid |
+| Tensor products and higher-order coupling | `ChannelwiseTensorProduct` | Couple equivariant representations through channelwise Clebsch–Gordan tensor products. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE | Register optimization and path scheduling by JIT |
+| Tensor products and higher-order coupling | `FullyConnectedTensorProduct` | Mix channels across allowed irreducible-representation coupling paths. | MACE, NequIP, SevenNet | Fused Gather + BatchGEMM + CG sparse  |
+| Tensor products and higher-order coupling | `SymmetricContraction` | Construct higher-order equivariant features through symmetric contractions. | MACE, TACE, TECE | Similar to ChannelwiseTensorProduct |
+| Equivariant linear maps | `SO3Linear` | Apply channel mixing between matching irreducible representations. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE, EquiformerV3, EquiformerV2, eSEN | Highly optimized fused TF32 GEMM and Triton FP32/FP64 fused GEMM | 
+| Equivariant linear maps | `SO2Linear` | Apply SO(2)-equivariant channel mixing in local coordinate frames. | EquiformerV3, TACE/TECE | Triton FP32/FP64 fused GEMM  |
+| Graph Softmax | `FusedGraphSoftmax` | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | Fused GraphSoftmax |
+| Graph attention | `FusedAttenAlpha` | Fuse normalization, activation, dropout, and weighted reduction in graph attention into a single kernel | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
+| Equivariant Gate| `FusedEquivariantGate` | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
+| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3 | Fused Norm |
+| Equivariant dropout | `FusedEquivariantDropout` | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout | 
 
 Graph softmax operates on attention weights; it supports equivariant attention but does not itself perform a representation rotation or tensor-product coupling.
 
