@@ -1,28 +1,35 @@
 """Fused edge gather, source/target merge, radial modulation and SO(3) rotate.
 
-Expected layouts (all contiguous, float32):
+In equiformer_v3/experimental/models/equiformer_v3/transformer_block.py:
+class EquivariantGraphAttention:
 
-    x:          [num_nodes, K, C]
-    edge_index: [2, E] (torch.int64)
-    rotation:   [E, M, K]
-
-Concat + radial-before-rotate:
-    radial:     [E, K, 2*C] or [E, 1, 2*C]
-    output:     [E, M, 2*C]
-
-Concat + radial-after-rotate:
-    radial:     [E, M, 2*C] or [E, 1, 2*C]
-    output:     [E, M, 2*C]
-
-Add + radial-before-rotate:
-    radial:     [E, K, 2*C] or [E, 1, 2*C]
-    output:     [E, M, C]
-
-This module implements forward and first-order backward. The Torch implementation
-below is the semantic reference and is also useful for accuracy comparisons.
-Backward supports gradients for x, radial, and rotation. It intentionally does
-not support double backward. The sparse path assumes the verified m-primary
-Wigner support: row degree l has nonzeros only in k=[l*l,(l+1)*(l+1)).
+    ...
+    def forward():
+        ...
+        # Fused this entire block: 
+        ===============================Begin==========================================
+        # Merge source/target node features
+        x = x.to(x_edge_weight.dtype)
+        x_source = torch.index_select(x, index=edge_index[0], dim=0)
+        x_target = torch.index_select(x, index=edge_index[1], dim=0)
+        if not self.use_add_merge:
+            # Concat    
+            x_message = torch.cat((x_source, x_target), dim=2)
+            if self.use_rad_l_parametrization:
+                x_message = x_message * x_edge_weight
+                x_message = self.so3_rotation.rotate(x_message)
+            else:
+                x_message = self.so3_rotation.rotate(x_message)
+                x_message = x_message * x_edge_weight
+        elif self.use_add_merge:
+            # Add
+            x_edge_weight_source = x_edge_weight.narrow(2, 0, self.num_in_channels)
+            x_edge_weight_target = x_edge_weight.narrow(2, self.num_in_channels, self.num_in_channels)
+            x_source = x_source * x_edge_weight_source
+            x_target = x_target * x_edge_weight_target
+            x_message = x_source + x_target
+            x_message = self.so3_rotation.rotate(x_message)
+        ===============================End==========================================
 """
 
 from __future__ import annotations

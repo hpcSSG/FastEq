@@ -5,11 +5,10 @@ y_real = x_real @ W1.T - x_imag @ W2.T
 y_imag = x_real @ W2.T + x_imag @ W1.T
 
 FP16/BF16/FP32 CUDA tensors; FP32 accumulation. NVIDIA default: tf32x3.
-First backward uses Triton, including split-K weight-gradient reduction.
-create_graph=True uses differentiable PyTorch backward to support higher orders.
-No weight cache. Autocast is handled by differentiable input casts.
-GPU compilation, numerical validation and speed are NOT verified by the author
-in the generation environment. Run this file on your GPU to validate/benchmark.
+
+In experimental/models/equiformer_v3/transformer_block.py:
+class SO2MLinear(nn.Module)
+    ...
 
 Usage inside your existing class (keep its __init__ and fc unchanged):
     y = so2m_linear(x_m, self.fc.weight)

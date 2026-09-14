@@ -1,8 +1,7 @@
 """Fused equivariant dropout. Run this file on a CUDA/Triton host to test.
-
-Forward and backward each use one Triton kernel, plus one torch RNG launch
-per forward to obtain a device seed (unless a seed tensor is supplied).
-Random masks are distributionally, not bitwise, equivalent to torch Dropout.
+In experimental/models/equiformer_v3/drop.py:
+class EquivariantDropout(nn.Module)
+    ...
 """
 import math
 import torch

@@ -1,9 +1,18 @@
 """Fused FP32 attention logits: optional LayerNorm -> activation -> dropout -> dot.
 
-Forward is Triton; backward recomputes with differentiable PyTorch operations,
-including second derivatives. This is NOT a fused-backward implementation.
-The module adapter falls back to the original PyTorch path for non-FP32/AMP.
-Run: python fused_attention_alpha.py  (requires CUDA, torch, triton).
+In equiformer_v3/experimental/models/equiformer_v3/transformer_block.py:
+class EquivariantGraphAttention:
+
+    ...
+    def forward():
+        ...
+        # Fused this entire block: 
+        ===============================Begin==========================================
+        x_alpha = self.alpha_norm(x_alpha)
+        x_alpha = self.alpha_act(x_alpha)
+        x_alpha = self.alpha_dropout(x_alpha)
+        alpha = torch.einsum('bik, ik -> bi', x_alpha, self.alpha_dot)
+        ===============================End==========================================
 """
 import math
 import torch

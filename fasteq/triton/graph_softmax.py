@@ -1,14 +1,17 @@
-"""CSR fused GraphSoftmax. Optimized path: CUDA FP32 contiguous [E,H], dim=0.
-
-python graphsoftmax_triton.py --check
-python graphsoftmax_triton.py --bench
-
-Dependencies: torch, torch_geometric, triton. GPU validation is required.
-First-order autograd only on the Triton path. Set force_torch=True BEFORE
-forward for create_graph / double backward. Non-FP32 and other layouts fall
-back to the original PyG algorithm. Finite logits and rescale are assumed.
-CSR construction synchronizes: build once per graph, outside timed regions.
-Do not mutate CSR metadata. Rebuild when connectivity or edge order changes.
+"""
+In experimental/models/equiformer_v3/transformer_block.py:
+replace :
+self.attn_softmax = GraphSoftmax(
+            eps=self.eps,
+            exp_dropout=attn_mask_rate, 
+            softcap=self.softcap
+        )
+to:
+self.attn_softmax = FusedGraphSoftmax(
+            eps=self.eps,
+            exp_dropout=attn_mask_rate, 
+            softcap=self.softcap
+        )
 """
 import argparse
 from dataclasses import dataclass

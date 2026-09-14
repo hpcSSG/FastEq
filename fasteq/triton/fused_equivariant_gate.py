@@ -1,12 +1,8 @@
 """Triton implementation compatible with :class:`e3nn.nn.Gate`.
 
 Supported pointwise activations are identity/None, SiLU, sigmoid, and tanh.
-Like e3nn.nn.Activation, non-identity activations are normalized with
-e3nn.math.normalize2mom before being evaluated by the Triton kernels.
 
-The module implements forward, backward, and double backward.  Metadata is
-constructed once in ``__init__`` and registered as buffers, so moving the
-module to CUDA also moves all index maps.
+
 """
 
 from __future__ import annotations

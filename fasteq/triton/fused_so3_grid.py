@@ -6,37 +6,15 @@ from torch.autograd.function import once_differentiable
 
 # ============================================================================
 # Optimized fused S2 activation
-#
-# separable=False:
-#   X [N,J,C]
-#       -> T @ X                (to_grid, tl.dot)
-#       -> SiLU
-#       -> FM @ grid            (from_grid, tl.dot)
-#   Y [N,J,C]
-#
-# separable=True:
-#   X [N,J,2C]
-#       -> T @ X[..., :C]       (tl.dot)
-#       -> T @ X[..., C:]       (tl.dot)
-#       -> u * v
-#       -> optional fused grid dropout
-#       -> FM @ grid            (tl.dot)
-#   Y [N,J,C]
-#
-# Matrix layout:
-#   T  = to_grid_mat   [A, J]
-#   FM = from_grid_mat [J, A]
-#
-# Performance strategy:
-#   * one Triton program owns one (n, C-tile) and all J rows;
-#   * J is padded to BLOCK_J (16/32/64) and evaluated by tl.dot;
-#   * A is tiled (16/32/64), so the full grid dimension is never held live;
-#   * X1/X2 are loaded once per program and reused for every A tile;
-#   * no x_grid tensor and no torch.chunk tensor are materialized;
-#   * backward uses the same A-tiled tl.dot structure and needs no atomics.
-#
-# This fast path is intended primarily for the small-J SO(3) layouts used by
-# Equiformer-style models, e.g. J=19 for lmax=4,mmax=2.
+# In equiformer_v3/experimental/models/equiformer_v3/activation.py
+# class SeparableGateS2Activation_SwiGLU_Merge:
+#   def forward:
+#       x_grid = self.so3_grid.to_grid(inputs)
+#        
+#       x_grid_1, x_grid_2 = torch.chunk(x_grid, chunks=2, dim=-1)
+#       x_grid = x_grid_1 * x_grid_2
+#       x_grid = self.grid_drop(x_grid)
+#       output_vectors = self.so3_grid.from_grid(x_grid)
 # ============================================================================
 
 
