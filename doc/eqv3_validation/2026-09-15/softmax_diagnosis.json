@@ -1,0 +1,8 @@
+{
+  "assertions": 344,
+  "failed_assertions": [],
+  "source": "/public-data/zhouxibo/zxb/equiformer_v3_baseline/repo/experimental/models/equiformer_v3/softmax.py",
+  "method": "Original self-test, recording each failed assertion to continue coverage; no tolerance changes",
+  "completed_all_assertions": true,
+  "status": "PASS"
+}

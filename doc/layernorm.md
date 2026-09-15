@@ -13,14 +13,12 @@ the `2*l + 1` components and `C` channels of degree `l`, after scalar centering.
 | Model | Native layer | Default normalization statistics |
 | --- | --- | --- |
 | EquiformerV3 | `EquivariantLayerNorm` | Each degree uses its own `q_l`. |
-| EquiformerV3 | `EquivariantMergeLayerNorm` | All degrees share `mean(q_0, ..., q_L)`. |
 | EquiformerV3 | `EquivariantSeparableLayerNorm` | Scalars use `q_0`; higher degrees share `mean(q_1, ..., q_L)`. |
 | EquiformerV2 | `EquivariantLayerNormArraySphericalHarmonics` | Scalars use `q_0`; higher degrees share `mean(q_1, ..., q_L)`. |
 
 The table uses the native defaults, including equal weighting of degrees where
 applicable. The adapter preserves the source layer's normalization options.
-Only scalar features (`l = 0`) are centered across channels; Merge can disable
-centering. Affine scales are learned per degree and channel and shared across
+Only scalar features (`l = 0`) are centered across channels. Affine scales are learned per degree and channel and shared across
 that degree's components. Bias applies only to scalars when the source has it.
 
 ## Fused operations
@@ -41,7 +39,7 @@ Group boundaries are device buffers, avoiding unsupported `constexpr` tuple
 indexing. Hardware lane width is read from the active Triton target; a
 32-channel tile is independent of warp/wavefront width. The implementation uses
 ordinary Triton expressions without CUDA libdevice calls or inline assembly.
-The model's `per_degree`, `scalar_high`, and `all` grouping remains explicit.
+The supported presets are `per_degree` (the default) and `scalar_high`.
 
 Only requested gradients are computed. Double backward and `create_graph=True`
 are unsupported. Source adapters default to `parameter_reduction="native"`.
@@ -68,7 +66,7 @@ where `K = (L + 1)**2`. CUDA and HIP FP32 are supported execution targets.
 
 ## Validation coverage
 
-All four native layers in the table have been compared against their unmodified
+All three native layers in the table have been compared against their unmodified
 PyTorch FP32 implementations on NVIDIA H100 and Hygon BW/gfx936. Comparisons cover the output,
 input gradient, and all affine parameter gradients, including NKC and KNC
 storage. See the [native-layer comparison tests](../test/test_triton_equivariant_layer_norm_precision.py)
@@ -78,7 +76,24 @@ This validation covers individual model layers. Full-model inference and
 training with this shared implementation have not been validated. eSEN has
 not been directly tested.
 
-## Validation record: 2026-09-15
+## Current scope validation
+
+After reducing the adaptation scope, the remaining suite passed **218 tests,
+0 failed, 0 skipped** on H100 with Torch 2.11.0 and Triton 3.6.0. Comparisons use
+the unmodified V2/V3 Torch forward and autograd implementations, including large-N
+parameter gradients, NKC/KNC layouts, and two SGD steps through supported layers.
+See [regression.json](eqv3_validation/2026-09-15/regression.json) for the exact
+implementation, test and reference hashes. This cleanup was retested on CUDA;
+HIP and performance measurements were not rerun.
+
+The [EQv3 report](eqv3_validation.md) summarizes existing performance and accuracy
+records for the retained operator list, with their original measurement revision.
+
+## Historical validation record: 2026-09-15
+
+The following snapshot predates the scope cleanup. Its 305-test count describes
+the original suite, not the current one. Raw records are preserved for audit;
+see the [snapshot note](layernorm_validation/2026-09-15/README.md).
 
 The shared implementation was developed from FastEq commit
 `40ba40e72bee769d74a869bb4a4ba820ee1c55c0`. Both machines tested the identical
@@ -165,15 +180,6 @@ N=4096, NKC on Hygon, and V2 `EquivariantLayerNormArraySphericalHarmonics`,
 N=4096, NKC on H100. Exact values and test identifiers are recorded in
 [`validation.json`](layernorm_validation/2026-09-15/validation.json).
 
-Numerical diagnosis proceeded through statistics, `dX`, local parameter
-contributions, and final parameter reductions. A CUDA Merge N=262144 failure
-was localized to forward rstd: substituting the reference mean did not repair
-the parameter gradient, whereas substituting the reference rstd did. The
-shared weighted channel-first statistics now use two ordered FMA streams for
-small groups; larger generic groups retain tree summation to bound compilation
-size. Torch reductions preserve native FP32 agreement in cancellation cases.
-These changes apply on both devices.
-
 ### Representative performance
 
 Measurements use **N=4096, Lmax=3, C=128**, shape `[4096, 16, 128]`, FP32 and
@@ -200,7 +206,6 @@ time; these numbers include the cost of the partial backward fusion split.
 | Native layer | Torch forward (ms) | Unified forward (ms) | Speedup | Torch forward + backward (ms) | Unified forward + backward (ms) | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | V3 LayerNorm | 0.8011 | 0.3758 | 2.13× | 2.7340 | 1.8670 | 1.46× |
-| V3 Merge | 0.6762 | 0.3222 | 2.10× | 2.1907 | 1.0563 | 2.07× |
 | V3 Separable | 0.7174 | 0.3911 | 1.83× | 2.1048 | 1.2849 | 1.64× |
 | V2 SphericalHarmonics | 0.6305 | 0.2951 | 2.14× | 2.4856 | 1.8120 | 1.37× |
 
@@ -209,7 +214,6 @@ time; these numbers include the cost of the partial backward fusion split.
 | Native layer | Torch forward (ms) | Unified forward (ms) | Speedup | Torch forward + backward (ms) | Unified forward + backward (ms) | Speedup |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | V3 LayerNorm | 0.2429 | 0.1233 | 1.97× | 1.0427 | 0.6991 | 1.49× |
-| V3 Merge | 0.2088 | 0.0997 | 2.09× | 0.8198 | 0.4563 | 1.80× |
 | V3 Separable | 0.1916 | 0.1291 | 1.48× | 0.7198 | 0.5266 | 1.37× |
 | V2 SphericalHarmonics | 0.2033 | 0.1096 | 1.85× | 0.9617 | 0.6991 | 1.38× |
 
@@ -219,8 +223,42 @@ are in [`perf_hip.json`](layernorm_validation/2026-09-15/perf_hip.json) and
 logs are [`unified_hip.log`](layernorm_validation/2026-09-15/unified_hip.log) and
 [`unified_cuda.log`](layernorm_validation/2026-09-15/unified_cuda.log).
 
-This implementation has **not** had a new doubling-to-OOM performance sweep.
-The measurements above do not establish its maximum atom count or OOM boundary.
+These historical representative measurements alone do not establish a maximum
+atom count or OOM boundary. See the [EQv3 report](eqv3_validation.md) for the
+separate scaling measurements and their source revision.
 GPU FP32, supported layouts, tile-size limits, and 32-bit indexing restrictions
 still apply; second-order gradients and full-model training remain unvalidated
 or unsupported as described above.
+
+## EQv3 operator comparison plots
+
+H100, FP32; measurements use FastEq `3bc9a82d40ef646c3ce75f6f517e3f618fb12754`.
+The charts cover the retained EQv3 operator list. Speedup is original Torch time
+divided by FastEq time; forward + backward includes all first-order gradients.
+These existing measurements were not rerun after the adaptation scope cleanup.
+
+### N = 4096
+
+| Operator | Forward speedup | Forward + backward speedup |
+| --- | ---: | ---: |
+| GraphSoftmax (cached CSR) | 4.82× | 1.23× |
+| AttentionAlpha | 3.43× | 0.75× |
+| e3nn Gate | 2.17× | 3.11× |
+| LayerNorm | 2.92× | 1.85× |
+| SeparableLayerNorm | 1.55× | 1.40× |
+| EquivariantDropout | 0.61× | 0.85× |
+
+GraphSoftmax and AttentionAlpha have accuracy failures in other configurations.
+The e3nn Gate measurements do not validate EQv3 GateActivation. See the
+[full report](eqv3_validation.md) for correctness coverage and timing details.
+
+![Measured speedup at N=4096](eqv3_validation/2026-09-15/speedup_4096.png)
+
+### Doubling the atom count
+
+![Speedup as the atom count doubles](eqv3_validation/2026-09-15/speedup_scaling.png)
+
+The curves end at each path's measured memory boundary or explicit execution
+limit. Raw [paired timings](eqv3_validation/2026-09-15/paired.csv) and
+[stopping boundaries](eqv3_validation/2026-09-15/boundaries.csv) distinguish OOM,
+index limits and fallback; a stopping point is not always an OOM.

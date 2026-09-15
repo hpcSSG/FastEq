@@ -42,7 +42,7 @@ reference_forward = _reference_forward()
 
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-GROUPINGS = ("per_degree", "all", "scalar_high")
+GROUPINGS = ("per_degree", "scalar_high")
 
 
 def _layout(x, layout):
@@ -62,14 +62,14 @@ def _groups(lmax, grouping):
         return [(l,) for l in range(lmax + 1)]
     if grouping == "scalar_high":
         return [(0,)] + ([tuple(range(1, lmax + 1))] if lmax else [])
-    return [tuple(range(lmax + 1))]
+    raise ValueError(f"unsupported grouping: {grouping}")
 
 
 def _oracle(x, grouping, weighting, center=True, weight=None, bias=None, eps=1e-5):
     """Direct slice/reduction equations, independent of the plan's metadata.
 
-    Per-degree and SH reduce magnetic components before channels. Merge
-    reduces channels before magnetic components. SH's scalar output uses
+    Per-degree and SH reduce magnetic components before channels.
+    SH's scalar output uses
     native LayerNorm, like EquiformerV2, for source-compatibility checks.
     """
     lmax = int(x.shape[1] ** 0.5) - 1
@@ -87,13 +87,7 @@ def _oracle(x, grouping, weighting, center=True, weight=None, bias=None, eps=1e-
                 torch.full((2 * l + 1,), 1 / (len(degrees) * (2 * l + 1)),
                            dtype=x.dtype, device=x.device) for l in degrees
             ])
-            if grouping == "all":
-                moment = (square.mean(-1) * coefficients).sum(-1)
-            else:
-                moment = (square * coefficients[None, :, None]).sum(1).mean(-1)
-        elif grouping == "all":
-            per_component = square.mean(-1)
-            moment = per_component.mean(-1) if weighting == "component" else per_component.sum(-1)
+            moment = (square * coefficients[None, :, None]).sum(1).mean(-1)
         else:
             per_channel = square.mean(1) if weighting == "component" else square.sum(1)
             moment = per_channel.mean(-1)
@@ -123,7 +117,7 @@ def _plan(lmax, channels, grouping, weighting="degree_balanced", center=True):
     )
     op = TritonEquivariantNorm(
         spec, device="cuda",
-        reduction_order="channels_first" if grouping == "all" else "components_first",
+        reduction_order="components_first",
     )
     return spec, op
 
@@ -180,11 +174,6 @@ def test_default_source_equations(layout, grouping, shape):
 
 NONDEFAULTS = (
     ("per_degree", "norm", True),
-    ("all", "component", True),
-    ("all", "norm", True),
-    ("all", "degree_balanced", False),
-    ("all", "component", False),
-    ("all", "norm", False),
     ("scalar_high", "component", True),
     ("scalar_high", "norm", True),
 )
@@ -340,7 +329,7 @@ def test_input_guards_and_grad_dispatch():
 def test_cpu_reference_and_spec(grouping):
     spec = EquivariantNormSpec.from_preset(lmax=2, channels=7, grouping=grouping)
     assert spec.components == 9
-    assert spec.num_stats == {"per_degree": 3, "all": 1, "scalar_high": 2}[grouping]
+    assert spec.num_stats == {"per_degree": 3, "scalar_high": 2}[grouping]
     x = torch.randn(3, 9, 7, dtype=torch.float64)
     weight, bias = torch.randn(3, 7, dtype=torch.float64), torch.randn(7, dtype=torch.float64)
     expected = _oracle(x, grouping, "degree_balanced", weight=weight, bias=bias)
@@ -351,7 +340,8 @@ def test_cpu_reference_and_spec(grouping):
 
 @pytest.mark.parametrize("kwargs", (
     {"lmax": -1}, {"channels": 0}, {"eps": 0.}, {"eps": float("nan")},
-    {"center_scalar": 1}, {"grouping": "unknown"}, {"weighting": "unknown"},
+    {"center_scalar": 1}, {"grouping": "unknown"}, {"grouping": "all"},
+    {"weighting": "unknown"},
 ))
 def test_invalid_spec(kwargs):
     options = dict(lmax=2, channels=7)
@@ -381,7 +371,7 @@ def test_public_package_exports():
 
 SOURCE_CLASSES = (
     ("V3", "EquivariantLayerNorm"),
-    ("V3", "EquivariantMergeLayerNorm"),
+    ("V3", "EquivariantSeparableLayerNorm"),
     ("V2", "EquivariantLayerNormArraySphericalHarmonics"),
 )
 
@@ -416,3 +406,17 @@ def test_optional_original_source(source_family, class_name):
             source.affine_bias = torch.nn.Parameter(torch.randn_like(source.affine_bias))
         _assert_close(adapter(x), source(x))
         assert any(key.startswith("source.") for key in adapter.state_dict())
+
+
+def test_default_preset_is_per_degree():
+    default = EquivariantNormSpec.from_preset(lmax=2, channels=7)
+    explicit = EquivariantNormSpec.from_preset(lmax=2, channels=7, grouping="per_degree")
+    assert default == explicit
+
+
+def test_out_of_scope_source_is_rejected_before_allocation():
+    class EquivariantMergeLayerNorm:
+        pass
+
+    with pytest.raises(NotImplementedError, match="no verified source adapter"):
+        from_reference(EquivariantMergeLayerNorm(), device="cpu")

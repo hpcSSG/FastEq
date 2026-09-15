@@ -1,7 +1,7 @@
 r"""Benchmark original Torch LayerNorm classes against the fused Triton adapter.
 
     PYTHONPATH=. FASTEQ_BACKEND=cpu python test/benchmark_triton_equivariant_layer_norm.py \
-        --v3-source /path/to/equiformer_v3/layer_norm.py --operators norm merge \
+        --v3-source /path/to/equiformer_v3/layer_norm.py --operators norm separable \
         --mode fwd_bwd --nodes 108 4096 --output layernorm_benchmark.json
 
 V2/V3 paths also accept FASTEQ_EQUIFORMER_{V2,V3}_LAYER_NORM. Each case checks
@@ -27,7 +27,6 @@ from fasteq.triton.fused_equivariant_layer_norm import from_reference
 
 OPERATORS = {
     "norm": ("V3", "EquivariantLayerNorm"),
-    "merge": ("V3", "EquivariantMergeLayerNorm"),
     "separable": ("V3", "EquivariantSeparableLayerNorm"),
     "sh": ("V2", "EquivariantLayerNormArraySphericalHarmonics"),
 }
