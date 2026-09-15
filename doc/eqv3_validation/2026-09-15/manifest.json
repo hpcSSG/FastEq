@@ -110,6 +110,7 @@
     "extras.py": "9b404fbfbb68d670fa9b69aefb9046758badd4e3fbcce577b11c94029ca40e52",
     "plot.py": "370de4a0a5b0c58c58cbdc40f54b46a1bbb22e336a115203838fdcfda9a71fe9",
     "run.py": "1efe72d272ee195980802641b251d84dc63d12fe94da2babc308fa0c1938d080",
-    "summarize.py": "0315cee7b6913f8842657682c78dae68ab9d592ff67d8a70a724245c37bfb6d2"
+    "summarize.py": "0315cee7b6913f8842657682c78dae68ab9d592ff67d8a70a724245c37bfb6d2",
+    "plot_by_operator.py": "21849def14f3601f091aea9e7364c72aeb479931b82b06a576768f3b2dd5434e"
   }
 }

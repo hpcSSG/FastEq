@@ -86,8 +86,8 @@ See [regression.json](eqv3_validation/2026-09-15/regression.json) for the exact
 implementation, test and reference hashes. This cleanup was retested on CUDA;
 HIP and performance measurements were not rerun.
 
-The [EQv3 report](eqv3_validation.md) summarizes existing performance and accuracy
-records for the retained operator list, with their original measurement revision.
+The LayerNorm scaling results below retain their original measurement revision.
+The [validation index](eqv3_validation.md) contains the shared testing method.
 
 ## Historical validation record: 2026-09-15
 
@@ -224,41 +224,70 @@ logs are [`unified_hip.log`](layernorm_validation/2026-09-15/unified_hip.log) an
 [`unified_cuda.log`](layernorm_validation/2026-09-15/unified_cuda.log).
 
 These historical representative measurements alone do not establish a maximum
-atom count or OOM boundary. See the [EQv3 report](eqv3_validation.md) for the
-separate scaling measurements and their source revision.
+atom count or OOM boundary. The following section records the separate
+LayerNorm scaling measurements and their source revision.
 GPU FP32, supported layouts, tile-size limits, and 32-bit indexing restrictions
 still apply; second-order gradients and full-model training remain unvalidated
 or unsupported as described above.
 
-## EQv3 operator comparison plots
+## H100 LayerNorm scaling measurements
 
-H100, FP32; measurements use FastEq `3bc9a82d40ef646c3ce75f6f517e3f618fb12754`.
-The charts cover the retained EQv3 operator list. Speedup is original Torch time
-divided by FastEq time; forward + backward includes all first-order gradients.
-These existing measurements were not rerun after the adaptation scope cleanup.
+This sweep uses the original EQv3 `EquivariantLayerNorm` and
+`EquivariantSeparableLayerNorm` as Torch references, with input `[N,16,128]`,
+Lmax=3 and C=128. Each variant has 15 passing scaling/small-shape comparisons,
+covering outputs and all requested first-order gradients. Native FP32 acceptance
+uses `atol=5e-5, rtol=5e-4`. These archived scaling checks are separate from
+the current 218-test regression suite above; this sweep did not include V2.
 
-### N = 4096
+### Performance
 
-| Operator | Forward speedup | Forward + backward speedup |
-| --- | ---: | ---: |
-| GraphSoftmax (cached CSR) | 4.82× | 1.23× |
-| AttentionAlpha | 3.43× | 0.75× |
-| e3nn Gate | 2.17× | 3.11× |
-| LayerNorm | 2.92× | 1.85× |
-| SeparableLayerNorm | 1.55× | 1.40× |
-| EquivariantDropout | 0.61× | 0.85× |
+H100 80GB, FP32, Torch 2.11.0+cu128, Triton 3.6.0; archived FastEq commit
+`3bc9a82d40ef646c3ce75f6f517e3f618fb12754`. The table shows N=4096 and the
+largest common runnable N for each mode. Speedup is Torch time / FastEq time.
+Five warmups and 20 synchronized GPU-event samples were used per point.
+Forward + backward includes all requested first-order gradients, without an optimizer.
+Peak memory is allocator-allocated memory, including inputs and results.
 
-GraphSoftmax and AttentionAlpha have accuracy failures in other configurations.
-The e3nn Gate measurements do not validate EQv3 GateActivation. See the
-[full report](eqv3_validation.md) for correctness coverage and timing details.
+| Operator | N | Mode | Torch ms | FastEq ms | Speedup | Peak GiB (Torch / FastEq) | Accuracy at this point |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | --- |
+| LayerNorm | 4,096 | Forward | 0.3847 | 0.1317 | 2.92× | 0.096 / 0.063 | Pass |
+| LayerNorm | 4,096 | Forward + backward | 1.6003 | 0.8641 | 1.85× | 0.180 / 0.190 | Pass |
+| LayerNorm | 524,288 | Forward | 13.9120 | 7.1032 | 1.96× | 12.252 / 8.000 | Pass |
+| LayerNorm | 524,288 | Forward + backward | 67.7502 | 45.8218 | 1.48× | 23.008 / 24.270 | Pass |
+| SeparableLayerNorm | 4,096 | Forward | 0.1900 | 0.1228 | 1.55× | 0.154 / 0.063 | Pass |
+| SeparableLayerNorm | 4,096 | Forward + backward | 0.7303 | 0.5221 | 1.40× | 0.303 / 0.248 | Pass |
+| SeparableLayerNorm | 524,288 | Forward | 15.7124 | 6.1454 | 2.56× | 15.781 / 8.000 | Pass |
+| SeparableLayerNorm | 524,288 | Forward + backward | 61.9116 | 28.9391 | 2.14× | 30.816 / 31.758 | Pass |
 
-![Measured speedup at N=4096](eqv3_validation/2026-09-15/speedup_4096.png)
+Both variants use the public source adapter with `parameter_reduction="native"`.
+Forward + backward includes native Torch statistic and parameter reductions.
+The timings are standalone calls, not complete-model measurements.
 
-### Doubling the atom count
+![LayerNorm scaling speedup](eqv3_validation/2026-09-15/operator_plots/layernorm.png)
 
-![Speedup as the atom count doubles](eqv3_validation/2026-09-15/speedup_scaling.png)
+### Scaling boundaries
 
-The curves end at each path's measured memory boundary or explicit execution
-limit. Raw [paired timings](eqv3_validation/2026-09-15/paired.csv) and
-[stopping boundaries](eqv3_validation/2026-09-15/boundaries.csv) distinguish OOM,
-index limits and fallback; a stopping point is not always an OOM.
+| Operator | Mode | Backend | Last successful N | Next N | Stop |
+| --- | --- | --- | ---: | ---: | --- |
+| LayerNorm | Forward | Torch | 2,097,152 | 4,194,304 | OOM |
+| LayerNorm | Forward | FastEq | 524,288 | 1,048,576 | LIMIT |
+| LayerNorm | Forward + backward | Torch | 1,048,576 | 2,097,152 | OOM |
+| LayerNorm | Forward + backward | FastEq | 524,288 | 1,048,576 | LIMIT |
+| SeparableLayerNorm | Forward | Torch | 1,048,576 | 2,097,152 | OOM |
+| SeparableLayerNorm | Forward | FastEq | 524,288 | 1,048,576 | LIMIT |
+| SeparableLayerNorm | Forward + backward | Torch | 1,048,576 | 2,097,152 | OOM |
+| SeparableLayerNorm | Forward + backward | FastEq | 524,288 | 1,048,576 | LIMIT |
+
+Both FastEq variants reach the explicit 32-bit element-indexing limit at
+N=1,048,576: `[N,16,128]` contains 2^31 elements. The harness stops before
+allocating that shape; this is not a FastEq OOM. Torch's stops above are actual
+allocation failures.
+
+Use operator keys `norm` and `separable` in the
+[paired timings](eqv3_validation/2026-09-15/paired.csv),
+[accuracy records](eqv3_validation/2026-09-15/correctness_summary.json), and
+[boundary details](eqv3_validation/2026-09-15/boundaries.csv).
+The [shared measurement method](eqv3_validation.md#measurement-method) defines
+GPU/wall-clock timing and allocator peak memory. Follow the
+[reproduction instructions](eqv3_validation/2026-09-15/REPRODUCE.md) with
+`run.py --ops norm separable` in a new results directory.

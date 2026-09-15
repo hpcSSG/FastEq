@@ -79,3 +79,16 @@ explicit compact mask generated using the same seed and RNG offsets, which
 also handles exactly-zero inputs. The initial helper is retained as
 `cases_initial_mask_replay.py`; the production dropout implementation and its
 timing path were unchanged.
+
+## Rebuild the per-operator documentation plots
+
+`plot_by_operator.py` reads only the archived `paired.csv`. It does not run
+GPU tests or change timing records. From the repository root, using the Python
+environment above (with Matplotlib available), run:
+
+```bash
+python doc/eqv3_validation/2026-09-15/plot_by_operator.py
+```
+
+The five images in `operator_plots/` are used by the separate operator pages.
+The older `plot.py` retains the combined snapshot plots.
