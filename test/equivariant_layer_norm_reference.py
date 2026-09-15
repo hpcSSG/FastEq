@@ -2,7 +2,7 @@
 
 import torch
 
-from fasteq.triton.fused_equivariant_layer_norm_common import NormResult
+from fasteq.triton.fused_equivariant_layer_norm import NormResult
 
 
 def reference_forward(x, spec, *, weight=None, bias=None):
