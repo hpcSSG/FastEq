@@ -7,8 +7,8 @@ FASTEQ_EQUIFORMER_{V2,V3}_LAYER_NORM paths as the forward tests. Use
 errors from the accuracy tests. There are no timing or performance assertions.
 
 The mathematical oracle below builds an ordinary autograd graph from slices,
-reductions, and concatenation, independently of the kernel metadata and shipped
-reference_forward. Its FP64 inputs are the exact tested FP32 values converted
+reductions, and concatenation, independently of the kernel metadata and the shared
+test reference_forward. Its FP64 inputs are the exact tested FP32 values converted
 to double, so errors do not include a different random-input quantization.
 """
 
@@ -30,7 +30,6 @@ from fasteq.triton.fused_equivariant_layer_norm import (
 
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-VERSIONS = ("v0", "v1")
 GROUPINGS = ("per_degree", "all", "scalar_high")
 
 
@@ -80,13 +79,13 @@ def _math_output(x, grouping, weighting, center, weight, bias, eps=1e-5):
     return torch.cat(outputs, dim=1)
 
 
-def _plan(lmax, channels, grouping, version, weighting="degree_balanced", center=True):
+def _plan(lmax, channels, grouping, weighting="degree_balanced", center=True):
     spec = EquivariantNormSpec.from_preset(
         lmax=lmax, channels=channels, grouping=grouping, weighting=weighting,
         center_scalar=center,
     )
     return TritonEquivariantNorm(
-        spec, version=version, device="cuda",
+        spec, device="cuda",
         reduction_order="channels_first" if grouping == "all" else "components_first",
     )
 
@@ -224,14 +223,13 @@ def _seed():
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("lmax,channels", ((0, 1), (2, 7), (4, 33)))
 @pytest.mark.parametrize("parameters", ("packed", "split"))
 def test_backward_matches_fp64_and_fp32_math(
-        version, layout, grouping, lmax, channels, parameters, record_property):
-    op = _plan(lmax, channels, grouping, version)
+        layout, grouping, lmax, channels, parameters, record_property):
+    op = _plan(lmax, channels, grouping)
     for seed in (17, 821):
         torch.manual_seed(seed)
         x, weight, bias, grad_output = _inputs(
@@ -255,11 +253,10 @@ NONDEFAULTS = (
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("grouping,weighting,center", NONDEFAULTS)
-def test_backward_nondefault_statistics(version, layout, grouping, weighting, center):
-    op = _plan(2, 7, grouping, version, weighting, center)
+def test_backward_nondefault_statistics(layout, grouping, weighting, center):
+    op = _plan(2, 7, grouping, weighting, center)
     x, weight, bias, grad_output = _inputs(layout=layout)
     # The source merge class omits beta when scalar centering is disabled.
     bias = bias if center else None
@@ -268,21 +265,19 @@ def test_backward_nondefault_statistics(version, layout, grouping, weighting, ce
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("parameters", ("none", "bias_only", "weight_only"))
-def test_backward_optional_affine(version, grouping, parameters):
-    op = _plan(2, 7, grouping, version)
+def test_backward_optional_affine(grouping, parameters):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(layout="KNC", parameters=parameters)
     _compare_math(op, x, weight, bias, grad_output, grouping=grouping)
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("grad_mode", ("input", "weight", "bias", "params"))
-def test_backward_only_requested_leaves(version, grouping, grad_mode):
-    op = _plan(2, 7, grouping, version)
+def test_backward_only_requested_leaves(grouping, grad_mode):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(parameters="split", grad_mode=grad_mode)
     _, actual = _compare_math(op, x, weight, bias, grad_output, grouping=grouping)
     assert ("dX" in actual) == (grad_mode == "input")
@@ -291,22 +286,20 @@ def test_backward_only_requested_leaves(version, grouping, grad_mode):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("profile", ("tiny", "near_constant", "constant", "zero"))
-def test_backward_small_variance(version, grouping, profile, record_property):
-    op = _plan(2, 7, grouping, version)
+def test_backward_small_variance(grouping, profile, record_property):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(parameters="split", profile=profile)
     _compare_math(op, x, weight, bias, grad_output, grouping=grouping, profile=profile,
                   record_property=record_property, prefix=profile)
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("gradient_layout", ("KNC", "strided", "broadcast"))
-def test_backward_noncontiguous_upstream_gradient(version, grouping, gradient_layout):
-    op = _plan(2, 7, grouping, version)
+def test_backward_noncontiguous_upstream_gradient(grouping, gradient_layout):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(layout="KNC")
     if gradient_layout == "KNC":
         grad_output = _layout(grad_output, "KNC")
@@ -319,11 +312,10 @@ def test_backward_noncontiguous_upstream_gradient(version, grouping, gradient_la
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
-def test_backward_empty_batch(version, grouping, layout):
-    op = _plan(2, 7, grouping, version)
+def test_backward_empty_batch(grouping, layout):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(n=0, layout=layout, parameters="split")
     _, actual = _compare_math(op, x, weight, bias, grad_output, grouping=grouping)
     for value in actual.values():
@@ -332,10 +324,9 @@ def test_backward_empty_batch(version, grouping, layout):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_backward_forward_with_stats_marks_auxiliary_outputs_nondifferentiable(version, grouping):
-    op = _plan(2, 7, grouping, version)
+def test_backward_forward_with_stats_marks_auxiliary_outputs_nondifferentiable(grouping):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs()
     result, _ = _compare_math(op, x, weight, bias, grad_output, grouping=grouping,
                               with_stats=True)
@@ -346,9 +337,8 @@ def test_backward_forward_with_stats_marks_auxiliary_outputs_nondifferentiable(v
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
-def test_backward_uncentered_stats_have_no_mean(version):
-    op = _plan(2, 7, "all", version, center=False)
+def test_backward_uncentered_stats_have_no_mean():
+    op = _plan(2, 7, "all", center=False)
     x, weight, _, grad_output = _inputs()
     result, _ = _compare_math(op, x, weight, None, grad_output, grouping="all",
                               center=False, with_stats=True)
@@ -357,10 +347,9 @@ def test_backward_uncentered_stats_have_no_mean(version):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_backward_rejects_higher_order_graphs_explicitly(version, grouping):
-    op = _plan(2, 7, grouping, version)
+def test_backward_rejects_higher_order_graphs_explicitly(grouping):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs()
     output = op(x, weight=weight, bias=bias)
     # First-order-only means create_graph must fail immediately and clearly;
@@ -393,17 +382,16 @@ def _load_source(source_family, class_name):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("source_family,class_name", SOURCE_CLASSES)
 @pytest.mark.parametrize("profile", ("random", "near_constant"))
 def test_backward_optional_original_source(
-        version, layout, source_family, class_name, profile, record_property):
+        layout, source_family, class_name, profile, record_property):
     source = _load_source(source_family, class_name)(2, 7).cuda().train()
     with torch.no_grad():
         for parameter in source.parameters():
             parameter.normal_(mean=.1, std=.9)
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
     x, _, _, grad_output = _inputs(layout=layout, profile=profile)
     rx = _clone_leaf(x)
     named = dict(source.named_parameters())
@@ -441,15 +429,14 @@ def _custom_partition_output(x, weight, bias, center):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("center", (True, False))
 @pytest.mark.parametrize("order", ("channels_first", "components_first"))
-def test_backward_custom_nonuniform_partition(version, center, order, record_property):
+def test_backward_custom_nonuniform_partition(center, order, record_property):
     spec = EquivariantNormSpec(
         3, 7, ((.7, .2, 0., 0.), (0., 0., .3, .05)), (0, 0, 1, 1),
         center_scalar=center, eps=.17,
     )
-    op = TritonEquivariantNorm(spec, version=version, reduction_order=order, device="cuda")
+    op = TritonEquivariantNorm(spec, reduction_order=order, device="cuda")
     x, weight, bias, grad_output = _inputs(lmax=3, layout="KNC")
     actual = _gradients(op(x, weight=weight, bias=bias), x, weight, bias, grad_output)
     for dtype in (torch.float64, torch.float32):
@@ -461,11 +448,10 @@ def test_backward_custom_nonuniform_partition(version, center, order, record_pro
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("trainable", ("scalar", "higher"))
-def test_backward_split_only_one_weight_requires_grad(version, grouping, trainable):
-    op = _plan(2, 7, grouping, version)
+def test_backward_split_only_one_weight_requires_grad(grouping, trainable):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(parameters="split", grad_mode="weight")
     weight[1 if trainable == "scalar" else 0].requires_grad_(False)
     _, actual = _compare_math(op, x, weight, bias, grad_output, grouping=grouping)
@@ -474,12 +460,11 @@ def test_backward_split_only_one_weight_requires_grad(version, grouping, trainab
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", ("per_degree", "scalar_high"))
 @pytest.mark.parametrize("corrupted_tensor", ("X", "dY"))
 @pytest.mark.parametrize("corrupted_degree", (0, 1))
-def test_backward_nan_isolation(version, grouping, corrupted_tensor, corrupted_degree):
-    op = _plan(2, 7, grouping, version)
+def test_backward_nan_isolation(grouping, corrupted_tensor, corrupted_degree):
+    op = _plan(2, 7, grouping)
     x, weight, bias, grad_output = _inputs(layout="KNC")
     rx, rw, rb = _clone_arguments(x, weight, bias, torch.float64)
     clean_output = _math_output(rx, grouping, "degree_balanced", True, rw, rb)
@@ -514,10 +499,9 @@ def test_backward_nan_isolation(version, grouping, corrupted_tensor, corrupted_d
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_backward_model_shape_l4_c128_n108(version, grouping, record_property):
-    op = _plan(4, 128, grouping, version)
+def test_backward_model_shape_l4_c128_n108(grouping, record_property):
+    op = _plan(4, 128, grouping)
     x, weight, bias, grad_output = _inputs(
         lmax=4, channels=128, n=108, layout="KNC",
         parameters="split" if grouping == "scalar_high" else "packed",
@@ -527,12 +511,11 @@ def test_backward_model_shape_l4_c128_n108(version, grouping, record_property):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_backward_tiny_epsilon_zero_input_stays_finite(version, grouping, record_property):
+def test_backward_tiny_epsilon_zero_input_stays_finite(grouping, record_property):
     eps = 1e-30
     spec = EquivariantNormSpec.from_preset(lmax=2, channels=7, grouping=grouping, eps=eps)
-    op = TritonEquivariantNorm(spec, version=version, device="cuda")
+    op = TritonEquivariantNorm(spec, device="cuda")
     x, weight, bias, grad_output = _inputs(profile="zero")
     actual = _gradients(op(x, weight=weight, bias=bias), x, weight, bias, grad_output)
     rx, rw, rb = _clone_arguments(x, weight, bias, torch.float64)
@@ -554,8 +537,7 @@ def test_backward_tiny_epsilon_zero_input_stays_finite(version, grouping, record
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
-def test_backward_optional_original_source_chain_two_sgd_steps(version, record_property):
+def test_backward_optional_original_source_chain_two_sgd_steps(record_property):
     originals = torch.nn.Sequential(*[
         _load_source(family, class_name)(2, 7) for family, class_name in SOURCE_CLASSES
     ]).cuda().train()
@@ -566,7 +548,7 @@ def test_backward_optional_original_source_chain_two_sgd_steps(version, record_p
             else:
                 parameter.normal_(mean=0., std=.1)
     reference = copy.deepcopy(originals)
-    adapted = torch.nn.Sequential(*[from_reference(module, version=version)
+    adapted = torch.nn.Sequential(*[from_reference(module)
                                     for module in originals]).train()
     optimizer = torch.optim.SGD(adapted.parameters(), lr=.05)
     reference_optimizer = torch.optim.SGD(reference.parameters(), lr=.05)

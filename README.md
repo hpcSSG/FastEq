@@ -32,66 +32,16 @@ Model associations below follow the project operator inventory. Exact usage depe
 | Graph Softmax | `FusedGraphSoftmax` | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | Fused GraphSoftmax |
 | Graph attention | `FusedAttenAlpha` | Fuse normalization, activation, dropout, and weighted reduction in graph attention into a single kernel | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
 | Equivariant Gate| `FusedEquivariantGate` | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
-| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2, eSEN | Shared Triton v0/v1; FP32 forward and first-order backward |
+| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2 | Fused statistics and affine transformation; first-order backward |
 | Equivariant dropout | `FusedEquivariantDropout` | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout | 
 
 Graph softmax operates on attention weights; it supports equivariant attention but does not itself perform a representation rotation or tensor-product coupling.
 
 ### Equivariant LayerNorm
 
-The shared implementation supports `EquivariantLayerNorm` (each degree separately),
-`EquivariantMergeLayerNorm` (all degrees together), and
-`EquivariantLayerNormArraySphericalHarmonics` (scalar and higher-degree groups).
-The source adapter preserves each module's statistic weights, reduction order,
-scalar centering, and degree-wise affine parameters.
-
-```python
-from fasteq.triton import from_reference
-
-# source is the original FP32 module on CUDA; x is [N, (lmax+1)**2, C].
-op = from_reference(source, version="v1")  # "v0" selects separate stages
-y = op(x)
-y.square().mean().backward()             # gradients reach source parameters
-```
-
-| Version | Forward | Backward when input and all affine gradients are needed |
-| --- | --- | --- |
-| `v0` | Separate scalar mean, grouped statistics, and affine output | Group dot products, input gradients, parameter partials, then cross-atom reduction: four kernels |
-| `v1` | One fused kernel per invocation | Per-atom fused input gradients and parameter partials, then cross-atom reduction: two kernels |
-
-Both versions compute `dX`, degree/channel-specific `dgamma`, and scalar-only
-`dbeta` with Triton. Parameter gradients are summed across atoms using a
-deterministic partial-buffer reduction without floating-point atomics. v1 reuses
-loaded features and upstream gradients and omits the intermediate group-dot
-tensor. Input-gradient-only backward uses one v1 kernel. Training forward saves
-the scalar mean and reciprocal standard deviations; inference under
-`torch.no_grad()` or `torch.inference_mode()` does not retain backward statistics.
-
-The current interface supports CUDA FP32 and first-order gradients, NKC or KNC
-input storage, and contiguous, disjoint groups of complete degrees with equal
-channel counts. Noncontiguous and broadcast upstream gradients are accepted.
-`forward_with_stats()` returns a differentiable output and detached diagnostic
-statistics. Double backward and `create_graph=True` are explicitly rejected.
-
-Correctness checks cover independent FP64/FP32 references, the three original
-source modules, and a three-module chain with two SGD steps: 288 backward tests
-and 139 forward regression tests passed on H100 with PyTorch 2.8.0 and Triton 3.4.0.
-Near-constant inputs use separately declared precision tolerances; FP32 reduction
-orders are not bitwise equivalent to the sources. No backward performance claim
-is made. See the [implementation](fasteq/triton/fused_equivariant_layer_norm.py),
-[backward kernels](fasteq/triton/_equivariant_norm_backward.py), and
-[gradient tests](test/test_triton_equivariant_layer_norm_backward.py).
-
-```bash
-PYTHONPATH=. FASTEQ_BACKEND=cpu CUDA_VISIBLE_DEVICES=0 \
-  python -m pytest -q test/test_triton_equivariant_layer_norm.py \
-  test/test_triton_equivariant_layer_norm_backward.py
-```
-
-`FASTEQ_BACKEND=cpu` skips the native extension loader in a source checkout;
-these Triton operators still run on CUDA. To enable the original-source checks,
-set `FASTEQ_EQUIFORMER_V3_LAYER_NORM` and `FASTEQ_EQUIFORMER_V2_LAYER_NORM` to the
-respective original `layer_norm.py` files.
+CUDA FP32 normalization with first-order gradients for EquiformerV3 and
+EquiformerV2 layers. See [Equivariant LayerNorm](doc/layernorm.md) for supported
+layers, fused operations, usage, and validation coverage.
 
 ## How FastEq Optimizes Equivariant Computation
 

@@ -1,0 +1,634 @@
+[
+  {
+    "family": "V3",
+    "class": "EquivariantLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "torch",
+    "median_ms": 0.24292799830436707,
+    "peak_allocated_bytes": 136335360,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0005980196292512119,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.003747959854081273,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.02422207035124302,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "unified",
+    "median_ms": 0.12329600006341934,
+    "peak_allocated_bytes": 100667392,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0005980196292512119,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.003747959854081273,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.02422207035124302,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "torch",
+    "median_ms": 1.0427200198173523,
+    "peak_allocated_bytes": 193009664,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0005980196292512119,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.003747959854081273,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.02422207035124302,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "unified",
+    "median_ms": 0.699072003364563,
+    "peak_allocated_bytes": 203591680,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0005980196292512119,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.003747959854081273,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.02422207035124302,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantMergeLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "torch",
+    "median_ms": 0.20876800268888474,
+    "peak_allocated_bytes": 239105024,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 4.76837158203125e-07,
+        "max_tolerance_ratio": 0.00356669700704515,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantMergeLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "unified",
+    "median_ms": 0.09969599917531013,
+    "peak_allocated_bytes": 167777280,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 4.76837158203125e-07,
+        "max_tolerance_ratio": 0.00356669700704515,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantMergeLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "torch",
+    "median_ms": 0.8198240101337433,
+    "peak_allocated_bytes": 369170432,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 4.76837158203125e-07,
+        "max_tolerance_ratio": 0.00356669700704515,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantMergeLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "unified",
+    "median_ms": 0.45633600652217865,
+    "peak_allocated_bytes": 337687552,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 4.76837158203125e-07,
+        "max_tolerance_ratio": 0.00356669700704515,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 0.0,
+        "max_tolerance_ratio": 0.0,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantSeparableLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "torch",
+    "median_ms": 0.1915839985013008,
+    "peak_allocated_bytes": 232796672,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 6.103515625e-05,
+        "max_tolerance_ratio": 0.27791091799736023,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantSeparableLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "unified",
+    "median_ms": 0.12911999970674515,
+    "peak_allocated_bytes": 167777280,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 6.103515625e-05,
+        "max_tolerance_ratio": 0.27791091799736023,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantSeparableLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "torch",
+    "median_ms": 0.7198399901390076,
+    "peak_allocated_bytes": 325161472,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 6.103515625e-05,
+        "max_tolerance_ratio": 0.27791091799736023,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V3",
+    "class": "EquivariantSeparableLayerNorm",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "unified",
+    "median_ms": 0.526608020067215,
+    "peak_allocated_bytes": 333527552,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 6.103515625e-05,
+        "max_tolerance_ratio": 0.27791091799736023,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V2",
+    "class": "EquivariantLayerNormArraySphericalHarmonics",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "torch",
+    "median_ms": 0.2032640054821968,
+    "peak_allocated_bytes": 203444736,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.6317837834358215,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V2",
+    "class": "EquivariantLayerNormArraySphericalHarmonics",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward",
+    "backend": "unified",
+    "median_ms": 0.1096160002052784,
+    "peak_allocated_bytes": 167776768,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.6317837834358215,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V2",
+    "class": "EquivariantLayerNormArraySphericalHarmonics",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "torch",
+    "median_ms": 0.9617280066013336,
+    "peak_allocated_bytes": 327194624,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.6317837834358215,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  },
+  {
+    "family": "V2",
+    "class": "EquivariantLayerNormArraySphericalHarmonics",
+    "shape": [
+      4096,
+      16,
+      128
+    ],
+    "mode": "forward_backward",
+    "backend": "unified",
+    "median_ms": 0.6990559995174408,
+    "peak_allocated_bytes": 270635520,
+    "warmup": 5,
+    "repeats": 20,
+    "correctness": {
+      "output": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.008221857249736786,
+        "pass": true
+      },
+      "grad_0": {
+        "max_abs": 1.9073486328125e-06,
+        "max_tolerance_ratio": 0.0028039810713380575,
+        "pass": true
+      },
+      "grad_1": {
+        "max_abs": 7.62939453125e-05,
+        "max_tolerance_ratio": 0.6317837834358215,
+        "pass": true
+      },
+      "grad_2": {
+        "max_abs": 4.57763671875e-05,
+        "max_tolerance_ratio": 0.10262971371412277,
+        "pass": true
+      },
+      "grad_3": {
+        "max_abs": 4.1961669921875e-05,
+        "max_tolerance_ratio": 0.03056231513619423,
+        "pass": true
+      }
+    }
+  }
+]

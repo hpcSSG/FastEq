@@ -1,25 +1,92 @@
-"""Shared FP32 forward and first-order gradients for equivariant norm groups.
+"""Shared Triton normalization with framework-native source reductions.
 
-v0: scalar mean -> group statistics -> affine output (separate launches).
-v1: one program per atom, sharing the input tile across statistic groups.
-Both use the same statistics and affine helpers; no model/shape-specific tuning.
-The version flag changes scheduling; both versions use the same math contract.
+Forward statistics/affine and backward dX/parameter partials use shared Triton
+kernels. Native-source reduction axes use Torch without backend dispatch here.
 """
+from dataclasses import dataclass
+from typing import NamedTuple
+import math
 import torch
 import triton
 import triton.language as tl
 
-from ._equivariant_norm_spec import EquivariantNormSpec, NormResult, reference_forward
-from ._equivariant_norm_backward import backward as _backward
+@dataclass(frozen=True)
+class EquivariantNormSpec:
+    lmax: int
+    channels: int
+    stats_weights: tuple[tuple[float, ...], ...]
+    output_group: tuple[int, ...]
+    center_scalar: bool = True
+    eps: float = 1e-5
 
+    def __post_init__(self):
+        if type(self.lmax) is not int or self.lmax < 0:
+            raise ValueError('lmax must be a nonnegative integer')
+        if type(self.channels) is not int or self.channels < 1:
+            raise ValueError('channels must be a positive integer')
+        if type(self.center_scalar) is not bool:
+            raise ValueError('center_scalar must be boolean')
+        if not math.isfinite(self.eps) or self.eps <= 0:
+            raise ValueError('eps must be finite and positive')
+        weights = tuple(tuple(float(v) for v in row) for row in self.stats_weights)
+        groups = tuple(self.output_group)
+        if not weights or any(len(row) != self.lmax + 1 for row in weights):
+            raise ValueError('stats_weights must have shape [G, lmax+1], G > 0')
+        if any(not math.isfinite(v) or v < 0 for row in weights for v in row):
+            raise ValueError('statistic weights must be finite and nonnegative')
+        if any(not any(v > 0 for v in row) for row in weights):
+            raise ValueError('each statistic must have a nonzero source')
+        if len(groups) != self.lmax + 1 or any(
+            type(g) is not int or not 0 <= g < len(weights) for g in groups
+        ):
+            raise ValueError('output_group must select one valid group per degree')
+        if set(groups) != set(range(len(weights))):
+            raise ValueError('every statistic must be used by an output degree')
+        object.__setattr__(self, 'stats_weights', weights)
+        object.__setattr__(self, 'output_group', groups)
 
-@triton.jit
-def _scalar_mean(X, MU, C: tl.constexpr, SN: tl.constexpr, BC: tl.constexpr):
-    n = tl.program_id(0)
-    c = tl.arange(0, BC)
-    x = tl.load(X + n * SN + c, c < C, 0.)
-    tl.store(MU + n, tl.sum(x, 0) / C)
+    @property
+    def components(self):
+        return (self.lmax + 1) ** 2
 
+    @property
+    def num_stats(self):
+        return len(self.stats_weights)
+
+    @classmethod
+    def from_preset(cls, *, lmax, channels, grouping='all',
+                    weighting='degree_balanced', center_scalar=True, eps=1e-5):
+        if type(lmax) is not int or lmax < 0:
+            raise ValueError('lmax must be a nonnegative integer')
+        if grouping == 'per_degree':
+            sources = [(l,) for l in range(lmax + 1)]
+        elif grouping == 'scalar_high':
+            sources = [(0,)] + ([tuple(range(1, lmax + 1))] if lmax else [])
+        elif grouping == 'all':
+            sources = [tuple(range(lmax + 1))]
+        else:
+            raise ValueError('unknown grouping preset')
+        if weighting not in ('component', 'degree_balanced', 'norm'):
+            raise ValueError('unknown weighting preset')
+        weights, output_group = [], [0] * (lmax + 1)
+        for g, degrees in enumerate(sources):
+            row = [0.] * (lmax + 1)
+            for l in degrees:
+                if weighting == 'degree_balanced':
+                    row[l] = 1. / (len(degrees) * (2 * l + 1))
+                elif weighting == 'component':
+                    row[l] = 1. / sum(2 * j + 1 for j in degrees)
+                else:
+                    row[l] = 1.
+                output_group[l] = g
+            weights.append(tuple(row))
+        return cls(lmax, channels, tuple(weights), tuple(output_group), center_scalar, eps)
+
+class NormResult(NamedTuple):
+    output: torch.Tensor
+    mean: torch.Tensor | None   # [N]; absent if scalar centering is disabled
+    moments: torch.Tensor | None  # [N,G]; omitted unless requested
+    rstd: torch.Tensor          # [N,G]
 
 @triton.jit
 def _moment(square, w, coefficient, C: tl.constexpr, ORDER: tl.constexpr,
@@ -29,14 +96,28 @@ def _moment(square, w, coefficient, C: tl.constexpr, ORDER: tl.constexpr,
         if UNIFORM:
             # Source unbalanced component/norm path reduces before scaling.
             return tl.sum(q, 0) * coefficient
-        return tl.sum(q * w, 0)
+        if q.shape[0] > 64:
+            # Bound compile size for large generic specifications.
+            return tl.sum(q * w, 0)
+        # Two ordered FMA streams preserve weighted source statistics without
+        # backend-specific math libraries or inline assembly.
+        a = tl.full((), 0., tl.float32)
+        b = tl.full((), 0., tl.float32)
+        k = tl.arange(0, q.shape[0])
+        for i in tl.static_range(q.shape[0] // 2):
+            ai = tl.sum(tl.where(k == i, q, 0.), 0)
+            aw = tl.sum(tl.where(k == i, w, 0.), 0)
+            bi = tl.sum(tl.where(k == i + q.shape[0] // 2, q, 0.), 0)
+            bw = tl.sum(tl.where(k == i + q.shape[0] // 2, w, 0.), 0)
+            a = tl.fma(ai, aw, a)
+            b = tl.fma(bi, bw, b)
+        return a + b
     else:
         if UNIFORM:
             q = tl.sum(square, 0) * coefficient
         else:
             q = tl.sum(square * w[:, None], 0)
         return tl.sum(q, 0) / C
-
 
 @triton.jit
 def _affine(z, r, k, c, valid, DEGREE, WEIGHT0, WEIGHTH, BIAS,
@@ -60,57 +141,19 @@ def _affine(z, r, k, c, valid, DEGREE, WEIGHT0, WEIGHTH, BIAS,
         y = tl.where(k == 0, y + beta, y)
     return y
 
-
 @triton.jit
-def _statistics(X, MU, MOMENTS, RSTD, BOUNDS, COEFFICIENT,
-                C: tl.constexpr, G: tl.constexpr, SN: tl.constexpr, SK: tl.constexpr,
-                CENTER: tl.constexpr, EPS: tl.constexpr,
-                ORDER: tl.constexpr, UNIFORM: tl.constexpr,
-                BK: tl.constexpr, BC: tl.constexpr):
-    n, g = tl.program_id(0), tl.program_id(1)
-    start = tl.load(BOUNDS + g)
-    end = tl.load(BOUNDS + g + 1)
-    k = start + tl.arange(0, BK)
-    c = tl.arange(0, BC)
-    valid = (k[:, None] < end) & (c[None, :] < C)
-    x = tl.load(X + n * SN + k[:, None] * SK + c[None, :], valid, 0.)
-    if CENTER:
-        mu = tl.load(MU + n)
-        z = tl.where(valid, x - tl.where(k[:, None] == 0, mu, 0.), 0.)
-    else:
-        z = x
-    w = tl.load(COEFFICIENT + k, k < end, 0.)
-    coefficient = tl.sum(tl.where(tl.arange(0, BK) == 0, w, 0.), 0)
-    v = _moment(z * z, w, coefficient, C, ORDER, UNIFORM)
-    r = tl.rsqrt(v + EPS)
-    tl.store(MOMENTS + n * G + g, v)
-    tl.store(RSTD + n * G + g, r)
-
-
-@triton.jit
-def _output(X, MU, RSTD, Y, DEGREE, GROUP, WEIGHT0, WEIGHTH, BIAS,
-            N: tl.constexpr, K: tl.constexpr, C: tl.constexpr, G: tl.constexpr,
-            SN: tl.constexpr, SK: tl.constexpr, CENTER: tl.constexpr,
-            HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr, HAS_BIAS: tl.constexpr,
-            WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr,
-            BS: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n = i // (K * C)
-    k = i // C % K
-    c = i % C
-    valid = i < N * K * C
-    x = tl.load(X + n * SN + k * SK + c, valid, 0.)
-    if CENTER:
-        mu = tl.load(MU + n, valid, 0.)
-        z = x - tl.where(k == 0, mu, 0.)
-    else:
-        z = x
-    group = tl.load(GROUP + k, valid, 0)
-    r = tl.load(RSTD + n * G + group, valid, 0.)
-    y = _affine(z, r, k, c, valid, DEGREE, WEIGHT0, WEIGHTH, BIAS,
-                HAS_WEIGHT, SPLIT, HAS_BIAS, WS0, WSL, WSC, BS, K)
-    tl.store(Y + i, y, valid)
-
+def _gamma(k, c, valid, DEGREE, W0, WH, K: tl.constexpr,
+           HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr,
+           WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr):
+    if HAS_WEIGHT:
+        degree = tl.load(DEGREE + k, k < K, 0)
+        if SPLIT:
+            scalar = tl.load(W0 + c * WS0 + tl.zeros_like(k), valid & (k == 0), 0.)
+            higher = tl.load(WH + (degree - 1) * WSL + c * WSC,
+                             valid & (k > 0), 0.)
+            return tl.where(k == 0, scalar, higher)
+        return tl.load(W0 + degree * WSL + c * WSC, valid, 0.)
+    return tl.full(valid.shape, 1., tl.float32)
 
 @triton.jit
 def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
@@ -120,7 +163,7 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
            HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr, HAS_BIAS: tl.constexpr,
            WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr, BS: tl.constexpr,
            SAVE: tl.constexpr, SAVE_MOMENTS: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
-           GROUP_BOUNDS: tl.constexpr):
+           GROUP_BOUNDS):
     n = tl.program_id(0)
     k = tl.arange(0, BK)
     c = tl.arange(0, BC)
@@ -136,8 +179,8 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
     square = z * z
     row_rstd = tl.full((BK,), 0., tl.float32)
     for g in tl.static_range(G):
-        start = GROUP_BOUNDS[g]
-        end = GROUP_BOUNDS[g + 1]
+        start = tl.load(GROUP_BOUNDS + g)
+        end = tl.load(GROUP_BOUNDS + g + 1)
         member = (k >= start) & (k < end)
         # Select absent sources before reduction: 0 * NaN is not isolation.
         group_square = tl.where(member[:, None], square, 0.)
@@ -157,6 +200,258 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
         if CENTER:
             tl.store(MU + n, mu)
 
+@triton.jit
+def _component_sum(value, k, start, end, SEQUENTIAL: tl.constexpr):
+    if SEQUENTIAL:
+        # Native affine broadcasting reduces each degree in component order.
+        # Keep this local order for cancellation; atom reduction stays a tree.
+        total = tl.full((value.shape[1],), 0., tl.float32)
+        for i in range(start, end):
+            total += tl.sum(tl.where(k == i, value, 0.), 0)
+        return total
+    return tl.sum(tl.where((k >= start) & (k < end), value, 0.), 0)
+
+
+@triton.jit
+def _portable_backward(X, DY, MU, RSTD, DR, DX, PW, PB, COEF, DEGREE, W0, WH, BOUNDS,
+                       K: tl.constexpr, C: tl.constexpr, G: tl.constexpr, L: tl.constexpr,
+                       SN: tl.constexpr, SK: tl.constexpr, DN: tl.constexpr, DK: tl.constexpr, DC: tl.constexpr,
+                       CENTER: tl.constexpr, HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr,
+                       WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr,
+                       NX: tl.constexpr, NW: tl.constexpr, NB: tl.constexpr,
+                       EXPANDED: tl.constexpr, NATIVE_REDUCE: tl.constexpr, PRECOMPUTED_DR: tl.constexpr, SOURCE_ORDER: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr):
+    n = tl.program_id(0)
+    k = tl.arange(0, BK)[:, None]
+    c = tl.arange(0, BC)[None, :]
+    valid = (k < K) & (c < C)
+    z = tl.load(X + n * SN + k * SK + c, valid, 0.)
+    if CENTER:
+        mu = tl.load(MU + n)
+        z = tl.where(valid, z - tl.where(k == 0, mu, 0.), 0.)
+    dy = tl.load(DY + n * DN + k * DK + c * DC, valid, 0.)
+    row_r = tl.full((BK, 1), 0., tl.float32)
+    for g in tl.static_range(G):
+        a = tl.load(BOUNDS + g)
+        b = tl.load(BOUNDS + g + 1)
+        member = (k >= a) & (k < b)
+        r = tl.load(RSTD + n * G + g)
+        row_r = tl.where(member, r, row_r)
+    # Source operation order: d(scale)=dY*z; broadcast reduces m before r.
+    product = dy * z
+    if NX:
+        gamma = _gamma(k, c, valid, DEGREE, W0, WH, K, HAS_WEIGHT, SPLIT, WS0, WSL, WSC)
+        direct = dy * (row_r * gamma)
+        row_dv = tl.full((BK, 1), 0., tl.float32)
+        for g in tl.static_range(G):
+            a = tl.load(BOUNDS + g)
+            b = tl.load(BOUNDS + g + 1)
+            member = (k >= a) & (k < b)
+            if PRECOMPUTED_DR:
+                dr = tl.load(DR + n * G + g)
+            else:
+                if EXPANDED:
+                    dr = tl.sum(tl.reshape(tl.where(member & valid, product * gamma, 0.), (BK * BC,)), 0)
+                else:
+                    dr = tl.full((), 0., tl.float32)
+                    for l in tl.static_range(L, -1, -1):
+                        lm = (k >= l*l) & (k < (l+1)*(l+1)) & member
+                        ds = _component_sum(tl.where(member & valid, product, 0.), k, l*l, (l+1)*(l+1), SOURCE_ORDER)
+                        weight = tl.sum(tl.where(k == l*l, gamma, 0.), 0)
+                        if HAS_WEIGHT:
+                            dr += tl.sum(ds * weight, 0)
+                        else:
+                            dr += tl.sum(tl.reshape(tl.where(lm & valid, product, 0.), (BK * BC,)), 0)
+            r = tl.load(RSTD + n * G + g)
+            # Multiply dr first: avoids overflowing r**3 for tiny eps and zero dr.
+            dv = (((dr * -0.5) * r) * r) * r
+            row_dv = tl.where(member, dv, row_dv)
+        coeff = tl.load(COEF + k, k < K, 0.)
+        u = tl.where(valid, direct + ((row_dv * coeff) / C) * (2. * z), 0.)
+        if CENTER:
+            scalar = tl.sum(tl.where(k == 0, u, 0.), 0)
+            mean_u = tl.sum(scalar, 0) / C
+            u = tl.where(valid, u - tl.where(k == 0, mean_u, 0.), 0.)
+        tl.store(DX + n*K*C + k*C + c, u, valid)
+    if NW and (EXPANDED and NATIVE_REDUCE):
+        tl.store(PW + n*K*C + k*C + c, product * row_r, valid)
+    elif NW:
+        for l in tl.static_range(L + 1):
+            member = (k >= l*l) & (k < (l+1)*(l+1))
+            if EXPANDED:
+                partial = _component_sum(tl.where(valid, product * row_r, 0.), k, l*l, (l+1)*(l+1), SOURCE_ORDER)
+            else:
+                partial = _component_sum(tl.where(valid, product, 0.), k, l*l, (l+1)*(l+1), SOURCE_ORDER)
+                partial *= tl.sum(tl.where(k == l*l, row_r, 0.), 0)
+            tl.store(PW + (n*(L+1)+l)*C + tl.arange(0, BC), partial, tl.arange(0, BC) < C)
+    if NB:
+        partial = tl.sum(tl.where(k == 0, dy, 0.), 0)
+        tl.store(PB + n*C + tl.arange(0, BC), partial, tl.arange(0, BC) < C)
+
+
+@triton.jit
+def _tree_reduce_rows(X, Y, N: tl.constexpr, W: tl.constexpr,
+                      FP64: tl.constexpr, BN: tl.constexpr, BC: tl.constexpr):
+    block = tl.program_id(0)
+    row = block * BN + tl.arange(0, BN)
+    col = tl.program_id(1) * BC + tl.arange(0, BC)
+    value = tl.load(X + row[:, None]*W + col[None, :],
+                    (row[:, None] < N) & (col[None, :] < W), 0.)
+    if FP64:
+        value = value.to(tl.float64)
+    total = tl.sum(value, 0)
+    tl.store(Y + block*W + col, total, col < W)
+
+
+def _reduce_rows(value, width, accumulation):
+    """Fixed 256-row tree; BC=32 is a channel tile, not the device warp width."""
+    n = value.shape[0]
+    if not n:
+        return torch.zeros(width, dtype=value.dtype, device=value.device)
+    if n == 1:
+        return value.reshape(width)
+    dtype = torch.float64 if accumulation == 'fp64' else torch.float32
+    while n > 1:
+        blocks = triton.cdiv(n, 256)
+        output = torch.empty((blocks, width), dtype=dtype, device=value.device)
+        _tree_reduce_rows[(blocks, triton.cdiv(width, 32))](
+            value, output, n, width, accumulation == 'fp64', 256, 32,
+            num_warps=4, enable_fp_fusion=False)
+        value, n = output, blocks
+    return value.reshape(width).to(torch.float32)
+
+
+def _sum_n(partials, width, groups=1, group_stride=0, **_):
+    # The same public Torch reduction API handles the active GPU backend.
+    view = partials.as_strided((partials.shape[0], groups, width),
+                              (partials.stride(0), group_stride, 1))
+    if groups == 1:
+        return view[:, 0].sum(0, keepdim=True)
+    return torch.stack([view[:, g].sum(0) for g in range(groups)])
+
+@triton.jit
+def _write_parameters(V, S, B, DW0, DWH, DB, C: tl.constexpr,
+                       EXPANDED: tl.constexpr, SPLIT: tl.constexpr,
+                       W0_GRAD: tl.constexpr, WH_GRAD: tl.constexpr,
+                       BIAS_GRAD: tl.constexpr, BC: tl.constexpr):
+    l = tl.program_id(0)
+    c = tl.program_id(1) * BC + tl.arange(0, BC)
+    weight_grad = (W0_GRAD & ((l == 0) | (not SPLIT))) | (WH_GRAD & (l > 0))
+    if weight_grad:
+        if EXPANDED:
+            if SPLIT and l == 0:
+                value = tl.load(S + c, c < C, 0.)
+            else:
+                value = tl.full((BC,), 0., tl.float32)
+                for k in range(l * l, (l + 1) * (l + 1)):
+                    value += tl.load(V + (k - (1 if SPLIT else 0)) * C + c, c < C, 0.)
+        else:
+            value = tl.load(V + l * C + c, c < C, 0.)
+        if SPLIT:
+            if l == 0:
+                tl.store(DW0 + c, value, c < C)
+            else:
+                tl.store(DWH + (l - 1) * C + c, value, c < C)
+        else:
+            tl.store(DW0 + l * C + c, value, c < C)
+    if BIAS_GRAD:
+        if l == 0:
+            tl.store(DB + c, tl.load(B + c, c < C, 0.), c < C)
+
+def reduce_parameters(op, pw, pb, dw0, dwh, db, split, needs, placeholder, dy):
+    _, nw0, nwh, nb = needs
+    c, lmax = op.spec.channels, op.spec.lmax
+    expanded = op.parameter_order == 'expanded'
+    value = scalar = bias = placeholder
+    if nw0 or nwh:
+        if expanded:
+            if split:
+                if nw0:
+                    scalar = _sum_n(pw[:, 0], c)
+                if nwh:
+                    value = _sum_n(pw[:, 1:], (op.spec.components - 1) * c)
+            else:
+                value = _sum_n(pw, op.spec.components * c)
+        else:
+            value = _sum_n(pw, c, lmax + 1, c)
+    if nb:
+        bias = _sum_n(pb, c, logical_stride=dy.stride(0), logical_ptr=dy.data_ptr(),
+                      logical_c_stride=dy.stride(2))
+    _write_parameters[(lmax + 1, triton.cdiv(c, 32))](
+        value, scalar, bias, dw0 if nw0 else placeholder, dwh if nwh else placeholder,
+        db if nb else placeholder, c, expanded, split, nw0, nwh, nb, 32,
+        num_warps=4, enable_fp_fusion=False)
+
+
+def _source_dr(op, x, mean, w0, wh, dy):
+    """Source tensor reductions through a backend-independent framework API."""
+    n = x.shape[0]
+    z = torch.cat((x[:, :1] - mean[:, None, None], x[:, 1:]), 1) if op.spec.center_scalar else x
+    result = []
+    split = wh is not None
+    for a, b in zip(op.group_bounds, op.group_bounds[1:]):
+        if op.parameter_order == 'expanded':
+            p = dy[:, a:b] * z[:, a:b]
+            if w0 is not None:
+                weight = torch.cat((w0[None], wh), 0) if split else w0
+                p = p * weight.index_select(0, op.degrees[a:b].long())[None]
+            dr = p.sum((1, 2))
+        else:
+            dr = torch.zeros(n, device=x.device, dtype=x.dtype)
+            for l in range(op.spec.lmax, -1, -1):
+                if a <= l * l < b:
+                    p = dy[:, l*l:(l+1)**2] * z[:, l*l:(l+1)**2]
+                    if w0 is not None:
+                        weight = (w0 if l == 0 else wh[l-1]) if split else w0[l]
+                        value = (p.sum(1) * weight).sum(1)
+                    else:
+                        value = p.sum((1, 2))
+                    dr = dr + value
+        result.append(dr)
+    return torch.stack(result, 1)
+
+
+def _backward(op, x, mean, rstd, weight0, weight_high, dy, needs, *, return_partials=False):
+    with torch.cuda.device(x.device):
+        return _backward_on_device(op, x, mean, rstd, weight0, weight_high, dy,
+                                   needs, return_partials=return_partials)
+
+
+def _backward_on_device(op, x, mean, rstd, weight0, weight_high, dy, needs, *, return_partials=False):
+    if dy.layout != torch.strided or dy.shape != x.shape or dy.dtype != x.dtype or dy.device != x.device:
+        raise ValueError('output gradient must match input shape, device and dtype')
+    if any(s < 0 for s in dy.stride()) or sum(max(d-1, 0)*s for d,s in zip(dy.shape,dy.stride())) > 2**31-1:
+        raise NotImplementedError('output gradient requires nonnegative 32-bit strides')
+    n,k,c=x.shape; s=op.spec
+    nx,nw0,nwh,nb=needs; nwh=nwh and s.lmax>0; nw=nw0 or nwh
+    split=weight_high is not None
+    def empty(shape):return torch.empty(shape,device=x.device,dtype=x.dtype)
+    dx=empty(x.shape) if nx else None
+    native=(op.parameter_reduction == 'native' and op.source_kind != 0)
+    pw=empty((n,k if native and op.parameter_order=='expanded' else s.lmax+1,c)) if nw else None
+    pb=empty((n,c)) if nb else None
+    def ptr(v):return x if v is None else v
+    dr = _source_dr(op, x, mean, weight0, weight_high, dy) if native and nx and n else None
+    if n:
+        _portable_backward[(n,)](x,dy,ptr(mean),rstd,ptr(dr),ptr(dx),ptr(pw),ptr(pb),op.coefficients,
+            op.degrees,ptr(weight0),ptr(weight_high),op.bounds,
+            k,c,s.num_stats,s.lmax,x.stride(0),x.stride(1),*dy.stride(),s.center_scalar,
+            weight0 is not None,split,weight0.stride(0) if split else 0,
+            weight_high.stride(0) if split else weight0.stride(0) if weight0 is not None else 0,
+            weight_high.stride(1) if split else weight0.stride(1) if weight0 is not None else 0,
+            nx,nw,nb,op.parameter_order=='expanded',native,dr is not None,op.parameter_order!='accurate',op.atom_block_k,op.block_c,
+            num_warps=4,enable_fp_fusion=False)
+    if native:
+        dw0=empty(weight0.shape) if nw0 else None
+        dwh=empty(weight_high.shape) if nwh else None
+        db=empty((c,)) if nb else None
+        reduce_parameters(op,pw,pb,dw0,dwh,db,split,(nx,nw0,nwh,nb),x,dy)
+    else:
+        dw=_reduce_rows(pw,(s.lmax+1)*c,op.accumulation).view(s.lmax+1,c) if nw else None
+        dw0=(dw[0] if split else dw) if nw0 else None
+        dwh=dw[1:] if nwh else None
+        db=_reduce_rows(pb,c,op.accumulation) if nb else None
+    result=(dx,dw0,dwh,db)
+    return (result,dict(weight=pw,bias=pb)) if return_partials else result
 
 class _EquivariantNormFunction(torch.autograd.Function):
     @staticmethod
@@ -181,7 +476,6 @@ class _EquivariantNormFunction(torch.autograd.Function):
                               dy, ctx.needs_input_grad[:4])
         return (*gradients, None, None)
 
-
 class TritonEquivariantNorm(torch.nn.Module):
     """Execution plan; affine parameters belong to the caller.
 
@@ -190,16 +484,14 @@ class TritonEquivariantNorm(torch.nn.Module):
     contiguous, disjoint range of full degrees and scale exactly that range.
     Broader/overlapping specs remain valid math specs but are rejected here.
     """
-    def __init__(self, spec, *, version='v1', reduction_order='channels_first',
-                 device='cuda'):
+    def __init__(self, spec, *, reduction_order='channels_first',
+                 device='cuda', parameter_order='accurate', accumulation='fp64'):
         super().__init__()
         if not isinstance(spec, EquivariantNormSpec):
             raise TypeError('spec must be EquivariantNormSpec')
-        if version not in ('v0', 'v1'):
-            raise ValueError('version must be v0 or v1')
         if reduction_order not in ('components_first', 'channels_first'):
             raise ValueError('unknown reduction order')
-        bounds, coefficients, degrees, groups = [0], [], [], []
+        bounds, coefficients, degrees = [0], [], []
         uniform = True
         for g, row in enumerate(spec.stats_weights):
             source = [l for l, a in enumerate(row) if a > 0]
@@ -213,23 +505,28 @@ class TritonEquivariantNorm(torch.nn.Module):
             for l in source:
                 coefficients.extend([row[l]] * (2*l + 1))
                 degrees.extend([l] * (2*l + 1))
-                groups.extend([g] * (2*l + 1))
         if bounds[-1] != spec.components:
             raise NotImplementedError('groups must cover all degrees')
-        self.spec, self.version = spec, version
+        self.spec = spec
+        if parameter_order not in ('accurate', 'broadcast', 'expanded'):
+            raise ValueError('unknown parameter reduction order')
+        if accumulation not in ('fp32', 'fp64'):
+            raise ValueError('accumulation must be fp32 or fp64')
+        self.accumulation = accumulation
+        self.parameter_reduction = 'stable'
+        with torch.cuda.device(device):
+            self.warp_size = triton.runtime.driver.active.get_current_target().warp_size
+        self.parameter_order = parameter_order
+        self.source_kind = 0
         self.reduction_order = reduction_order
         self.uniform = uniform
         self.group_bounds = tuple(bounds)
-        self.block_k = triton.next_power_of_2(max(b-a for a, b in zip(bounds, bounds[1:])))
         self.atom_block_k = triton.next_power_of_2(spec.components)
         self.block_c = triton.next_power_of_2(spec.channels)
-        tile_k = self.block_k if version == 'v0' else self.atom_block_k
-        if tile_k * self.block_c > 65536:
+        if self.atom_block_k * self.block_c > 65536:
             raise NotImplementedError('execution tile exceeds 65536 padded elements')
-        for name, values, dtype in [('bounds', bounds, torch.int32),
-                                    ('coefficients', coefficients, torch.float32),
-                                    ('degrees', degrees, torch.int32),
-                                    ('groups', groups, torch.int32)]:
+        for name, values, dtype in [('bounds', bounds, torch.int32), ('coefficients', coefficients, torch.float32),
+                                    ('degrees', degrees, torch.int32)]:
             self.register_buffer(name, torch.tensor(values, dtype=dtype, device=device),
                                  persistent=False)
 
@@ -238,8 +535,8 @@ class TritonEquivariantNorm(torch.nn.Module):
         if x.ndim != 3 or tuple(x.shape[1:]) != (s.components, s.channels):
             raise ValueError('expected [N,(lmax+1)^2,channels]')
         if x.device.type != 'cuda' or x.dtype != torch.float32:
-            raise TypeError('Triton backend supports CUDA FP32 only')
-        if x.device != self.bounds.device or self.coefficients.dtype != torch.float32:
+            raise TypeError('Triton backend supports GPU FP32 only')
+        if x.device != self.coefficients.device or self.coefficients.dtype != torch.float32:
             raise ValueError('move the execution plan to the input device; keep it FP32')
         if not (x.is_contiguous() or x.stride() == (s.channels, x.shape[0]*s.channels, 1)):
             raise ValueError('supported input storage: NKC and KNC')
@@ -268,49 +565,31 @@ class TritonEquivariantNorm(torch.nn.Module):
             check(bias, (s.channels,))
 
     def _run(self, x, weight, bias, save, training=False):
-        n, k, c = x.shape
-        s = self.spec
-        y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        need_stats = save or training or self.version == 'v0'
-        mu = torch.empty(n, dtype=x.dtype, device=x.device) if need_stats and s.center_scalar else None
-        moments = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if save or self.version == 'v0' else None
-        rstd = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if need_stats else None
+        with torch.cuda.device(x.device):
+            self.warp_size = triton.runtime.driver.active.get_current_target().warp_size
+            return self._run_on_device(x, weight, bias, save, training)
+
+    def _run_on_device(self, x, weight, bias, save, training=False):
+        n,k,c=x.shape; s=self.spec
+        y=torch.empty(x.shape,device=x.device,dtype=x.dtype)
+        need=save or training
+        mu=torch.empty(n,device=x.device,dtype=x.dtype) if need and s.center_scalar else None
+        moments=torch.empty((n,s.num_stats),device=x.device,dtype=x.dtype) if save else None
+        rstd=torch.empty((n,s.num_stats),device=x.device,dtype=x.dtype) if need else None
         if n:
-            split = isinstance(weight, tuple)
-            w0 = weight[0] if split else weight
-            wh = weight[1] if split else None
-            ws0 = w0.stride(0) if split else 0
-            wsl = wh.stride(0) if split else w0.stride(0) if w0 is not None else 0
-            wsc = wh.stride(1) if split else w0.stride(1) if w0 is not None else 0
-            bs = bias.stride(0) if bias is not None else 0
-            affine = dict(HAS_WEIGHT=weight is not None, SPLIT=split, HAS_BIAS=bias is not None,
-                          WS0=ws0, WSL=wsl, WSC=wsc, BS=bs)
-            common = dict(C=c, G=s.num_stats, SN=x.stride(0), SK=x.stride(1),
-                          CENTER=s.center_scalar)
-            stats = dict(EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
-                         BK=self.block_k, BC=self.block_c)
-            # Placeholders are never dereferenced when the corresponding flag is false.
-            w0, wh, bp = w0 if w0 is not None else y, wh if wh is not None else y, bias if bias is not None else y
-            with torch.cuda.device(x.device):
-                if self.version == 'v0':
-                    if s.center_scalar:
-                        _scalar_mean[(n,)](x, mu, c, x.stride(0), self.block_c,
-                                            num_warps=4, enable_fp_fusion=False)
-                    _statistics[(n, s.num_stats)](x, mu if mu is not None else y,
-                        moments, rstd, self.bounds, self.coefficients, **common, **stats,
-                        num_warps=4, enable_fp_fusion=False)
-                    _output[(triton.cdiv(n*k*c, 256),)](x, mu if mu is not None else y,
-                        rstd, y, self.degrees, self.groups, w0, wh, bp, N=n, K=k,
-                        **common, **affine, BLOCK=256, num_warps=4, enable_fp_fusion=False)
-                else:
-                    _fused[(n,)](x, y, mu if mu is not None else y,
-                        moments if moments is not None else y, rstd if rstd is not None else y,
-                        self.coefficients, self.degrees, w0, wh, bp, K=k,
-                        **common, EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
-                        BK=self.atom_block_k, BC=self.block_c,
-                        GROUP_BOUNDS=self.group_bounds, **affine, SAVE=need_stats, SAVE_MOMENTS=save,
-                        num_warps=4, enable_fp_fusion=False)
-        return NormResult(y, mu, moments, rstd) if save or training else y
+            split=isinstance(weight,tuple);w0,wh=weight if split else (weight,None)
+            def ptr(v):return y if v is None else v
+            _fused[(n,)](x,y,ptr(mu),ptr(moments),ptr(rstd),self.coefficients,self.degrees,
+                ptr(w0),ptr(wh),ptr(bias),K=k,C=c,G=s.num_stats,SN=x.stride(0),SK=x.stride(1),
+                CENTER=s.center_scalar,EPS=s.eps,ORDER=self.reduction_order,UNIFORM=self.uniform,
+                HAS_WEIGHT=w0 is not None,SPLIT=split,HAS_BIAS=bias is not None,
+                WS0=w0.stride(0) if split else 0,
+                WSL=wh.stride(0) if split else w0.stride(0) if w0 is not None else 0,
+                WSC=wh.stride(1) if split else w0.stride(1) if w0 is not None else 0,
+                BS=bias.stride(0) if bias is not None else 0,SAVE=need,SAVE_MOMENTS=save,
+                BK=self.atom_block_k,BC=self.block_c,GROUP_BOUNDS=self.bounds,
+                num_warps=4,enable_fp_fusion=False)
+        return NormResult(y,mu,moments,rstd) if need else y
 
     def _dispatch(self, x, weight, bias, save):
         self._check(x, weight, bias)
@@ -328,7 +607,6 @@ class TritonEquivariantNorm(torch.nn.Module):
         """Return differentiable output and detached diagnostic statistics."""
         return self._dispatch(x, weight, bias, True)
 
-
 class _SourceAdapter(torch.nn.Module):
     """Keep source parameter ownership/state keys; never call its forward.
 
@@ -340,7 +618,6 @@ class _SourceAdapter(torch.nn.Module):
         super().__init__()
         self.source, self.op = source, op
         self.spec = op.spec
-        self.version = op.version
 
     def _params(self):
         if not self.source.affine:
@@ -357,13 +634,15 @@ class _SourceAdapter(torch.nn.Module):
         weight, bias = self._params()
         return self.op.forward_with_stats(x, weight=weight, bias=bias)
 
+def from_reference(source, *, device=None, accumulation="fp64", parameter_reduction="native"):
+    """Adapt source equations with the same implementation on every backend.
 
-def from_reference(source, *, version='v1', device=None):
-    """Adapt verified source variants, preserving their grouping and FP32 weights.
-
-    Construction may read tiny coefficient buffers to CPU; forward never does.
-    No model-wide automatic replacement: target class choice remains explicit.
+    Native reductions use Torch APIs; stable reductions use a fixed Triton tree.
+    Neither policy selects kernels by CUDA/HIP identity. Native is the default
+    for agreement with original Torch FP32 forward and first-order autograd.
     """
+    if parameter_reduction not in ('native', 'stable'):
+        raise ValueError('parameter_reduction must be native or stable')
     name = type(source).__name__
     if name in ('EquivariantLayerNorm', 'EquivariantLayerNormArray'):
         grouping, order, center = 'per_degree', 'components_first', True
@@ -391,5 +670,12 @@ def from_reference(source, *, version='v1', device=None):
     if device is None:
         tensors = list(source.parameters()) + list(source.buffers())
         device = tensors[0].device if tensors else torch.device('cuda')
-    op = TritonEquivariantNorm(spec, version=version, reduction_order=order, device=device)
+    parameter_order = ('expanded' if name in ('EquivariantMergeLayerNorm', 'EquivariantSeparableLayerNorm')
+                       else 'broadcast')
+    op = TritonEquivariantNorm(spec, reduction_order=order, device=device,
+                              parameter_order=parameter_order, accumulation=accumulation)
+    op.parameter_reduction = parameter_reduction
+    op.source_kind = (1 if name in ("EquivariantLayerNorm", "EquivariantLayerNormArray")
+                      else 2 if name == "EquivariantLayerNormArraySphericalHarmonics"
+                      else 3 if name == "EquivariantMergeLayerNorm" else 4)
     return _SourceAdapter(source, op)
