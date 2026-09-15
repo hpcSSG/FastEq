@@ -20,19 +20,29 @@ from fasteq.triton.fused_equivariant_layer_norm import (
     EquivariantNormSpec,
     TritonEquivariantNorm,
     from_reference,
-    reference_forward,
 )
 
 
+def _reference_forward():
+    # Load the sibling by path so both pytest import modes work.
+    path = Path(__file__).with_name("equivariant_layer_norm_reference.py")
+    descriptor = importlib.util.spec_from_file_location("_fasteq_norm_math_reference", path)
+    module = importlib.util.module_from_spec(descriptor)
+    descriptor.loader.exec_module(module)
+    return module.reference_forward
+
+
+reference_forward = _reference_forward()
+
+
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-VERSIONS = ("v0", "v1")
 GROUPINGS = ("per_degree", "all", "scalar_high")
 
 
-def _plan(grouping, version, channels):
+def _plan(grouping, channels):
     spec = EquivariantNormSpec.from_preset(lmax=3, channels=channels, grouping=grouping)
     return TritonEquivariantNorm(
-        spec, version=version, device="cuda",
+        spec, device="cuda",
         reduction_order="channels_first" if grouping == "all" else "components_first",
     )
 
@@ -42,9 +52,9 @@ def _record_error(record_property, name, actual, expected):
     record_property(f"{name}/max_abs", error)
 
 
-def _check_cancellation(n, grouping, version, record_property):
+def _check_cancellation(n, grouping, record_property):
     channels = 7
-    op = _plan(grouping, version, channels)
+    op = _plan(grouping, channels)
     # Every higher component has z=1; the centered scalar has z=0.
     x = torch.ones(n, 16, channels, device="cuda")
     x[:, 0] = 0.
@@ -75,17 +85,15 @@ def _check_cancellation(n, grouping, version, record_property):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_large_parameter_reduction_cancellation(version, grouping, record_property):
-    _check_cancellation(27648, grouping, version, record_property)
+def test_large_parameter_reduction_cancellation(grouping, record_property):
+    _check_cancellation(27648, grouping, record_property)
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
-def test_large_parameter_reduction_partial_final_tile(version, record_property):
+def test_large_parameter_reduction_partial_final_tile(record_property):
     # One extra atom exercises masking in the last, incomplete reduction tile.
-    _check_cancellation(27649, "all", version, record_property)
+    _check_cancellation(27649, "all", record_property)
 
 
 def _backward_helpers():
@@ -103,11 +111,10 @@ def _math_oracle():
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_large_random_gradients_match_fp64(version, grouping, record_property):
+def test_large_random_gradients_match_fp64(grouping, record_property):
     torch.manual_seed(20260914)
-    op = _plan(grouping, version, 128)
+    op = _plan(grouping, 128)
     weight = torch.randn(4, 128, device="cuda", requires_grad=True)
     bias = torch.randn(128, device="cuda", requires_grad=True)
     x = torch.randn(4096, 16, 128, device="cuda", requires_grad=True)
@@ -150,12 +157,11 @@ def _native_comparison_metrics(actual, expected):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("n", (1, 17, 257, 4096, 27648))
 @pytest.mark.parametrize("source_family,class_name", NATIVE_SOURCES)
 def test_optional_original_source_large_batch_acceptance(
-        version, layout, n, source_family, class_name, record_property):
+        layout, n, source_family, class_name, record_property):
     source_class = _backward_helpers()._load_source(source_family, class_name)
     source_path = Path(os.environ[f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -174,7 +180,7 @@ def test_optional_original_source_large_batch_acceptance(
     if layout == "KNC":
         x = x.transpose(0, 1).contiguous().transpose(0, 1).detach().requires_grad_()
     rx = x.detach().clone(memory_format=torch.preserve_format).requires_grad_()
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
     actual_output = adapter(x)
     expected_output = source(rx)
     dy = torch.randn_like(actual_output)
@@ -201,11 +207,10 @@ def test_optional_original_source_large_batch_acceptance(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("n", (27648, 27649))
 @pytest.mark.parametrize("source_family,class_name", NATIVE_SOURCES)
 def test_optional_original_source_cancellation_acceptance(
-        version, n, source_family, class_name, record_property):
+        n, source_family, class_name, record_property):
     source_class = _backward_helpers()._load_source(source_family, class_name)
     source_path = Path(os.environ[f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -220,7 +225,7 @@ def test_optional_original_source_cancellation_acceptance(
     dy = torch.full_like(x, 1e-8)
     dy[:32] = 1.
     dy[-32:] = -1.
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
     actual_output = adapter(x)
     expected_output = source(rx)
     named = dict(source.named_parameters())
@@ -241,12 +246,11 @@ def test_optional_original_source_cancellation_acceptance(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("terms", ((1e8, -1e8, 1.), (1e8, 1., -1e8)),
                          ids=("large_cancel_then_small", "small_between_large"))
 @pytest.mark.parametrize("source_family,class_name", NATIVE_SOURCES)
 def test_optional_original_source_component_cancellation_acceptance(
-        version, terms, source_family, class_name, record_property):
+        terms, source_family, class_name, record_property):
     source_class = _backward_helpers()._load_source(source_family, class_name)
     source_path = Path(os.environ[f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -261,7 +265,7 @@ def test_optional_original_source_component_cancellation_acceptance(
     rx = x.detach().clone().requires_grad_()
     dy = torch.zeros_like(x)
     dy[0, 1:4, 0] = torch.tensor(terms, device="cuda", dtype=torch.float32)
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
     actual_output, expected_output = adapter(x), source(rx)
     named = dict(source.named_parameters())
     parameters = tuple(named.values())
@@ -284,10 +288,9 @@ def test_optional_original_source_component_cancellation_acceptance(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("source_family,class_name", NATIVE_SOURCES)
 def test_optional_original_source_unweighted_component_cancellation(
-        version, source_family, class_name, record_property):
+        source_family, class_name, record_property):
     source_class = _backward_helpers()._load_source(source_family, class_name)
     source_path = Path(os.environ[f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -302,7 +305,7 @@ def test_optional_original_source_unweighted_component_cancellation(
     rx = x.detach().clone().requires_grad_()
     dy = torch.zeros_like(x)
     dy[0, 1:4, 0] = torch.tensor((1e8, -1e8, 1.), device="cuda")
-    actual_output = from_reference(source, version=version)(x)
+    actual_output = from_reference(source)(x)
     expected_output = source(rx)
     actual_dx = torch.autograd.grad(actual_output, x, dy)[0]
     expected_dx = torch.autograd.grad(expected_output, rx, dy)[0]
@@ -320,11 +323,10 @@ def test_optional_original_source_unweighted_component_cancellation(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("terms", ((1e8, -1e8, 1.), (1e8, 1., -1e8)),
                          ids=("large_cancel_then_small", "small_between_large"))
 def test_optional_original_source_shared_scale_degree_accumulation(
-        version, terms, record_property):
+        terms, record_property):
     class_name = "EquivariantLayerNormArraySphericalHarmonics"
     source_class = _backward_helpers()._load_source("V2", class_name)
     source_path = Path(os.environ["FASTEQ_EQUIFORMER_V2_LAYER_NORM"])
@@ -343,7 +345,7 @@ def test_optional_original_source_shared_scale_degree_accumulation(
     # graph accumulates the shared scale's branches in reverse degree order.
     for degree, term in zip((1, 2, 3), terms):
         dy[0, degree**2, 0] = term
-    actual_output = from_reference(source, version=version)(x)
+    actual_output = from_reference(source)(x)
     expected_output = source(rx)
     named = dict(source.named_parameters())
     parameters = tuple(named.values())
@@ -363,7 +365,6 @@ def test_optional_original_source_shared_scale_degree_accumulation(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("source_family,class_name,n,lmax,channels", (
     ("V3", "EquivariantMergeLayerNorm", 17, 4, 512),
     ("V3", "EquivariantSeparableLayerNorm", 17, 5, 256),
@@ -371,7 +372,7 @@ def test_optional_original_source_shared_scale_degree_accumulation(
     ("V2", "EquivariantLayerNormArraySphericalHarmonics", 108, 0, 8192),
 ))
 def test_optional_original_source_wide_reduction_acceptance(
-        version, source_family, class_name, n, lmax, channels, record_property):
+        source_family, class_name, n, lmax, channels, record_property):
     source_class = _backward_helpers()._load_source(source_family, class_name)
     source_path = Path(os.environ[f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -387,7 +388,7 @@ def test_optional_original_source_wide_reduction_acceptance(
             parameter.copy_(torch.randn_like(parameter))
     x = torch.randn(n, (lmax + 1)**2, channels, device="cuda", requires_grad=True)
     rx = x.detach().clone().requires_grad_()
-    actual_output = from_reference(source, version=version)(x)
+    actual_output = from_reference(source)(x)
     expected_output = source(rx)
     dy = torch.randn_like(actual_output)
     # A split-affine lmax=0 source can declare an empty higher-degree weight.
@@ -453,7 +454,6 @@ def _native_comparison_metrics_chunked(actual, expected, chunk_elements=2**22):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("class_name,n", (
     pytest.param("EquivariantLayerNorm", 32768, id="norm-32768"),
     pytest.param("EquivariantLayerNorm", 131072, id="norm-131072"),
@@ -461,7 +461,7 @@ def _native_comparison_metrics_chunked(actual, expected, chunk_elements=2**22):
     pytest.param("EquivariantSeparableLayerNorm", 524288, id="separable-524288"),
 ))
 def test_optional_original_source_scaling_precision_regressions(
-        version, class_name, n, record_property):
+        class_name, n, record_property):
     """Reproduce the four native-FP32 failures from the scaling benchmark."""
     source_class = _backward_helpers()._load_source("V3", class_name)
     source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
@@ -488,7 +488,7 @@ def test_optional_original_source_scaling_precision_regressions(
     dy = torch.randn_like(x)
     named = dict(source.named_parameters())
     parameters = tuple(named.values())
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
 
     # Share the exact input and parameters. Finish one backward before the
     # next forward so both large sets of saved activations are not live together.
@@ -513,15 +513,14 @@ def test_optional_original_source_scaling_precision_regressions(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
-def test_generic_large_tile_skips_unused_source_schedules(version, record_property):
+def test_generic_large_tile_skips_unused_source_schedules(record_property):
     """A supported generic tile must not require an unused native m schedule."""
     record_property("reference", "independent FP32 reference_forward equations")
     torch.manual_seed(20260915)
     n, lmax, channels = 32, 180, 2
     spec = EquivariantNormSpec.from_preset(
         lmax=lmax, channels=channels, grouping="all")
-    op = TritonEquivariantNorm(spec, version=version, device="cuda")
+    op = TritonEquivariantNorm(spec, device="cuda")
     x = torch.randn(n, (lmax + 1)**2, channels, device="cuda")
     weight = torch.randn(lmax + 1, channels, device="cuda")
     bias = torch.randn(channels, device="cuda")
@@ -535,12 +534,11 @@ def test_generic_large_tile_skips_unused_source_schedules(version, record_proper
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("class_name", (
     "EquivariantLayerNorm", "EquivariantMergeLayerNorm"))
 @pytest.mark.parametrize("offset", (1, 2, 3))
 def test_optional_original_source_scalar_pointer_alignment(
-        version, class_name, offset, record_property):
+        class_name, offset, record_property):
     """Preserve the original scalar slice's address in its native mean order."""
     source_class = _backward_helpers()._load_source("V3", class_name)
     source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
@@ -566,7 +564,7 @@ def test_optional_original_source_scalar_pointer_alignment(
     dy = torch.randn_like(x)
     named = dict(source.named_parameters())
     parameters = tuple(named.values())
-    adapter = from_reference(source, version=version)
+    adapter = from_reference(source)
     actual = adapter.forward_with_stats(x)
     with torch.no_grad():
         expected_mean = x[:, 0:1, :].mean(dim=2).flatten()
@@ -590,10 +588,9 @@ def test_optional_original_source_scalar_pointer_alignment(
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("channels", (129, 257))
 def test_optional_original_source_uncentered_merge_knc_alignment(
-        version, channels, record_property):
+        channels, record_property):
     """Without scalar centering, Merge's squared input retains KNC row order."""
     source_class = _backward_helpers()._load_source("V3", "EquivariantMergeLayerNorm")
     source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
@@ -616,7 +613,7 @@ def test_optional_original_source_uncentered_merge_knc_alignment(
     dy = torch.randn_like(x)
     named = dict(source.named_parameters())
     parameters = tuple(named.values())
-    actual = from_reference(source, version=version).forward_with_stats(x)
+    actual = from_reference(source).forward_with_stats(x)
     with torch.no_grad():
         rows = x.square().mean(dim=2, keepdim=True)
         moment = torch.einsum("ai,nic->nac", source.balance_degree_weight, rows).reshape(17, 1)

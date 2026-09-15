@@ -5,7 +5,6 @@ from .fused_equivariant_layer_norm import (
     NormResult,
     TritonEquivariantNorm,
     from_reference,
-    reference_forward,
 )
 
 __all__ = [
@@ -13,5 +12,4 @@ __all__ = [
     "NormResult",
     "TritonEquivariantNorm",
     "from_reference",
-    "reference_forward",
 ]

@@ -1,32 +1,17 @@
-"""Shared FP32 forward and first-order gradients for equivariant norm groups.
+"""Fused FP32 equivariant LayerNorm with first-order gradients.
 
-v0: scalar mean -> group statistics -> affine output (separate launches).
-v1: one program per atom, sharing the input tile across statistic groups.
-Both use the same statistics and affine helpers; no model/shape-specific tuning.
-The version flag changes scheduling; both versions use the same math contract.
+One program per atom shares the feature tile across statistic groups,
+normalization, and affine output.
 """
 import torch
 import triton
 import triton.language as tl
 
-from ._equivariant_norm_spec import EquivariantNormSpec, NormResult, reference_forward
-from ._equivariant_norm_backward import backward as _backward
-from ._torch_norm_stats import (source_row_mean, source_group_stats,
-    mean_factor, reduction_code, m_config)
-
-
-@triton.jit
-def _scalar_mean(X, MU, C: tl.constexpr, SN: tl.constexpr, BC: tl.constexpr,
-                 SOURCE: tl.constexpr, K: tl.constexpr, CCFG: tl.constexpr, CF: tl.constexpr,
-                 INPUT_SHIFT: tl.constexpr):
-    n = tl.program_id(0)
-    c = tl.arange(0, BC)
-    x = tl.load(X + n * SN + c, c < C, 0.)
-    if SOURCE == 1 or SOURCE == 3:
-        mu = source_row_mean(x, n*(SN//C), C, CCFG, CF, INPUT_SHIFT)
-    else:
-        mu = tl.sum(x, 0) / C
-    tl.store(MU + n, mu)
+from .fused_equivariant_layer_norm_backward import backward as _backward
+from .fused_equivariant_layer_norm_common import (
+    EquivariantNormSpec, NormResult, source_row_mean, source_group_stats,
+    mean_factor, reduction_code, m_config,
+)
 
 
 @triton.jit
@@ -67,70 +52,6 @@ def _affine(z, r, k, c, valid, DEGREE, WEIGHT0, WEIGHTH, BIAS,
         beta = tl.load(BIAS + c * BS + tl.zeros_like(k), valid & (k == 0), 0.)
         y = tl.where(k == 0, y + beta, y)
     return y
-
-
-@triton.jit
-def _statistics(X, MU, MOMENTS, RSTD, BOUNDS, COEFFICIENT,
-                C: tl.constexpr, G: tl.constexpr, SN: tl.constexpr, SK: tl.constexpr,
-                CENTER: tl.constexpr, EPS: tl.constexpr,
-                ORDER: tl.constexpr, UNIFORM: tl.constexpr,
-                BK: tl.constexpr, BC: tl.constexpr, SOURCE: tl.constexpr,
-                CCFG: tl.constexpr, CF: tl.constexpr, MCONFIG: tl.constexpr,
-                MF: tl.constexpr, COMPONENT: tl.constexpr, GROUP_BOUNDS: tl.constexpr,
-                BALANCED: tl.constexpr, KCONFIG: tl.constexpr, ROW_CCONFIG: tl.constexpr,
-                KF: tl.constexpr, ROW_CF: tl.constexpr, SINGLETON: tl.constexpr,
-                NODES: tl.constexpr, KNC: tl.constexpr):
-    n, g = tl.program_id(0), tl.program_id(1)
-    start = tl.load(BOUNDS + g)
-    end = tl.load(BOUNDS + g + 1)
-    k = start + tl.arange(0, BK)
-    c = tl.arange(0, BC)
-    valid = (k[:, None] < end) & (c[None, :] < C)
-    x = tl.load(X + n * SN + k[:, None] * SK + c[None, :], valid, 0.)
-    if CENTER:
-        mu = tl.load(MU + n)
-        z = tl.where(valid, x - tl.where(k[:, None] == 0, mu, 0.), 0.)
-    else:
-        z = x
-    w = tl.load(COEFFICIENT + k, k < end, 0.)
-    coefficient = tl.sum(tl.where(tl.arange(0, BK) == 0, w, 0.), 0)
-    v = _moment(z * z, w, coefficient, C, ORDER, UNIFORM)
-    r = tl.rsqrt(v + EPS)
-    if SOURCE != 0:
-        for group in tl.static_range(G):
-            if SOURCE == 1 or SOURCE == 3 or group > 0:
-                if g == group:
-                    v, r = source_group_stats(z, w, n, 0, GROUP_BOUNDS[group+1]-GROUP_BOUNDS[group], C,
-                        SOURCE, COMPONENT, BALANCED, ((MCONFIG >> (12*group)) & 4095), CCFG,
-                        ((KCONFIG >> (12*group)) & 4095), ((ROW_CCONFIG >> (12*group)) & 4095),
-                        MF[group], CF, KF[group], ROW_CF[group], EPS, SINGLETON, NODES, KNC)
-    tl.store(MOMENTS + n * G + g, v)
-    tl.store(RSTD + n * G + g, r)
-
-
-@triton.jit
-def _output(X, MU, RSTD, Y, DEGREE, GROUP, WEIGHT0, WEIGHTH, BIAS,
-            N: tl.constexpr, K: tl.constexpr, C: tl.constexpr, G: tl.constexpr,
-            SN: tl.constexpr, SK: tl.constexpr, CENTER: tl.constexpr,
-            HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr, HAS_BIAS: tl.constexpr,
-            WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr,
-            BS: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    n = i // (K * C)
-    k = i // C % K
-    c = i % C
-    valid = i < N * K * C
-    x = tl.load(X + n * SN + k * SK + c, valid, 0.)
-    if CENTER:
-        mu = tl.load(MU + n, valid, 0.)
-        z = x - tl.where(k == 0, mu, 0.)
-    else:
-        z = x
-    group = tl.load(GROUP + k, valid, 0)
-    r = tl.load(RSTD + n * G + group, valid, 0.)
-    y = _affine(z, r, k, c, valid, DEGREE, WEIGHT0, WEIGHTH, BIAS,
-                HAS_WEIGHT, SPLIT, HAS_BIAS, WS0, WSL, WSC, BS, K)
-    tl.store(Y + i, y, valid)
 
 
 @triton.jit
@@ -224,16 +145,14 @@ class TritonEquivariantNorm(torch.nn.Module):
     contiguous, disjoint range of full degrees and scale exactly that range.
     Broader/overlapping specs remain valid math specs but are rejected here.
     """
-    def __init__(self, spec, *, version='v1', reduction_order='channels_first',
+    def __init__(self, spec, *, reduction_order='channels_first',
                  device='cuda', parameter_order='accurate'):
         super().__init__()
         if not isinstance(spec, EquivariantNormSpec):
             raise TypeError('spec must be EquivariantNormSpec')
-        if version not in ('v0', 'v1'):
-            raise ValueError('version must be v0 or v1')
         if reduction_order not in ('components_first', 'channels_first'):
             raise ValueError('unknown reduction order')
-        bounds, coefficients, degrees, groups = [0], [], [], []
+        bounds, coefficients, degrees = [0], [], []
         uniform = True
         for g, row in enumerate(spec.stats_weights):
             source = [l for l, a in enumerate(row) if a > 0]
@@ -247,10 +166,9 @@ class TritonEquivariantNorm(torch.nn.Module):
             for l in source:
                 coefficients.extend([row[l]] * (2*l + 1))
                 degrees.extend([l] * (2*l + 1))
-                groups.extend([g] * (2*l + 1))
         if bounds[-1] != spec.components:
             raise NotImplementedError('groups must cover all degrees')
-        self.spec, self.version = spec, version
+        self.spec = spec
         if parameter_order not in ('accurate', 'broadcast', 'expanded'):
             raise ValueError('unknown parameter reduction order')
         self.parameter_order = parameter_order
@@ -260,16 +178,12 @@ class TritonEquivariantNorm(torch.nn.Module):
         self.reduction_order = reduction_order
         self.uniform = uniform
         self.group_bounds = tuple(bounds)
-        self.block_k = triton.next_power_of_2(max(b-a for a, b in zip(bounds, bounds[1:])))
         self.atom_block_k = triton.next_power_of_2(spec.components)
         self.block_c = triton.next_power_of_2(spec.channels)
-        tile_k = self.block_k if version == 'v0' else self.atom_block_k
-        if tile_k * self.block_c > 65536:
+        if self.atom_block_k * self.block_c > 65536:
             raise NotImplementedError('execution tile exceeds 65536 padded elements')
-        for name, values, dtype in [('bounds', bounds, torch.int32),
-                                    ('coefficients', coefficients, torch.float32),
-                                    ('degrees', degrees, torch.int32),
-                                    ('groups', groups, torch.int32)]:
+        for name, values, dtype in [('coefficients', coefficients, torch.float32),
+                                    ('degrees', degrees, torch.int32)]:
             self.register_buffer(name, torch.tensor(values, dtype=dtype, device=device),
                                  persistent=False)
 
@@ -279,7 +193,7 @@ class TritonEquivariantNorm(torch.nn.Module):
             raise ValueError('expected [N,(lmax+1)^2,channels]')
         if x.device.type != 'cuda' or x.dtype != torch.float32:
             raise TypeError('Triton backend supports CUDA FP32 only')
-        if x.device != self.bounds.device or self.coefficients.dtype != torch.float32:
+        if x.device != self.coefficients.device or self.coefficients.dtype != torch.float32:
             raise ValueError('move the execution plan to the input device; keep it FP32')
         if not (x.is_contiguous() or x.stride() == (s.channels, x.shape[0]*s.channels, 1)):
             raise ValueError('supported input storage: NKC and KNC')
@@ -311,9 +225,9 @@ class TritonEquivariantNorm(torch.nn.Module):
         n, k, c = x.shape
         s = self.spec
         y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        need_stats = save or training or self.version == 'v0'
+        need_stats = save or training
         mu = torch.empty(n, dtype=x.dtype, device=x.device) if need_stats and s.center_scalar else None
-        moments = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if save or self.version == 'v0' else None
+        moments = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if save else None
         rstd = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if need_stats else None
         if n:
             split = isinstance(weight, tuple)
@@ -355,33 +269,17 @@ class TritonEquivariantNorm(torch.nn.Module):
                                        for g,m in enumerate(sizes)),
                         KF=tuple(mean_factor(n,m) for m in sizes),
                         ROW_CF=tuple(mean_factor(n*m,c) for m in sizes))
-            stats = dict(EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
-                         BK=self.block_k, BC=self.block_c)
             # Placeholders are never dereferenced when the corresponding flag is false.
             w0, wh, bp = w0 if w0 is not None else y, wh if wh is not None else y, bias if bias is not None else y
             with torch.cuda.device(x.device):
-                if self.version == 'v0':
-                    if s.center_scalar:
-                        _scalar_mean[(n,)](x, mu, c, x.stride(0), self.block_c,
-                                            SOURCE=native_kind, K=k, CCFG=native["CCFG"], CF=native["CF"],
-                                            INPUT_SHIFT=input_shift,
-                                            num_warps=4, enable_fp_fusion=False)
-                    _statistics[(n, s.num_stats)](x, mu if mu is not None else y,
-                        moments, rstd, self.bounds, self.coefficients, **common, **stats, **native,
-                        GROUP_BOUNDS=self.group_bounds,
-                        num_warps=4, enable_fp_fusion=False)
-                    _output[(triton.cdiv(n*k*c, 256),)](x, mu if mu is not None else y,
-                        rstd, y, self.degrees, self.groups, w0, wh, bp, N=n, K=k,
-                        **common, **affine, BLOCK=256, num_warps=4, enable_fp_fusion=False)
-                else:
-                    _fused[(n,)](x, y, mu if mu is not None else y,
-                        moments if moments is not None else y, rstd if rstd is not None else y,
-                        self.coefficients, self.degrees, w0, wh, bp, K=k,
-                        **common, EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
-                        BK=self.atom_block_k, BC=self.block_c,
-                        GROUP_BOUNDS=self.group_bounds, **native, **affine, SAVE=need_stats, SAVE_MOMENTS=save,
-                        INPUT_SHIFT=input_shift,
-                        num_warps=4, enable_fp_fusion=False)
+                _fused[(n,)](x, y, mu if mu is not None else y,
+                    moments if moments is not None else y, rstd if rstd is not None else y,
+                    self.coefficients, self.degrees, w0, wh, bp, K=k,
+                    **common, EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
+                    BK=self.atom_block_k, BC=self.block_c,
+                    GROUP_BOUNDS=self.group_bounds, **native, **affine, SAVE=need_stats, SAVE_MOMENTS=save,
+                    INPUT_SHIFT=input_shift,
+                    num_warps=4, enable_fp_fusion=False)
         return NormResult(y, mu, moments, rstd) if save or training else y
 
     def _dispatch(self, x, weight, bias, save):
@@ -412,7 +310,6 @@ class _SourceAdapter(torch.nn.Module):
         super().__init__()
         self.source, self.op = source, op
         self.spec = op.spec
-        self.version = op.version
 
     def _params(self):
         if not self.source.affine:
@@ -430,7 +327,7 @@ class _SourceAdapter(torch.nn.Module):
         return self.op.forward_with_stats(x, weight=weight, bias=bias)
 
 
-def from_reference(source, *, version='v1', device=None):
+def from_reference(source, *, device=None):
     """Adapt verified source variants, preserving their grouping and FP32 weights.
 
     Construction may read tiny coefficient buffers to CPU; forward never does.
@@ -465,7 +362,7 @@ def from_reference(source, *, version='v1', device=None):
         device = tensors[0].device if tensors else torch.device('cuda')
     parameter_order = ('expanded' if name in ('EquivariantMergeLayerNorm', 'EquivariantSeparableLayerNorm')
                        else 'broadcast')
-    op = TritonEquivariantNorm(spec, version=version, reduction_order=order, device=device,
+    op = TritonEquivariantNorm(spec, reduction_order=order, device=device,
                               parameter_order=parameter_order)
     op.source_kind = (1 if name in ("EquivariantLayerNorm", "EquivariantLayerNormArray")
                       else 2 if name == "EquivariantLayerNormArraySphericalHarmonics"

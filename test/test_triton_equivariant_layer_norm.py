@@ -9,7 +9,7 @@ FASTEQ_BACKEND selects FastEq's native extension, not the Torch/Triton device.
 GPU tests skip when CUDA is unavailable. Optional original-source checks use
 FASTEQ_EQUIFORMER_V3_LAYER_NORM and FASTEQ_EQUIFORMER_V2_LAYER_NORM file paths.
 The independent oracle below follows the source equations directly; it does
-not use the shipped reference implementation to determine expected results.
+not use the shared test reference to determine expected results.
 """
 
 import importlib.util
@@ -26,12 +26,22 @@ from fasteq.triton.fused_equivariant_layer_norm import (
     EquivariantNormSpec,
     TritonEquivariantNorm,
     from_reference,
-    reference_forward,
 )
 
 
+def _reference_forward():
+    # Load the sibling by path so both pytest import modes work.
+    path = Path(__file__).with_name("equivariant_layer_norm_reference.py")
+    descriptor = importlib.util.spec_from_file_location("_fasteq_norm_math_reference", path)
+    module = importlib.util.module_from_spec(descriptor)
+    descriptor.loader.exec_module(module)
+    return module.reference_forward
+
+
+reference_forward = _reference_forward()
+
+
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-VERSIONS = ("v0", "v1")
 GROUPINGS = ("per_degree", "all", "scalar_high")
 
 
@@ -106,13 +116,13 @@ def _oracle(x, grouping, weighting, center=True, weight=None, bias=None, eps=1e-
     return output, mean, moments, torch.rsqrt(moments + eps)
 
 
-def _plan(lmax, channels, grouping, version, weighting="degree_balanced", center=True):
+def _plan(lmax, channels, grouping, weighting="degree_balanced", center=True):
     spec = EquivariantNormSpec.from_preset(
         lmax=lmax, channels=channels, grouping=grouping,
         weighting=weighting, center_scalar=center,
     )
     op = TritonEquivariantNorm(
-        spec, version=version, device="cuda",
+        spec, device="cuda",
         reduction_order="channels_first" if grouping == "all" else "components_first",
     )
     return spec, op
@@ -123,10 +133,10 @@ def _assert_close(actual, expected, *, atol=3e-5, rtol=3e-5):
                                check_dtype=False, equal_nan=True)
 
 
-def _check_case(x, grouping, version, weighting="degree_balanced", center=True,
+def _check_case(x, grouping, weighting="degree_balanced", center=True,
                 weight=None, bias=None):
     lmax, channels = int(x.shape[1] ** 0.5) - 1, x.shape[-1]
-    spec, op = _plan(lmax, channels, grouping, version, weighting, center)
+    spec, op = _plan(lmax, channels, grouping, weighting, center)
     before = x.clone()
     expected = _oracle(x, grouping, weighting, center, weight, bias)
     expected64 = _oracle(x.double(), grouping, weighting, center,
@@ -155,18 +165,17 @@ def _seed():
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("shape", ((0, 1), (2, 7), (4, 128)))
-def test_default_source_equations(version, layout, grouping, shape):
+def test_default_source_equations(layout, grouping, shape):
     lmax, channels = shape
     x = torch.randn(3, (lmax + 1) ** 2, channels, device="cuda")
     x[:, 0] += 1.5
     packed = torch.randn(lmax + 1, channels, device="cuda")
     weight = (packed[0], packed[1:]) if grouping == "scalar_high" else packed
     bias = torch.randn(channels, device="cuda")
-    _check_case(_layout(x, layout), grouping, version, weight=weight, bias=bias)
+    _check_case(_layout(x, layout), grouping, weight=weight, bias=bias)
 
 
 NONDEFAULTS = (
@@ -182,32 +191,29 @@ NONDEFAULTS = (
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("grouping,weighting,center", NONDEFAULTS)
-def test_nondefault_source_options(version, layout, grouping, weighting, center):
+def test_nondefault_source_options(layout, grouping, weighting, center):
     x = torch.randn(3, 9, 7, device="cuda")
     x[:, 0] += 2
-    _check_case(_layout(x, layout), grouping, version, weighting, center)
+    _check_case(_layout(x, layout), grouping, weighting, center)
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
 @pytest.mark.parametrize("parameters", ("packed", "split", "bias_only"))
-def test_strided_affine_parameters(version, layout, parameters):
+def test_strided_affine_parameters(layout, parameters):
     x = _layout(torch.randn(3, 9, 7, device="cuda"), layout)
     packed = torch.randn(6, 14, device="cuda")[::2, ::2]
     bias = torch.randn(14, device="cuda")[::2]
     weight = {"packed": packed, "split": (packed[0], packed[1:]), "bias_only": None}[parameters]
-    _check_case(x, "per_degree", version, weight=weight, bias=bias)
+    _check_case(x, "per_degree", weight=weight, bias=bias)
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_finite_pathologies(version, grouping):
-    spec, op = _plan(2, 7, grouping, version)
+def test_finite_pathologies(grouping):
+    spec, op = _plan(2, 7, grouping)
     random = torch.randn(3, 9, 7, device="cuda")
     for x in (torch.zeros_like(random), torch.full_like(random, 4.),
               random * 1e-6, random * 1e6, 1. + random * 1e-4):
@@ -220,11 +226,10 @@ def test_finite_pathologies(version, grouping):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
 @pytest.mark.parametrize("magnitude", (float("nan"), 1e20), ids=("nan", "square_overflow"))
-def test_nonfinite_values_do_not_leak_between_groups(version, grouping, magnitude):
-    spec, op = _plan(2, 7, grouping, version)
+def test_nonfinite_values_do_not_leak_between_groups(grouping, magnitude):
+    spec, op = _plan(2, 7, grouping)
     for corrupted_degree in (0, 1):
         x = torch.ones(2, 9, 7, device="cuda")
         x[:, 0] = torch.arange(-3, 4, device="cuda", dtype=torch.float32)
@@ -241,13 +246,12 @@ def test_nonfinite_values_do_not_leak_between_groups(version, grouping, magnitud
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("order", ("channels_first", "components_first"))
 @pytest.mark.parametrize("layout", ("NKC", "KNC"))
-def test_custom_partition_uses_shared_kernel(version, order, layout):
+def test_custom_partition_uses_shared_kernel(order, layout):
     spec = EquivariantNormSpec(3, 7, ((1., 1 / 3, 0., 0.), (0., 0., 1 / 10, 1 / 14)),
                                (0, 0, 1, 1), center_scalar=False)
-    op = TritonEquivariantNorm(spec, version=version, reduction_order=order, device="cuda")
+    op = TritonEquivariantNorm(spec, reduction_order=order, device="cuda")
     x = _layout(torch.randn(3, 16, 7, device="cuda"), layout)
     # Independent explicit equations for {l=0,1} and {l=2,3}; no model preset.
     q = x.double().square().mean(-1)
@@ -267,10 +271,9 @@ def test_custom_partition_uses_shared_kernel(version, order, layout):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_empty_batch_and_live_weights(version, grouping):
-    spec, op = _plan(2, 7, grouping, version)
+def test_empty_batch_and_live_weights(grouping):
+    spec, op = _plan(2, 7, grouping)
     with torch.inference_mode():
         for layout in ("NKC", "KNC"):
             x = _layout(torch.empty(0, 9, 7, device="cuda"), layout)
@@ -287,10 +290,9 @@ def test_empty_batch_and_live_weights(version, grouping):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("grouping", GROUPINGS)
-def test_orthogonal_equivariance(version, grouping):
-    _, op = _plan(2, 7, grouping, version)
+def test_orthogonal_equivariance(grouping):
+    _, op = _plan(2, 7, grouping)
     x = torch.randn(3, 9, 7, device="cuda")
     weight, bias = torch.randn(3, 7, device="cuda"), torch.randn(7, device="cuda")
     transforms = [torch.linalg.qr(torch.randn(2 * l + 1, 2 * l + 1,
@@ -312,9 +314,8 @@ def test_orthogonal_equivariance(version, grouping):
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
-def test_input_guards_and_grad_dispatch(version):
-    _, op = _plan(2, 7, "per_degree", version)
+def test_input_guards_and_grad_dispatch():
+    _, op = _plan(2, 7, "per_degree")
     x = torch.randn(3, 9, 7, device="cuda")
     with pytest.raises(TypeError, match="FP32"):
         op(x.half())
@@ -359,8 +360,7 @@ def test_invalid_spec(kwargs):
         EquivariantNormSpec.from_preset(**options)
 
 
-@pytest.mark.parametrize("version", VERSIONS)
-def test_unsupported_gpu_partition_is_rejected_before_allocation(version):
+def test_unsupported_gpu_partition_is_rejected_before_allocation():
     unsupported = (
         EquivariantNormSpec(2, 7, ((1., 0., 0.), (1 / 3, 1 / 9, 1 / 15)), (0, 1, 1)),
         EquivariantNormSpec(2, 7, ((1., 0., 1 / 5), (0., 1 / 3, 0.)), (0, 1, 0)),
@@ -368,7 +368,7 @@ def test_unsupported_gpu_partition_is_rejected_before_allocation(version):
     )
     for spec in unsupported:
         with pytest.raises(NotImplementedError, match="groups"):
-            TritonEquivariantNorm(spec, version=version, device="cpu")
+            TritonEquivariantNorm(spec, device="cpu")
 
 
 def test_public_package_exports():
@@ -387,9 +387,8 @@ SOURCE_CLASSES = (
 
 
 @GPU
-@pytest.mark.parametrize("version", VERSIONS)
 @pytest.mark.parametrize("source_family,class_name", SOURCE_CLASSES)
-def test_optional_original_source(version, source_family, class_name):
+def test_optional_original_source(source_family, class_name):
     """Extended check against user-provided, unmodified model source files."""
     variable = f"FASTEQ_EQUIFORMER_{source_family}_LAYER_NORM"
     source_path = os.environ.get(variable)
@@ -404,7 +403,7 @@ def test_optional_original_source(version, source_family, class_name):
         source = getattr(module, class_name)(2, 7).cuda().eval()
         for parameter in source.parameters():
             parameter.normal_(mean=.1, std=.9)
-        adapter = from_reference(source, version=version)
+        adapter = from_reference(source)
         for layout in ("NKC", "KNC"):
             x = _layout(torch.randn(3, 9, 7, device="cuda"), layout)
             _assert_close(adapter(x), source(x))

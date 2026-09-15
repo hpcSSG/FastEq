@@ -32,111 +32,16 @@ Model associations below follow the project operator inventory. Exact usage depe
 | Graph Softmax | `FusedGraphSoftmax` | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | Fused GraphSoftmax |
 | Graph attention | `FusedAttenAlpha` | Fuse normalization, activation, dropout, and weighted reduction in graph attention into a single kernel | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
 | Equivariant Gate| `FusedEquivariantGate` | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
-| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2, eSEN | Shared Triton v0/v1; FP32 forward and first-order backward |
+| Equivariant normalization | `FusedEquivariantLayerNorm` | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2 | Fused statistics and affine transformation; first-order backward |
 | Equivariant dropout | `FusedEquivariantDropout` | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout | 
 
 Graph softmax operates on attention weights; it supports equivariant attention but does not itself perform a representation rotation or tensor-product coupling.
 
 ### Equivariant LayerNorm
 
-The shared implementation supports `EquivariantLayerNorm` (each degree separately),
-`EquivariantMergeLayerNorm` (all degrees together), and
-`EquivariantLayerNormArraySphericalHarmonics` (scalar and higher-degree groups).
-The adapter also accepts V3 `EquivariantSeparableLayerNorm`. It preserves each
-module's statistic weights, scalar centering, degree-wise affine parameters,
-and the source's affine broadcast and gradient reduction order.
-
-```python
-from fasteq.triton import from_reference
-
-# source is the original FP32 module on CUDA; x is [N, (lmax+1)**2, C].
-op = from_reference(source, version="v1")  # "v0" selects separate stages
-y = op(x)
-y.square().mean().backward()             # gradients reach source parameters
-```
-
-| Version | Forward | Backward when input and all affine gradients are needed |
-| --- | --- | --- |
-| `v0` | Separate scalar mean, grouped statistics, and affine output | Separate group dot products, input gradients, and parameter partials; then parameter reduction |
-| `v1` | One fused kernel per invocation | Fuse per-atom input gradients and parameter partials; then parameter reduction |
-
-Both versions compute `dX`, degree/channel-specific `dgamma`, and scalar-only
-`dbeta` with Triton. Parameter gradients are summed across atoms using a
-deterministic partial-buffer reduction without floating-point atomics.
-`from_reference()` selects the FP32 operation order of the original source:
-degree-wise broadcast weights reduce components before atoms, whereas expanded
-weights retain component partials until after the atom reduction. Source adapters
-also preserve the component/channel reduction used to differentiate the inverse
-standard deviation. These CUDA reductions follow ATen's reduction schedule;
-using a more accurate sum alone does not ensure agreement with Torch FP32.
-Forward statistics preserve the source's mean reduction order and weighted
-contraction order inside the resident tile. Large parameter reductions also
-preserve TensorIterator's logical byte-range splits and FP32 accumulation
-between slices. The source's logical layout determines these schedules, even
-when Triton stores parameter partials in a different physical layout.
-
-Direct `TritonEquivariantNorm(spec, ...)` construction defaults to
-`parameter_order="accurate"`, which uses FP64 for the final parameter sum and
-does not promise the rounding order of a particular Torch source graph. Use
-`from_reference()` for original-source comparisons. Both paths return FP32
-gradients. v1 reuses loaded features and upstream gradients and omits the group-dot
-tensor. Input-gradient-only backward uses one v1 kernel. Training forward saves
-the scalar mean and reciprocal standard deviations; inference under
-`torch.no_grad()` or `torch.inference_mode()` does not retain backward statistics.
-Source-ordered parameter reductions can require multiple kernels depending on
-shape. Expanded weights use `[N,K,C]` partials instead of `[N,L+1,C]`; previous
-two-kernel timing and memory figures do not describe this corrected path.
-
-The current interface supports CUDA FP32 and first-order gradients, NKC or KNC
-input storage, and contiguous, disjoint groups of complete degrees with equal
-channel counts. Noncontiguous and broadcast upstream gradients are accepted.
-`forward_with_stats()` returns a differentiable output and detached diagnostic
-statistics. Double backward and `create_graph=True` are explicitly rejected.
-Source-ordered backward explicitly rejects HIP/ROCm: the CUDA reduction schedule
-has not been adapted and validated against the Hygon Torch build. This correction
-does not establish that the previously reported Hygon failure is resolved.
-
-The corrected implementation passed 599 tests on H100 with PyTorch 2.8.0+cu128
-and Triton 3.4.0: 139 forward, 288 backward, and 172 precision regressions,
-with no skips. The precision suite includes 156 direct comparisons against
-unmodified Torch FP32 sources at `atol=5e-5, rtol=5e-4`, 14 FP64/closed-form
-diagnostics, and two generic large-tile regressions.
-Direct comparisons cover v0/v1, NKC/KNC random inputs, large-batch cancellation,
-component cancellation, absent affine parameters, shared-scale gradient
-accumulation, and wider tiles. The 16 large-batch cancellation cases that exposed
-the earlier FP64-only fix now all pass the original FP32 reference. The existing
-suite also checks a three-module chain with two SGD steps.
-Batch-doubling measurements exposed four additional parameter-gradient
-failures at the same native FP32 tolerance: V3 LayerNorm at N=32768/131072,
-V3 Merge at N=262144, and V3 Separable at N=524288 (L=3, C=128).
-The repair preserves the source's forward statistics and large-reduction
-splitting. All four cases now have permanent v0/v1 regressions comparing every
-output, input gradient, and parameter gradient; none uses sampling or a relaxed
-tolerance. Separate full-tensor checks cover all four variants at N=256 doubling
-through 524288. Native mean alignment also accounts for input storage offsets
-and the layout of source intermediates.
-Passing an FP64 diagnostic does not replace original-source acceptance.
-Near-constant inputs use separately declared precision tolerances; FP32 reduction
-orders are not claimed to be bitwise equivalent for the full operator. Other
-Torch versions and GPU/compiler combinations require validation. See the
-[implementation](fasteq/triton/fused_equivariant_layer_norm.py),
-[backward kernels](fasteq/triton/_equivariant_norm_backward.py),
-[source-ordered parameter reduction](fasteq/triton/_torch_norm_reduce.py),
-[source-ordered statistics](fasteq/triton/_torch_norm_stats.py),
-[gradient tests](test/test_triton_equivariant_layer_norm_backward.py), and
-[precision tests](test/test_triton_equivariant_layer_norm_precision.py).
-
-```bash
-PYTHONPATH=. FASTEQ_BACKEND=cpu CUDA_VISIBLE_DEVICES=0 \
-  python -m pytest -q test/test_triton_equivariant_layer_norm.py \
-  test/test_triton_equivariant_layer_norm_backward.py \
-  test/test_triton_equivariant_layer_norm_precision.py
-```
-
-`FASTEQ_BACKEND=cpu` skips the native extension loader in a source checkout;
-these Triton operators still run on CUDA. To enable the original-source checks,
-set `FASTEQ_EQUIFORMER_V3_LAYER_NORM` and `FASTEQ_EQUIFORMER_V2_LAYER_NORM` to the
-respective original `layer_norm.py` files.
+CUDA FP32 normalization with first-order gradients for EquiformerV3 and
+EquiformerV2 layers. See [Equivariant LayerNorm](doc/layernorm.md) for supported
+layers, fused operations, usage, and validation coverage.
 
 ## How FastEq Optimizes Equivariant Computation
 
