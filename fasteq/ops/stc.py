@@ -29,9 +29,13 @@ from .uniform1d_auto_schedule import (
     _normalize_stc_padded_paths,
     infer_stc_path_lens_from_padded,
     _infer_stc_path_lens_tensor_from_padded,
+    build_triton_stc_fwd_module,
+    build_triton_stc_bwd_module,
+    build_triton_stc_double_bwd_module,
 )
 
 from .uniform1d_jit import (
+    _resolve_multiwarp_candidates_enabled,
     _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
     _discover_prebuilt_jit_candidates as _u1d_discover_prebuilt_jit_candidates,
     _load_persistent_best_candidate as _u1d_load_persistent_best_candidate,
@@ -40,6 +44,23 @@ from .uniform1d_jit import (
 
 
 _MODULE_CACHE: Dict[str, Any] = {}
+
+
+_TRITON_STC_FWD_MODULE_CACHE: Dict[str, Any] = {}
+_TRITON_STC_BWD_MODULE_CACHE: Dict[str, Any] = {}
+_TRITON_STC_DOUBLE_BWD_MODULE_CACHE: Dict[str, Any] = {}
+
+
+def _fasteq_codegen_backend() -> str:
+    backend = os.environ.get("FASTEQ_CODEGEN_BACKEND", "cuda").strip().lower()
+    if backend in ("cuda", "hip", "cpp", "native"):
+        return "native"
+    if backend == "triton":
+        return "triton"
+    raise ValueError(
+        f"Unsupported FASTEQ_CODEGEN_BACKEND={backend!r}; expected cuda/native or triton"
+    )
+
 
 
 # -----------------------------------------------------------------------------
@@ -403,7 +424,7 @@ def _make_stc_fwd_tune_key(
         dtype_str = "float"
     if dtype == torch.float64:
         dtype_str = "double"
-    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    warp_tag = "autowarp_global_v1" if bool(use_multiwarp_candidates) else "base_global_v1"
     return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
 
@@ -433,7 +454,7 @@ def _make_stc_bwd_tune_key(
         dtype_str = "float"
     if dtype == torch.float64:
         dtype_str = "double"
-    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    warp_tag = "autowarp_global_v1" if bool(use_multiwarp_candidates) else "base_global_v1"
     grad_tag = "x1_x0" if bool(need_grad_x0) else "x1_only"
     return f"stc_u1d_bwd_{grad_tag}_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
@@ -458,7 +479,7 @@ def _make_stc_double_bwd_tune_key(
         dtype_str = "double"
     else:
         raise TypeError(f"Unsupported dtype for STC double backward JIT: {dtype}")
-    warp_tag = "autowarp" if bool(use_multiwarp_candidates) else "w1only"
+    warp_tag = "autowarp_global_v1" if bool(use_multiwarp_candidates) else "base_global_v1"
     return f"stc_u1d_double_bwd_x0gather_v3_ggx0_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
 
 
@@ -537,6 +558,7 @@ def _get_or_build_module_candidates(
     use_multiwarp_candidates: bool = False,
     verbose: bool = False,
 ):
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
     base_name = _make_stc_fwd_tune_key(
         idx_lists,
         coeffs,
@@ -618,6 +640,7 @@ def _get_or_build_bwd_module_candidates(
     need_grad_x0: bool = True,
     verbose: bool = False,
 ):
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
     base_name = _make_stc_bwd_tune_key(
         idx_lists,
         coeffs,
@@ -689,6 +712,7 @@ def _get_or_build_double_bwd_module_candidates(
     use_multiwarp_candidates: bool = False,
     verbose: bool = False,
 ):
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
     base_name = _make_stc_double_bwd_tune_key(
         idx_lists, coeffs, V=V, U=U, dtype=dtype, path_lens=path_lens,
         pad_value=pad_value, use_multiwarp_candidates=use_multiwarp_candidates,
@@ -814,16 +838,29 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         key = _make_stc_bwd_tune_key(
             idx_lists_tensor, coeffs_tensor, V=V, U=U,
             dtype=x1.dtype, path_lens=None, pad_value=int(pad_value),
-            use_multiwarp_candidates=bool(use_multiwarp_candidates),
+            use_multiwarp_candidates=(False if _fasteq_codegen_backend() == "triton" else bool(use_multiwarp_candidates)),
             need_grad_x0=need_grad_x0)
-        candidates = _get_or_build_bwd_module_candidates(
-            idx_lists_tensor, coeffs_tensor, path_lens=None, pad_value=int(pad_value),
-            V=V, U=U, dtype=x1.dtype,
-            use_multiwarp_candidates=bool(use_multiwarp_candidates),
-            need_grad_x0=need_grad_x0)
-        _tag, mod, _ms = _select_best_stc_bwd_module(
-            key, candidates, grad_out_3d, x1.contiguous(), x0_g, V)
-        bwd_result = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
+        if _fasteq_codegen_backend() == "triton":
+            print("[STC][bwd] using triton backend")
+            triton_key = "triton:" + key
+            mod = _TRITON_STC_BWD_MODULE_CACHE.get(triton_key)
+            if mod is None:
+                mod = build_triton_stc_bwd_module(
+                    idx_lists_tensor, coeffs_tensor, path_lens=None,
+                    pad_value=int(pad_value), num_out_segments=V, u_dim=U,
+                    need_grad_x0=need_grad_x0,
+                )
+                _TRITON_STC_BWD_MODULE_CACHE[triton_key] = mod
+            bwd_result = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
+        else:
+            candidates = _get_or_build_bwd_module_candidates(
+                idx_lists_tensor, coeffs_tensor, path_lens=None, pad_value=int(pad_value),
+                V=V, U=U, dtype=x1.dtype,
+                use_multiwarp_candidates=bool(use_multiwarp_candidates),
+                need_grad_x0=need_grad_x0)
+            _tag, mod, _ms = _select_best_stc_bwd_module(
+                key, candidates, grad_out_3d, x1.contiguous(), x0_g, V)
+            bwd_result = mod.run(grad_out_3d, x1.contiguous(), x0_g, V)
         if need_grad_x0:
             gx1, gx0_g = bwd_result
         else:
@@ -888,18 +925,31 @@ class FastSTCBackwardFunction(torch.autograd.Function):
             idx_lists_tensor, coeffs_tensor,
             V=int(ctx.num_out_segments), U=int(x1.size(2)), dtype=x1.dtype,
             path_lens=None, pad_value=int(ctx.pad_value),
-            use_multiwarp_candidates=bool(ctx.use_multiwarp_candidates),
+            use_multiwarp_candidates=(False if _fasteq_codegen_backend() == "triton" else bool(ctx.use_multiwarp_candidates)),
         )
-        candidates = _get_or_build_double_bwd_module_candidates(
-            idx_lists_tensor, coeffs_tensor, path_lens=None,
-            pad_value=int(ctx.pad_value), V=int(ctx.num_out_segments),
-            U=int(x1.size(2)), dtype=x1.dtype,
-            use_multiwarp_candidates=bool(ctx.use_multiwarp_candidates),
-        )
-        _tag, mod, _ms = _select_best_stc_double_bwd_module(
-            key, candidates, grad_out_3d, x1, x0, i0_i64,
-            grad_grad_x0_3d, grad_grad_x1_3d, int(ctx.num_out_segments),
-        )
+        if _fasteq_codegen_backend() == "triton":
+            print("[STC][double_bwd] using triton backend")
+            triton_key = "triton:" + key
+            mod = _TRITON_STC_DOUBLE_BWD_MODULE_CACHE.get(triton_key)
+            if mod is None:
+                mod = build_triton_stc_double_bwd_module(
+                    idx_lists_tensor, coeffs_tensor, path_lens=None,
+                    pad_value=int(ctx.pad_value),
+                    num_out_segments=int(ctx.num_out_segments),
+                    u_dim=int(x1.size(2)),
+                )
+                _TRITON_STC_DOUBLE_BWD_MODULE_CACHE[triton_key] = mod
+        else:
+            candidates = _get_or_build_double_bwd_module_candidates(
+                idx_lists_tensor, coeffs_tensor, path_lens=None,
+                pad_value=int(ctx.pad_value), V=int(ctx.num_out_segments),
+                U=int(x1.size(2)), dtype=x1.dtype,
+                use_multiwarp_candidates=bool(ctx.use_multiwarp_candidates),
+            )
+            _tag, mod, _ms = _select_best_stc_double_bwd_module(
+                key, candidates, grad_out_3d, x1, x0, i0_i64,
+                grad_grad_x0_3d, grad_grad_x1_3d, int(ctx.num_out_segments),
+            )
         d_go_3d, d_x1, d_x0 = mod.run(
             grad_out_3d, x1.contiguous(), x0.contiguous(),
             i0_i64, grad_grad_x0_3d, grad_grad_x1_3d,
@@ -947,6 +997,7 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         #torch.cuda.synchronize()
         #start_time = time.perf_counter() * 1000
 
+        use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
         x0_g = x0[i0]
         U = int(x1.size(2))
 
@@ -973,22 +1024,35 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             dtype=x1.dtype,
             path_lens=None,
             pad_value=int(pad_value),
-            use_multiwarp_candidates=bool(use_multiwarp_candidates),
+            use_multiwarp_candidates=(False if _fasteq_codegen_backend() == "triton" else bool(use_multiwarp_candidates)),
         )
-        candidates = _get_or_build_module_candidates(
-            idx_lists_tensor,
-            coeffs_tensor,
-            path_lens=None,
-            pad_value=int(pad_value),
-            V=int(num_out_segments),
-            U=U,
-            dtype=x1.dtype,
-            use_multiwarp_candidates=bool(use_multiwarp_candidates),
-        )
-        best_tag, mod, _best_ms = _select_best_stc_fwd_module(
-            fwd_key, candidates, x1.contiguous(), x0_g.contiguous(), int(num_out_segments)
-        )
-        out = mod.run(x1.contiguous(), x0_g.contiguous(), int(num_out_segments))
+        if _fasteq_codegen_backend() == "triton":
+            print("[STC][fwd] using triton backend")
+            triton_key = "triton:" + fwd_key
+            mod = _TRITON_STC_FWD_MODULE_CACHE.get(triton_key)
+            if mod is None:
+                mod = build_triton_stc_fwd_module(
+                    idx_lists_tensor, coeffs_tensor, path_lens=None,
+                    pad_value=int(pad_value), num_out_segments=int(num_out_segments),
+                    u_dim=U,
+                )
+                _TRITON_STC_FWD_MODULE_CACHE[triton_key] = mod
+            out = mod.run(x1.contiguous(), x0_g.contiguous(), int(num_out_segments))
+        else:
+            candidates = _get_or_build_module_candidates(
+                idx_lists_tensor,
+                coeffs_tensor,
+                path_lens=None,
+                pad_value=int(pad_value),
+                V=int(num_out_segments),
+                U=U,
+                dtype=x1.dtype,
+                use_multiwarp_candidates=bool(use_multiwarp_candidates),
+            )
+            best_tag, mod, _best_ms = _select_best_stc_fwd_module(
+                fwd_key, candidates, x1.contiguous(), x0_g.contiguous(), int(num_out_segments)
+            )
+            out = mod.run(x1.contiguous(), x0_g.contiguous(), int(num_out_segments))
 
         out = out.view(out.shape[0], -1)
 
@@ -1041,10 +1105,11 @@ def fast_stc_uniform1d_jit(
     ``path_lens_tensor`` and variable-argument parsing are intentionally not
     accepted here; preprocessing is the single source of metadata layout.
 
-    ``use_multiwarp_candidates=False`` builds and uses only the one-warp
-    candidate. Set it to ``True`` to generate, benchmark and select from legal
-    multi-warp variants. Forward and backward always use the same setting.
+    Candidate generation and benchmarking are controlled exclusively by
+    uniform1d_jit.ENABLE_JIT_CANDIDATES (default False).
+    use_multiwarp_candidates is retained for compatibility and is ignored.
     """
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
     return FastSymmetricTensorContractionUniform1dFunction.apply(
         x1,
         x0,

@@ -26,8 +26,28 @@ from .uniform1d_auto_schedule import (
     generate_code_uniform1d_double_bwd_with_scheduler,
     generate_code_uniform1d_fwd_baseline_unrolled,
     generate_code_uniform1d_bwd_baseline_unrolled,
+    build_triton_uniform1d_fwd_module,
+    build_triton_uniform1d_bwd_module,
+    build_triton_uniform1d_double_bwd_module,
 
 )
+
+
+# Triton register-only runtime caches.  CUDA/HIP remains the default backend.
+_TRITON_FWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_TRITON_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_TRITON_DOUBLE_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+
+
+def _fasteq_codegen_backend() -> str:
+    backend = os.environ.get("FASTEQ_CODEGEN_BACKEND", "cuda").strip().lower()
+    if backend in ("cuda", "hip", "cpp", "native"):
+        return "native"
+    if backend == "triton":
+        return "triton"
+    raise ValueError(
+        f"Unsupported FASTEQ_CODEGEN_BACKEND={backend!r}; expected cuda/native or triton"
+    )
 
 # -----------------------------------------------------------------------------
 # JIT cache
@@ -62,7 +82,10 @@ _DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = False
 _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = False
 _DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
 _DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
-_DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED = False
+# Shared by Uniform1D and STC. Set once before model execution.
+# False: one base implementation, no variant search or benchmarking.
+# True: generate multi-warp variants and select by benchmark.
+ENABLE_JIT_CANDIDATES = False
 
 # Fallbacks are used only when importing or smoke-testing without a visible GPU.
 # Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
@@ -88,19 +111,9 @@ def _env_int(name: str, default: int, *, min_value: int = 0) -> int:
         return max(int(min_value), int(default))
 
 
-def _resolve_multiwarp_candidates_enabled(value: Optional[bool]) -> bool:
-    """Resolve the per-call multi-warp candidate switch.
-
-    A non-None function argument has priority.  When it is None, the environment
-    variable keeps command-line experimentation convenient without changing the
-    operator call site.
-    """
-    if value is not None:
-        return bool(value)
-    return _env_bool(
-        "FASTEQ_UNIFORM1D_MULTI_WARP_CANDIDATES",
-        _DEFAULT_UNIFORM1D_MULTI_WARP_CANDIDATES_ENABLED,
-    )
+def _resolve_multiwarp_candidates_enabled(value: Optional[bool] = None) -> bool:
+    """Read the shared file-level policy; retain value only for API compatibility."""
+    return bool(ENABLE_JIT_CANDIDATES)
 
 
 def _runtime_device_properties():
@@ -829,6 +842,8 @@ def _discover_prebuilt_jit_candidates(
     This is the key fast path: it avoids calling codegen_fn(), so scheduler
     search/LARS scheduling and CUDA source regeneration are skipped entirely.
     """
+    if not ENABLE_JIT_CANDIDATES:
+        return []
 
     build_root = _default_build_root()
     if not build_root.exists():
@@ -901,6 +916,8 @@ def _load_persistent_best_candidate(
     When this hits, callers can skip candidate generation/scheduling/compilation
     and also skip runtime benchmarking.
     """
+    if not ENABLE_JIT_CANDIDATES:
+        return None
 
     meta_path = _best_candidate_meta_path(kind, tune_key)
     if not meta_path.exists():
@@ -1178,6 +1195,17 @@ def _build_jit_candidates_from_sources(
     This function is shared by Uniform1D and STC.  STC passes one raw CUDA
     source, while Uniform1D may pass multiple scheduler/codegen candidates.
     """
+    use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
+    if not use_multiwarp_candidates:
+        if len(raw_candidates) != 1:
+            raise RuntimeError("Candidate search is disabled: expected one base source")
+        _tag, code = raw_candidates[0]
+        module_name = f"{tune_key}_base_{_sha1_text(code)}"
+        mod = _build_jit_module_common(
+            module_name=module_name, cache=cache, kind=f"{kind}:base",
+            codegen_fn=lambda: code,
+        )
+        return [("base", mod)]
     use_multiwarp_candidates = bool(use_multiwarp_candidates)
     base_infos = _candidate_infos_from_sources(
         tune_key=tune_key,
@@ -1346,7 +1374,7 @@ def _make_fwd_module_name(
     h = _sha1_text(sig)
     mode_str = "uu_u" if mode == "u,u,,u" else "uuuu"
     layout_tag = _sanitize_module_tag(layout_tag)
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
     return f"uniform1d_fwd_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 def _make_bwd_module_name(
@@ -1388,7 +1416,7 @@ def _make_bwd_module_name(
     gw_tag = "gradw" if grad_w else "nogradw"
     gx_tag = "gradx" if grad_x else "nogradx"
     gy_tag = "grady" if grad_y else "nogrady"
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
     return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
@@ -1427,7 +1455,7 @@ def _make_double_bwd_module_name(
     gw_tag = "gradw" if grad_w else "nogradw"
     gx_tag = "gradx" if grad_x else "nogradx"
     gy_tag = "grady" if grad_y else "nogrady"
-    warp_tag = "autowarp" if use_multiwarp_candidates else "w1only"
+    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
     return (
         f"uniform1d_double_bwd_sched_{mode_str}_u{u_dim}_path{P}_"
         f"{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
@@ -1653,7 +1681,7 @@ def _build_fwd_jit_candidates(
             out_path="generated_uniform1d_fwd_baseline_unrolled.cu",
             path_semantics="wxy",
         ) """
-    print(f"[JIT][FWD] generate candidates for: {tune_key}")
+    print(f"[JIT][FWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     codegen_out = _codegen_candidates()
     raw_candidates = _normalize_codegen_candidates(codegen_out)
     if not raw_candidates:
@@ -1890,7 +1918,7 @@ def _build_bwd_jit_candidates(
             path_semantics="wxy",
         ) """
 
-    print(f"[JIT][BWD] generate candidates for: {tune_key}")
+    print(f"[JIT][BWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     raw_candidates = _normalize_codegen_candidates(_codegen_candidates())
     if not raw_candidates:
         raise RuntimeError("backward codegen returned zero candidates")
@@ -2035,7 +2063,7 @@ def _build_double_bwd_jit_candidates(
     if prebuilt:
         return tune_key, prebuilt
 
-    print(f"[JIT][DOUBLE_BWD] generate candidates for: {tune_key}")
+    print(f"[JIT][DOUBLE_BWD] generate {'candidates' if ENABLE_JIT_CANDIDATES else 'base implementation'} for: {tune_key}")
     codegen_out = generate_code_uniform1d_double_bwd_with_scheduler(
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
         coeff_list=coeff_list,
@@ -2149,6 +2177,15 @@ def _benchmark_and_select_best_jit_candidate(
     operator-specific ABI.  Everything else is operator-agnostic and is reused
     by Uniform1D FWD/BWD and STC FWD/BWD.
     """
+    if not ENABLE_JIT_CANDIDATES:
+        if len(candidates) != 1:
+            raise RuntimeError("Candidate search is disabled: expected one base module")
+        tag, mod = candidates[0]
+        best = (tag, mod, float("nan"))
+        best_cache[tune_key] = best
+        return best
+    # Enabling the shared switch also enables selection by measurement.
+    tune_enabled = True
     if tune_key in best_cache:
         return best_cache[tune_key]
     if not candidates:
@@ -2373,6 +2410,41 @@ def _run_fwd(
     ky_dim = int(y.size(1))
     v_dim = int(out_seg_num)
 
+    if _fasteq_codegen_backend() == "triton":
+        print("[JIT][FWD] using triton backend for forward pass")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            raise RuntimeError("Input_indices 1 and 2 all empty")
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        key = _make_candidate_fast_key(
+            kind="TRITON_FWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
+            ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
+            dtype_str=dtype_str, use_multiwarp_candidates=False,
+        )
+        mod = _TRITON_FWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = build_triton_uniform1d_fwd_module(
+                i_list, j_list, k_list, v_list, coeff_list,
+                input_indices=input_indices, output_indices=output_indices,
+                u_dim=u_dim, mode=mode,
+            )
+            _TRITON_FWD_MODULE_CACHE[key] = mod
+        return _call_fwd_module(
+            mod, w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
+            out_seg_num=out_seg_num, fused_scatter=fused_scatter,
+        )
+
     tune_key, candidates = _build_fwd_jit_candidates(
         i_list=i_list,
         j_list=j_list,
@@ -2457,6 +2529,46 @@ def _run_bwd(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
+    if _fasteq_codegen_backend() == "triton":
+        print("[JIT][BWD] using triton backend for backward pass")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            raise RuntimeError("Input_indices 1 and 2 all empty")
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
+        key = _make_candidate_fast_key(
+            kind="TRITON_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
+            ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
+            dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x, grad_y=grad_y,
+            use_multiwarp_candidates=False,
+        )
+        mod = _TRITON_BWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = build_triton_uniform1d_bwd_module(
+                i_list, j_list, k_list, v_list, coeff_list,
+                input_indices=input_indices, output_indices=output_indices,
+                u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
+                v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
+                need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+            )
+            _TRITON_BWD_MODULE_CACHE[key] = mod
+        return _call_bwd_module(
+            mod, w=w, x=x, y=y, grad_out=grad_out_3d,
+            src_idx=src_idx, dst_idx=dst_idx, out_seg_num=out_seg_num,
+            fused_scatter=fused_scatter,
+        )
+
     tune_key, candidates = _build_bwd_jit_candidates(
         i_list=i_list,
         j_list=j_list,
@@ -2549,6 +2661,54 @@ def _run_double_bwd(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
+    if _fasteq_codegen_backend() == "triton":
+        print("[JIT][BWD] using triton backend for backward pass")
+        use_x_src = 1 in input_indices
+        use_y_src = 2 in input_indices
+        use_src = use_x_src or use_y_src
+        fused_scatter = 0 in output_indices
+        if use_x_src:
+            src_idx = _as_int32_meta_tensor(input_indices[1]).contiguous()
+        elif use_y_src:
+            src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
+        else:
+            src_idx = None
+        dst_idx = (
+            _as_int32_meta_tensor(output_indices[0]).contiguous()
+            if fused_scatter else None
+        )
+        grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
+        if bool(grad_w):
+            grad_grad_w = torch.zeros_like(w) if grad_grad_w is None else grad_grad_w.contiguous()
+        if bool(grad_x):
+            grad_grad_x = torch.zeros_like(x) if grad_grad_x is None else grad_grad_x.contiguous()
+        if bool(grad_y):
+            grad_grad_y = torch.zeros_like(y) if grad_grad_y is None else grad_grad_y.contiguous()
+        key = _make_candidate_fast_key(
+            kind="TRITON_DOUBLE_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
+            output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim,
+            ky_dim=ky_dim, v_dim=v_dim, mode=mode, dtype_str=dtype_str,
+            grad_w=grad_w, grad_x=grad_x, grad_y=grad_y, use_multiwarp_candidates=False,
+        )
+        mod = _TRITON_DOUBLE_BWD_MODULE_CACHE.get(key)
+        if mod is None:
+            mod = build_triton_uniform1d_double_bwd_module(
+                i_list, j_list, k_list, v_list, coeff_list,
+                input_indices=input_indices, output_indices=output_indices,
+                u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
+                v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
+                need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+            )
+            _TRITON_DOUBLE_BWD_MODULE_CACHE[key] = mod
+        return _call_double_bwd_module(
+            mod, w=w, x=x, y=y, grad_out=grad_out_3d,
+            grad_grad_w=grad_grad_w, grad_grad_x=grad_grad_x,
+            grad_grad_y=grad_grad_y, src_idx=src_idx, dst_idx=dst_idx,
+            out_seg_num=out_seg_num, use_src=use_src, fused_scatter=fused_scatter,
+            need_grad_w=bool(grad_w), need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+        )
+
     tune_key, candidates = _build_double_bwd_jit_candidates(
         i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
         coeff_list=coeff_list,
@@ -2850,9 +3010,11 @@ def fast_uniform1d_jit(
     input_indices,
     output_indices,
     meta,
-    use_multiwarp_candidates: Optional[bool] = False,
+    use_multiwarp_candidates: Optional[bool] = None,
 ):
-    """Run Uniform1D JIT with optional multi-warp candidate generation.
+    """Run Uniform1D JIT using ENABLE_JIT_CANDIDATES from this file.
+
+    use_multiwarp_candidates is retained for compatibility and is ignored.
     """
     return FastUniform1dJITFunction.apply(
         w,
