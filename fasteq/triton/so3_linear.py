@@ -24,7 +24,7 @@ The path-parallel kernel launches one logical CTA grid per path and uses atomic
 adds into an FP32 workspace when paths share an output segment. Its wrapper
 includes output zeroing and the final cast to the input dtype.
 FP32 defaults to IEEE dot, not reduced-precision TF32. On supported NVIDIA
-hardware use input_precision='tf32x3' explicitly if desired.
+hardware use input_precision='tf32', or call so3_linear_auto(..., tf32=True).
 Revision: flat constexpr metadata avoids runtime indexing of Triton tuples.
 GPU numerical execution and performance require target-device testing.
 """
@@ -34,7 +34,8 @@ import math
 import operator
 
 
-# Process-local cache: (canonical descriptor, dtype) -> implementation name.
+# Process-local cache:
+# (canonical descriptor, dtype) -> {effective_tf32: implementation name}.
 # Z is intentionally excluded because the requested policy reuses one choice
 # across changing batch sizes.
 _BEST_IMPL_CACHE = {}
@@ -672,8 +673,8 @@ def best_impl_cache_key(layout, dtype):
 
 
 def get_best_impl_cache():
-    """Return a snapshot of cached descriptor/dtype implementation choices."""
-    return dict(_BEST_IMPL_CACHE)
+    """Return a detached snapshot of cached IEEE/TF32 choices."""
+    return {key: dict(modes) for key, modes in _BEST_IMPL_CACHE.items()}
 
 
 def clear_best_impl_cache():
@@ -681,44 +682,57 @@ def clear_best_impl_cache():
     _BEST_IMPL_CACHE.clear()
 
 
-def so3_linear_auto(w, x, layout, *, benchmark_warmup=10,
+def so3_linear_auto(w, x, layout, *, tf32=False, benchmark_warmup=10,
                     benchmark_rep=50, verbose=False):
     """Run the cached fastest Triton implementation for descriptor and dtype.
 
     On a cache miss, benchmarks serial CTA, path-parallel and group-parallel
     wrappers using the current inputs, caches the fastest implementation name,
     then executes it. Z affects that first measurement but is not part of the
-    key, as requested. Call ``clear_best_impl_cache()`` to retune explicitly.
+    key, as requested. IEEE and TF32 choices are stored beneath the same
+    descriptor/dtype key. ``tf32`` only changes FP32 dot precision; FP16/BF16
+    use their normal tensor-core paths. Call ``clear_best_impl_cache()`` to
+    retune explicitly.
     """
     if torch is None or triton is None:
         raise RuntimeError('automatic selection requires installed torch and triton')
+    if not isinstance(tf32, bool):
+        raise TypeError('tf32 must be bool')
+    if tf32 and torch.version.hip:
+        raise ValueError('tf32=True is only supported by the CUDA backend')
     if not isinstance(benchmark_warmup, int) or isinstance(benchmark_warmup, bool) or benchmark_warmup < 0:
         raise ValueError('benchmark_warmup must be a nonnegative integer')
     if not isinstance(benchmark_rep, int) or isinstance(benchmark_rep, bool) or benchmark_rep <= 0:
         raise ValueError('benchmark_rep must be a positive integer')
     key = best_impl_cache_key(layout, x.dtype)
+    effective_tf32 = tf32 and x.dtype == torch.float32
+    precision = 'tf32' if effective_tf32 else 'ieee'
+    modes = _BEST_IMPL_CACHE.setdefault(key, {})
     implementations = {
         'serial': so3_linear_serial_cta,
         'path_parallel': so3_linear_path_parallel,
         'group_parallel': so3_linear_group_parallel,
     }
-    selected = _BEST_IMPL_CACHE.get(key)
+    selected = modes.get(effective_tf32)
     if selected is None:
         timings = {}
         for name, implementation in implementations.items():
             timings[name] = _bench(
-                lambda implementation=implementation: implementation(w, x, layout),
+                lambda implementation=implementation: implementation(
+                    w, x, layout, input_precision=precision),
                 warmup=benchmark_warmup,
                 rep=benchmark_rep)
         selected = min(timings, key=timings.get)
-        _BEST_IMPL_CACHE[key] = selected
+        modes[effective_tf32] = selected
         if verbose:
             timing_text = ', '.join(f'{name}={ms:.6f} ms'
                                     for name, ms in timings.items())
-            print(f'SO3 linear autotune: {timing_text}; selected={selected}')
+            print(f'SO3 linear autotune precision={precision}: '
+                  f'{timing_text}; selected={selected}')
     elif verbose:
-        print(f'SO3 linear cache hit: selected={selected}')
-    return implementations[selected](w, x, layout)
+        print(f'SO3 linear cache hit precision={precision}: selected={selected}')
+    return implementations[selected](
+        w, x, layout, input_precision=precision)
 
 
 def torch_reference(w, x, layout):
@@ -865,22 +879,42 @@ def gpu_test(model, batch, dtype_name):
                   f'group_max_abs={(grouped.float()-expected.float()).abs().max().item():.6g}, '
                   f'grad_x_max_abs={(grad_x.float()-expected_grad_x.float()).abs().max().item():.6g}')
             if idx == 0:
+                # Tune and time the cached IEEE automatic path. The first call
+                # performs autotuning; it is deliberately outside _bench.
                 clear_best_impl_cache()
-                automatic = so3_linear_auto(w, x, layout, verbose=True)
-                torch.testing.assert_close(automatic,expected,atol=atol,rtol=rtol)
+                automatic_ieee = so3_linear_auto(
+                    w, x, layout, tf32=False, verbose=True)
+                torch.testing.assert_close(
+                    automatic_ieee, expected, atol=atol, rtol=rtol)
                 cache_key = best_impl_cache_key(layout, dtype)
-                print(f'auto_cache_selected={get_best_impl_cache()[cache_key]}')
-                ms_serial = _bench(lambda: so3_linear_serial_cta(w,x,layout))
-                ms_parallel = _bench(lambda: so3_linear_path_parallel(w,x,layout))
-                ms_group = _bench(lambda: so3_linear_group_parallel(w,x,layout))
+                ieee_selected = get_best_impl_cache()[cache_key][False]
+                ms_auto_ieee = _bench(
+                    lambda: so3_linear_auto(w, x, layout, tf32=False))
+
+                # These measurements explicitly request IEEE. Merely passing
+                # tf32=True to so3_linear_auto does not change direct wrapper
+                # calls because their input_precision default is 'ieee'.
+                ms_serial = _bench(
+                    lambda: so3_linear_serial_cta(
+                        w, x, layout, input_precision='ieee'))
+                ms_parallel = _bench(
+                    lambda: so3_linear_path_parallel(
+                        w, x, layout, input_precision='ieee'))
+                ms_group = _bench(
+                    lambda: so3_linear_group_parallel(
+                        w, x, layout, input_precision='ieee'))
                 ms_torch = _bench(lambda: torch_reference(w,x,layout))
-                ms_grad_x = _bench(lambda: so3_linear_backward_x(w,grad_out,layout))
+                ms_grad_x = _bench(
+                    lambda: so3_linear_backward_x(
+                        w, grad_out, layout, input_precision='ieee'))
                 ms_grad_x_torch = _bench(
                     lambda: torch_backward_x_reference(w,grad_out,layout))
                 print(f'{model} {dtype_name} Z={z}: '
-                      f'serial={ms_serial:.6f} ms, '
+                      f'precision=ieee, serial={ms_serial:.6f} ms, '
                       f'path_parallel={ms_parallel:.6f} ms, '
-                      f'group_parallel={ms_group:.6f} ms, torch={ms_torch:.6f} ms')
+                      f'group_parallel={ms_group:.6f} ms, '
+                      f'auto={ms_auto_ieee:.6f} ms ({ieee_selected}), '
+                      f'torch={ms_torch:.6f} ms')
                 print(f'speedup_vs_torch: serial={ms_torch/ms_serial:.2f}x, '
                       f'path_parallel={ms_torch/ms_parallel:.2f}x, '
                       f'group_parallel={ms_torch/ms_group:.2f}x; '
@@ -891,6 +925,49 @@ def gpu_test(model, batch, dtype_name):
                 print(f'backward_x: triton={ms_grad_x:.6f} ms, '
                       f'torch={ms_grad_x_torch:.6f} ms, '
                       f'speedup={ms_grad_x_torch/ms_grad_x:.2f}x')
+
+                if dtype == torch.float32:
+                    # Tune TF32 independently. Cache selection is separated by
+                    # the effective_tf32 boolean under the descriptor/dtype key.
+                    # TF32 is approximate, so it needs a looser tolerance than
+                    # the IEEE correctness check above.
+                    automatic_tf32 = so3_linear_auto(
+                        w, x, layout, tf32=True, verbose=True)
+                    tf32_atol, tf32_rtol = 5e-3, 5e-3
+                    torch.testing.assert_close(
+                        automatic_tf32, expected,
+                        atol=tf32_atol, rtol=tf32_rtol)
+                    tf32_selected = get_best_impl_cache()[cache_key][True]
+                    ms_auto_tf32 = _bench(
+                        lambda: so3_linear_auto(w, x, layout, tf32=True))
+                    ms_serial_tf32 = _bench(
+                        lambda: so3_linear_serial_cta(
+                            w, x, layout, input_precision='tf32'))
+                    ms_parallel_tf32 = _bench(
+                        lambda: so3_linear_path_parallel(
+                            w, x, layout, input_precision='tf32'))
+                    ms_group_tf32 = _bench(
+                        lambda: so3_linear_group_parallel(
+                            w, x, layout, input_precision='tf32'))
+                    ms_grad_x_tf32 = _bench(
+                        lambda: so3_linear_backward_x(
+                            w, grad_out, layout, input_precision='tf32'))
+                    tf32_max_abs = (
+                        automatic_tf32.float() - expected.float()
+                    ).abs().max().item()
+                    print(f'{model} {dtype_name} Z={z}: '
+                          f'precision=tf32, serial={ms_serial_tf32:.6f} ms, '
+                          f'path_parallel={ms_parallel_tf32:.6f} ms, '
+                          f'group_parallel={ms_group_tf32:.6f} ms, '
+                          f'auto={ms_auto_tf32:.6f} ms ({tf32_selected}), '
+                          f'max_abs={tf32_max_abs:.6g}')
+                    print(
+                        f'tf32_speedup_over_ieee: '
+                        f'serial={ms_serial/ms_serial_tf32:.2f}x, '
+                        f'path_parallel={ms_parallel/ms_parallel_tf32:.2f}x, '
+                        f'group_parallel={ms_group/ms_group_tf32:.2f}x, '
+                        f'auto={ms_auto_ieee/ms_auto_tf32:.2f}x, '
+                        f'backward_x={ms_grad_x/ms_grad_x_tf32:.2f}x')
 
 
 if __name__ == '__main__':
