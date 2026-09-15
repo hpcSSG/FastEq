@@ -1,4 +1,4 @@
-"""Shared FP32 inference kernels for disjoint equivariant norm groups.
+"""Shared FP32 forward and first-order gradients for equivariant norm groups.
 
 v0: scalar mean -> group statistics -> affine output (separate launches).
 v1: one program per atom, sharing the input tile across statistic groups.
@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 from ._equivariant_norm_spec import EquivariantNormSpec, NormResult, reference_forward
+from ._equivariant_norm_backward import backward as _backward
 
 
 @triton.jit
@@ -118,7 +119,7 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
            EPS: tl.constexpr, ORDER: tl.constexpr, UNIFORM: tl.constexpr,
            HAS_WEIGHT: tl.constexpr, SPLIT: tl.constexpr, HAS_BIAS: tl.constexpr,
            WS0: tl.constexpr, WSL: tl.constexpr, WSC: tl.constexpr, BS: tl.constexpr,
-           SAVE: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
+           SAVE: tl.constexpr, SAVE_MOMENTS: tl.constexpr, BK: tl.constexpr, BC: tl.constexpr,
            GROUP_BOUNDS: tl.constexpr):
     n = tl.program_id(0)
     k = tl.arange(0, BK)
@@ -146,7 +147,8 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
         r = tl.rsqrt(v + EPS)
         row_rstd = tl.where(member, r, row_rstd)
         if SAVE:
-            tl.store(MOMENTS + n * G + g, v)
+            if SAVE_MOMENTS:
+                tl.store(MOMENTS + n * G + g, v)
             tl.store(RSTD + n * G + g, r)
     y = _affine(z, row_rstd[:, None], k[:, None], c[None, :], valid, DEGREE, WEIGHT0,
                 WEIGHTH, BIAS, HAS_WEIGHT, SPLIT, HAS_BIAS, WS0, WSL, WSC, BS, K)
@@ -156,10 +158,34 @@ def _fused(X, Y, MU, MOMENTS, RSTD, COEFFICIENT, DEGREE,
             tl.store(MU + n, mu)
 
 
+class _EquivariantNormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight0, weight_high, bias, op, save_stats):
+        weight = (weight0, weight_high) if weight_high is not None else weight0
+        result = op._run(x, weight, bias, save_stats, training=True)
+        ctx.op = op
+        ctx.save_for_backward(x, result.mean, result.rstd, weight0, weight_high)
+        ctx.set_materialize_grads(False)
+        ctx.mark_non_differentiable(*(value for value in result[1:] if value is not None))
+        return tuple(result)
+
+    @staticmethod
+    def backward(ctx, dy, _dmean, _dmoments, _drstd):
+        if torch.is_grad_enabled():
+            raise RuntimeError('equivariant norm supports first-order gradients only; '
+                               'create_graph=True and double backward are not supported')
+        if dy is None:
+            return (None,) * 6
+        x, mean, rstd, weight0, weight_high = ctx.saved_tensors
+        gradients = _backward(ctx.op, x, mean, rstd, weight0, weight_high,
+                              dy, ctx.needs_input_grad[:4])
+        return (*gradients, None, None)
+
+
 class TritonEquivariantNorm(torch.nn.Module):
     """Execution plan; affine parameters belong to the caller.
 
-    GPU scope: FP32 inference, contiguous NKC / transposed KNC inputs,
+    GPU scope: FP32 forward/backward, contiguous NKC / transposed KNC inputs,
     positive-stride packed or split weights. Each statistic must describe one
     contiguous, disjoint range of full degrees and scale exactly that range.
     Broader/overlapping specs remain valid math specs but are rejected here.
@@ -212,15 +238,13 @@ class TritonEquivariantNorm(torch.nn.Module):
         if x.ndim != 3 or tuple(x.shape[1:]) != (s.components, s.channels):
             raise ValueError('expected [N,(lmax+1)^2,channels]')
         if x.device.type != 'cuda' or x.dtype != torch.float32:
-            raise TypeError('Triton backend supports CUDA FP32 inference only')
+            raise TypeError('Triton backend supports CUDA FP32 only')
         if x.device != self.bounds.device or self.coefficients.dtype != torch.float32:
             raise ValueError('move the execution plan to the input device; keep it FP32')
         if not (x.is_contiguous() or x.stride() == (s.channels, x.shape[0]*s.channels, 1)):
             raise ValueError('supported input storage: NKC and KNC')
         if x.numel() > 2**31 - 1:
             raise NotImplementedError('this backend uses 32-bit tensor indexing')
-        tensors = [x]
-
         def check(t, shape):
             if not isinstance(t, torch.Tensor) or tuple(t.shape) != shape:
                 raise ValueError(f'expected parameter shape {shape}')
@@ -230,7 +254,6 @@ class TritonEquivariantNorm(torch.nn.Module):
                 raise ValueError('parameter strides must be positive')
             if sum(max(a - 1, 0) * b for a, b in zip(t.shape, t.stride())) > 2**31 - 1:
                 raise NotImplementedError('parameter offsets exceed 32-bit indexing')
-            tensors.append(t)
 
         split = isinstance(weight, tuple)
         if weight is not None:
@@ -243,18 +266,15 @@ class TritonEquivariantNorm(torch.nn.Module):
                 check(weight, (s.lmax+1, s.channels))
         if bias is not None:
             check(bias, (s.channels,))
-        if torch.is_grad_enabled() and any(t.requires_grad for t in tensors):
-            raise RuntimeError('inference only: use torch.no_grad() or torch.inference_mode()')
 
-    def _run(self, x, weight, bias, save):
-        self._check(x, weight, bias)
+    def _run(self, x, weight, bias, save, training=False):
         n, k, c = x.shape
         s = self.spec
         y = torch.empty(x.shape, dtype=x.dtype, device=x.device)
-        need_stats = save or self.version == 'v0'
+        need_stats = save or training or self.version == 'v0'
         mu = torch.empty(n, dtype=x.dtype, device=x.device) if need_stats and s.center_scalar else None
-        moments = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if need_stats else None
-        rstd = torch.empty_like(moments) if need_stats else None
+        moments = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if save or self.version == 'v0' else None
+        rstd = torch.empty((n, s.num_stats), dtype=x.dtype, device=x.device) if need_stats else None
         if n:
             split = isinstance(weight, tuple)
             w0 = weight[0] if split else weight
@@ -288,15 +308,25 @@ class TritonEquivariantNorm(torch.nn.Module):
                         self.coefficients, self.degrees, w0, wh, bp, K=k,
                         **common, EPS=s.eps, ORDER=self.reduction_order, UNIFORM=self.uniform,
                         BK=self.atom_block_k, BC=self.block_c,
-                        GROUP_BOUNDS=self.group_bounds, **affine, SAVE=save,
+                        GROUP_BOUNDS=self.group_bounds, **affine, SAVE=need_stats, SAVE_MOMENTS=save,
                         num_warps=4, enable_fp_fusion=False)
-        return NormResult(y, mu, moments, rstd) if save else y
+        return NormResult(y, mu, moments, rstd) if save or training else y
+
+    def _dispatch(self, x, weight, bias, save):
+        self._check(x, weight, bias)
+        weight0, weight_high = weight if isinstance(weight, tuple) else (weight, None)
+        tensors = (x, weight0, weight_high, bias)
+        if torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in tensors):
+            result = NormResult(*_EquivariantNormFunction.apply(*tensors, self, save))
+            return result if save else result.output
+        return self._run(x, weight, bias, save)
 
     def forward(self, x, *, weight=None, bias=None):
-        return self._run(x, weight, bias, False)
+        return self._dispatch(x, weight, bias, False)
 
     def forward_with_stats(self, x, *, weight=None, bias=None):
-        return self._run(x, weight, bias, True)
+        """Return differentiable output and detached diagnostic statistics."""
+        return self._dispatch(x, weight, bias, True)
 
 
 class _SourceAdapter(torch.nn.Module):
@@ -304,7 +334,7 @@ class _SourceAdapter(torch.nn.Module):
 
     The registered source means .to() and parameter replacement stay live.
     The adapter's state_dict is namespaced under source.; source.state_dict()
-    retains the original class keys. This is a standalone inference adapter.
+    retains the original class keys. Source parameters receive Triton gradients.
     """
     def __init__(self, source, op):
         super().__init__()

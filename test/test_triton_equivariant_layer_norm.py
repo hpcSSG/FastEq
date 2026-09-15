@@ -313,7 +313,7 @@ def test_orthogonal_equivariance(version, grouping):
 
 @GPU
 @pytest.mark.parametrize("version", VERSIONS)
-def test_input_and_inference_guards(version):
+def test_input_guards_and_grad_dispatch(version):
     _, op = _plan(2, 7, "per_degree", version)
     x = torch.randn(3, 9, 7, device="cuda")
     with pytest.raises(TypeError, match="FP32"):
@@ -329,10 +329,8 @@ def test_input_and_inference_guards(version):
     with pytest.raises(ValueError, match="dtype"):
         op(x, bias=torch.zeros(7, device="cuda", dtype=torch.float64))
     with torch.enable_grad():
-        with pytest.raises(RuntimeError, match="inference"):
-            op(x.clone().requires_grad_())
-        with pytest.raises(RuntimeError, match="inference"):
-            op(x, weight=torch.ones(3, 7, device="cuda", requires_grad=True))
+        assert op(x.clone().requires_grad_()).requires_grad
+        assert op(x, weight=torch.ones(3, 7, device="cuda", requires_grad=True)).requires_grad
     with torch.no_grad():
         assert not op(x.clone().requires_grad_()).requires_grad
 

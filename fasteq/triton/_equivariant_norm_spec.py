@@ -95,7 +95,7 @@ def reference_forward(x, spec, *, weight=None, bias=None):
 
     weight: None, packed [L+1,C], or (scalar [C], higher [L,C]).
     bias: None or scalar-only [C]. Split weights need no per-call concatenation.
-    Reference calculations support float32/float64; initial GPU scope is FP32.
+    Reference calculations support float32/float64; GPU forward/backward uses FP32.
     """
     if x.ndim != 3 or tuple(x.shape[1:]) != (spec.components, spec.channels):
         raise ValueError('expected [N,(lmax+1)^2,channels]')
