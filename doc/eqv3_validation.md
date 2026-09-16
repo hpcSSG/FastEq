@@ -147,3 +147,10 @@ Fresh records:
 - [Accuracy](eqv3_validation/2026-09-16-hygon/correctness_summary.json), [failed elements](eqv3_validation/2026-09-16-hygon/failures.csv), and [repeated native GraphSoftmax checks](eqv3_validation/2026-09-16-hygon/softmax_native_checks.json)
 - [LayerNorm log](eqv3_validation/2026-09-16-hygon/layernorm.log) and [JUnit record](eqv3_validation/2026-09-16-hygon/layernorm.xml)
 - [Raw measurement records](eqv3_validation/2026-09-16-hygon/raw_results.json.gz), [reproduction](eqv3_validation/2026-09-16-hygon/REPRODUCE.md), and [comparison plotting script](eqv3_validation/2026-09-16-hygon/plot_by_operator.py)
+
+## GraphSoftmax and AttentionAlpha diagnosis
+
+See the [2026-09-16 diagnosis](eqv3_validation/2026-09-16-diagnosis/REPORT.md) for
+fixed-input replay, AttentionAlpha contraction ablations, H100 profiling,
+and the documented HIP launch-dimension limit behind the archived error points.
+This investigation preserves the original timing archives and production code.

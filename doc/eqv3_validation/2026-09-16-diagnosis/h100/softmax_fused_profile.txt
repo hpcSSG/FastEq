@@ -1,0 +1,24 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                        _GraphSoftmaxFn         4.20%     101.136us        88.73%       2.138ms       2.138ms      11.456us        37.80%      22.912us      22.912us             1
+                                Activity Buffer Request        69.98%       1.686ms        69.98%       1.686ms       1.686ms      11.456us        37.80%      11.456us      11.456us             1
+                                                   _fwd         0.00%       0.000us         0.00%       0.000us       0.000us      11.456us        37.80%      11.456us      11.456us             1
+                                _GraphSoftmaxFnBackward         4.94%     119.000us         7.90%     190.274us     190.274us       9.984us        32.95%      18.848us      18.848us             1
+                                                   _bwd         0.00%       0.000us         0.00%       0.000us       0.000us       9.984us        32.95%       9.984us       9.984us             1
+                                              aten::sum         0.78%      18.838us         1.18%      28.332us      28.332us       8.864us        29.25%       8.864us       8.864us             1
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       8.864us        29.25%       8.864us       8.864us             1
+                                        aten::expand_as         0.47%      11.330us         1.05%      25.376us      12.688us       0.000us         0.00%       0.000us       0.000us             2
+                                           aten::expand         0.48%      11.489us         0.58%      14.046us       7.023us       0.000us         0.00%       0.000us       0.000us             2
+                                       aten::as_strided         0.11%       2.557us         0.11%       2.557us       1.279us       0.000us         0.00%       0.000us       0.000us             2
+                                       aten::empty_like         0.56%      13.507us         1.72%      41.498us      10.374us       0.000us         0.00%       0.000us       0.000us             4
+                                    aten::empty_strided         1.16%      27.991us         1.16%      27.991us       6.998us       0.000us         0.00%       0.000us       0.000us             4
+                                       cuLaunchKernelEx        14.25%     343.283us        14.25%     343.283us     171.641us       0.000us         0.00%       0.000us       0.000us             2
+autograd::engine::evaluate_function: _GraphSoftmaxFn...         1.90%      45.857us         9.80%     236.131us     236.131us       0.000us         0.00%      18.848us      18.848us             1
+                                      aten::sum_to_size         0.21%       5.125us         1.39%      33.457us      33.457us       0.000us         0.00%       8.864us       8.864us             1
+                                       cudaLaunchKernel         0.39%       9.494us         0.39%       9.494us       9.494us       0.000us         0.00%       0.000us       0.000us             1
+autograd::engine::evaluate_function: torch::autograd...         0.22%       5.390us         0.22%       5.390us       2.695us       0.000us         0.00%       0.000us       0.000us             2
+                                  cudaDeviceSynchronize         0.35%       8.329us         0.35%       8.329us       4.165us       0.000us         0.00%       0.000us       0.000us             2
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.409ms
+Self CUDA time total: 30.304us

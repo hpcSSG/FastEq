@@ -1,0 +1,46 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                           aten::gather         1.13%      28.056us         1.86%      45.870us      15.290us     241.050us        60.52%     241.050us      80.350us             3
+void at::native::vectorized_gather_kernel<16, long>(...         0.00%       0.000us         0.00%       0.000us       0.000us     241.050us        60.52%     241.050us      80.350us             3
+                                  aten::scatter_reduce_         0.63%      15.521us         1.41%      34.744us      34.744us      51.743us        12.99%      58.751us      58.751us             1
+void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us      51.743us        12.99%      51.743us      51.743us             1
+                                              aten::mul         2.17%      53.591us         3.64%      90.092us      12.870us      25.920us         6.51%      25.920us       3.703us             7
+                                              aten::div         3.15%      77.783us        72.93%       1.803ms     300.543us      19.839us         4.98%      24.223us       4.037us             6
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      12.831us         3.22%      12.831us       3.208us             4
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      10.592us         2.66%      10.592us       3.531us             3
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us      10.240us         2.57%      10.240us       5.120us             2
+                                              aten::sum         0.47%      11.617us         0.71%      17.568us      17.568us       9.216us         2.31%       9.216us       9.216us             1
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us       9.216us         2.31%       9.216us       9.216us             1
+                                       aten::index_add_         0.33%       8.262us         0.61%      14.962us      14.962us       9.056us         2.27%       9.056us       9.056us             1
+void at::native::indexFuncLargeIndex<float, long, un...         0.00%       0.000us         0.00%       0.000us       0.000us       9.056us         2.27%       9.056us       9.056us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       7.520us         1.89%       7.520us       3.760us             2
+                                         aten::scatter_         0.35%       8.551us         0.56%      13.847us      13.847us       7.008us         1.76%       7.008us       7.008us             1
+void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us       7.008us         1.76%       7.008us       7.008us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       7.008us         1.76%       7.008us       3.504us             2
+                                     aten::scatter_add_         0.54%      13.285us         0.91%      22.401us      22.401us       6.848us         1.72%       6.848us       6.848us             1
+void at::native::_scatter_gather_elementwise_kernel<...         0.00%       0.000us         0.00%       0.000us       0.000us       6.848us         1.72%       6.848us       6.848us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       5.088us         1.28%       5.088us       2.544us             2
+                                              aten::neg         0.30%       7.323us         0.51%      12.612us      12.612us       4.864us         1.22%       4.864us       4.864us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.864us         1.22%       4.864us       4.864us             1
+                                Activity Buffer Request        67.29%       1.664ms        67.29%       1.664ms       1.664ms       4.384us         1.10%       4.384us       4.384us             1
+                                    aten::tanh_backward         0.31%       7.584us         0.53%      13.083us      13.083us       4.160us         1.04%       4.160us       4.160us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.160us         1.04%       4.160us       4.160us             1
+                                            aten::fill_         0.48%      11.833us         1.06%      26.193us       8.731us       4.128us         1.04%       4.128us       1.376us             3
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.128us         1.04%       4.128us       1.376us             3
+                                              aten::sub         0.38%       9.399us         0.53%      13.227us      13.227us       3.872us         0.97%       3.872us       3.872us             1
+                                             aten::add_         0.22%       5.480us         0.48%      11.797us      11.797us       3.648us         0.92%       3.648us       3.648us             1
+                                             aten::tanh         0.69%      17.064us         0.94%      23.256us      23.256us       2.688us         0.67%       2.688us       2.688us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.688us         0.67%       2.688us       2.688us             1
+                                              aten::exp         0.33%       8.089us         0.56%      13.763us      13.763us       2.656us         0.67%       2.656us       2.656us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.656us         0.67%       2.656us       2.656us             1
+                                              aten::add         0.36%       8.826us         0.49%      12.204us      12.204us       1.632us         0.41%       1.632us       1.632us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       1.632us         0.41%       1.632us       1.632us             1
+                                       cudaLaunchKernel         7.61%     188.075us         7.61%     188.075us       6.067us       0.000us         0.00%       0.000us       0.000us            31
+                                           aten::detach         0.10%       2.398us         0.18%       4.534us       4.534us       0.000us         0.00%       0.000us       0.000us             1
+                                                 detach         0.09%       2.136us         0.09%       2.136us       2.136us       0.000us         0.00%       0.000us       0.000us             1
+                                             aten::view         0.30%       7.519us         0.30%       7.519us       1.880us       0.000us         0.00%       0.000us       0.000us             4
+                                        aten::expand_as         0.16%       4.036us         0.65%      16.108us       8.054us       0.000us         0.00%       0.000us       0.000us             2
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 2.473ms
+Self CUDA time total: 398.328us

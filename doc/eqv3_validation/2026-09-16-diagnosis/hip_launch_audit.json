@@ -1,0 +1,12 @@
+{
+  "source_path": "/public/home/lixian_ma/ysq/containers/bw1000_triton_sandbox/usr/local/lib/python3.10/dist-packages/triton/backends/hcu/driver.py",
+  "sha256": "5d3ee717472e74da5add148397676ea4948e5e3029dc007fa9b6337c4e4d8de0",
+  "launch_line": 335,
+  "launch_expression": "HIP_CHECK(hipSymbolTable.hipModuleLaunchKernel(function, gridX, gridY, gridZ, {warp_size}*num_warps, 1, 1, shared_memory, stream, params, 0));",
+  "warp_size": 64,
+  "num_warps": 4,
+  "block_dim_x": 256,
+  "first_error_grid_dim_x": 16777216,
+  "product": 4294967296,
+  "source_basis": "read-only launcher source audit and prior measured error boundaries; no new HIP execution"
+}

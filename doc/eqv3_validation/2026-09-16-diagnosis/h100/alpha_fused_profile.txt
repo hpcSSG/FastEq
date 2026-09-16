@@ -1,0 +1,46 @@
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                                   Name    Self CPU %      Self CPU   CPU total %     CPU total  CPU time avg     Self CUDA   Self CUDA %    CUDA total  CUDA time avg    # of Calls
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+                                              aten::mul         5.70%     421.394us         8.87%     655.659us      29.803us       2.193ms        36.58%       2.193ms      99.665us            22
+                                              aten::sum         2.35%     173.478us         3.72%     274.668us      45.778us       1.055ms        17.60%       1.055ms     175.858us             6
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     780.532us        13.02%     780.532us     111.505us             7
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     776.277us        12.95%     776.277us     110.897us             7
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     705.076us        11.76%     705.076us     235.025us             3
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     660.855us        11.03%     660.855us     132.171us             5
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     635.832us        10.61%     635.832us      79.479us             8
+                                            _FusedAlpha         1.99%     147.213us        25.54%       1.888ms       1.888ms     632.407us        10.55%       1.265ms       1.265ms             1
+                                Activity Buffer Request        22.98%       1.699ms        22.98%       1.699ms       1.699ms     632.407us        10.55%     632.407us     632.407us             1
+                                               _forward         0.00%       0.000us         0.00%       0.000us       0.000us     632.407us        10.55%     632.407us     632.407us             1
+                                             aten::add_         0.47%      34.428us         0.86%      63.654us      15.914us     528.922us         8.82%     528.922us     132.230us             4
+                                             aten::mean         1.06%      78.571us         1.64%     121.343us      60.671us     470.905us         7.86%     470.905us     235.453us             2
+void at::native::reduce_kernel<512, 1, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     470.905us         7.86%     470.905us     235.453us             2
+void at::native::reduce_kernel<128, 4, at::native::R...         0.00%       0.000us         0.00%       0.000us       0.000us     346.522us         5.78%     346.522us     115.507us             3
+                                              aten::add         0.97%      71.933us         1.45%     107.497us      35.832us     248.859us         4.15%     248.859us      82.953us             3
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     226.717us         3.78%     226.717us     113.359us             2
+                                              aten::sub         0.71%      52.730us         1.06%      78.578us      39.289us     202.718us         3.38%     202.718us     101.359us             2
+                                              aten::div         0.43%      31.578us         0.58%      42.713us      21.356us     162.590us         2.71%     162.590us      81.295us             2
+void at::native::elementwise_kernel<128, 2, at::nati...         0.00%       0.000us         0.00%       0.000us       0.000us     162.590us         2.71%     162.590us      81.295us             2
+                                 aten::sigmoid_backward         0.27%      19.859us         0.43%      32.044us      32.044us     132.702us         2.21%     132.702us     132.702us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us     132.702us         2.21%     132.702us     132.702us             1
+                                              aten::pow         1.18%      87.085us         1.92%     141.923us      47.308us      93.246us         1.56%     184.284us      61.428us             3
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      92.927us         1.55%      92.927us      46.464us             2
+                                            aten::copy_         0.10%       7.113us         0.33%      24.494us      24.494us      91.038us         1.52%      91.038us      91.038us             1
+                         Memcpy DtoD (Device -> Device)         0.00%       0.000us         0.00%       0.000us       0.000us      91.038us         1.52%      91.038us      91.038us             1
+                                              aten::neg         0.11%       8.171us         0.18%      13.152us      13.152us      90.495us         1.51%      90.495us      90.495us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      90.495us         1.51%      90.495us      90.495us             1
+                                          aten::sigmoid         0.34%      24.793us         0.49%      35.887us      35.887us      89.439us         1.49%      89.439us      89.439us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      89.439us         1.49%      89.439us      89.439us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us      88.862us         1.48%      88.862us      88.862us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       4.384us         0.07%       4.384us       4.384us             1
+                                        Memset (Device)         0.00%       0.000us         0.00%       0.000us       0.000us       3.551us         0.06%       3.551us       1.184us             3
+                                            aten::rsqrt         0.37%      27.499us         0.54%      39.639us      39.639us       2.656us         0.04%       2.656us       2.656us             1
+void at::native::vectorized_elementwise_kernel<4, at...         0.00%       0.000us         0.00%       0.000us       0.000us       2.656us         0.04%       2.656us       2.656us             1
+                                            aten::empty         0.23%      16.818us         0.23%      16.818us       8.409us       0.000us         0.00%       0.000us       0.000us             2
+                                       cuLaunchKernelEx         0.34%      25.384us         0.34%      25.384us      25.384us       0.000us         0.00%       0.000us       0.000us             1
+autograd::engine::evaluate_function: _FusedAlphaBack...         1.32%      97.329us        40.40%       2.986ms       2.986ms       0.000us         0.00%       5.361ms       5.361ms             1
+                                    _FusedAlphaBackward        11.06%     817.786us        39.09%       2.889ms       2.889ms       0.000us         0.00%       5.361ms       5.361ms             1
+                                       cudaLaunchKernel         6.91%     510.563us         6.91%     510.563us      10.863us       0.000us         0.00%       0.000us       0.000us            47
+                                           aten::square         0.08%       5.961us         0.96%      71.295us      71.295us       0.000us         0.00%      88.862us      88.862us             1
+-------------------------------------------------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------  ------------
+Self CPU time total: 7.392ms
+Self CUDA time total: 5.994ms
