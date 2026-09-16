@@ -130,11 +130,3 @@ same method as the H100 run. The combined figures plot within-device speedup.
 A largest passing N describes one sampled point; it does not imply that every
 smaller size passes. Any FastEq-only sizes beyond Torch have no matched Torch
 accuracy check.
-
-## Follow-up diagnosis: 2026-09-16
-
-A [new fixed-input, ablation and profiling investigation](eqv3_validation/2026-09-16-diagnosis/REPORT.md)
-explains the observed precision and performance issues. It includes fresh H100
-measurements and retains the original FP32 tolerances. The Hygon allocation
-could not start because of account GPU quota, so fresh HIP profiling remains
-unavailable. The operator implementation is unchanged.
