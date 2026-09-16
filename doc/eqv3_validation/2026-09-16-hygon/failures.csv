@@ -1,0 +1,5 @@
+operator,atoms,tensor,failing_elements,max_abs,max_tolerance_ratio,examples
+alpha,16384,alpha_dot,2.0,0.03955078125,2.4026745172155466,"[{'flat_index': 19, 'actual': -1.0308189392089844, 'expected': -1.0318659543991089}, {'flat_index': 33, 'actual': -2.2710800170898438, 'expected': -2.268234968185425}]"
+alpha,4096,alpha_dot,1.0,0.00738525390625,1.3327187279176036,"[{'flat_index': 162, 'actual': 2.013458251953125, 'expected': 2.0120508670806885}]"
+alpha,8192,alpha_dot,1.0,0.0223388671875,1.7334344639157349,"[{'flat_index': 189, 'actual': 0.3468799591064453, 'expected': 0.3464929759502411}]"
+separable,262144,affine_weight,2.0,0.001007080078125,2.7865502507895226,"[{'flat_index': 48, 'actual': -0.1632080078125, 'expected': -0.162841796875}, {'flat_index': 256, 'actual': -0.408447265625, 'expected': -0.407958984375}]"

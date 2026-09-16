@@ -1,0 +1,395 @@
+{"operator": "norm", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.6864799857139587}
+{"operator": "norm", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.20975999534130096}
+{"operator": "norm", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.5307204723358154}
+{"operator": "norm", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.4719955325126648}
+{"operator": "norm", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.2144790068268776}
+{"operator": "norm", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.6758359968662262}
+{"operator": "norm", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.473916471004486}
+{"operator": "norm", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.5444730520248413}
+{"operator": "norm", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.6883210241794586}
+{"operator": "norm", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.26584000885486603}
+{"operator": "norm", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.68951952457428}
+{"operator": "norm", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.5232759714126587}
+{"operator": "norm", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.29791851341724396}
+{"operator": "norm", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.6757600009441376}
+{"operator": "norm", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.5368799567222595}
+{"operator": "norm", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.5487940311431885}
+{"operator": "norm", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.8076740205287933}
+{"operator": "norm", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.3677600026130676}
+{"operator": "norm", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.6885534524917603}
+{"operator": "norm", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.8549609780311584}
+{"operator": "norm", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.5641599893569946}
+{"operator": "norm", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.2919880151748657}
+{"operator": "norm", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.0423940420150757}
+{"operator": "norm", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.6745994091033936}
+{"operator": "norm", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.402885913848877}
+{"operator": "norm", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.9206480085849762}
+{"operator": "norm", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 8.530067443847656}
+{"operator": "norm", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.475684881210327}
+{"operator": "norm", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.6292860507965088}
+{"operator": "norm", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.507523536682129}
+{"operator": "norm", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 10.419670581817627}
+{"operator": "norm", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 16.148008346557617}
+{"operator": "norm", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 8.659235000610352}
+{"operator": "norm", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.036895990371704}
+{"operator": "norm", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 31.315035820007324}
+{"operator": "norm", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 20.072993278503418}
+{"operator": "norm", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 131072, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.85153341293335}
+{"operator": "norm", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 16.88567352294922}
+{"operator": "norm", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 39.21192169189453}
+{"operator": "norm", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 61.355316162109375}
+{"operator": "norm", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 33.176984786987305}
+{"operator": "norm", "atoms": 262144, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 11.480770587921143}
+{"operator": "norm", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 121.16260147094727}
+{"operator": "norm", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 77.33671951293945}
+{"operator": "norm", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 524288, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 22.74135398864746}
+{"operator": "norm", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 65.75548553466797}
+{"operator": "norm", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 153.56893920898438}
+{"operator": "norm", "atoms": 524288, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 239.94293212890625}
+{"operator": "norm", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "norm", "atoms": 1048576, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 142.51517486572266}
+{"operator": "norm", "atoms": 1048576, "mode": "fwd", "backend": "fused", "task": "timing", "status": "LIMIT"}
+{"operator": "norm", "atoms": 1048576, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 490.59165954589844}
+{"operator": "norm", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "LIMIT"}
+{"operator": "norm", "atoms": 2097152, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 284.5270233154297}
+{"operator": "norm", "atoms": 2097152, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "norm", "atoms": 4194304, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "separable", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.4277599900960922}
+{"operator": "separable", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.21592000126838684}
+{"operator": "separable", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.213599979877472}
+{"operator": "separable", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2307174801826477}
+{"operator": "separable", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.22551999986171722}
+{"operator": "separable", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.4379200041294098}
+{"operator": "separable", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2563999891281128}
+{"operator": "separable", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.204479992389679}
+{"operator": "separable", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.46671999990940094}
+{"operator": "separable", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.2512809932231903}
+{"operator": "separable", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.2327200174331665}
+{"operator": "separable", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2752800583839417}
+{"operator": "separable", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.2961609959602356}
+{"operator": "separable", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5224795043468475}
+{"operator": "separable", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2601580023765564}
+{"operator": "separable", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.3551194667816162}
+{"operator": "separable", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.7068800032138824}
+{"operator": "separable", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.392877995967865}
+{"operator": "separable", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.116480588912964}
+{"operator": "separable", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2658374905586243}
+{"operator": "separable", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.5923999845981598}
+{"operator": "separable", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.2333589792251587}
+{"operator": "separable", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.8067980408668518}
+{"operator": "separable", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 3.865441083908081}
+{"operator": "separable", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.309598445892334}
+{"operator": "separable", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.9727205038070679}
+{"operator": "separable", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 7.494561433792114}
+{"operator": "separable", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.143278956413269}
+{"operator": "separable", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.7537689805030823}
+{"operator": "separable", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.480320930480957}
+{"operator": "separable", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.849266529083252}
+{"operator": "separable", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 14.629045963287354}
+{"operator": "separable", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 8.811432361602783}
+{"operator": "separable", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.304223418235779}
+{"operator": "separable", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 29.0443172454834}
+{"operator": "separable", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 11.241748332977295}
+{"operator": "separable", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 131072, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 6.406630516052246}
+{"operator": "separable", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 17.567766189575195}
+{"operator": "separable", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 21.97158145904541}
+{"operator": "separable", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 57.95510482788086}
+{"operator": "separable", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 35.0782356262207}
+{"operator": "separable", "atoms": 262144, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 12.608069896697998}
+{"operator": "separable", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 115.56826400756836}
+{"operator": "separable", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 43.394195556640625}
+{"operator": "separable", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "FAIL"}
+{"operator": "separable", "atoms": 524288, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 25.01541805267334}
+{"operator": "separable", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 70.14961242675781}
+{"operator": "separable", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 86.4216537475586}
+{"operator": "separable", "atoms": 524288, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 225.76876831054688}
+{"operator": "separable", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "separable", "atoms": 1048576, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 151.62330627441406}
+{"operator": "separable", "atoms": 1048576, "mode": "fwd", "backend": "fused", "task": "timing", "status": "LIMIT"}
+{"operator": "separable", "atoms": 1048576, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 462.15887451171875}
+{"operator": "separable", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "LIMIT"}
+{"operator": "separable", "atoms": 2097152, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "separable", "atoms": 2097152, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "alpha", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5672799944877625}
+{"operator": "alpha", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.362479493021965}
+{"operator": "alpha", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.162719964981079}
+{"operator": "alpha", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.604161024093628}
+{"operator": "alpha", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "alpha", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.5901600122451782}
+{"operator": "alpha", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.0569599866867065}
+{"operator": "alpha", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 2.848557949066162}
+{"operator": "alpha", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.4747180938720703}
+{"operator": "alpha", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "alpha", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.038078546524048}
+{"operator": "alpha", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.0244794487953186}
+{"operator": "alpha", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.827917575836182}
+{"operator": "alpha", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.276959180831909}
+{"operator": "alpha", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "alpha", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.9014309644699097}
+{"operator": "alpha", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.000316381454468}
+{"operator": "alpha", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 10.103540897369385}
+{"operator": "alpha", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 9.628877639770508}
+{"operator": "alpha", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "alpha", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 7.936881065368652}
+{"operator": "alpha", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.651922106742859}
+{"operator": "alpha", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 19.104557991027832}
+{"operator": "alpha", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 19.779199600219727}
+{"operator": "alpha", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 7.155520915985107}
+{"operator": "alpha", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 15.805835723876953}
+{"operator": "alpha", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 39.17268371582031}
+{"operator": "alpha", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 37.989925384521484}
+{"operator": "alpha", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "FAIL"}
+{"operator": "alpha", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 31.548973083496094}
+{"operator": "alpha", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 14.160850524902344}
+{"operator": "alpha", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 75.56534576416016}
+{"operator": "alpha", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 78.06719970703125}
+{"operator": "alpha", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "FAIL"}
+{"operator": "alpha", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 28.16981601715088}
+{"operator": "alpha", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 63.01738166809082}
+{"operator": "alpha", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 155.72726440429688}
+{"operator": "alpha", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 150.76457977294922}
+{"operator": "alpha", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "alpha", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 125.96484756469727}
+{"operator": "alpha", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "ERROR"}
+{"operator": "alpha", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 300.9891357421875}
+{"operator": "alpha", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "ERROR"}
+{"operator": "alpha", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 251.76409149169922}
+{"operator": "alpha", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 601.3858947753906}
+{"operator": "alpha", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 503.51792907714844}
+{"operator": "alpha", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "alpha", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "gate", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5799194872379303}
+{"operator": "gate", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.16623999923467636}
+{"operator": "gate", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.068400502204895}
+{"operator": "gate", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.49824050068855286}
+{"operator": "gate", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.1674399971961975}
+{"operator": "gate", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5666394829750061}
+{"operator": "gate", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.6230399906635284}
+{"operator": "gate", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.0996769666671753}
+{"operator": "gate", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5721610188484192}
+{"operator": "gate", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.2115199938416481}
+{"operator": "gate", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.089116096496582}
+{"operator": "gate", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.8781594932079315}
+{"operator": "gate", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.30607999861240387}
+{"operator": "gate", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5772795081138611}
+{"operator": "gate", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.3988779783248901}
+{"operator": "gate", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.1916760206222534}
+{"operator": "gate", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.6994390189647675}
+{"operator": "gate", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.49295899271965027}
+{"operator": "gate", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 3.0165600776672363}
+{"operator": "gate", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 2.592079997062683}
+{"operator": "gate", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.8660795092582703}
+{"operator": "gate", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.9349595010280609}
+{"operator": "gate", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.0403993129730225}
+{"operator": "gate", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 5.075598955154419}
+{"operator": "gate", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.7847989797592163}
+{"operator": "gate", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.6075990200042725}
+{"operator": "gate", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 9.811129570007324}
+{"operator": "gate", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 9.932720184326172}
+{"operator": "gate", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.089600086212158}
+{"operator": "gate", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 3.391199469566345}
+{"operator": "gate", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 19.72377586364746}
+{"operator": "gate", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 19.152711868286133}
+{"operator": "gate", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 6.674650430679321}
+{"operator": "gate", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 6.054322719573975}
+{"operator": "gate", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 38.037559509277344}
+{"operator": "gate", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 39.30135726928711}
+{"operator": "gate", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 131072, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 11.975759983062744}
+{"operator": "gate", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 13.308259963989258}
+{"operator": "gate", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 78.45757293701172}
+{"operator": "gate", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 75.80868911743164}
+{"operator": "gate", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 26.68370532989502}
+{"operator": "gate", "atoms": 262144, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 23.82015609741211}
+{"operator": "gate", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 151.53067016601562}
+{"operator": "gate", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 156.76651763916016}
+{"operator": "gate", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 524288, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 47.51145935058594}
+{"operator": "gate", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 53.67790603637695}
+{"operator": "gate", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 313.41368103027344}
+{"operator": "gate", "atoms": 524288, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 303.31842041015625}
+{"operator": "gate", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "gate", "atoms": 1048576, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 118.79542922973633}
+{"operator": "gate", "atoms": 1048576, "mode": "fwd", "backend": "fused", "task": "timing", "status": "INDEX_GUARD"}
+{"operator": "gate", "atoms": 1048576, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 615.6728820800781}
+{"operator": "gate", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "INDEX_GUARD"}
+{"operator": "gate", "atoms": 2097152, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "gate", "atoms": 2097152, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "dropout", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.16503950208425522}
+{"operator": "dropout", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.1926399990916252}
+{"operator": "dropout", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.2903195023536682}
+{"operator": "dropout", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.42375999689102173}
+{"operator": "dropout", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.19256000220775604}
+{"operator": "dropout", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.16159900277853012}
+{"operator": "dropout", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.42448149621486664}
+{"operator": "dropout", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.2850400060415268}
+{"operator": "dropout", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.17096000164747238}
+{"operator": "dropout", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.19119999557733536}
+{"operator": "dropout", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.2836799919605255}
+{"operator": "dropout", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4392009973526001}
+{"operator": "dropout", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.20800000429153442}
+{"operator": "dropout", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.22512199729681015}
+{"operator": "dropout", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4283200055360794}
+{"operator": "dropout", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.2836804986000061}
+{"operator": "dropout", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.2967205047607422}
+{"operator": "dropout", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.2679995000362396}
+{"operator": "dropout", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.3786404877901077}
+{"operator": "dropout", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4649605005979538}
+{"operator": "dropout", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.38263899087905884}
+{"operator": "dropout", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5045569837093353}
+{"operator": "dropout", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.6360814869403839}
+{"operator": "dropout", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.670960009098053}
+{"operator": "dropout", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.9216064810752869}
+{"operator": "dropout", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.6347180008888245}
+{"operator": "dropout", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.21663898229599}
+{"operator": "dropout", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.100801944732666}
+{"operator": "dropout", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.0919204950332642}
+{"operator": "dropout", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.7333709597587585}
+{"operator": "dropout", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 2.0377650260925293}
+{"operator": "dropout", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.4221580028533936}
+{"operator": "dropout", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 3.380460023880005}
+{"operator": "dropout", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 2.0228805541992188}
+{"operator": "dropout", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.610950946807861}
+{"operator": "dropout", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.907122492790222}
+{"operator": "dropout", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 131072, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.891759991645813}
+{"operator": "dropout", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 6.749316453933716}
+{"operator": "dropout", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 7.646559476852417}
+{"operator": "dropout", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 9.205838203430176}
+{"operator": "dropout", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 13.443850040435791}
+{"operator": "dropout", "atoms": 262144, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 7.630894899368286}
+{"operator": "dropout", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 18.36956024169922}
+{"operator": "dropout", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 15.118896007537842}
+{"operator": "dropout", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 524288, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 15.108803272247314}
+{"operator": "dropout", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 26.820616722106934}
+{"operator": "dropout", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 30.074612617492676}
+{"operator": "dropout", "atoms": 524288, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 36.456586837768555}
+{"operator": "dropout", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 1048576, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 96.4063835144043}
+{"operator": "dropout", "atoms": 1048576, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 30.06220054626465}
+{"operator": "dropout", "atoms": 1048576, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 116.61517333984375}
+{"operator": "dropout", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 60.047245025634766}
+{"operator": "dropout", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "dropout", "atoms": 2097152, "mode": "fwd", "backend": "fused", "task": "timing", "status": "ERROR"}
+{"operator": "dropout", "atoms": 2097152, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 193.5824737548828}
+{"operator": "dropout", "atoms": 2097152, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "ERROR"}
+{"operator": "dropout", "atoms": 2097152, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "dropout", "atoms": 4194304, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "softmax", "atoms": 256, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.3607195019721985}
+{"operator": "softmax", "atoms": 256, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.18200049549341202}
+{"operator": "softmax", "atoms": 256, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.7829599976539612}
+{"operator": "softmax", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.42871999740600586}
+{"operator": "softmax", "atoms": 256, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 512, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.18240000307559967}
+{"operator": "softmax", "atoms": 512, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.37935949862003326}
+{"operator": "softmax", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4280804991722107}
+{"operator": "softmax", "atoms": 512, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.79663947224617}
+{"operator": "softmax", "atoms": 512, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 1024, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.36400000751018524}
+{"operator": "softmax", "atoms": 1024, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.18184000253677368}
+{"operator": "softmax", "atoms": 1024, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.7971999943256378}
+{"operator": "softmax", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4352000057697296}
+{"operator": "softmax", "atoms": 1024, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 2048, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.18327999860048294}
+{"operator": "softmax", "atoms": 2048, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.36872050166130066}
+{"operator": "softmax", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4538400024175644}
+{"operator": "softmax", "atoms": 2048, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.8018409907817841}
+{"operator": "softmax", "atoms": 2048, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 4096, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.3649599999189377}
+{"operator": "softmax", "atoms": 4096, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.1807200014591217}
+{"operator": "softmax", "atoms": 4096, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.7940804958343506}
+{"operator": "softmax", "atoms": 4096, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4956800043582916}
+{"operator": "softmax", "atoms": 8192, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.20656000077724457}
+{"operator": "softmax", "atoms": 8192, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.3963194936513901}
+{"operator": "softmax", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.5728799998760223}
+{"operator": "softmax", "atoms": 8192, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.8427194952964783}
+{"operator": "softmax", "atoms": 8192, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 16384, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.5486389994621277}
+{"operator": "softmax", "atoms": 16384, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.4469600021839142}
+{"operator": "softmax", "atoms": 16384, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.258399486541748}
+{"operator": "softmax", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.1566399931907654}
+{"operator": "softmax", "atoms": 16384, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 32768, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 0.6843205094337463}
+{"operator": "softmax", "atoms": 32768, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 0.922080010175705}
+{"operator": "softmax", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 3.320321559906006}
+{"operator": "softmax", "atoms": 32768, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 2.22135853767395}
+{"operator": "softmax", "atoms": 32768, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 65536, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 1.7442390322685242}
+{"operator": "softmax", "atoms": 65536, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 1.2152010202407837}
+{"operator": "softmax", "atoms": 65536, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 4.284877061843872}
+{"operator": "softmax", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 6.692080497741699}
+{"operator": "softmax", "atoms": 65536, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 131072, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 2.3208014965057373}
+{"operator": "softmax", "atoms": 131072, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 3.589041590690613}
+{"operator": "softmax", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 13.42951774597168}
+{"operator": "softmax", "atoms": 131072, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 8.605365753173828}
+{"operator": "softmax", "atoms": 131072, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 262144, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 7.232402801513672}
+{"operator": "softmax", "atoms": 262144, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 5.394479990005493}
+{"operator": "softmax", "atoms": 262144, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 17.363603591918945}
+{"operator": "softmax", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 30.336562156677246}
+{"operator": "softmax", "atoms": 262144, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 524288, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 13.377352237701416}
+{"operator": "softmax", "atoms": 524288, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 14.356081485748291}
+{"operator": "softmax", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 60.65310287475586}
+{"operator": "softmax", "atoms": 524288, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 34.691450119018555}
+{"operator": "softmax", "atoms": 524288, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 1048576, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 28.778326988220215}
+{"operator": "softmax", "atoms": 1048576, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 27.492395401000977}
+{"operator": "softmax", "atoms": 1048576, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 69.6524887084961}
+{"operator": "softmax", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 121.7124137878418}
+{"operator": "softmax", "atoms": 1048576, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 2097152, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 55.817914962768555}
+{"operator": "softmax", "atoms": 2097152, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 57.72951126098633}
+{"operator": "softmax", "atoms": 2097152, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 247.09225463867188}
+{"operator": "softmax", "atoms": 2097152, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 139.36134338378906}
+{"operator": "softmax", "atoms": 2097152, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 4194304, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 115.67449188232422}
+{"operator": "softmax", "atoms": 4194304, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 118.52289962768555}
+{"operator": "softmax", "atoms": 4194304, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 278.6249084472656}
+{"operator": "softmax", "atoms": 4194304, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 508.12196350097656}
+{"operator": "softmax", "atoms": 4194304, "mode": "fwd_bwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 8388608, "mode": "fwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 237.76721954345703}
+{"operator": "softmax", "atoms": 8388608, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OK", "gpu_ms_median": 272.38743591308594}
+{"operator": "softmax", "atoms": 8388608, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OK", "gpu_ms_median": 767.8692016601562}
+{"operator": "softmax", "atoms": 8388608, "mode": "fwd_bwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "softmax", "atoms": 8388608, "mode": "fwd", "backend": "fused", "task": "check", "status": "PASS"}
+{"operator": "softmax", "atoms": 16777216, "mode": "fwd", "backend": "torch", "task": "timing", "status": "OOM"}
+{"operator": "softmax", "atoms": 16777216, "mode": "fwd", "backend": "fused", "task": "timing", "status": "ERROR"}
+{"operator": "softmax", "atoms": 16777216, "mode": "fwd_bwd", "backend": "fused", "task": "timing", "status": "OOM"}

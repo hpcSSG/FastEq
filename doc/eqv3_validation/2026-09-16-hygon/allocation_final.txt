@@ -1,0 +1,6 @@
+838109           eqv3_five_ops  CANCELLED+   01:02:47                           billing=8,cpu=8,gres/dcu=1,mem=31104M,node=1
+838109.batch     batch           CANCELLED   01:02:48                                     cpu=8,gres/dcu=1,mem=31104M,node=1
+838109.extern    extern          COMPLETED   01:02:48                           billing=8,cpu=8,gres/dcu=1,mem=31104M,node=1
+838109.0         bash            COMPLETED   00:00:36                                     cpu=8,gres/dcu=1,mem=31104M,node=1
+838109.1         bash            COMPLETED   00:03:12                                     cpu=8,gres/dcu=1,mem=31104M,node=1
+838109.2         bash            COMPLETED   00:55:13                                     cpu=8,gres/dcu=1,mem=31104M,node=1

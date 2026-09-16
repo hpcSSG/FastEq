@@ -1,0 +1,349 @@
+{
+  "operators": [
+    {
+      "operator": "softmax",
+      "checks": 19,
+      "statuses": {
+        "PASS": 19
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576,
+        2097152,
+        4194304,
+        8388608
+      ],
+      "components": {
+        "output": {
+          "max_abs": 3.5762786865234375e-07,
+          "max_tolerance_ratio": 0.024636348525771252,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 1048576
+        },
+        "x": {
+          "max_abs": 2.682209014892578e-07,
+          "max_tolerance_ratio": 0.0032764392410669376,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        },
+        "exp_rescale": {
+          "max_abs": 2.1457672119140625e-06,
+          "max_tolerance_ratio": 0.024672565101558977,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 1048576
+        }
+      },
+      "largest_passing_forward_n": 8388608,
+      "largest_passing_fwd_bwd_n": 4194304
+    },
+    {
+      "operator": "alpha",
+      "checks": 11,
+      "statuses": {
+        "PASS": 8,
+        "FAIL": 3
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768
+      ],
+      "components": {
+        "output": {
+          "max_abs": 1.1444091796875e-05,
+          "max_tolerance_ratio": 0.06857547181801117,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 16384
+        },
+        "alpha_dot": {
+          "max_abs": 0.165283203125,
+          "max_tolerance_ratio": 2.4026745172155466,
+          "failing_elements": 4.0,
+          "worst_ratio_n": 16384
+        },
+        "norm_weight": {
+          "max_abs": 0.0078125,
+          "max_tolerance_ratio": 0.10130667887074457,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 32768
+        },
+        "norm_bias": {
+          "max_abs": 0.00537109375,
+          "max_tolerance_ratio": 0.35013468383034757,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 8192
+        },
+        "x": {
+          "max_abs": 5.7220458984375e-06,
+          "max_tolerance_ratio": 0.03883832678209111,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 32768
+        }
+      },
+      "largest_passing_forward_n": 32768,
+      "largest_passing_fwd_bwd_n": 32768
+    },
+    {
+      "operator": "gate",
+      "checks": 15,
+      "statuses": {
+        "PASS": 15
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288
+      ],
+      "components": {
+        "output": {
+          "max_abs": 1.9073486328125e-06,
+          "max_tolerance_ratio": 0.0006425536315018856,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 262144
+        },
+        "x": {
+          "max_abs": 2.9802322387695312e-06,
+          "max_tolerance_ratio": 0.012412485131554879,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        }
+      },
+      "largest_passing_forward_n": 524288,
+      "largest_passing_fwd_bwd_n": 524288
+    },
+    {
+      "operator": "norm",
+      "checks": 15,
+      "statuses": {
+        "PASS": 15
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288
+      ],
+      "components": {
+        "output": {
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.013758362791516775,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 131072
+        },
+        "affine_weight": {
+          "max_abs": 0.00146484375,
+          "max_tolerance_ratio": 0.3977276493633043,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 2048
+        },
+        "affine_bias": {
+          "max_abs": 0.00067138671875,
+          "max_tolerance_ratio": 0.1071497453407719,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        },
+        "x": {
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.006109048622132931,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        }
+      },
+      "largest_passing_forward_n": 524288,
+      "largest_passing_fwd_bwd_n": 524288
+    },
+    {
+      "operator": "separable",
+      "checks": 15,
+      "statuses": {
+        "PASS": 14,
+        "FAIL": 1
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288
+      ],
+      "components": {
+        "output": {
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.012197407541634484,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        },
+        "affine_weight": {
+          "max_abs": 0.00146484375,
+          "max_tolerance_ratio": 2.7865502507895226,
+          "failing_elements": 2.0,
+          "worst_ratio_n": 262144
+        },
+        "norm_l0.weight": {
+          "max_abs": 0.0008544921875,
+          "max_tolerance_ratio": 0.15757641739987452,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 32768
+        },
+        "norm_l0.bias": {
+          "max_abs": 0.00115966796875,
+          "max_tolerance_ratio": 0.218834052170038,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 8192
+        },
+        "x": {
+          "max_abs": 2.86102294921875e-06,
+          "max_tolerance_ratio": 0.007144777812399383,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 524288
+        }
+      },
+      "largest_passing_forward_n": 524288,
+      "largest_passing_fwd_bwd_n": 524288
+    },
+    {
+      "operator": "dropout",
+      "checks": 16,
+      "statuses": {
+        "PASS": 16
+      },
+      "atom_counts": [
+        1,
+        17,
+        256,
+        257,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+        1048576
+      ],
+      "components": {
+        "output": {
+          "max_abs": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 1024
+        },
+        "x": {
+          "max_abs": 0.0,
+          "max_tolerance_ratio": 0.0,
+          "failing_elements": 0.0,
+          "worst_ratio_n": 1024
+        }
+      },
+      "largest_passing_forward_n": 1048576,
+      "largest_passing_fwd_bwd_n": 1048576
+    }
+  ],
+  "native_graph_softmax": {
+    "status": "FAIL",
+    "assertions": 1720,
+    "failed_assertions": 2
+  },
+  "extras": [
+    {
+      "name": "graph_softmax_builtin",
+      "status": "PASS"
+    },
+    {
+      "name": "attention_alpha_builtin",
+      "status": "PASS"
+    },
+    {
+      "name": "equivariant_dropout_builtin",
+      "status": "PASS"
+    },
+    {
+      "name": "alpha_irregular_strided",
+      "status": "PASS"
+    },
+    {
+      "name": "norm_irregular_strided",
+      "status": "PASS"
+    },
+    {
+      "name": "separable_irregular_strided",
+      "status": "PASS"
+    },
+    {
+      "name": "dropout_irregular_strided",
+      "status": "PASS"
+    },
+    {
+      "name": "eqv3_gate_activation_public_module",
+      "status": "ERROR",
+      "error": "Module [fused_gate_activation] is missing the required \"forward\" function"
+    },
+    {
+      "name": "gate_irregular_strided",
+      "status": "PASS"
+    },
+    {
+      "name": "dropout_exact_zero_input_mask_replay",
+      "status": "PASS"
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "complete": true,
+  "operators": [
+    "norm",
+    "separable",
+    "alpha",
+    "gate",
+    "dropout",
+    "softmax"
+  ]
+}
