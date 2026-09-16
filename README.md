@@ -138,3 +138,24 @@ pip install hatchling twine editables
 pip install -e . --no-build-isolation
 cd ../../..
 ```
+
+### 5. Testing
+
+
+Run the MACE batch benchmark with the `medium` model in FP32 precision.
+
+```bash
+cd test
+```
+
+#### CUDA Code Generation Backend
+
+```bash
+python3 mace_batch.py medium float32
+```
+
+#### Triton Code Generation Backend
+
+```bash
+FASTEQ_CODEGEN_BACKEND=triton python3 mace_batch.py medium float32
+```
