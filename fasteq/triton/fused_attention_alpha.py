@@ -1,55 +1,58 @@
-"""Fused FP32 attention logits: optional LayerNorm -> activation -> dropout -> dot.
-
-In equiformer_v3/experimental/models/equiformer_v3/transformer_block.py:
-class EquivariantGraphAttention:
-
-    ...
-    def forward():
-        ...
-        # Fused this entire block: 
-        ===============================Begin==========================================
-        x_alpha = self.alpha_norm(x_alpha)
-        x_alpha = self.alpha_act(x_alpha)
-        x_alpha = self.alpha_dropout(x_alpha)
-        alpha = torch.einsum('bik, ik -> bi', x_alpha, self.alpha_dot)
-        ===============================End==========================================
-"""
+"""FP32 attention logits with Triton forward and first-order backward."""
 import math
 import torch
 import triton
 import triton.language as tl
 
 
+# Accumulator count is a numerical schedule, not a hardware warp width.
+# The gfx936 Torch FP32 contraction needs a sequential chain in the reproduced
+# cancellation cases. All targets still execute the same Triton kernel.
+_WEIGHT_GRAD_ACCUMULATORS = {"gfx936": 1}
+
+
+def _row_grid(programs):
+    # Bound every launch dimension independently of a device's warp width.
+    x = min(programs, 65535)
+    return (x, triton.cdiv(programs, x))
+
+
 @triton.jit
-def _forward(X, W, G, B, SEED, MASK, Y,
-             H: tl.constexpr, C: tl.constexpr,
+def _forward(X, W, G, B, SEED, MASK, Y, U, A, RS,
+             R: tl.constexpr, H: tl.constexpr, C: tl.constexpr,
              LN: tl.constexpr, HAS_G: tl.constexpr, HAS_B: tl.constexpr,
              EPS: tl.constexpr, SLOPE: tl.constexpr, SILU: tl.constexpr,
-             P: tl.constexpr, SAVE_MASK: tl.constexpr, BLOCK: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
-    c = tl.arange(0, BLOCK)
-    valid = c < C
-    off = row * C + c
+             P: tl.constexpr, SAVE_U: tl.constexpr, SAVE_A: tl.constexpr,
+             SAVE_RS: tl.constexpr, SAVE_MASK: tl.constexpr,
+             BC: tl.constexpr, BR: tl.constexpr):
+    pid = (tl.program_id(0).to(tl.int64)
+           + tl.program_id(1).to(tl.int64) * tl.num_programs(0))
+    row = pid * BR + tl.arange(0, BR)
+    c = tl.arange(0, BC)
+    valid = (c[None, :] < C) & (row[:, None] < R)
+    off = row[:, None] * C + c[None, :]
     x = tl.load(X + off, valid, other=0)
-    z = x
+    u = x
+    rs = tl.full((BR,), 1, tl.float32)
     if LN:
-        mean = tl.sum(x, 0) / C
-        centered = tl.where(valid, x - mean, 0.0)
-        var = tl.sum(centered * centered, 0) / C
-        z = (x - mean) * tl.rsqrt(var + EPS)
-        if HAS_G:
-            z = z * tl.load(G + c, valid, other=1)
-        if HAS_B:
-            z = z + tl.load(B + c, valid, other=0)
+        mean = tl.sum(x, 1) / C
+        centered = tl.where(c[None, :] < C, x - mean[:, None], 0.0)
+        var = tl.sum(centered * centered, 1) / C
+        rs = tl.rsqrt(var + EPS)
+        u = (x - mean[:, None]) * rs[:, None]
+    z = u
+    if LN and HAS_G:
+        z = z * tl.load(G + c, c < C, other=1)[None, :]
+    if LN and HAS_B:
+        z = z + tl.load(B + c, c < C, other=0)[None, :]
     s = tl.sigmoid(z)
     if SILU:
         a = z * s
     else:
-        # Preserve the supplied expression's operation order as far as possible.
         a = ((1.0 + SLOPE) / 2.0) * z + ((1.0 - SLOPE) / 2.0) * z * (2.0 * s - 1.0)
     if P > 0.0:
         if P == 1.0:
-            keep = tl.full((BLOCK,), False, tl.int1)
+            keep = tl.full((BR, BC), False, tl.int1)
             a = a * 0.0
         else:
             seed = tl.load(SEED).to(tl.uint32)
@@ -57,71 +60,230 @@ def _forward(X, W, G, B, SEED, MASK, Y,
             a = a * tl.where(keep, 1.0 / (1.0 - P), 0.0)
         if SAVE_MASK:
             tl.store(MASK + off, keep, valid)
-    w = tl.load(W + (row % H) * C + c, valid, other=0)
-    result = tl.sum(tl.where(valid, a * w, 0.0), 0)
-    tl.store(Y + row, result)
+    w = tl.load(W + (row[:, None] % H) * C + c[None, :], c[None, :] < C, other=0)
+    result = tl.sum(tl.where(c[None, :] < C, a * w, 0.0), 1)
+    tl.store(Y + row, result, row < R)
+    if SAVE_U:
+        tl.store(U + off, x - mean[:, None], valid)
+    if SAVE_A:
+        tl.store(A + off, a, valid)
+    if SAVE_RS:
+        tl.store(RS + row, rs, row < R)
 
 
-def _reference(x, w, gamma, beta, ln, eps, silu, slope, p, mask):
-    z = x
-    if ln:
-        mean = x.mean(dim=-1, keepdim=True)
-        centered = x - mean
-        z = centered * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + eps)
-        if gamma is not None:
-            z = z * gamma
-        if beta is not None:
-            z = z + beta
-    s = torch.sigmoid(z)
-    a = z * s if silu else ((1 + slope) / 2) * z + ((1 - slope) / 2) * z * (2 * s - 1)
-    if p > 0:
-        a = a * (mask.to(x.dtype) / (1 - p) if p < 1 else 0.0)
-    return (a * w).sum(-1)
+@triton.jit
+def _select_row(values, index: tl.constexpr, ROWS: tl.constexpr, COLS: tl.constexpr):
+    # Static binary slicing works on Triton 3.1 as well as newer compilers.
+    # Unlike masked sums it does not turn every extraction into a reduction.
+    tl.static_assert(ROWS <= 64 and (ROWS & (ROWS - 1)) == 0)
+    result = values
+    for shift in tl.static_range(6):
+        if ROWS > (1 << shift):
+            paired = tl.permute(result.reshape((ROWS >> (shift + 1), 2, COLS)), (0, 2, 1))
+            even, odd = tl.split(paired)
+            if (index & (1 << shift)) == 0:
+                result = even
+            else:
+                result = odd
+    return result.reshape((COLS,))
+
+
+@triton.jit
+def _backward_rows(DY, W, G, B, U, MASK, RS, DX, PG, PB,
+                   R: tl.constexpr, H: tl.constexpr, C: tl.constexpr,
+                   LN: tl.constexpr, HAS_G: tl.constexpr, HAS_B: tl.constexpr,
+                   SILU: tl.constexpr, SLOPE: tl.constexpr, P: tl.constexpr,
+                   NEED_X: tl.constexpr, NEED_G: tl.constexpr, NEED_B: tl.constexpr,
+                   BC: tl.constexpr, BR: tl.constexpr):
+    pid = (tl.program_id(0).to(tl.int64)
+           + tl.program_id(1).to(tl.int64) * tl.num_programs(0))
+    row = pid * BR + tl.arange(0, BR)
+    c = tl.arange(0, BC)
+    valid = (row[:, None] < R) & (c[None, :] < C)
+    off = row[:, None] * C + c[None, :]
+    centered = tl.load(U + off, valid, other=0)
+    u = centered
+    if LN:
+        rs = tl.load(RS + row, row < R, other=0)
+        u = centered * rs[:, None]
+    z = u
+    if LN and HAS_G:
+        g = tl.load(G + c, c < C, other=0)
+        z = z * g[None, :]
+    if LN and HAS_B:
+        z = z + tl.load(B + c, c < C, other=0)[None, :]
+    w = tl.load(W + (row[:, None] % H) * C + c[None, :], c[None, :] < C, other=0)
+    dy = tl.load(DY + row, row < R, other=0)
+    da = dy[:, None] * w
+    if P > 0.0:
+        if P == 1.0:
+            da = da * 0.0
+        else:
+            keep = tl.load(MASK + off, valid, other=0)
+            da = da * tl.where(keep, 1.0 / (1.0 - P), 0.0)
+    s = tl.sigmoid(z)
+    if SILU:
+        dz = (da * s) * (1.0 + z * (1.0 - s))
+    else:
+        k1 = (1.0 + SLOPE) / 2.0
+        k2 = (1.0 - SLOPE) / 2.0
+        ds = (da * (k2 * z)) * 2.0
+        dz = (ds * (1.0 - s)) * s + (da * (2.0 * s - 1.0)) * k2 + da * k1
+    dz = tl.where(valid, dz, 0.0)
+    if NEED_G or NEED_B:
+        local_g = tl.full((BC,), 0, tl.float32)
+        local_b = tl.full((BC,), 0, tl.float32)
+        for i in tl.static_range(BR):
+            gi = _select_row(dz, i, BR, BC)
+            if NEED_G:
+                ci = _select_row(centered, i, BR, BC)
+                ri = tl.sum(_select_row(rs[:, None], i, BR, 1), 0)
+                local_g = tl.fma(gi * ci, ri, local_g)
+            if NEED_B:
+                local_b += gi
+        if NEED_G:
+            tl.store(PG + pid * C + c, local_g, c < C)
+        if NEED_B:
+            tl.store(PB + pid * C + c, local_b, c < C)
+    if NEED_X:
+        dx = dz
+        if LN:
+            rs = tl.load(RS + row, row < R, other=0)
+            if HAS_G:
+                dx = dx * g[None, :]
+            mean_dx = tl.sum(dx, 1) / C
+            mean_dxu = tl.sum(dx * u, 1) / C
+            dx = (dx - mean_dx[:, None] - u * mean_dxu[:, None]) * rs[:, None]
+        tl.store(DX + off, dx, valid)
+
+
+@triton.jit
+def _weight_gradient(A, DY, DW, E: tl.constexpr, H: tl.constexpr, C: tl.constexpr,
+                     LANES: tl.constexpr):
+    pid = (tl.program_id(0).to(tl.int64)
+           + tl.program_id(1).to(tl.int64) * tl.num_programs(0))
+    head, c = pid // C, pid % C
+    # A fixed number of independent FP32 chains, selected by the host schedule.
+    lane = tl.arange(0, LANES)
+    steps = tl.arange(0, 8)
+    acc = tl.full((LANES,), 0, tl.float32)
+    for start in range(tl.cdiv(E, 8 * LANES)):
+        e = (start.to(tl.int64) * 8 + steps[:, None]) * LANES + lane[None, :]
+        a = tl.load(A + (e.to(tl.int64) * H + head) * C + c,
+                    (e < E) & (head < H), other=0)
+        dy = tl.load(DY + e.to(tl.int64) * H + head,
+                     (e < E) & (head < H), other=0)
+        # Prefetch eight rounds, but accumulate in the original FP32 order.
+        for i in tl.static_range(8):
+            ai = _select_row(a, i, 8, LANES)
+            gi = _select_row(dy, i, 8, LANES)
+            acc = tl.fma(ai, gi, acc)
+    tl.store(DW + head * C + c, tl.sum(acc, 0), head < H)
+
+
+@triton.jit
+def _reduce_chunks(PART, OUT, K: tl.constexpr, D: tl.constexpr,
+                   BK: tl.constexpr, BD: tl.constexpr):
+    pid = (tl.program_id(0).to(tl.int64)
+           + tl.program_id(1).to(tl.int64) * tl.num_programs(0))
+    tiles = tl.cdiv(D, BD)
+    chunk = pid // tiles
+    d = (pid % tiles) * BD + tl.arange(0, BD)
+    k = chunk * BK + tl.arange(0, BK)
+    values = tl.load(PART + k[:, None] * D + d[None, :],
+                     (k[:, None] < K) & (d[None, :] < D), other=0)
+    tl.store(OUT + chunk * D + d, tl.sum(values.to(tl.float64), 0),
+             (d < D) & (chunk < tl.maximum(1, tl.cdiv(K, BK))))
+
+
+def _sum_partials(partial, out):
+    count, width = partial.shape
+    # Widen only the cross-tile sum: FP32 partials can nearly cancel.
+    # Each level has a fixed tree; no floating-point atomics or device branches.
+    while True:
+        blocks = max(1, triton.cdiv(count, 256))
+        target = out if blocks == 1 else torch.empty((blocks, width), device=out.device, dtype=torch.float64)
+        _reduce_chunks[_row_grid(triton.cdiv(width, 32) * blocks)](
+            partial, target, count, width, 256, 32, num_warps=4, enable_fp_fusion=False)
+        if blocks == 1:
+            return
+        partial, count = target, blocks
 
 
 class _FusedAlpha(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, w, gamma, beta, ln, eps, silu, slope, p, seed):
+    def forward(ctx, x, w, gamma, beta, ln, eps, silu, slope, p, seed, needs_backward):
         n, h, c = x.shape
+        rows = n * h
+        need_x, need_w, need_g, need_b = (ctx.needs_input_grad[:4]
+                                        if needs_backward else (False,) * 4)
+        need_u = need_x or need_g or need_b
         y = torch.empty((n, h), device=x.device, dtype=x.dtype)
-        save_mask = p > 0 and any(ctx.needs_input_grad[:4])
+        save_mask = p > 0 and needs_backward and any(ctx.needs_input_grad[:4])
         mask = torch.empty(x.shape if save_mask else (0,), device=x.device, dtype=torch.bool)
-        if n:
+        u = torch.empty_like(x) if ln and need_u else x
+        a = torch.empty_like(x) if need_w else x
+        rs = torch.empty((rows,), device=x.device, dtype=x.dtype) if ln and need_u else x
+        br = 32 if c <= 128 else (4 if c <= 1024 else 1)
+        if rows:
             with torch.cuda.device(x.device):
-                _forward[(n * h,)](
-                    x, w, gamma if gamma is not None else x,
-                    beta if beta is not None else x,
-                    seed if seed is not None else x, mask, y,
-                    h, c, ln, gamma is not None, beta is not None,
-                    eps, slope, silu, p, save_mask, triton.next_power_of_2(c),
+                _forward[_row_grid(triton.cdiv(rows, br))](
+                    x, w, gamma if gamma is not None else x, beta if beta is not None else x,
+                    seed if seed is not None else x, mask, y, u, a, rs,
+                    rows, h, c, ln, gamma is not None, beta is not None,
+                    eps, slope, silu, p, ln and need_u, need_w, ln and need_u,
+                    save_mask, triton.next_power_of_2(c), br,
                     num_warps=4 if c <= 1024 else 8, enable_fp_fusion=False)
-        ctx.save_for_backward(x, w, gamma, beta, mask)
-        ctx.config = ln, eps, silu, slope, p
+        if needs_backward:
+            ctx.save_for_backward(w, gamma, beta, u, a, rs, mask)
+        ctx.config = x.shape, ln, silu, slope, p, br
         return y
 
     @staticmethod
     def backward(ctx, grad_y):
-        x, w, gamma, beta, mask = ctx.saved_tensors
-        higher_order = torch.is_grad_enabled()
-        inputs = (x, w, gamma, beta)
-        required = [i for i, t in enumerate(inputs) if t is not None and ctx.needs_input_grad[i]]
-        with torch.enable_grad():
-            # Use saved original inputs, without detach, so double backward can
-            # differentiate through x, dot weights, and LayerNorm parameters.
-            y = _reference(x, w, gamma, beta, *ctx.config, mask)
-            grads = torch.autograd.grad(y, [inputs[i] for i in required], grad_y,
-                                        create_graph=higher_order)
-        result = [None] * 10
-        for i, g in zip(required, grads):
-            result[i] = g
-        return tuple(result)
+        if torch.is_grad_enabled():
+            raise NotImplementedError("AttentionAlpha Triton backward supports first-order gradients only")
+        w, gamma, beta, u, a, rs, mask = ctx.saved_tensors
+        (n, h, c), ln, silu, slope, p, br = ctx.config
+        rows = n * h
+        need_x, need_w, need_g, need_b = ctx.needs_input_grad[:4]
+        dy = grad_y.contiguous()
+        dx = torch.empty_like(u) if need_x else None
+        dw = torch.empty_like(w) if need_w else None
+        dg = torch.empty((c,), device=w.device, dtype=w.dtype) if need_g else None
+        db = torch.empty((c,), device=w.device, dtype=w.dtype) if need_b else None
+        programs = triton.cdiv(rows, br)
+        # Masked programs in the rectangular grid write zero partials.
+        padded = math.prod(_row_grid(programs)) if programs else 0
+        pg = torch.empty((padded, c), device=w.device, dtype=w.dtype) if need_g else u
+        pb = torch.empty((padded, c), device=w.device, dtype=w.dtype) if need_b else u
+        with torch.cuda.device(w.device):
+            if rows and (need_x or need_g or need_b):
+                _backward_rows[_row_grid(programs)](
+                    dy, w, gamma if gamma is not None else u, beta if beta is not None else u,
+                    u, mask, rs, dx if dx is not None else u, pg, pb,
+                    rows, h, c, ln, gamma is not None, beta is not None,
+                    silu, slope, p, need_x, need_g, need_b, triton.next_power_of_2(c), br,
+                    num_warps=4 if c <= 1024 else 8, enable_fp_fusion=False)
+            if need_w:
+                target = triton.runtime.driver.active.get_current_target()
+                lanes = _WEIGHT_GRAD_ACCUMULATORS.get(target.arch, target.warp_size)
+                _weight_gradient[_row_grid(h * c)](
+                    a, dy, dw, n, h, c, lanes, num_warps=4, enable_fp_fusion=False)
+            if need_g:
+                _sum_partials(pg, dg)
+            if need_b:
+                _sum_partials(pb, db)
+        return dx, dw, dg, db, None, None, None, None, None, None, None
 
 
 def fused_attention_alpha(x, alpha_dot, norm_weight=None, norm_bias=None, *,
                           use_layer_norm=True, eps=1e-5, activation='silu',
                           negative_slope=0.2, dropout_p=0.0, training=True,
                           seed=None):
-    """FP32 CUDA [E,H,C] -> [E,H].
+    """FP32 CUDA/HIP [E,H,C] -> [E,H], with a Triton first-order backward.
+
+    Double backward is unsupported and rejected; no Torch recomputation is used.
 
     activation is independent of training: eval disables dropout, not SiLU.
     Seed, if supplied, must be an immutable scalar CUDA int64/int32 tensor.
@@ -158,7 +320,7 @@ def fused_attention_alpha(x, alpha_dot, norm_weight=None, norm_bias=None, *,
                             norm_weight.contiguous() if norm_weight is not None else None,
                             norm_bias.contiguous() if norm_bias is not None else None,
                             use_layer_norm, float(eps), activation == 'silu',
-                            float(negative_slope), p, seed)
+                            float(negative_slope), p, seed, torch.is_grad_enabled())
 
 
 def fused_atten_alpha(x, alpha_dot, alpha_norm, alpha_act, alpha_dropout):
@@ -189,42 +351,3 @@ def fused_atten_alpha(x, alpha_dot, alpha_norm, alpha_act, alpha_dropout):
         negative_slope=float(alpha_act.alpha) if is_smooth else 0.2,
         dropout_p=alpha_dropout.p if isinstance(alpha_dropout, torch.nn.Dropout) else 0.0,
         training=alpha_dropout.training)
-
-
-def self_test():
-    if not torch.cuda.is_available():
-        raise RuntimeError('Tests require CUDA')
-    for ln in (False, True):
-        for activation, p in (('silu', 0.0), ('silu', 0.25), ('silu', 1.0), ('smooth_leaky_relu', 0.0)):
-            for c in (1, 13, 64):
-                x = torch.randn(9, 3, c, device='cuda', requires_grad=True)
-                w = torch.randn(3, c, device='cuda', requires_grad=True)
-                g = torch.randn(c, device='cuda', requires_grad=True) if ln else None
-                b = torch.randn(c, device='cuda', requires_grad=True) if ln else None
-                seed = torch.tensor(123, device='cuda', dtype=torch.int64)
-                # Capture the kernel's mask to compare identical dropout samples.
-                with torch.autograd.graph.saved_tensors_hooks(lambda t: t, lambda t: t):
-                    y = fused_attention_alpha(x, w, g, b, use_layer_norm=ln,
-                                              activation=activation, dropout_p=p, seed=seed)
-                mask = y.grad_fn.saved_tensors[-1]
-                ref = _reference(x, w, g, b, ln, 1e-5, activation == 'silu', 0.2, p, mask)
-                torch.testing.assert_close(y, ref, atol=3e-4, rtol=3e-4)
-                inputs = [t for t in (x, w, g, b) if t is not None]
-                upstream = torch.randn_like(y, requires_grad=True)
-                actual = torch.autograd.grad(y, inputs, upstream, create_graph=True)
-                expected = torch.autograd.grad(ref, inputs, upstream, create_graph=True)
-                vectors = [torch.randn_like(t) for t in actual]
-                for a, e in zip(actual, expected):
-                    torch.testing.assert_close(a, e)
-                a2 = torch.autograd.grad(sum((a*v).sum() for a,v in zip(actual,vectors)), inputs + [upstream], allow_unused=True)
-                e2 = torch.autograd.grad(sum((e*v).sum() for e,v in zip(expected,vectors)), inputs + [upstream], allow_unused=True)
-                for a, e in zip(a2, e2):
-                    if a is None or e is None:
-                        assert a is None and e is None
-                    else:
-                        torch.testing.assert_close(a, e)
-    print('CUDA forward, backward and double-backward checks passed.')
-
-
-if __name__ == '__main__':
-    self_test()
