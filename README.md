@@ -159,3 +159,28 @@ python3 mace_batch.py medium float32
 ```bash
 FASTEQ_CODEGEN_BACKEND=triton python3 mace_batch.py medium float32
 ```
+
+
+# FastEq Performance on a Hygon DCU
+
+## Significant Single-Accelerator Speedup with Performance Comparable to an A800 with CuEq
+
+In single-accelerator benchmarks using FP64 precision over 100 steps, FastEq achieved speedups of approximately **16.2×**, **16.5×**, and **13.4×** for aluminum, silicon, and magnesium oxide systems, respectively, compared with runs without FastEq.
+
+Compared with an NVIDIA A800 using CuEq, the domestic heterogeneous accelerator running FastEq delivered relative performance of approximately **1.47×**, **0.84×**, and **0.89×** for the three systems. These results demonstrate that FastEq provides substantial acceleration. Through joint optimization of domestic hardware and the operator library, the solution achieves application performance broadly comparable to the NVIDIA A800 and CuEq software ecosystem.
+
+![FastEq single-accelerator speedup and cross-platform performance comparison](pics/dcu/single_accelerator_performance.png)
+
+*Figure 1. FastEq single-accelerator speedup and performance comparison between the domestic heterogeneous accelerator and the A800-based solution.*
+
+## Compute and Interconnect Scaling for High-Accuracy Simulations with Over 100,000 Atoms
+
+Multi-accelerator tests demonstrate how the compute capability of each domestic heterogeneous accelerator and efficient inter-accelerator communication work together to support large-scale simulations. In the weak-scaling tests, increasing the accelerator count from 1 to 8 expanded the aluminum, silicon, and magnesium oxide systems to approximately **187,000**, **111,000**, and **97,000 atoms**, respectively. The corresponding eight-accelerator weak-scaling efficiencies were **88.4%**, **91.7%**, and **96.8%**.
+
+In the strong-scaling tests, increasing the accelerator count from 4 to 8 improved the simulation speed of the three fixed-size systems by approximately **1.55–1.61×**, corresponding to parallel efficiencies of approximately **77.4%–80.7%**. On eight accelerators, the aluminum system containing 108,000 atoms and the silicon system containing approximately 157,000 atoms achieved **0.194 ns/day** and **0.165 ns/day**, respectively.
+
+These results show that the compute and interconnect capabilities of the domestic heterogeneous accelerator platform can support high-accuracy molecular dynamics simulations involving more than 100,000 atoms on a single server, with simulation speeds on the order of **0.1–0.2 ns/day**.
+
+![Weak- and strong-scaling performance on domestic heterogeneous accelerators](pics/dcu/multi_accelerator_scaling.png)
+
+*Figure 2. Weak-scaling throughput and strong-scaling simulation speed on domestic heterogeneous accelerators.*
