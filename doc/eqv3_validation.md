@@ -1,149 +1,98 @@
-# EQv3 operator validation index
+# EQv3 operator validation
 
-Operator-specific results are recorded separately. LayerNorm also documents
-the shared implementation, source adapters and fusion; the other pages record
-the scope and results of performance validation.
+This is the consolidated record for the production sources in this checkout.
+Every retained measurement is tied to the current operator's SHA-256 in
+[the source manifest](validation/manifest.json). Older implementation results
+and duplicate debug snapshots are omitted. Dates identify when a measurement
+was made; an unchanged operator can retain an earlier measurement.
 
-| Operator | Documentation |
-| --- | --- |
-| Equivariant LayerNorm and supported variants | [LayerNorm](layernorm.md) |
-| GraphSoftmax | [GraphSoftmax performance](graph_softmax.md) |
-| AttentionAlpha | [AttentionAlpha performance](attention_alpha.md) |
-| Equivariant Gate | [Equivariant Gate performance](equivariant_gate.md) |
-| Equivariant Dropout | [Equivariant Dropout performance](equivariant_dropout.md) |
+## Current status
+
+| Operator | Correctness on H100 | Correctness on Hygon BW | Performance and remaining limits |
+| --- | --- | --- | --- |
+| [GraphSoftmax](graph_softmax.md) | 215 tests passed | 215 tests passed | Four matched graph cases per device pass. Reusable node order substantially improves the large-graph Hygon result. |
+| [AttentionAlpha](attention_alpha.md) | 66 tests + 13 stress cases passed | 66 tests + 13 stress cases passed | Triton forward and first-order backward. H100 forward + backward is 5.43–6.25x Torch at measured sizes; Hygon is 0.51–0.52x. |
+| [Equivariant LayerNorm](layernorm.md) | 218 tests passed | 218 tests passed; separate scaling suite has one failing Separable case | Hygon Separable affine-weight gradient at N=262,144 has two elements outside tolerance. Current-source H100 performance was not rerun. |
+| [e3nn Equivariant Gate](equivariant_gate.md) | 15 shape comparisons passed | 15 shape comparisons passed | The separate EQv3 GateActivation class still lacks a callable forward. |
+| [Equivariant Dropout](equivariant_dropout.md) | 17 shape comparisons passed | 16 shape comparisons passed | Exact output/gradient agreement with a shared mask. Hygon launch error at N=2,097,152. |
+
+Test counts describe different suites and are not added into one acceptance
+score. Full-model training and higher-order autograd are not validated by this
+record. A passed regression suite does not erase a failure from a separate
+larger-scale comparison.
+
+## Machines and software
+
+| Measurement | Host / device | Torch | Triton | Date |
+| --- | --- | --- | --- | --- |
+| GraphSoftmax | gxn70, physical GPU 7, NVIDIA H100 80GB HBM3, sm90 | 2.11.0+cu128 | 3.6.0 | 2026-09-17 |
+| GraphSoftmax | a14r1n06, one Hygon BW DCU, gfx936, approximately 64 GiB | 2.7.1 | HCU 3.1.0 | 2026-09-17 |
+| AttentionAlpha | gxn70, physical GPU 5, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-16 |
+| AttentionAlpha | a14r1n06, one Hygon BW DCU, gfx936 | 2.7.1 | HCU 3.1.0 | 2026-09-16 |
+| LayerNorm regression; Gate / Dropout | gxn70, physical GPU 5, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-15 |
+| LayerNorm; Gate / Dropout | a14r1n09, one Hygon BW DCU, gfx936, 65,520 MiB | 2.7.1 / HIP 6.3.26045 | HCU 3.1.0 | 2026-09-16 |
+
+Gate uses e3nn 0.4.4; graph references use torch-geometric 2.6.1. H100 runs used
+a shared host without exclusive reservation or locked clocks. Compare FastEq
+with Torch **within each device**; differing software and workloads do not
+establish a hardware throughput ranking. PyTorch's `torch.cuda` API also
+selects HIP devices in these scripts.
+
+## Accuracy and references
+
+Ordinary comparisons use the original eager Torch FP32 expression and check
+every output and requested first-order input/parameter gradient element:
+`abs(actual-reference) <= atol + rtol*abs(reference)`.
+
+| Operator | Absolute tolerance | Relative tolerance | Reference |
+| --- | --- | --- | --- |
+| GraphSoftmax output | 3e-6 | 3e-5 | Original EQv3 GraphSoftmax |
+| GraphSoftmax gradients | 3e-5 | 3e-4 | Torch FP32, with the narrowly documented cancellation-boundary exception |
+| AttentionAlpha, LayerNorm, Gate | 5e-5 | 5e-4 | Original Torch expressions / native source layers / e3nn Gate |
+| Dropout with the same mask | 0 | 0 | Original EQv3 EquivariantDropout |
+
+The maximum tolerance ratio is the maximum error divided by the allowed
+absolute-plus-relative error; a ratio at most 1 passes. Existing stricter
+mathematical regression tests remain in force. Only GraphSoftmax's demonstrated
+unstable cancellation boundaries use independent analytical/FP64 derivatives,
+as detailed on its page. This exception does not apply to LayerNorm or
+AttentionAlpha failures.
+
+EQv3 references are pinned to
+[`a7300c58`](https://github.com/malixian/equiformer_v3/tree/a7300c58df683dc99cb48027d5bfd4c887486c48/experimental/models/equiformer_v3).
+LayerNorm also tests official EQv2
+[`d5ad4be7`](https://github.com/atomicarchitects/equiformer_v2/blob/d5ad4be729b56f74012ebb7f097f77c5b00a1004/nets/equiformer_v2/layer_norm.py).
+Reference file hashes are retained beside the operator records.
 
 ## Measurement method
 
-This section describes the archived H100 run. Fresh Hygon coverage and its
-software differences are recorded in the dated section below.
+All reported timings are FP32 standalone operator calls. Forward uses
+`no_grad`; forward + backward includes all requested input and parameter
+gradients, without an optimizer. Five warmups precede 20 synchronized
+GPU-event samples; tables report medians. Host dispatch gaps are included.
+GraphSoftmax rotates provider order; AttentionAlpha measures Torch then
+Triton. The Gate/Dropout/LayerNorm sweep uses a fresh process per
+implementation, mode and shape. These differences are retained rather than
+combining separate runs into a hardware comparison.
 
-The archived sweep tested FastEq commit
-`3bc9a82d40ef646c3ce75f6f517e3f618fb12754`. Operator files were unchanged during
-measurement. This documentation split reuses those results. The later LayerNorm
-scope-cleanup regression is recorded separately in
-[regression.json](eqv3_validation/2026-09-15/regression.json).
+GraphSoftmax reports resident node order, per-call feature packing/restoration,
+and topology preparation separately. LayerNorm timings include its Torch
+backward reductions. Active Dropout generates masks normally during timing;
+only correctness comparisons replay a common mask. Raw sweep records include
+all timing samples and allocator-allocated peak memory, which is not total
+device occupancy.
 
-| Item | Configuration |
-| --- | --- |
-| Hardware | One H100 80GB on gxn70, physical GPU 5 |
-| Software | PyTorch 2.11.0+cu128, Triton 3.6.0; e3nn 0.4.4 for Gate |
-| Dtype | FP32 |
-| Native EQv3 source | Commit a7300c58df683dc99cb48027d5bfd4c887486c48; files verified byte for byte |
-| Timing | 5 warmups, 20 synchronized samples; median GPU-event interval and wall-clock time |
-| Forward | no_grad; active training dropout where specified on the operator page |
-| Forward + backward | Forward and requested first-order input/parameter gradients, no optimizer |
-| Scale | N starts at 256 and doubles; fresh process per backend, mode and shape |
-| Host conditions | Shared machine, no exclusive reservation or locked clocks |
+For retained scaling sweeps, N starts at 256 and doubles. `OOM` is an actual
+allocation failure; `LIMIT` or `INDEX_GUARD` stops before allocating an
+unsupported index range; `ERROR` is a runtime failure. A FastEq-only point
+beyond Torch's memory ceiling has no matched accuracy result. The latest
+GraphSoftmax and AttentionAlpha measurements are bounded representative runs,
+so prior implementation OOM limits are not carried forward.
 
-The baseline is the original eager Torch implementation; Gate uses
-`e3nn.nn.Gate`, while AttentionAlpha executes the original EQv3 attention
-expressions. Each operator page identifies its reference and input shapes.
-GPU-event intervals include all work in the public call and host-submission
-gaps; hybrid backward costs are included. They are not isolated kernel timings
-or pure-backward estimates. Speedup is Torch time divided by FastEq time.
+## Reproduction and records
 
-Peak memory is PyTorch allocator-allocated memory, including inputs, outputs,
-gradients and temporaries; it is not total device occupancy. GraphSoftmax's
-cached-CSR and per-call graph-preparation measurements are distinguished on
-its page.
-
-Matched accuracy checks compare every output and requested gradient element
-against Torch with `abs(actual-reference) <= atol + rtol*abs(reference)`.
-Default tolerances are `atol=5e-5, rtol=5e-4`; GraphSoftmax uses stricter
-forward/gradient tolerances, and Dropout requires exact equality for a shared
-mask. Tolerances were not relaxed. Raw records retain 32 numeric samples per
-tensor in addition to the complete comparison metrics.
-
-`OOM` records an actual allocation failure. `LIMIT`, `INDEX_GUARD` and
-`FALLBACK` are harness stops based on verified indexing/fallback conditions;
-the next shape is not allocated. Successful FastEq-only shapes beyond Torch's
-memory ceiling have no matched Torch accuracy check.
-
-The archived 2026-09-15 sweep measures standalone operators on CUDA, without
-full-model timing. Its records contain no new HIP measurements. Earlier
-CUDA/HIP LayerNorm results retain their own source hashes and are described in [LayerNorm](layernorm.md).
-
-## Shared records
-
-- [Paired timings, speedups and memory](eqv3_validation/2026-09-15/paired.csv)
-- [Execution and stopping boundaries](eqv3_validation/2026-09-15/boundaries.csv)
-- [Accuracy summary](eqv3_validation/2026-09-15/correctness_summary.json) and [failures](eqv3_validation/2026-09-15/failures.csv)
-- [Raw points and comparisons](eqv3_validation/2026-09-15/raw_results.json.gz), [source manifest](eqv3_validation/2026-09-15/manifest.json) and [source audit](eqv3_validation/2026-09-15/reference_audit.json)
-- [Reproduction instructions](eqv3_validation/2026-09-15/REPRODUCE.md)
-- [Per-operator plotting script](eqv3_validation/2026-09-15/plot_by_operator.py)
-
-The original combined report and plots remain in the dated artifact directory
-as a historical snapshot. The five pages above are the operator documentation.
-
-## Hygon rerun: 2026-09-16
-
-The five operator pages now combine the archived H100 measurements above with
-a fresh Hygon run. Device columns distinguish the timing and stopping tables;
-the figures use separate device panels. Existing H100 raw data and failures
-remain unchanged.
-
-| Item | Fresh Hygon run | H100 comparison record |
-| --- | --- | --- |
-| Host | `a14r1n09` | `gxn70` |
-| Device | One Hygon BW DCU, 65,520 MiB, wavefront 64 | One H100 80GB, physical GPU 5, warp 32 |
-| Allocation | Slurm `838109`, `hx1hdnormal01`, 8 CPUs | Shared host; no exclusive GPU reservation or locked clocks |
-| Torch | 2.7.1 | 2.11.0+cu128 |
-| GPU runtime | HIP 6.3.26045 | CUDA 12.8 build |
-| Triton | HCU Triton 3.1.0 | Triton 3.6.0 |
-| Gate / graph dependencies | e3nn 0.4.4 / torch-geometric 2.6.1 | e3nn 0.4.4 / torch-geometric 2.6.1 |
-| FastEq source | `d37eacaf21b5048159a1211794efbb58941485a9` | Archived timings: `3bc9a82d40ef646c3ce75f6f517e3f618fb12754` |
-| LayerNorm suite after scope cleanup | 218 passed, 0 failed, 0 skipped | Separate existing regression: 218 passed, 0 failed, 0 skipped |
-
-The four non-LayerNorm production operator files are byte-identical between
-these runs. Hygon tests the current LayerNorm source after Merge removal,
-SHA256 `35d689624e48422801cfdb0b8461243f7a88ee012dc20122206433098a90da5d`.
-The H100 performance archive used the earlier source hash
-`f2bc0ea975eac5bf5a16b3297415cc37d896fb8a41d5375e04e57d7ed1461520`; its
-later 218-test correctness run is recorded separately. The old 305-test
-CUDA/HIP record remains a dated historical result, not the current suite size.
-
-All five original EQv3 reference files match the verified H100 source hashes.
-The e3nn version is also matched. The harness retains the same shapes, native
-Torch arithmetic, full-tensor comparisons, tolerances, seed, 5 warmups,
-20 synchronized samples, fresh child processes and doubling-to-stop rules.
-Path configuration and report aggregation were adapted to the Hygon machine.
-Within each device, Torch and FastEq receive matched inputs; identical GPU
-random streams across CUDA and HIP are not assumed.
-
-The five families use six sweep keys because LayerNorm covers both the
-per-degree and scalar/high-degree variants. The Hygon sweep includes first-order
-input and parameter gradients, active p=0.3 Dropout, cached-CSR GraphSoftmax and
-separate per-call CSR measurements. It does not add second-order or full-model
-validation. FastEq's Torch products/reductions in LayerNorm backward and Torch
-recomputation in AttentionAlpha backward are included in the measured calls.
-
-Accuracy failures stay visible in the tables, raw records and red-cross plot
-markers. `OOM` is an actual allocation failure; `LIMIT`, `INDEX_GUARD` and
-`FALLBACK` stop before allocating a shape that violates the documented bound.
-`ERROR` records a runtime failure, including HIP kernel-launch errors; it is
-not an allocation OOM.
-A successful FastEq-only point beyond Torch's memory ceiling has no matched
-Torch correctness result. Speedups compare implementations on the same device;
-the two software stacks and source revisions do not support a direct hardware
-throughput ranking.
-
-The run completed 328 execution points and 91 full-tensor comparisons
-(**87 PASS, 4 FAIL**), producing 145 paired timing rows. The failures are
-AttentionAlpha `alpha_dot` gradients at N=4,096 / 8,192 / 16,384 and
-SeparableLayerNorm `affine_weight` at N=262,144. Separately, the repeated native
-GraphSoftmax checks failed 2 of 1,720 assertions. The e3nn Gate comparisons
-pass; the distinct EQv3 GateActivation API still lacks a callable forward.
-
-Runtime launch errors stop Hygon FastEq AttentionAlpha at N=65,536, Dropout at
-N=2,097,152, and GraphSoftmax forward at N=16,777,216. Both LayerNorm variants
-and e3nn Gate reach the inherited indexing prechecks. All 24 backend/mode
-sequences reached an explicit stopping condition. The single-DCU allocation
-was released after collection; the measured Slurm steps completed normally.
-
-Fresh records:
-
-- [Manifest and source hashes](eqv3_validation/2026-09-16-hygon/manifest.json)
-- [Paired timings and memory](eqv3_validation/2026-09-16-hygon/paired.csv), [boundaries](eqv3_validation/2026-09-16-hygon/boundaries.csv), and [summary](eqv3_validation/2026-09-16-hygon/summary.json)
-- [Accuracy](eqv3_validation/2026-09-16-hygon/correctness_summary.json), [failed elements](eqv3_validation/2026-09-16-hygon/failures.csv), and [repeated native GraphSoftmax checks](eqv3_validation/2026-09-16-hygon/softmax_native_checks.json)
-- [LayerNorm log](eqv3_validation/2026-09-16-hygon/layernorm.log) and [JUnit record](eqv3_validation/2026-09-16-hygon/layernorm.xml)
-- [Raw measurement records](eqv3_validation/2026-09-16-hygon/raw_results.json.gz), [reproduction](eqv3_validation/2026-09-16-hygon/REPRODUCE.md), and [comparison plotting script](eqv3_validation/2026-09-16-hygon/plot_by_operator.py)
+[Reproduction instructions](validation/REPRODUCE.md) cover the current test and
+benchmark entry points. Raw metrics, JUnit reports, filtered scaling records,
+and their checksums are under [doc/validation](validation/manifest.json).
+The operator pages contain the supported behavior, precision conclusions,
+performance tables and limitations; the raw files provide audit evidence.

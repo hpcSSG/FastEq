@@ -1,0 +1,2 @@
+operator,atoms,tensor,failing_elements,max_abs,max_tolerance_ratio,examples
+separable,262144,affine_weight,2.0,0.001007080078125,2.7865502507895226,"[{'flat_index': 48, 'actual': -0.1632080078125, 'expected': -0.162841796875}, {'flat_index': 256, 'actual': -0.408447265625, 'expected': -0.407958984375}]"

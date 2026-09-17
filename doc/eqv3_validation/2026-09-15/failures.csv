@@ -1,3 +1,0 @@
-operator,atoms,tensor,failing_elements,max_abs,max_tolerance_ratio,examples
-alpha,131072,alpha_dot,2.0,0.04150390625,7.680816280511866,"[{'flat_index': 77, 'actual': 13.4097900390625, 'expected': 13.388671875}, {'flat_index': 82, 'actual': 1.62567138671875, 'expected': 1.63232421875}]"
-alpha,32768,alpha_dot,1.0,0.0107421875,2.6261015036862685,"[{'flat_index': 92, 'actual': -3.66021728515625, 'expected': -3.6651611328125}]"

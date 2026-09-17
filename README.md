@@ -30,7 +30,7 @@ Model associations below follow the project operator inventory. Exact usage depe
 | Equivariant linear maps | `SO3Linear` | Apply channel mixing between matching irreducible representations. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE, EquiformerV3, EquiformerV2, eSEN | Highly optimized fused TF32 GEMM and Triton FP32/FP64 fused GEMM | 
 | Equivariant linear maps | `SO2Linear` | Apply SO(2)-equivariant channel mixing in local coordinate frames. | EquiformerV3, TACE/TECE | Triton FP32/FP64 fused GEMM  |
 | Graph Softmax | [`FusedGraphSoftmax`](doc/graph_softmax.md) | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | Fused GraphSoftmax |
-| Graph attention | [`FusedAttenAlpha`](doc/attention_alpha.md) | Fuse normalization, activation, dropout, and weighted reduction in graph attention into a single kernel | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
+| Graph attention | [`FusedAttenAlpha`](doc/attention_alpha.md) | Fuse normalization, activation, dropout, and weighted reduction in graph attention; Triton first-order backward | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
 | Equivariant Gate| [`FusedEquivariantGate`](doc/equivariant_gate.md) | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
 | Equivariant normalization | [`FusedEquivariantLayerNorm`](doc/layernorm.md) | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2 | Fused statistics and affine transformation; first-order backward |
 | Equivariant dropout | [`FusedEquivariantDropout`](doc/equivariant_dropout.md) | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout |
@@ -39,9 +39,13 @@ Graph softmax operates on attention weights; it supports equivariant attention b
 
 ### Equivariant LayerNorm
 
-CUDA FP32 normalization with first-order gradients for EquiformerV3 and
+CUDA/HIP FP32 normalization with first-order gradients for EquiformerV3 and
 EquiformerV2 layers. See [Equivariant LayerNorm](doc/layernorm.md) for supported
 layers, fused operations, usage, and validation coverage.
+
+See the [EQv3 validation index](doc/eqv3_validation.md) for current-source
+accuracy, performance, tested hardware, and remaining limits across five
+operator families.
 
 ## How FastEq Optimizes Equivariant Computation
 

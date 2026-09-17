@@ -1,0 +1,75 @@
+{
+  "implementation": {
+    "path": "fasteq/triton/fused_attention_alpha.py",
+    "sha256": "e5d339e77faa9d36ac816bad12f6edb7639b63e8d9940487eb12186024ab8002"
+  },
+  "source_commit": "8595d936bddec222bb4af4a2c466fbe1bc0d1feb",
+  "reference": "native Torch FP32 layer_norm, EQv3 SmoothLeakyReLU expressions and einsum",
+  "tolerance": {
+    "atol": 5e-05,
+    "rtol": 0.0005
+  },
+  "devices": {
+    "h100": {
+      "host": "gxn70",
+      "device": "NVIDIA H100 80GB HBM3",
+      "torch": "2.11.0+cu128",
+      "triton": "3.6.0",
+      "pytest": {
+        "tests": 66,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "stress_cases": 13,
+      "records": [
+        "h100/stress.json",
+        "h100/perf_4096.json",
+        "h100/perf_32768.json",
+        "h100/perf_131072.json"
+      ],
+      "physical_gpu": 5
+    },
+    "hygon": {
+      "host": "a14r1n06",
+      "device": "BW",
+      "torch": "2.7.1",
+      "triton": "3.1.0",
+      "pytest": {
+        "tests": 66,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "stress_cases": 13,
+      "records": [
+        "hygon/stress.json",
+        "hygon/perf_4096.json",
+        "hygon/perf_32768.json"
+      ]
+    }
+  },
+  "benchmark": {
+    "edges_per_node": 32,
+    "heads": 8,
+    "channels": 32,
+    "dtype": "float32",
+    "dropout": 0,
+    "warmup": 5,
+    "samples": 20,
+    "statistic": "median synchronized GPU events",
+    "order": "native followed by Triton",
+    "hygon_largest_attempt": "N=131072 native benchmark allocation OOM; no matched timing or memory limit inferred"
+  },
+  "files_sha256": {
+    "h100/perf_4096.json": "0099e552025d908dbdc064c99785a161ada7518243f43cafdb7674ed22ca74f4",
+    "h100/perf_32768.json": "0df43b3185f3497a0c6123314e700b6fdb66783c92b717cced0a52bdd85c022a",
+    "h100/stress.json": "a5618c4430d8b30c1197deb8db7ebb3a020e5a25a58b2d7b3111613a536e2136",
+    "h100/pytest.xml": "018b8c742f4885e07ed4b7dfb527ea8dcd1cbb92105066d364d7c69706d494bf",
+    "h100/perf_131072.json": "5e094eba46ca9a84115f87c387b1cdef5b0c0037bab1152ed1f3eb46f6572330",
+    "hygon/perf_4096.json": "fcc15a1f3bad09ca2491f17cc91cca7f91582bdbc1d0d287c8ee190c4f2d0a3e",
+    "hygon/perf_32768.json": "a828091dcc75ae89b0d34e0917aff0dceba98a8c9b45b4f77c9598785730c429",
+    "hygon/stress.json": "96bbeff9bbe4b992b3f999a4202b9bf03c0a050102f6d3308428db5c29dfb02e",
+    "hygon/pytest.xml": "dc2d3a592227dc22b8844a955815ac556a9da383db3702a7ebcfd4ff9860709e"
+  }
+}
