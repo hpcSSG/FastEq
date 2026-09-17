@@ -158,6 +158,15 @@ def _backward_rows(DY, W, G, B, U, MASK, RS, DX, PG, PB,
 
 
 @triton.jit
+def _load_weight_pair(A, DY, edge, head, c, E: tl.constexpr,
+                      H: tl.constexpr, C: tl.constexpr):
+    valid = (edge < E) & (head < H)
+    a = tl.load(A + (edge * H + head) * C + c, valid, other=0)
+    dy = tl.load(DY + edge * H + head, valid, other=0)
+    return a, dy
+
+
+@triton.jit
 def _weight_gradient(A, DY, DW, E: tl.constexpr, H: tl.constexpr, C: tl.constexpr,
                      LANES: tl.constexpr):
     pid = (tl.program_id(0).to(tl.int64)
@@ -165,19 +174,28 @@ def _weight_gradient(A, DY, DW, E: tl.constexpr, H: tl.constexpr, C: tl.constexp
     head, c = pid // C, pid % C
     # A fixed number of independent FP32 chains, selected by the host schedule.
     lane = tl.arange(0, LANES)
-    steps = tl.arange(0, 8)
     acc = tl.full((LANES,), 0, tl.float32)
     for start in range(tl.cdiv(E, 8 * LANES)):
-        e = (start.to(tl.int64) * 8 + steps[:, None]) * LANES + lane[None, :]
-        a = tl.load(A + (e.to(tl.int64) * H + head) * C + c,
-                    (e < E) & (head < H), other=0)
-        dy = tl.load(DY + e.to(tl.int64) * H + head,
-                     (e < E) & (head < H), other=0)
-        # Prefetch eight rounds, but accumulate in the original FP32 order.
-        for i in tl.static_range(8):
-            ai = _select_row(a, i, 8, LANES)
-            gi = _select_row(dy, i, 8, LANES)
-            acc = tl.fma(ai, gi, acc)
+        edge = start.to(tl.int64) * (8 * LANES) + lane
+        # Keep each prefetched round in its own lane vector. Extracting rows
+        # from a [8, LANES] tile introduces repeated LDS transfers on HCU 3.1.
+        # Explicit vectors preserve the exact per-lane FP32 FMA sequence.
+        a0, g0 = _load_weight_pair(A, DY, edge, head, c, E, H, C)
+        a1, g1 = _load_weight_pair(A, DY, edge + LANES, head, c, E, H, C)
+        a2, g2 = _load_weight_pair(A, DY, edge + 2 * LANES, head, c, E, H, C)
+        a3, g3 = _load_weight_pair(A, DY, edge + 3 * LANES, head, c, E, H, C)
+        a4, g4 = _load_weight_pair(A, DY, edge + 4 * LANES, head, c, E, H, C)
+        a5, g5 = _load_weight_pair(A, DY, edge + 5 * LANES, head, c, E, H, C)
+        a6, g6 = _load_weight_pair(A, DY, edge + 6 * LANES, head, c, E, H, C)
+        a7, g7 = _load_weight_pair(A, DY, edge + 7 * LANES, head, c, E, H, C)
+        acc = tl.fma(a0, g0, acc)
+        acc = tl.fma(a1, g1, acc)
+        acc = tl.fma(a2, g2, acc)
+        acc = tl.fma(a3, g3, acc)
+        acc = tl.fma(a4, g4, acc)
+        acc = tl.fma(a5, g5, acc)
+        acc = tl.fma(a6, g6, acc)
+        acc = tl.fma(a7, g7, acc)
     tl.store(DW + head * C + c, tl.sum(acc, 0), head < H)
 
 
@@ -268,8 +286,9 @@ class _FusedAlpha(torch.autograd.Function):
             if need_w:
                 target = triton.runtime.driver.active.get_current_target()
                 lanes = _WEIGHT_GRAD_ACCUMULATORS.get(target.arch, target.warp_size)
+                # The lane vectors fit within one target warp/wavefront.
                 _weight_gradient[_row_grid(h * c)](
-                    a, dy, dw, n, h, c, lanes, num_warps=4, enable_fp_fusion=False)
+                    a, dy, dw, n, h, c, lanes, num_warps=1, enable_fp_fusion=False)
             if need_g:
                 _sum_partials(pg, dg)
             if need_b:

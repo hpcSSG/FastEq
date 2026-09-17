@@ -49,9 +49,11 @@ python -m pytest -q test/test_triton_equivariant_layer_norm.py \
 python test/stress_triton_attention_alpha.py --out "$run_dir/alpha_stress.json"
 ```
 
-Expected retained suite counts are GraphSoftmax 215, AttentionAlpha 66, and
+Expected retained suite counts are GraphSoftmax 215, AttentionAlpha 67, and
 LayerNorm 218 per device, plus 13 AttentionAlpha stress cases. Individual-suite
 passes do not override the separately documented Separable scaling failure.
+The retained Alpha evidence has 66 existing tests and one separately executed
+padded-grid test per device; the command above runs all 67 together.
 Saved historical failure tensors in `test/data/graph_softmax` are regression
 inputs for the current implementation, not old implementation test results.
 
@@ -64,18 +66,33 @@ for n in 4096 262144 1048576; do
 done
 python test/benchmark_triton_graph_softmax.py --n 4096 --topology random \
   --out "$run_dir/graph_softmax_random.json"
-for n in 4096 32768; do
-  python test/benchmark_triton_attention_alpha.py --n "$n" --bench \
+for n in 4096 32768 131072; do
+  python test/benchmark_triton_attention_alpha_matched.py --n "$n" \
     --out "$run_dir/attention_alpha_${n}.json"
 done
-# Also measured successfully on H100; the recorded Hygon attempt ran out of memory.
-python test/benchmark_triton_attention_alpha.py --n 131072 --bench \
-  --out "$run_dir/attention_alpha_131072.json"
 ```
 
-The Alpha benchmark/stress calculation is the measured script, with only its
-module-path default and stress-loader path made repository-relative. The
-GraphSoftmax benchmark is byte-identical to the measured script.
+The matched Alpha benchmark stages reference tensors on the CPU and releases
+GPU comparison temporaries before timing, so all three sizes were measured
+successfully on both devices. The portable entry point preserves the measured
+input generation, reference arithmetic, precision check and timing procedure;
+it omits debug assembly dumps. The default runs Torch and the current source.
+To reproduce the retained run's three-provider rotation, add the optional
+control from the recorded source commit:
+
+```bash
+git show 7546658c05ff95a80985be28d45072caab1d94c2:fasteq/triton/fused_attention_alpha.py \
+  > "$run_dir/alpha_control.py"
+python test/benchmark_triton_attention_alpha_matched.py --n 4096 \
+  --control-module "$run_dir/alpha_control.py" --out "$run_dir/alpha_rotated.json"
+```
+
+Only current-source checks and Torch/current timing arrays were selected for
+publication from the measured three-provider JSON; their numeric values are
+unchanged. The original comparison-file checksums are listed in the Alpha
+summary. The older general Alpha harness remains the helper used by the
+stress script, not the source of the current performance table. GraphSoftmax's
+benchmark is byte-identical to its measured script.
 
 ## Gate, Dropout and LayerNorm scaling
 

@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import statistics
 import xml.etree.ElementTree as ET
 
 
@@ -61,14 +62,24 @@ def main():
     verify_hashes(alpha, summary["files_sha256"])
     for device in ("h100", "hygon"):
         junit(alpha / device / "pytest.xml", 66)
+        junit(alpha / device / "pytest_grid.xml", 1)
         for path in (alpha / device).glob("*.json"):
             result = read(path)
             assert result["module_sha256"] == expected, path
             if path.name == "stress.json":
                 assert len(result["cases"]) == 13, path
-            for case in result["cases"]:
+                checks = [case["checks"] for case in result["cases"]]
+            else:
+                checks = [result["checks"]["triton"]]
+                assert result["N"] in (4096, 32768, 131072), path
+                for mode in ("fwd", "fwd_bwd"):
+                    assert set(result["timings"][mode]) == {"torch", "triton"}, path
+                    for measurement in result["timings"][mode].values():
+                        assert len(measurement["samples_ms"]) == 20, path
+                        assert statistics.median(measurement["samples_ms"]) == measurement["median_ms"], path
+            for metrics in checks:
                 assert all(m["bad"] == 0 and m["max_ratio"] <= 1
-                           for m in case["checks"].values()), path
+                           for m in metrics.values()), path
 
     for device in ("h100", "hygon"):
         folder = RECORDS / "layernorm" / device
@@ -100,7 +111,7 @@ def main():
                     assert result["checks"]["affine_weight"]["failures"] == 2, key
 
     print("Current-source hashes and retained artifacts verified.")
-    print("H100 / Hygon: GraphSoftmax 215 / 215; AttentionAlpha 66 / 66 plus 13 / 13 stress;")
+    print("H100 / Hygon: GraphSoftmax 215 / 215; AttentionAlpha 67 / 67 plus 13 / 13 stress;")
     print("LayerNorm 218 / 218. Current Separable scaling failure remains recorded.")
 
 

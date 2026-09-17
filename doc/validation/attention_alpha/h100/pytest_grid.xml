@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="7.727" timestamp="2026-09-17T10:28:13.486243+08:00" hostname="gxn70"><testcase classname="repo.test.test_triton_attention_alpha" name="test_padded_weight_gradient_grid" time="4.281" /></testsuite></testsuites>

@@ -156,3 +156,8 @@ def test_original_large_reduction_cases(n):
 def test_parameter_cancellation_cases(seed,c,activation):
     compare(e=131072,h=8,c=c,activation=activation,seed=seed)
     torch.cuda.empty_cache()
+
+
+def test_padded_weight_gradient_grid():
+    # H*C exceeds the one-dimensional grid bound, leaving padded programs.
+    compare(e=3,h=257,c=257,ln=False,affine='none')

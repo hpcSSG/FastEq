@@ -1,5 +1,5 @@
 {
-  "module_sha256": "e5d339e77faa9d36ac816bad12f6edb7639b63e8d9940487eb12186024ab8002",
+  "module_sha256": "a1fb1f31b9d07166b71171b9fa52da8d290a93bbad1585830f27d8fd4817593a",
   "device": "BW",
   "torch": "2.7.1",
   "triton": "3.1.0",
