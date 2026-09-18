@@ -1,0 +1,37 @@
+{
+  "implementation": {
+    "path": "fasteq/triton/fused_equivariant_layer_norm.py",
+    "sha256": "35d689624e48422801cfdb0b8461243f7a88ee012dc20122206433098a90da5d"
+  },
+  "test_module_sha256": {
+    "test/test_triton_equivariant_layer_norm_backward.py": "d3092e73ad4e32d0def636115307fad27a3690676d4188f008423752a89992ce",
+    "test/test_triton_equivariant_layer_norm_precision.py": "33c6910d4e0d1a53302da7b5354e39816d5a9494b5a7d1f3df48c553d85537dc",
+    "test/test_triton_equivariant_layer_norm.py": "bfcc9a8d17018908b44fa5a0513a52083f454fc5346883bf1c16ebffcfe59aff"
+  },
+  "tests": {
+    "tests": 218,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0
+  },
+  "timestamp": "2026-09-16T09:31:04.717816+08:00",
+  "hostname": "a14r1n09",
+  "native_fp32_max_tolerance_ratios": {
+    "forward": {
+      "ratio": 0.013758362791516775,
+      "test": "test_optional_original_source_large_batch_acceptance[V3-EquivariantLayerNorm-27648-NKC]",
+      "metric": "forward/max_tolerance_ratio"
+    },
+    "dX": {
+      "ratio": 0.007144777812399383,
+      "test": "test_optional_original_source_scaling_precision_regressions[separable-524288]",
+      "metric": "dX/max_tolerance_ratio"
+    },
+    "parameter": {
+      "ratio": 0.2774656289452144,
+      "test": "test_optional_original_source_large_batch_acceptance[V3-EquivariantLayerNorm-4096-NKC]",
+      "metric": "parameter/affine_weight/max_tolerance_ratio"
+    }
+  },
+  "pytest_sha256": "2b557c4ffc44f17eec275d11ff67dd3a79944ad3f75cc49e65d8a562b5a6385a"
+}
