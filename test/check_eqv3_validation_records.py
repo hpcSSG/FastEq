@@ -4,6 +4,7 @@ import csv
 import gzip
 import hashlib
 import json
+import math
 from pathlib import Path
 import statistics
 import xml.etree.ElementTree as ET
@@ -35,11 +36,77 @@ def junit(path, count):
     assert actual == dict(tests=count, failures=0, errors=0, skipped=0), (path, actual)
 
 
+def audit_graph_softmax_index():
+    folder = RECORDS / "graph_softmax_index"
+    summary = read(folder / "summary.json")
+    verify_hashes(ROOT, summary["source_sha256"])
+    verify_hashes(folder, summary["files_sha256"])
+    providers = {"torch", "index_fused", "csr_rebuild", "packed_rebuild"}
+    components = {"output", "dx", "dr"}
+    expected_cases = {(n, topology) for n in (256, 4096, 32768, 262144)
+                      for topology in ("random", "interleaved", "contiguous")}
+    for device in ("h100", "hygon"):
+        info = summary["devices"][device]
+        junit(folder / info["junit_file"], 105)
+        assert info["junit"] == dict(tests=105, failures=0, errors=0, skipped=0)
+        rows = info["performance"]
+        assert len(rows) == 12
+        assert {(r["N"], r["topology"]) for r in rows} == expected_cases
+        assert {r["file"] for r in rows} == {
+            str(p.relative_to(folder)) for p in (folder / device).glob("perf_*.json")}
+        metrics = []
+        for row in rows:
+            path = folder / row["file"]
+            result = read(path)
+            verify_hashes(ROOT / "fasteq/triton", result["sources"])
+            assert result["native_sha256"] == summary["reference"]["sha256"], path
+            for key in ("host", "device", "target", "torch", "triton"):
+                assert result[key] == info["machine"][key], (path, key)
+            assert (result["N"], result["topology"]) == (row["N"], row["topology"])
+            assert result["E"] == 32 * result["N"] and result["H"] == 8, path
+            assert result["settings"] == dict(
+                dtype="FP32", rescale="[E,1]", softcap=3.0, eps=1e-16,
+                warmup=5, repeat=20, order="rotated", topology_reuse=False,
+                statistic="median synchronized wall and GPU event ms"), path
+            assert set(result["checks"]) == providers - {"torch"}, path
+            for checks in result["checks"].values():
+                assert set(checks) == components, path
+                assert all(m["bad"] == 0 and 0 <= m["max_tolerance_ratio"] <= 1
+                           and math.isfinite(m["max_abs"]) and m["max_abs"] >= 0
+                           for m in checks.values()), path
+            metrics.append(result["checks"]["index_fused"])
+            for mode, field in (("fwd", "forward_ms"), ("fwd_bwd", "forward_backward_ms")):
+                assert set(result["timings"][mode]) == providers, path
+                for measurement in result["timings"][mode].values():
+                    assert set(measurement) == {"wall_ms", "gpu_ms"}, path
+                    for series in measurement.values():
+                        assert len(series["samples"]) == 20, path
+                        assert all(math.isfinite(v) and v > 0 for v in series["samples"]), path
+                        assert statistics.median(series["samples"]) == series["median"], path
+                assert row[field] == {
+                    name: result["timings"][mode][name]["wall_ms"]["median"]
+                    for name in providers}, path
+        assert info["precision"] == {
+            component: {
+                "max_abs": max(m[component]["max_abs"] for m in metrics),
+                "max_tolerance_ratio": max(m[component]["max_tolerance_ratio"] for m in metrics),
+                "bad": sum(m[component]["bad"] for m in metrics)}
+            for component in components}, device
+        speedups = [r["forward_backward_ms"]["torch"] / r["forward_backward_ms"]["index_fused"]
+                    for r in rows]
+        assert info["forward_backward_speedup_vs_torch"] == [min(speedups), max(speedups)]
+        faster = [r for r in rows if r["forward_backward_ms"]["csr_rebuild"]
+                  < r["forward_backward_ms"]["index_fused"]]
+        assert sorted(info["csr_rebuild_faster_cases"], key=lambda r: r["file"]) == sorted(
+            faster, key=lambda r: r["file"]), device
+
+
 def main():
     manifest = read(RECORDS / "manifest.json")
     verify_hashes(ROOT, manifest["runtime_sha256"])
     verify_hashes(ROOT, manifest["test_and_harness_sha256"])
     verify_hashes(RECORDS, manifest["artifacts_sha256"])
+    audit_graph_softmax_index()
 
     graph = RECORDS / "graph_softmax"
     summary = read(graph / "summary.json")
@@ -111,7 +178,8 @@ def main():
                     assert result["checks"]["affine_weight"]["failures"] == 2, key
 
     print("Current-source hashes and retained artifacts verified.")
-    print("H100 / Hygon: GraphSoftmax 215 / 215; AttentionAlpha 67 / 67 plus 13 / 13 stress;")
+    print("H100 / Hygon: GraphSoftmax CSR 215 / 215; raw index 105 / 105 plus 12 / 12 matched cases;")
+    print("AttentionAlpha 67 / 67 plus 13 / 13 stress;")
     print("LayerNorm 218 / 218. Current Separable scaling failure remains recorded.")
 
 

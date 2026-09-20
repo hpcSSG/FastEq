@@ -1,10 +1,24 @@
-# GraphSoftmax
+# GraphSoftmax with CSR
 
 [GraphSoftmax](../fasteq/triton/graph_softmax.py) implements FP32 forward and
 Triton first-order backward on CUDA and HIP. The optional
 [node-major layout helper](../fasteq/triton/graph_edge_layout.py) stores each
 node's incoming edges contiguously and reuses the topology permutation.
-Both devices pass 215 regression tests and four matched performance cases.
+This CSR implementation passes 215 regression tests and four matched
+performance cases on each device. The separate
+[raw-index implementation](graph_softmax_index.md) consumes destination indices
+without building CSR or sorting features; it passes 105 tests and 12 matched
+performance cases per device. Both interfaces remain available.
+
+| Interface | Topology handling | When to consider it |
+| --- | --- | --- |
+| `FusedGraphSoftmax` / layout helper | Build CSR; reuse topology or contiguous node order when possible | Reusable graphs, or workloads where CSR traversal offsets construction cost |
+| `FusedGraphSoftmaxIndex` | Read raw indices on each call; no CSR, sorting or topology cache | Changing graphs where topology preparation cannot be amortized |
+
+The [dynamic-graph comparison](graph_softmax_index.md#performance) includes
+CSR reconstruction on every call. It also identifies two large H100 cases
+where rebuilding CSR is faster than raw-index fusion. The reusable-layout
+measurements below answer a different integration question.
 
 ## Implementation and integration
 

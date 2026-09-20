@@ -10,7 +10,8 @@ was made; an unchanged operator can retain an earlier measurement.
 
 | Operator | Correctness on H100 | Correctness on Hygon BW | Performance and remaining limits |
 | --- | --- | --- | --- |
-| [GraphSoftmax](graph_softmax.md) | 215 tests passed | 215 tests passed | Four matched graph cases per device pass. Reusable node order substantially improves the large-graph Hygon result. |
+| [GraphSoftmax CSR](graph_softmax.md) | 215 tests passed | 215 tests passed | Four matched graph cases per device pass. Reusable node order substantially improves the large-graph Hygon result. |
+| [GraphSoftmax raw index](graph_softmax_index.md) | 105 tests passed | 105 tests passed | 12 matched graph cases per device pass. Forward + backward is 1.11–6.00x Torch on H100 and 1.16–1.85x on Hygon. Rebuilt CSR still wins two large H100 cases. |
 | [AttentionAlpha](attention_alpha.md) | 67 tests + 13 stress cases passed | 67 tests + 13 stress cases passed | Triton forward and first-order backward. H100 forward + backward is 2.67–6.44x Torch at measured sizes; Hygon is 1.45–1.54x. |
 | [Equivariant LayerNorm](layernorm.md) | 218 tests passed | 218 tests passed; separate scaling suite has one failing Separable case | Hygon Separable affine-weight gradient at N=262,144 has two elements outside tolerance. Current-source H100 performance was not rerun. |
 | [e3nn Equivariant Gate](equivariant_gate.md) | 15 shape comparisons passed | 15 shape comparisons passed | The separate EQv3 GateActivation class still lacks a callable forward. |
@@ -25,8 +26,10 @@ larger-scale comparison.
 
 | Measurement | Host / device | Torch | Triton | Date |
 | --- | --- | --- | --- | --- |
-| GraphSoftmax | gxn70, physical GPU 7, NVIDIA H100 80GB HBM3, sm90 | 2.11.0+cu128 | 3.6.0 | 2026-09-17 |
-| GraphSoftmax | a14r1n06, one Hygon BW DCU, gfx936, approximately 64 GiB | 2.7.1 | HCU 3.1.0 | 2026-09-17 |
+| GraphSoftmax CSR | gxn70, physical GPU 7, NVIDIA H100 80GB HBM3, sm90 | 2.11.0+cu128 | 3.6.0 | 2026-09-17 |
+| GraphSoftmax CSR | a14r1n06, one Hygon BW DCU, gfx936, approximately 64 GiB | 2.7.1 | HCU 3.1.0 | 2026-09-17 |
+| GraphSoftmax raw index / rebuilt CSR | gxn70, physical GPU 0, NVIDIA H100 80GB HBM3, sm90 | 2.11.0+cu128 | 3.6.0 | 2026-09-18 |
+| GraphSoftmax raw index / rebuilt CSR | f11r1n20, one Hygon BW DCU, gfx936 | 2.7.1 | HCU 3.1.0 | 2026-09-18 |
 | AttentionAlpha | gxn70, physical GPU 7, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-17 |
 | AttentionAlpha | a14r2n09, one Hygon BW DCU, gfx936 | 2.7.1 | HCU 3.1.0 | 2026-09-17 |
 | LayerNorm regression; Gate / Dropout | gxn70, physical GPU 5, NVIDIA H100 80GB HBM3 | 2.11.0+cu128 | 3.6.0 | 2026-09-15 |
@@ -69,7 +72,9 @@ Reference file hashes are retained beside the operator records.
 All reported timings are FP32 standalone operator calls. Forward uses
 `no_grad`; forward + backward includes all requested input and parameter
 gradients, without an optimizer. Five warmups precede 20 synchronized
-GPU-event samples; tables report medians. Host dispatch gaps are included.
+GPU-event samples; tables report medians. The raw-index GraphSoftmax comparison
+also records synchronized wall time and uses that complete-call measure in its
+tables, including per-call CSR/layout construction. Host dispatch gaps are included.
 GraphSoftmax and AttentionAlpha rotate provider order; the retained Alpha
 measurements came from a three-provider run with an independent control.
 Only current-source and Torch results are retained. The Gate/Dropout/LayerNorm
@@ -77,8 +82,10 @@ sweep uses a fresh process per
 implementation, mode and shape. These differences are retained rather than
 combining separate runs into a hardware comparison.
 
-GraphSoftmax reports resident node order, per-call feature packing/restoration,
-and topology preparation separately. LayerNorm timings include its Torch
+GraphSoftmax CSR reports resident node order, per-call feature packing/restoration,
+and topology preparation separately. Its raw-index comparison rebuilds both CSR
+alternatives on every invocation and never reuses a topology mapping.
+LayerNorm timings include its Torch
 backward reductions. Active Dropout generates masks normally during timing;
 only correctness comparisons replay a common mask. Raw sweep records include
 all timing samples and allocator-allocated peak memory, which is not total

@@ -29,13 +29,19 @@ Model associations below follow the project operator inventory. Exact usage depe
 | Tensor products and higher-order coupling | `SymmetricContraction` | Construct higher-order equivariant features through symmetric contractions. | MACE, TACE, TECE | Similar to ChannelwiseTensorProduct |
 | Equivariant linear maps | `SO3Linear` | Apply channel mixing between matching irreducible representations. | EquFlash, MACE, NequIP, SevenNet, TACE/TECE, EquiformerV3, EquiformerV2, eSEN | Highly optimized fused TF32 GEMM and Triton FP32/FP64 fused GEMM | 
 | Equivariant linear maps | `SO2Linear` | Apply SO(2)-equivariant channel mixing in local coordinate frames. | EquiformerV3, TACE/TECE | Triton FP32/FP64 fused GEMM  |
-| Graph Softmax | [`FusedGraphSoftmax`](doc/graph_softmax.md) | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | Fused GraphSoftmax |
+| Graph Softmax | [`FusedGraphSoftmax`](doc/graph_softmax.md), [`FusedGraphSoftmaxIndex`](doc/graph_softmax_index.md) | Normalize attention logits over graph neighborhoods, with optional soft capping and exponential rescaling or dropout. | EquiformerV3; TACE/TECE attention integration targets | CSR and raw-index fusion; Triton first-order backward |
 | Graph attention | [`FusedAttenAlpha`](doc/attention_alpha.md) | Fuse normalization, activation, dropout, and weighted reduction in graph attention; Triton first-order backward | EquiformerV3; TACE/TECE attention integration targets | Fused Norm + Act + Dropout + Reduce |
 | Equivariant Gate| [`FusedEquivariantGate`](doc/equivariant_gate.md) | Fuse scalar activations with broadcast gating of higher-order features. | EquFlash, SevenNet, NequIP; EquiformerV3 gate variants | Fused e3nn.nn.Gate |
 | Equivariant normalization | [`FusedEquivariantLayerNorm`](doc/layernorm.md) | Normalize features while preserving the required SO(3) representation structure. | EquiformerV3, EquiformerV2 | Fused statistics and affine transformation; first-order backward |
 | Equivariant dropout | [`FusedEquivariantDropout`](doc/equivariant_dropout.md) | Apply dropout with masks shared across components as required to preserve equivariance. | EquiformerV3 | Fused Dropout |
 
 Graph softmax operates on attention weights; it supports equivariant attention but does not itself perform a representation rotation or tensor-product coupling.
+
+GraphSoftmax keeps two explicit interfaces: the [CSR route](doc/graph_softmax.md)
+can reuse topology and contiguous node order, while the
+[raw-index route](doc/graph_softmax_index.md) avoids CSR construction and feature
+sorting when topology changes. Both are validated on H100 and Hygon; choose
+using the measured full-call cost for the intended graph distribution.
 
 ### Equivariant LayerNorm
 

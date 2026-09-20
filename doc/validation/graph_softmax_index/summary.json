@@ -1,0 +1,622 @@
+{
+  "date": "2026-09-18",
+  "scope": "Raw-index GraphSoftmax forward and first-order backward; CSR topology rebuilt on every comparison call",
+  "base_commit": "1f9b4a3c5b61d5320c924459afa10e34e25e064b",
+  "source_sha256": {
+    "fasteq/triton/graph_softmax_index.py": "a6418a77d88f6892c9fd267e075fe29576476756f6b9d813cb88ecd89123a081",
+    "fasteq/triton/graph_softmax.py": "df6315ecd5e179ee52e62a8b0da10401b04ed85bda1ef6be44c7034a87d280c8",
+    "fasteq/triton/graph_edge_layout.py": "d159a14695f5612e00975e27cdd09c14b6141ba1acb5ce80a7d312349f02a2f5",
+    "test/test_triton_graph_softmax_index.py": "d8b0f04787442c54a9329a16d64942f17298861d9b7377e970d4022b3ecf387b",
+    "test/test_triton_graph_softmax_precision.py": "48ff6536494a5f244660657931558a3ea2ec625570b0a6df826a8ef58214404b",
+    "test/benchmark_triton_graph_softmax_index.py": "9c05c6394b00076e3cb08f0c5abd11b9d6651bbe148fb02824d708ebfcd9af2c"
+  },
+  "reference": {
+    "repository": "https://github.com/malixian/equiformer_v3",
+    "commit": "a7300c58df683dc99cb48027d5bfd4c887486c48",
+    "path": "experimental/models/equiformer_v3/softmax.py",
+    "sha256": "643467db97b6168f387c1d63bcc4af88af5ea5aed979325ce37ecd4c906b17b9"
+  },
+  "tolerances": {
+    "output": {
+      "atol": 3e-06,
+      "rtol": 3e-05
+    },
+    "gradients": {
+      "atol": 3e-05,
+      "rtol": 0.0003
+    }
+  },
+  "boundary_reference": "Only archived shared-rescale and proven single-neighbor/small-rescale cancellation boundaries use analytical/FP64 derivatives. Ordinary inputs retain native Torch FP32 tolerances. Zero-rescale components retain FP32 checks.",
+  "benchmark_method": {
+    "nodes": [
+      256,
+      4096,
+      32768,
+      262144
+    ],
+    "topologies": [
+      "random",
+      "interleaved",
+      "contiguous"
+    ],
+    "edges_per_node": 32,
+    "heads": 8,
+    "dtype": "float32",
+    "rescale_shape": "[E,1]",
+    "softcap": 3.0,
+    "eps": 1e-16,
+    "dropout": 0,
+    "warmups": 5,
+    "repeats": 20,
+    "statistic": "median synchronized wall milliseconds; GPU-event samples also retained",
+    "provider_order": "rotated",
+    "gradient_inputs": [
+      "logits",
+      "rescale"
+    ],
+    "topology_reuse": false,
+    "csr_rebuild": "Rebuild CSR on every invocation; keep original edge feature order.",
+    "packed_rebuild": "Rebuild sorted topology, pack features and restore output on every invocation; include inverse gradient copies.",
+    "input_generation": "Inputs generated before timing; fixed graph per case but no topology cache is reused."
+  },
+  "limitations": [
+    "First-order standalone operator tests; no full-model training, double backward or OOM limit claim.",
+    "Three synthetic edge distributions and four sizes; no universal winner between raw-index and CSR paths.",
+    "Scatter atomic sums have no fixed execution order; acceptance uses tolerances, not bitwise equality.",
+    "H100 shared host without exclusive reservation or locked clocks; compare providers within each device."
+  ],
+  "devices": {
+    "h100": {
+      "machine": {
+        "host": "gxn70",
+        "device": "NVIDIA H100 80GB HBM3",
+        "target": "GPUTarget(backend='cuda', arch=90, warp_size=32)",
+        "torch": "2.11.0+cu128",
+        "triton": "3.6.0",
+        "physical_gpu": 0
+      },
+      "junit": {
+        "tests": 105,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "junit_file": "h100/pytest.xml",
+      "performance": [
+        {
+          "file": "h100/perf_random_256.json",
+          "N": 256,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 0.3408011980354786,
+            "index_fused": 0.25706877931952477,
+            "csr_rebuild": 0.5082539282739162,
+            "packed_rebuild": 0.7173269987106323
+          },
+          "forward_backward_ms": {
+            "torch": 0.6205257959663868,
+            "index_fused": 0.5247723311185837,
+            "csr_rebuild": 0.785202719271183,
+            "packed_rebuild": 1.1091851629316807
+          }
+        },
+        {
+          "file": "h100/perf_random_4096.json",
+          "N": 4096,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 0.35473378375172615,
+            "index_fused": 0.1592719927430153,
+            "csr_rebuild": 0.41028205305337906,
+            "packed_rebuild": 0.5433894693851471
+          },
+          "forward_backward_ms": {
+            "torch": 0.5421396344900131,
+            "index_fused": 0.4163444973528385,
+            "csr_rebuild": 0.6819949485361576,
+            "packed_rebuild": 0.9400146082043648
+          }
+        },
+        {
+          "file": "h100/perf_random_32768.json",
+          "N": 32768,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 1.6521532088518143,
+            "index_fused": 0.2582366578280926,
+            "csr_rebuild": 0.5906489677727222,
+            "packed_rebuild": 0.6593288853764534
+          },
+          "forward_backward_ms": {
+            "torch": 2.8285481967031956,
+            "index_fused": 0.5945302546024323,
+            "csr_rebuild": 0.9967805817723274,
+            "packed_rebuild": 1.1636242270469666
+          }
+        },
+        {
+          "file": "h100/perf_random_262144.json",
+          "N": 262144,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 12.52390630543232,
+            "index_fused": 1.3818140141665936,
+            "csr_rebuild": 2.7770702727138996,
+            "packed_rebuild": 3.3335192129015923
+          },
+          "forward_backward_ms": {
+            "torch": 21.40265330672264,
+            "index_fused": 4.2089126072824,
+            "csr_rebuild": 5.363138392567635,
+            "packed_rebuild": 6.0272300615906715
+          }
+        },
+        {
+          "file": "h100/perf_interleaved_256.json",
+          "N": 256,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 0.22567715495824814,
+            "index_fused": 0.15800213441252708,
+            "csr_rebuild": 0.3839796409010887,
+            "packed_rebuild": 0.5052331835031509
+          },
+          "forward_backward_ms": {
+            "torch": 0.565885566174984,
+            "index_fused": 0.4967544227838516,
+            "csr_rebuild": 0.7060072384774685,
+            "packed_rebuild": 1.0207300074398518
+          }
+        },
+        {
+          "file": "h100/perf_interleaved_4096.json",
+          "N": 4096,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 0.3580162301659584,
+            "index_fused": 0.16408227384090424,
+            "csr_rebuild": 0.41827699169516563,
+            "packed_rebuild": 0.5501103587448597
+          },
+          "forward_backward_ms": {
+            "torch": 0.5443454720079899,
+            "index_fused": 0.4596821963787079,
+            "csr_rebuild": 0.7111462764441967,
+            "packed_rebuild": 0.9933523833751678
+          }
+        },
+        {
+          "file": "h100/perf_interleaved_32768.json",
+          "N": 32768,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 1.645995769649744,
+            "index_fused": 0.2290494740009308,
+            "csr_rebuild": 0.5470495671033859,
+            "packed_rebuild": 0.6288187578320503
+          },
+          "forward_backward_ms": {
+            "torch": 2.8262538835406303,
+            "index_fused": 0.5533951334655285,
+            "csr_rebuild": 0.8579576388001442,
+            "packed_rebuild": 1.0161646641790867
+          }
+        },
+        {
+          "file": "h100/perf_interleaved_262144.json",
+          "N": 262144,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 12.429411057382822,
+            "index_fused": 1.2337211519479752,
+            "csr_rebuild": 2.0606834441423416,
+            "packed_rebuild": 2.656092867255211
+          },
+          "forward_backward_ms": {
+            "torch": 21.30449702963233,
+            "index_fused": 4.033919889479876,
+            "csr_rebuild": 3.6273756995797157,
+            "packed_rebuild": 4.481934942305088
+          }
+        },
+        {
+          "file": "h100/perf_contiguous_256.json",
+          "N": 256,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 0.23013446480035782,
+            "index_fused": 0.16464199870824814,
+            "csr_rebuild": 0.3838352859020233,
+            "packed_rebuild": 0.51469961181283
+          },
+          "forward_backward_ms": {
+            "torch": 0.5516097880899906,
+            "index_fused": 0.495007261633873,
+            "csr_rebuild": 0.6975168362259865,
+            "packed_rebuild": 1.0135238990187645
+          }
+        },
+        {
+          "file": "h100/perf_contiguous_4096.json",
+          "N": 4096,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 0.36435481160879135,
+            "index_fused": 0.17755571752786636,
+            "csr_rebuild": 0.4503559321165085,
+            "packed_rebuild": 0.596651341766119
+          },
+          "forward_backward_ms": {
+            "torch": 0.5837981589138508,
+            "index_fused": 0.5105817690491676,
+            "csr_rebuild": 0.7858495227992535,
+            "packed_rebuild": 1.1135442182421684
+          }
+        },
+        {
+          "file": "h100/perf_contiguous_32768.json",
+          "N": 32768,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 1.7984998412430286,
+            "index_fused": 0.3310833126306534,
+            "csr_rebuild": 0.6457907147705555,
+            "packed_rebuild": 0.8543180301785469
+          },
+          "forward_backward_ms": {
+            "torch": 2.987312152981758,
+            "index_fused": 0.7617995142936707,
+            "csr_rebuild": 1.0007130913436413,
+            "packed_rebuild": 1.3667624443769455
+          }
+        },
+        {
+          "file": "h100/perf_contiguous_262144.json",
+          "N": 262144,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 13.27645918354392,
+            "index_fused": 1.5024547465145588,
+            "csr_rebuild": 2.0062564872205257,
+            "packed_rebuild": 2.4013356305658817
+          },
+          "forward_backward_ms": {
+            "torch": 22.166491486132145,
+            "index_fused": 3.692056518048048,
+            "csr_rebuild": 3.2624993473291397,
+            "packed_rebuild": 4.019279032945633
+          }
+        }
+      ],
+      "precision": {
+        "output": {
+          "max_abs": 2.980232238769531e-07,
+          "max_tolerance_ratio": 0.024441152811050415,
+          "bad": 0
+        },
+        "dx": {
+          "max_abs": 2.8312206268310547e-07,
+          "max_tolerance_ratio": 0.0038914019241929054,
+          "bad": 0
+        },
+        "dr": {
+          "max_abs": 1.430511474609375e-06,
+          "max_tolerance_ratio": 0.028613392263650894,
+          "bad": 0
+        }
+      },
+      "forward_backward_speedup_vs_torch": [
+        1.114346860830464,
+        6.003833196424452
+      ],
+      "csr_rebuild_faster_cases": [
+        {
+          "file": "h100/perf_contiguous_262144.json",
+          "N": 262144,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 13.27645918354392,
+            "index_fused": 1.5024547465145588,
+            "csr_rebuild": 2.0062564872205257,
+            "packed_rebuild": 2.4013356305658817
+          },
+          "forward_backward_ms": {
+            "torch": 22.166491486132145,
+            "index_fused": 3.692056518048048,
+            "csr_rebuild": 3.2624993473291397,
+            "packed_rebuild": 4.019279032945633
+          }
+        },
+        {
+          "file": "h100/perf_interleaved_262144.json",
+          "N": 262144,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 12.429411057382822,
+            "index_fused": 1.2337211519479752,
+            "csr_rebuild": 2.0606834441423416,
+            "packed_rebuild": 2.656092867255211
+          },
+          "forward_backward_ms": {
+            "torch": 21.30449702963233,
+            "index_fused": 4.033919889479876,
+            "csr_rebuild": 3.6273756995797157,
+            "packed_rebuild": 4.481934942305088
+          }
+        }
+      ]
+    },
+    "hygon": {
+      "machine": {
+        "host": "f11r1n20",
+        "device": "BW",
+        "target": "GPUTarget(backend='hip', arch='gfx936', warp_size=64)",
+        "torch": "2.7.1",
+        "triton": "3.1.0"
+      },
+      "junit": {
+        "tests": 105,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "junit_file": "hygon/pytest.xml",
+      "performance": [
+        {
+          "file": "hygon/perf_random_256.json",
+          "N": 256,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 0.43007556814700365,
+            "index_fused": 0.34594442695379257,
+            "csr_rebuild": 0.647359061986208,
+            "packed_rebuild": 0.9746579453349113
+          },
+          "forward_backward_ms": {
+            "torch": 0.8708719396963716,
+            "index_fused": 0.7391900289803743,
+            "csr_rebuild": 0.9628525003790855,
+            "packed_rebuild": 1.5797758242115378
+          }
+        },
+        {
+          "file": "hygon/perf_random_4096.json",
+          "N": 4096,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 0.4240454873070121,
+            "index_fused": 0.3437494160607457,
+            "csr_rebuild": 0.7458095205947757,
+            "packed_rebuild": 1.07111397664994
+          },
+          "forward_backward_ms": {
+            "torch": 0.8544365409761667,
+            "index_fused": 0.729380059055984,
+            "csr_rebuild": 1.0655639925971627,
+            "packed_rebuild": 1.6646821750327945
+          }
+        },
+        {
+          "file": "hygon/perf_random_32768.json",
+          "N": 32768,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 1.0174281196668744,
+            "index_fused": 0.6188430124893785,
+            "csr_rebuild": 2.3912115721032023,
+            "packed_rebuild": 1.9111901056021452
+          },
+          "forward_backward_ms": {
+            "torch": 2.326925517991185,
+            "index_fused": 1.3885584194213152,
+            "csr_rebuild": 4.0347130270674825,
+            "packed_rebuild": 2.9213684611022472
+          }
+        },
+        {
+          "file": "hygon/perf_random_262144.json",
+          "N": 262144,
+          "topology": "random",
+          "forward_ms": {
+            "torch": 8.066580980084836,
+            "index_fused": 5.413186037912965,
+            "csr_rebuild": 13.725840486586094,
+            "packed_rebuild": 13.908098451793194
+          },
+          "forward_backward_ms": {
+            "torch": 18.62254599109292,
+            "index_fused": 16.089542070403695,
+            "csr_rebuild": 24.093032465316355,
+            "packed_rebuild": 22.086211014539003
+          }
+        },
+        {
+          "file": "hygon/perf_interleaved_256.json",
+          "N": 256,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 0.4212500061839819,
+            "index_fused": 0.34483999479562044,
+            "csr_rebuild": 0.6450029322877526,
+            "packed_rebuild": 0.9697979548946023
+          },
+          "forward_backward_ms": {
+            "torch": 0.8481965633109212,
+            "index_fused": 0.7247194880619645,
+            "csr_rebuild": 0.9537576697766781,
+            "packed_rebuild": 1.5518200816586614
+          }
+        },
+        {
+          "file": "hygon/perf_interleaved_4096.json",
+          "N": 4096,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 0.42496505193412304,
+            "index_fused": 0.3435445250943303,
+            "csr_rebuild": 0.7547499844804406,
+            "packed_rebuild": 1.0811489773914218
+          },
+          "forward_backward_ms": {
+            "torch": 0.855841557495296,
+            "index_fused": 0.7288401247933507,
+            "csr_rebuild": 1.0702238650992513,
+            "packed_rebuild": 1.6826619394123554
+          }
+        },
+        {
+          "file": "hygon/perf_interleaved_32768.json",
+          "N": 32768,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 0.9953828994184732,
+            "index_fused": 0.6292085163295269,
+            "csr_rebuild": 2.2371745435521007,
+            "packed_rebuild": 1.9306255271658301
+          },
+          "forward_backward_ms": {
+            "torch": 2.290895557962358,
+            "index_fused": 1.4545039739459753,
+            "csr_rebuild": 3.9459720719605684,
+            "packed_rebuild": 2.9017183696851134
+          }
+        },
+        {
+          "file": "hygon/perf_interleaved_262144.json",
+          "N": 262144,
+          "topology": "interleaved",
+          "forward_ms": {
+            "torch": 7.269460940733552,
+            "index_fused": 3.6128279753029346,
+            "csr_rebuild": 15.429807943291962,
+            "packed_rebuild": 12.679877108894289
+          },
+          "forward_backward_ms": {
+            "torch": 17.40911405067891,
+            "index_fused": 10.708080953918397,
+            "csr_rebuild": 31.37180337216705,
+            "packed_rebuild": 21.24090993311256
+          }
+        },
+        {
+          "file": "hygon/perf_contiguous_256.json",
+          "N": 256,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 0.419270945712924,
+            "index_fused": 0.33707451075315475,
+            "csr_rebuild": 0.6384028820320964,
+            "packed_rebuild": 0.9539980674162507
+          },
+          "forward_backward_ms": {
+            "torch": 0.8433910552412271,
+            "index_fused": 0.714123947545886,
+            "csr_rebuild": 0.9443775052204728,
+            "packed_rebuild": 1.5393755165860057
+          }
+        },
+        {
+          "file": "hygon/perf_contiguous_4096.json",
+          "N": 4096,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 0.421875505708158,
+            "index_fused": 0.3458750434219837,
+            "csr_rebuild": 0.7527300622314215,
+            "packed_rebuild": 1.077069086022675
+          },
+          "forward_backward_ms": {
+            "torch": 0.8529165061190724,
+            "index_fused": 0.722069526091218,
+            "csr_rebuild": 1.0597589425742626,
+            "packed_rebuild": 1.6604119446128607
+          }
+        },
+        {
+          "file": "hygon/perf_contiguous_32768.json",
+          "N": 32768,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 1.2869220227003098,
+            "index_fused": 0.704023870639503,
+            "csr_rebuild": 1.5901060542091727,
+            "packed_rebuild": 1.8098584841936827
+          },
+          "forward_backward_ms": {
+            "torch": 2.6724700583145022,
+            "index_fused": 1.4954344369471073,
+            "csr_rebuild": 2.1583784837275743,
+            "packed_rebuild": 2.59884400293231
+          }
+        },
+        {
+          "file": "hygon/perf_contiguous_262144.json",
+          "N": 262144,
+          "topology": "contiguous",
+          "forward_ms": {
+            "torch": 8.973893010988832,
+            "index_fused": 3.895466448739171,
+            "csr_rebuild": 8.920038002543151,
+            "packed_rebuild": 9.790519019588828
+          },
+          "forward_backward_ms": {
+            "torch": 19.562927540391684,
+            "index_fused": 10.584988980554044,
+            "csr_rebuild": 13.297840021550655,
+            "packed_rebuild": 15.035802964121103
+          }
+        }
+      ],
+      "precision": {
+        "output": {
+          "max_abs": 3.2782554626464844e-07,
+          "max_tolerance_ratio": 0.027745768427848816,
+          "bad": 0
+        },
+        "dx": {
+          "max_abs": 2.384185791015625e-07,
+          "max_tolerance_ratio": 0.0023833296727389097,
+          "bad": 0
+        },
+        "dr": {
+          "max_abs": 1.6689300537109375e-06,
+          "max_tolerance_ratio": 0.017491616308689117,
+          "bad": 0
+        }
+      },
+      "forward_backward_speedup_vs_torch": [
+        1.1574316975340535,
+        1.8481764672907304
+      ],
+      "csr_rebuild_faster_cases": []
+    }
+  },
+  "files_sha256": {
+    "h100/pytest.xml": "9945dd82ec8137ae07564d91f27975dbd8a2bf88422ca1b5aecda3836477f9d0",
+    "h100/perf_random_256.json": "777e2f89f4648d2f6a023880fa1f45e2da26c034b46e8b00c2dd9b968d434f63",
+    "h100/perf_random_4096.json": "3a92214ff70fdc0567123b69386919df577899f06b732097bdc3907636c2761c",
+    "h100/perf_random_32768.json": "67b5b6bc826d0b10dbc75c584a1a5f6877bcb3a43879dce144abefe5ed6e8d60",
+    "h100/perf_random_262144.json": "8a72666f242066235d2b1cabe113820dc1656ed3dab77adc5e642c72c7b01021",
+    "h100/perf_interleaved_256.json": "3fe90e399e981b38a0e70a589a21c9d57e23a3293b8af839864d874dab907e57",
+    "h100/perf_interleaved_4096.json": "623720739310facab8d26c097f2ee39d6965383865a09e670c05b2f6f935194c",
+    "h100/perf_interleaved_32768.json": "15728918168e7a9a5f08ec7851ae1b095411e6746cde79da43c0ad1458feb9d0",
+    "h100/perf_interleaved_262144.json": "6d8945a19454ad24e05864fcb7e40a0beed673db831f10b54b08cd90520be414",
+    "h100/perf_contiguous_256.json": "717bd5cbcbb5dd76bd9355a0e3c6b6f82103ce917d603657bbaa691ea08c0d08",
+    "h100/perf_contiguous_4096.json": "bfbc3cc69c85e17573c143e9f30d5db8890e8ac750c0758ccecfee5d6a5f239b",
+    "h100/perf_contiguous_32768.json": "f3cf29ebc7704bfc7267046225241556c32fc2495439dcd4e10ebd7fca63fa6d",
+    "h100/perf_contiguous_262144.json": "850f3c4f50339a4deeac742a8f11244a82d1ad7c57191cf3721f4fb17f8ceffb",
+    "hygon/pytest.xml": "7f857bd17cf10a6f2453278ac8c02f4be786a31b680e1f3b9624e9dff8f33892",
+    "hygon/perf_random_256.json": "9f352e7526823d90ddfd78bd5441196f8dd230d1d0cafd21e21034e4d4f68ae4",
+    "hygon/perf_random_4096.json": "338ad2e5e2db59a64d22ceac2ffa53b53495206986ca15edf9f8f09d284ee560",
+    "hygon/perf_random_32768.json": "493863200e1b6cb2ea7550fc28853dbe8d399c8c7d5f59da97343a4ecb11e85a",
+    "hygon/perf_random_262144.json": "1080ba053bcb3bf6c3c7a9c63f8c9a3737664ae4aa8fee983ad7953be9f3203f",
+    "hygon/perf_interleaved_256.json": "0251c75295cfd80c6ad21fef8e181e9a183dfcca79fa9678e646e3521fea6b13",
+    "hygon/perf_interleaved_4096.json": "87b2a5c8835c32723fd5f990b5cc03de5d20b0d4090095df87747149a297f7a5",
+    "hygon/perf_interleaved_32768.json": "dc55247e8b773b16789e6c0d22018a5ba0a3b0141845a5b8d908943cffd57cca",
+    "hygon/perf_interleaved_262144.json": "d0f073669ff81dd9e423d9b92d9c8935f04316985dc0ae6463e35da77871574b",
+    "hygon/perf_contiguous_256.json": "20ef7b198601d47b28ec1780d207aa0b9a2fa4efc953d207804477e6b29bdc1a",
+    "hygon/perf_contiguous_4096.json": "fd427663fa06eb753398cc95e89bc1f37ab132683655e4f70ba2d09b0a7e4e18",
+    "hygon/perf_contiguous_32768.json": "8ebcbc95f42285b541fd61078856d8680cd47c18c1106f7effd2c6ef525f15af",
+    "hygon/perf_contiguous_262144.json": "d42fff8c8f58aa6cc8ea8de7c1063d1f207f842791ae0f9c5037108886a47163"
+  }
+}

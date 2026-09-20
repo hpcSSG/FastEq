@@ -1,6 +1,6 @@
 {
   "scope": "Latest available results matching the production operator source hashes in this checkout",
-  "production_base_commit": "7546658c05ff95a80985be28d45072caab1d94c2",
+  "production_base_commit": "1f9b4a3c5b61d5320c924459afa10e34e25e064b",
   "runtime_sha256": {
     "fasteq/triton/graph_softmax.py": "df6315ecd5e179ee52e62a8b0da10401b04ed85bda1ef6be44c7034a87d280c8",
     "fasteq/triton/graph_edge_layout.py": "d159a14695f5612e00975e27cdd09c14b6141ba1acb5ce80a7d312349f02a2f5",
@@ -8,7 +8,8 @@
     "fasteq/triton/fused_equivariant_layer_norm.py": "35d689624e48422801cfdb0b8461243f7a88ee012dc20122206433098a90da5d",
     "fasteq/triton/fused_equivariant_gate.py": "3a9e8211dd2c16ed96f47cdcbfa30d860ef521cd23b63c69e432eacf46834858",
     "fasteq/triton/fused_gate_act.py": "b51d48663d08a6b7a9c0c71dd9fafb46618465f2c62bd1b8ca4427b55440f234",
-    "fasteq/triton/fused_equivariant_dropout.py": "48444ccc2b51bf6268642fc071d4e04caa4e235354a1896aa051091db86abb3a"
+    "fasteq/triton/fused_equivariant_dropout.py": "48444ccc2b51bf6268642fc071d4e04caa4e235354a1896aa051091db86abb3a",
+    "fasteq/triton/graph_softmax_index.py": "a6418a77d88f6892c9fd267e075fe29576476756f6b9d813cb88ecd89123a081"
   },
   "test_and_harness_sha256": {
     "test/test_triton_graph_softmax_precision.py": "48ff6536494a5f244660657931558a3ea2ec625570b0a6df826a8ef58214404b",
@@ -22,10 +23,12 @@
     "test/test_triton_equivariant_layer_norm_precision.py": "33c6910d4e0d1a53302da7b5354e39816d5a9494b5a7d1f3df48c553d85537dc",
     "test/eqv3_validation/cases.py": "d7ab7d2fe2963601e583b632604e0a111f08e43ec06864551ed756e8df703ebf",
     "test/eqv3_validation/run.py": "6b9e6af2a53c37c24deff4b914bcb3c1601adb5440a4bb4c85e1cba107d2b9b9",
-    "test/check_eqv3_validation_records.py": "553ec5001c32c8b28425ab0ecd72306f8b13802880f6ee9a2060b7dbdc8d0453",
+    "test/check_eqv3_validation_records.py": "a209fff3567501c99e831d9f6df1d181111e0362bb67fe226fbdc0af8512d405",
     "test/data/graph_softmax/h100.json": "db5b8363d6a87dfeed356a0039aae9a3c86d788bb610602a75877f210d1850f6",
     "test/data/graph_softmax/hygon.json": "1c4f4594eba5270af54fe58bd2a48a0928ffde7efadff95424b8f1db5f177ef3",
-    "test/benchmark_triton_attention_alpha_matched.py": "5d3c9df94b827c9abf7d7cd96eac5483f86354171aebb643e516f925935ed738"
+    "test/benchmark_triton_attention_alpha_matched.py": "5d3c9df94b827c9abf7d7cd96eac5483f86354171aebb643e516f925935ed738",
+    "test/test_triton_graph_softmax_index.py": "d8b0f04787442c54a9329a16d64942f17298861d9b7377e970d4022b3ecf387b",
+    "test/benchmark_triton_graph_softmax_index.py": "9c05c6394b00076e3cb08f0c5abd11b9d6651bbe148fb02824d708ebfcd9af2c"
   },
   "groups": {
     "graph_softmax": "graph_softmax/summary.json",
@@ -45,12 +48,13 @@
     "layernorm_scaling": [
       "norm/hygon/manifest.json",
       "separable/hygon/manifest.json"
-    ]
+    ],
+    "graph_softmax_index": "graph_softmax_index/summary.json"
   },
   "selection_policy": "Measured runtime source must match byte for byte. Old mixed-operator archives were filtered by operator; retained point and check entries are unchanged. No mismatched-source H100 LayerNorm performance retained. Current failures are not filtered out.",
-  "harness_adaptations": "Alpha matched benchmark uses the measured reference arithmetic, CPU-staged comparisons and rotated event sampling, with portable module paths and an optional control; diagnostic assembly dumps omitted. Current Alpha records select only current-source checks and Torch/current timing arrays without changing values. The stress helper and scaling harness retain their previously documented path adaptations. GraphSoftmax benchmark unchanged.",
+  "harness_adaptations": "Alpha matched benchmark uses the measured reference arithmetic, CPU-staged comparisons and rotated event sampling, with portable module paths and an optional control; diagnostic assembly dumps omitted. Current Alpha records select only current-source checks and Torch/current timing arrays without changing values. The stress helper and scaling harness retain their previously documented path adaptations. GraphSoftmax benchmark unchanged. Raw-index GraphSoftmax operator, regression suite and benchmark are byte-identical to the sources measured on both devices; raw JSON and JUnit reports are unchanged.",
   "artifacts_sha256": {
-    "REPRODUCE.md": "e642b64ac9712cbd459f2e0d8ec7108add372417c54883b82b4b92df0132a31c",
+    "REPRODUCE.md": "2253b546e46932fe6801f081faf182bc40ae5ebc610ecdb599225868d39f77e3",
     "attention_alpha/h100/perf_131072.json": "4d50883677be9b6af18a5da21e417b1c79b8efb614d1065ef20d7bb72ab33227",
     "attention_alpha/h100/perf_32768.json": "a51eb197f3cd7947086e227326423c6e5eac4bfd0ec9c8121e901df548ef511f",
     "attention_alpha/h100/perf_4096.json": "65c83b145303e8e85f3a6ed4b77aa156b9b48beb12ef2f37f23756c5e4d9f70c",
@@ -103,6 +107,33 @@
     "graph_softmax/hygon/perf_random.json": "28620991d8d156d120930c3a54ab25707a1fb3c8da40df95f52c2a416b2685a4",
     "graph_softmax/hygon/pytest.xml": "1478c6ef02c7c6cc5c1e56e3fd086ab95891bce49cb1485681c615a052408e94",
     "graph_softmax/summary.json": "4c42c8c46136c38911bea6ff0b658557113d001724dffe285030d13dedcbcd52",
+    "graph_softmax_index/h100/perf_contiguous_256.json": "717bd5cbcbb5dd76bd9355a0e3c6b6f82103ce917d603657bbaa691ea08c0d08",
+    "graph_softmax_index/h100/perf_contiguous_262144.json": "850f3c4f50339a4deeac742a8f11244a82d1ad7c57191cf3721f4fb17f8ceffb",
+    "graph_softmax_index/h100/perf_contiguous_32768.json": "f3cf29ebc7704bfc7267046225241556c32fc2495439dcd4e10ebd7fca63fa6d",
+    "graph_softmax_index/h100/perf_contiguous_4096.json": "bfbc3cc69c85e17573c143e9f30d5db8890e8ac750c0758ccecfee5d6a5f239b",
+    "graph_softmax_index/h100/perf_interleaved_256.json": "3fe90e399e981b38a0e70a589a21c9d57e23a3293b8af839864d874dab907e57",
+    "graph_softmax_index/h100/perf_interleaved_262144.json": "6d8945a19454ad24e05864fcb7e40a0beed673db831f10b54b08cd90520be414",
+    "graph_softmax_index/h100/perf_interleaved_32768.json": "15728918168e7a9a5f08ec7851ae1b095411e6746cde79da43c0ad1458feb9d0",
+    "graph_softmax_index/h100/perf_interleaved_4096.json": "623720739310facab8d26c097f2ee39d6965383865a09e670c05b2f6f935194c",
+    "graph_softmax_index/h100/perf_random_256.json": "777e2f89f4648d2f6a023880fa1f45e2da26c034b46e8b00c2dd9b968d434f63",
+    "graph_softmax_index/h100/perf_random_262144.json": "8a72666f242066235d2b1cabe113820dc1656ed3dab77adc5e642c72c7b01021",
+    "graph_softmax_index/h100/perf_random_32768.json": "67b5b6bc826d0b10dbc75c584a1a5f6877bcb3a43879dce144abefe5ed6e8d60",
+    "graph_softmax_index/h100/perf_random_4096.json": "3a92214ff70fdc0567123b69386919df577899f06b732097bdc3907636c2761c",
+    "graph_softmax_index/h100/pytest.xml": "9945dd82ec8137ae07564d91f27975dbd8a2bf88422ca1b5aecda3836477f9d0",
+    "graph_softmax_index/hygon/perf_contiguous_256.json": "20ef7b198601d47b28ec1780d207aa0b9a2fa4efc953d207804477e6b29bdc1a",
+    "graph_softmax_index/hygon/perf_contiguous_262144.json": "d42fff8c8f58aa6cc8ea8de7c1063d1f207f842791ae0f9c5037108886a47163",
+    "graph_softmax_index/hygon/perf_contiguous_32768.json": "8ebcbc95f42285b541fd61078856d8680cd47c18c1106f7effd2c6ef525f15af",
+    "graph_softmax_index/hygon/perf_contiguous_4096.json": "fd427663fa06eb753398cc95e89bc1f37ab132683655e4f70ba2d09b0a7e4e18",
+    "graph_softmax_index/hygon/perf_interleaved_256.json": "0251c75295cfd80c6ad21fef8e181e9a183dfcca79fa9678e646e3521fea6b13",
+    "graph_softmax_index/hygon/perf_interleaved_262144.json": "d0f073669ff81dd9e423d9b92d9c8935f04316985dc0ae6463e35da77871574b",
+    "graph_softmax_index/hygon/perf_interleaved_32768.json": "dc55247e8b773b16789e6c0d22018a5ba0a3b0141845a5b8d908943cffd57cca",
+    "graph_softmax_index/hygon/perf_interleaved_4096.json": "87b2a5c8835c32723fd5f990b5cc03de5d20b0d4090095df87747149a297f7a5",
+    "graph_softmax_index/hygon/perf_random_256.json": "9f352e7526823d90ddfd78bd5441196f8dd230d1d0cafd21e21034e4d4f68ae4",
+    "graph_softmax_index/hygon/perf_random_262144.json": "1080ba053bcb3bf6c3c7a9c63f8c9a3737664ae4aa8fee983ad7953be9f3203f",
+    "graph_softmax_index/hygon/perf_random_32768.json": "493863200e1b6cb2ea7550fc28853dbe8d399c8c7d5f59da97343a4ecb11e85a",
+    "graph_softmax_index/hygon/perf_random_4096.json": "338ad2e5e2db59a64d22ceac2ffa53b53495206986ca15edf9f8f09d284ee560",
+    "graph_softmax_index/hygon/pytest.xml": "7f857bd17cf10a6f2453278ac8c02f4be786a31b680e1f3b9624e9dff8f33892",
+    "graph_softmax_index/summary.json": "b86d860471eb419f9e227e8ea9db6e9cda43d07bba8d5d18173044d55198dc97",
     "layernorm/h100/pytest.xml": "4b510b1a937baacca09d1ace1652d1f59bc1d456e8d26a76e7080a11fb800b82",
     "layernorm/h100/summary.json": "c4bad9b97999a3fc0ca09894704f46cb1e5d0b3b24b4cca3f3d08f21d60e897d",
     "layernorm/hygon/pytest.xml": "2b557c4ffc44f17eec275d11ff67dd3a79944ad3f75cc49e65d8a562b5a6385a",
@@ -121,5 +152,6 @@
     "separable/hygon/manifest.json": "320e17a55dda4acae2a5c335b3519dcb2bbf9bc5dd06d482e96e33638008be3c",
     "separable/hygon/paired.csv": "6e6789ba349a5f4d0b989cfb1257ed8dd7246e40cc6999ea062eecbe67adab39",
     "separable/hygon/raw_results.json.gz": "058ecf4f5d73862a0af52b08a7b4b16dfffc363de72be1ef12b725e1c8860cec"
-  }
+  },
+  "validation_policy": "Every operator code change requires relevant accuracy and performance tests on Hygon and H100 using identical source hashes. An unavailable platform remains pending; unchanged sources may retain matching evidence."
 }

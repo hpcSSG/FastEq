@@ -6,6 +6,12 @@ creates a new independent run and must not overwrite the retained evidence.
 Reserve sufficient host RAM for the scaling harness, which saves one
 implementation's outputs to host memory for full comparisons.
 
+Every operator code change requires relevant accuracy and performance checks
+on both Hygon and H100 using identical source hashes. If either platform is
+unavailable, its validation remains pending. Unchanged sources may retain
+their existing matched evidence; a documentation-only update does not imply
+a new GPU run.
+
 ## References and environment
 
 Run from the repository root. Supply unmodified reference files matching the
@@ -40,6 +46,8 @@ the Alpha large-test flag are required for the published zero-skip suite counts.
 ```bash
 python -m pytest -q test/test_triton_graph_softmax_precision.py \
   test/test_triton_graph_edge_layout.py --junitxml="$run_dir/graph_softmax.xml"
+python -m pytest -q test/test_triton_graph_softmax_index.py \
+  --junitxml="$run_dir/graph_softmax_index.xml"
 python -m pytest -q test/test_triton_attention_alpha.py \
   --junitxml="$run_dir/attention_alpha.xml"
 python -m pytest -q test/test_triton_equivariant_layer_norm.py \
@@ -49,7 +57,8 @@ python -m pytest -q test/test_triton_equivariant_layer_norm.py \
 python test/stress_triton_attention_alpha.py --out "$run_dir/alpha_stress.json"
 ```
 
-Expected retained suite counts are GraphSoftmax 215, AttentionAlpha 67, and
+Expected retained suite counts are GraphSoftmax CSR 215, GraphSoftmax raw index
+105, AttentionAlpha 67, and
 LayerNorm 218 per device, plus 13 AttentionAlpha stress cases. Individual-suite
 passes do not override the separately documented Separable scaling failure.
 The retained Alpha evidence has 66 existing tests and one separately executed
@@ -93,6 +102,28 @@ unchanged. The original comparison-file checksums are listed in the Alpha
 summary. The older general Alpha harness remains the helper used by the
 stress script, not the source of the current performance table. GraphSoftmax's
 benchmark is byte-identical to its measured script.
+
+## GraphSoftmax without topology reuse
+
+```bash
+for topology in random interleaved contiguous; do
+  for n in 256 4096 32768 262144; do
+    python test/benchmark_triton_graph_softmax_index.py --n "$n" \
+      --topology "$topology" --repeat 20 \
+      --out "$run_dir/graph_softmax_index_${topology}_${n}.json"
+  done
+done
+```
+
+This byte-identical measured script compares native EQv3 Torch, raw-index
+fusion, original-order CSR rebuilt on every call, and sorted CSR rebuilt with
+feature packing/output restoration on every call. Inputs are generated before
+timing; topology remains fixed within each case but neither CSR path reuses a
+mapping. The separate regression test checks in-place topology mutations.
+Each of the 12 cases checks full output, logits and rescale gradients before
+timing. Five warmups and 20 rotated samples record both synchronized wall and
+GPU-event milliseconds. The raw-index documentation reports wall medians;
+the earlier reusable-CSR tables report GPU-event medians.
 
 ## Gate, Dropout and LayerNorm scaling
 
