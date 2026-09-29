@@ -209,12 +209,158 @@ def _inverse_angles_kernel(A, B, C, OA, OB, OC, NA: tl.constexpr,
     tl.store(OC + i, -tl.load(A + i, i < NA, other=0), i < NA)
 
 
+@triton.jit
+def _matrix_to_angles_kernel(R, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = i < N
+    r01 = tl.load(R + 9 * i + 1, valid, other=0)
+    r21 = tl.load(R + 9 * i + 7, valid, other=0)
+    r11 = tl.load(R + 9 * i + 4, valid, other=1)
+    a = libdevice.atan2(r01, r21)
+    b = libdevice.acos(tl.minimum(1., tl.maximum(-1., r11)))
+    ca, sa = tl.cos(a), tl.sin(a)
+    r02 = tl.load(R + 9 * i + 2, valid, other=0)
+    r22 = tl.load(R + 9 * i + 8, valid, other=0)
+    r00 = tl.load(R + 9 * i, valid, other=1)
+    r20 = tl.load(R + 9 * i + 6, valid, other=0)
+    c = libdevice.atan2(ca * r02 - sa * r22, ca * r00 - sa * r20)
+    tl.store(OUT + i * 3, a, valid)
+    tl.store(OUT + i * 3 + 1, b, valid)
+    tl.store(OUT + i * 3 + 2, c, valid)
+
+
+@triton.jit
+def _matrix_to_axis_angle_kernel(R, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = i < N
+    r00 = tl.load(R + 9 * i, valid, other=1)
+    r11 = tl.load(R + 9 * i + 4, valid, other=1)
+    r22 = tl.load(R + 9 * i + 8, valid, other=1)
+    x = tl.load(R + 9 * i + 7, valid, other=0) - tl.load(R + 9 * i + 5, valid, other=0)
+    y = tl.load(R + 9 * i + 2, valid, other=0) - tl.load(R + 9 * i + 6, valid, other=0)
+    z = tl.load(R + 9 * i + 3, valid, other=0) - tl.load(R + 9 * i + 1, valid, other=0)
+    norm = tl.maximum(tl.sqrt(x*x+y*y+z*z), 1.e-12)
+    angle = libdevice.acos(tl.minimum(1., tl.maximum(-1., (r00+r11+r22-1.)/2.)))
+    tl.store(OUT + i * 4, x / norm, valid)
+    tl.store(OUT + i * 4 + 1, y / norm, valid)
+    tl.store(OUT + i * 4 + 2, z / norm, valid)
+    tl.store(OUT + i * 4 + 3, angle, valid)
+
+
+@triton.jit
+def _matrix_mul3_kernel(A, B, OUT, N: tl.constexpr, BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = i < N
+    for row in tl.static_range(3):
+        for col in tl.static_range(3):
+            value = tl.load(A + i*9 + row*3, valid, other=0) * tl.load(B + i*9 + col, valid, other=0)
+            for inner in tl.static_range(1, 3):
+                value += (tl.load(A + i*9 + row*3 + inner, valid, other=0)
+                          * tl.load(B + i*9 + inner*3 + col, valid, other=0))
+            tl.store(OUT + i*9 + row*3 + col, value, valid)
+
+
 def identity_angles(*shape, requires_grad=False, dtype=None, device=None):
     ref = torch.empty((), dtype=dtype, device=device)
     if not ref.is_cuda:
         raise ValueError("Triton implementation requires a GPU device")
     out = _run(0, shape, 3, ref.dtype, ref.device)
     return tuple(x.requires_grad_(requires_grad) for x in out.unbind(-1))
+
+
+@triton.jit
+def _rand_angles_transform_kernel(U_AG, U_B, OUT, N: tl.constexpr,
+                                  BLOCK: tl.constexpr):
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = i < N
+    u_alpha = tl.load(U_AG + i, valid, other=0)
+    u_gamma = tl.load(U_AG + N + i, valid, other=0)
+    u_beta = tl.load(U_B + i, valid, other=0)
+    tl.store(OUT + i, u_alpha * 6.283185307179586, valid)
+    tl.store(OUT + N + i, libdevice.acos((u_beta * 2.0) - 1.0), valid)
+    tl.store(OUT + 2 * N + i, u_gamma * 6.283185307179586, valid)
+
+
+def rand_angles(*shape, requires_grad=False, dtype=None, device=None):
+    """Random Euler angles with the same PyTorch RNG draws as e3nn."""
+    # Keep the two calls, their shapes, and their order identical to e3nn.
+    u_alpha_gamma = torch.rand(2, *shape, dtype=dtype, device=device)
+    u_beta = torch.rand(shape, dtype=dtype, device=device)
+    check_gpu(u_alpha_gamma, u_beta)
+    n = u_beta.numel()
+    angles = torch.empty((3, *shape), dtype=u_beta.dtype, device=u_beta.device)
+    if n:
+        _rand_angles_transform_kernel[grid(n)](
+            u_alpha_gamma, u_beta, angles, n, 256, enable_fp_fusion=False
+        )
+    return tuple(angles[i].detach().requires_grad_(requires_grad) for i in range(3))
+
+
+def rand_matrix(*shape, requires_grad=False, dtype=None, device=None):
+    matrix = angles_to_matrix(*rand_angles(*shape, dtype=dtype, device=device))
+    return matrix.detach().requires_grad_(requires_grad)
+
+
+def rand_quaternion(*shape, requires_grad=False, dtype=None, device=None):
+    quaternion = angles_to_quaternion(*rand_angles(*shape, dtype=dtype, device=device))
+    return quaternion.detach().requires_grad_(requires_grad)
+
+
+def rand_axis_angle(*shape, requires_grad=False, dtype=None, device=None):
+    axis, angle = angles_to_axis_angle(*rand_angles(*shape, dtype=dtype, device=device))
+    return axis.detach().requires_grad_(requires_grad), angle.detach().requires_grad_(requires_grad)
+
+
+def matrix_to_angles(matrix):
+    check_gpu(matrix)
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError("expected (..., 3, 3) matrices")
+    out = matrix.new_empty((*matrix.shape[:-2], 3))
+    if out.numel():
+        _matrix_to_angles_kernel[grid(matrix.numel() // 9)](
+            matrix.contiguous(), out, matrix.numel() // 9, 256
+        )
+    return out.unbind(-1)
+
+
+def matrix_to_axis_angle(matrix):
+    check_gpu(matrix)
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError("expected (..., 3, 3) matrices")
+    out = matrix.new_empty((*matrix.shape[:-2], 4))
+    if out.numel():
+        _matrix_to_axis_angle_kernel[grid(matrix.numel() // 9)](
+            matrix.contiguous(), out, matrix.numel() // 9, 256
+        )
+    return out[..., :3], out[..., 3]
+
+
+def compose_angles(a1, b1, c1, a2, b2, c2):
+    a1, b1, c1, a2, b2, c2 = _broadcast(a1, b1, c1, a2, b2, c2)
+    left = angles_to_matrix(a1, b1, c1)
+    right = angles_to_matrix(a2, b2, c2)
+    out = torch.empty_like(left)
+    if out.numel():
+        _matrix_mul3_kernel[grid(out.numel() // 9)](
+            left, right, out, out.numel() // 9, 256
+        )
+    return matrix_to_angles(out)
+
+
+def matrix_to_quaternion(matrix):
+    return axis_angle_to_quaternion(*matrix_to_axis_angle(matrix))
+
+
+def angles_to_axis_angle(alpha, beta, gamma):
+    return matrix_to_axis_angle(angles_to_matrix(alpha, beta, gamma))
+
+
+def quaternion_to_angles(quaternion):
+    return matrix_to_angles(quaternion_to_matrix(quaternion))
+
+
+def axis_angle_to_angles(axis, angle):
+    return matrix_to_angles(axis_angle_to_matrix(axis, angle))
 
 
 def inverse_angles(a, b, c):

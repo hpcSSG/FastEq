@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from .._common import check_gpu, grid
+from e3nn.math._linalg import _conditional_script, orthonormalize, complete_basis
 
 
 @triton.jit

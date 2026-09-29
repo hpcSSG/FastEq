@@ -1,32 +1,58 @@
-# e3nn Triton single-kernel batch
+# e3nn math and o3 Triton counterparts
 
-Baseline: e3nn `main` at `2aa7f58440a06b15352a2cbce01fa4c26f824969`.
+Source baseline: e3nn `main` at `2aa7f58440a06b15352a2cbce01fa4c26f824969`.
 
-This optional `e3nn.triton` package provides the 33 forward entry points selected
-from `o3` and `math`. It does not patch the upstream `e3nn.o3` or `e3nn.math`
-exports. Import the matching function or class explicitly, for example:
+This optional package has a matching module for every `.py` file directly under
+`e3nn/math` and `e3nn/o3`, excluding `o3/_irreps.py`, `o3/irrep/`,
+`o3/_tensor_product/`, and `o3/experimental/`. Every top-level function and
+class in the included files is accessible from its matching module. The
+package root exports the same selected public names as e3nn's `math` and `o3`
+packages. The upstream e3nn implementation remains unchanged.
+
+Import into FastEq by placing the `e3nn/triton` directory under
+`fasteq/e3nn/triton`:
 
 ```python
-from e3nn.triton.o3._rotation import angles_to_matrix
-from e3nn.triton.math._bessel import bessel
+import fasteq.e3nn.triton.o3._rotation as tr
+from fasteq.e3nn.triton.o3._s2grid import ToS2Grid, rfft
 ```
 
-The one-kernel classification counts the **main GPU calculation**. Python
-allocation, tensor views and first-use coefficient preparation are outside this
-count. Broadcasting through `.contiguous()` may launch a copy for expanded
-inputs. `SO3Grid`, `ToS2Grid`, and `FromS2Grid` inherit their original setup
-and replace only the listed methods or properties. The angular harmonics
-module caches polynomial coefficients on first use for each device and dtype.
+## Implementation choices
 
-GPU tensors in `float32` or `float64` are required. CUDA is the initial target;
-HIP compilation and numerical parity have not been checked. Forward functions using
-bare Triton launches do **not** currently implement autograd; the explicit
-`_SoftUnitStep.backward` is the exception. Do not use this package as a drop-in
-training replacement until the corresponding backward and double backward
-paths are implemented and verified.
+- Triton GPU paths cover the existing 33 selected entries, S2 Fourier
+  transforms and grid forwards, rotation matrix conversions, `rand_angles`
+  postprocessing, the power/mean part of `moment`, inference `Norm`, and
+  single-instruction, no-bias, no-grad `Linear`. A class method can call
+  several kernels where the operation has multiple computational stages.
+- `rand_angles` draws samples with the original two `torch.rand` calls in the
+  original order. Triton only transforms those samples. Derived random
+  rotations reuse that function. Other host RNG operations retain e3nn.
+- Python permutation/group operations, arbitrary activation functions,
+  symbolic generators, orthonormalization, general Linear code generation,
+  reduced tensor products, Wigner coefficient construction, and Cartesian
+  spherical harmonics retain the corresponding e3nn functions or classes.
+  General `Linear` configurations and differentiable `Norm` calls also use
+  the original e3nn implementation.
+- S2 and angular module initialization may use SymPy and PyTorch to prepare
+  coefficients and buffers. S2 `rfft` and `irfft` use direct DFT reduction;
+  their cost grows with both grid resolution and retained frequencies.
 
-Run `python tests/triton/test_inventory_static.py` for the 33-function
-inventory, and `pytest tests/triton/test_forward_gpu.py -q` on a CUDA or HIP GPU
-with PyTorch, Triton, e3nn dependencies and pytest installed. The latter
-compares against the original e3nn functions; benchmark performance separately
-after numerical parity passes.
+Triton paths accept CUDA `float32` or `float64` unless a function documents
+otherwise. Triton functions without a custom `torch.autograd.Function` do not
+provide input gradients. This package is not yet a complete training backend.
+The retained e3nn paths preserve e3nn's original autograd behavior.
+Triton `matrix_to_angles` and `matrix_to_axis_angle` expect valid rotation
+matrices; unlike the reference wrappers, they do not perform a separate
+global determinant assertion before the kernel launch.
+
+## Verification
+
+```bash
+python tests/triton/test_math_o3_coverage_static.py
+python tests/triton/test_inventory_static.py
+E3NN_TRITON_PACKAGE=fasteq.e3nn.triton pytest tests/triton -q
+```
+
+The local development workspace has no PyTorch, Triton, or GPU. Static
+coverage, syntax, and source checks can run there; CUDA numerical comparisons
+must run in a GPU environment.

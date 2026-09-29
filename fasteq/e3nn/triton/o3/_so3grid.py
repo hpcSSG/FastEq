@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 
 from e3nn.o3._so3grid import SO3Grid as _SO3Grid
+from e3nn.o3._so3grid import flat_wigner
 from .._common import check_gpu
 
 

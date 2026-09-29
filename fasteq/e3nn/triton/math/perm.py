@@ -5,6 +5,10 @@ import triton
 import triton.language as tl
 
 from .._common import grid
+from e3nn.math.perm import (
+    is_perm, identity, compose, inverse, rand, from_int, to_int,
+    group, germinate, is_group, to_cycles, sign, standard_representation,
+)
 
 
 @triton.jit
@@ -20,11 +24,12 @@ def _natural_kernel(OUT, N: tl.constexpr, INV: tl.constexpr, BLOCK: tl.constexpr
 
 def natural_representation(p, dtype=None, device=None) -> torch.Tensor:
     n = len(p)
-    if n == 0 or sorted(p) != list(range(n)):
-        raise ValueError("p must be a nonempty permutation")
+    if sorted(p) != list(range(n)):
+        raise ValueError("p must be a permutation")
     inverse = tuple(p.index(i) for i in range(n))
     out = torch.empty((n, n), dtype=dtype, device=device)
     if not out.is_cuda:
         raise ValueError("Triton implementation requires GPU output")
-    _natural_kernel[grid(n * n)](out, n, inverse, 256)
+    if n:
+        _natural_kernel[grid(n * n)](out, n, inverse, 256)
     return out
