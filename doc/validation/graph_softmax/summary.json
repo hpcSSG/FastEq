@@ -1,0 +1,214 @@
+{
+  "date": "2026-09-17",
+  "scope": "GraphSoftmax forward and first-order backward with reusable node-major edge layout",
+  "base_commit": "8595d936bddec222bb4af4a2c466fbe1bc0d1feb",
+  "source_sha256": {
+    "fasteq/triton/graph_softmax.py": "df6315ecd5e179ee52e62a8b0da10401b04ed85bda1ef6be44c7034a87d280c8",
+    "fasteq/triton/graph_edge_layout.py": "d159a14695f5612e00975e27cdd09c14b6141ba1acb5ce80a7d312349f02a2f5",
+    "test/test_triton_graph_softmax_precision.py": "48ff6536494a5f244660657931558a3ea2ec625570b0a6df826a8ef58214404b",
+    "test/test_triton_graph_edge_layout.py": "e4ec7694d719879d0f3330a43d82ee074851f04e820996369e02ab19dfa6818b",
+    "test/benchmark_triton_graph_softmax.py": "9dcfb46a572bc7e231f539043f3c5855d8116fc9f3779f6c6b85ac1f8cb3bdb8"
+  },
+  "reference": {
+    "repository": "https://github.com/malixian/equiformer_v3",
+    "commit": "a7300c58df683dc99cb48027d5bfd4c887486c48",
+    "path": "experimental/models/equiformer_v3/softmax.py",
+    "sha256": "643467db97b6168f387c1d63bcc4af88af5ea5aed979325ce37ecd4c906b17b9"
+  },
+  "tolerances": {
+    "output": {
+      "atol": 3e-06,
+      "rtol": 3e-05
+    },
+    "gradients": {
+      "atol": 3e-05,
+      "rtol": 0.0003
+    }
+  },
+  "boundary_reference": "Only archived shared-rescale and proven single-neighbor/small-rescale cancellation boundaries use analytical/FP64 derivatives. Ordinary inputs retain native Torch FP32 tolerances. Zero-rescale components retain FP32 checks.",
+  "test_breakdown": {
+    "precision_suite_original_and_sorted_routes": 198,
+    "layout_gradient_dropout_and_message_alignment": 17
+  },
+  "benchmark_method": {
+    "nodes": [
+      4096,
+      262144,
+      1048576
+    ],
+    "additional_random_graph_nodes": 4096,
+    "edges_per_node": 32,
+    "heads": 8,
+    "dtype": "float32",
+    "rescale_shape": "[E,1]",
+    "softcap": 3.0,
+    "eps": 1e-16,
+    "dropout": 0,
+    "warmups": 5,
+    "repeats": 20,
+    "statistic": "median GPU events",
+    "gradient_inputs": [
+      "logits",
+      "rescale"
+    ],
+    "sorted_resident": "Inputs and upstream gradients are already in node order; excludes feature permutation.",
+    "pack_restore_cached": "Includes feature packing, original-order output restoration, and inverse gradient permutations; topology mapping is reused.",
+    "cold_wall_time": "Includes rebuilding topology mapping and complete pack/restore forward+backward; three repeats."
+  },
+  "limitations": [
+    "First-order gradients only; no full EQv3 training or higher-order autograd acceptance.",
+    "Results describe these standalone synthetic graphs, not portable speedup guarantees.",
+    "Sorting gains require aligned edge features and reusable topology; per-call permutation costs are reported separately."
+  ],
+  "devices": {
+    "h100": {
+      "host": "gxn70",
+      "pytest": {
+        "tests": 215,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "results": [
+        {
+          "N": 1048576,
+          "topology": "interleaved",
+          "file": "h100/perf_1048576.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.022937729954719543,
+          "fwd_bwd_ms": {
+            "torch": 85.8322868347168,
+            "unsorted_triton": 9.05511999130249,
+            "sorted_resident": 6.116096019744873,
+            "pack_restore_cached": 11.75984001159668
+          }
+        },
+        {
+          "N": 262144,
+          "topology": "interleaved",
+          "file": "h100/perf_262144.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.028613392263650894,
+          "fwd_bwd_ms": {
+            "torch": 21.291647911071777,
+            "unsorted_triton": 2.3665759563446045,
+            "sorted_resident": 1.8443840146064758,
+            "pack_restore_cached": 2.8716800212860107
+          }
+        },
+        {
+          "N": 4096,
+          "topology": "interleaved",
+          "file": "h100/perf_4096.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.01689627207815647,
+          "fwd_bwd_ms": {
+            "torch": 0.6960960030555725,
+            "unsorted_triton": 0.43299199640750885,
+            "sorted_resident": 0.43087999522686005,
+            "pack_restore_cached": 0.7647520005702972
+          }
+        },
+        {
+          "N": 4096,
+          "topology": "random",
+          "file": "h100/perf_random.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.01980646327137947,
+          "fwd_bwd_ms": {
+            "torch": 0.9285439848899841,
+            "unsorted_triton": 0.6009120047092438,
+            "sorted_resident": 0.5837759971618652,
+            "pack_restore_cached": 0.9808800220489502
+          }
+        }
+      ],
+      "gpu_index": 7,
+      "device": "NVIDIA H100 80GB HBM3",
+      "torch": "2.11.0+cu128",
+      "triton": "3.6.0",
+      "target": "GPUTarget(backend='cuda', arch=90, warp_size=32)"
+    },
+    "hygon": {
+      "host": "a14r1n06",
+      "pytest": {
+        "tests": 215,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0
+      },
+      "results": [
+        {
+          "N": 1048576,
+          "topology": "interleaved",
+          "file": "hygon/perf_1048576.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.024636348709464073,
+          "fwd_bwd_ms": {
+            "torch": 69.72466659545898,
+            "unsorted_triton": 115.64190292358398,
+            "sorted_resident": 23.412059783935547,
+            "pack_restore_cached": 56.478031158447266
+          }
+        },
+        {
+          "N": 262144,
+          "topology": "interleaved",
+          "file": "hygon/perf_262144.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.023087428882718086,
+          "fwd_bwd_ms": {
+            "torch": 17.376864433288574,
+            "unsorted_triton": 24.943016052246094,
+            "sorted_resident": 5.983594655990601,
+            "pack_restore_cached": 14.096148014068604
+          }
+        },
+        {
+          "N": 4096,
+          "topology": "interleaved",
+          "file": "hygon/perf_4096.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.01663034036755562,
+          "fwd_bwd_ms": {
+            "torch": 0.8383989930152893,
+            "unsorted_triton": 0.5294395089149475,
+            "sorted_resident": 0.5011190176010132,
+            "pack_restore_cached": 1.0615984797477722
+          }
+        },
+        {
+          "N": 4096,
+          "topology": "random",
+          "file": "hygon/perf_random.json",
+          "all_fp32_checks_pass": true,
+          "max_tolerance_ratio": 0.019861500710248947,
+          "fwd_bwd_ms": {
+            "torch": 0.8545594811439514,
+            "unsorted_triton": 0.5404790043830872,
+            "sorted_resident": 0.504799485206604,
+            "pack_restore_cached": 1.0701590180397034
+          }
+        }
+      ],
+      "slurm_job": 841063,
+      "slurm_job_state": "COMPLETED",
+      "device": "BW",
+      "torch": "2.7.1",
+      "triton": "3.1.0",
+      "target": "GPUTarget(backend='hip', arch='gfx936', warp_size=64)"
+    }
+  },
+  "files_sha256": {
+    "h100/perf_1048576.json": "8d281a7e069f160f6d2331257e8fb45ff9f695b1659aeecc1031c63e49dcbdef",
+    "h100/perf_262144.json": "84292f5b121817ec90bcbee349b8dbe2b2843e62090f90baf82dc4f5a59e5a27",
+    "h100/perf_4096.json": "9ac9774197662985e55e7620a5c998ec027c8f12e5dfccbafa5789bf669fc581",
+    "h100/perf_random.json": "2ae8d2bad21827d5faba3623af8e2286d4515050ca8739517bdf1f7b0e901a7f",
+    "h100/pytest.xml": "e3d16293b65f037a0e2f2fc1b1944ad08e53929e974903362617c52f0a7aace9",
+    "hygon/perf_1048576.json": "94daf4344c78b989f98f780529c8071ed77125298603aa2fffc0358f6f01c9fa",
+    "hygon/perf_262144.json": "f0323a77e257517ce11e562b29a206f3805bc57bc50375e9c609a259646be8f7",
+    "hygon/perf_4096.json": "495c1b1bc12c530963559f8108eb0f1e5f4c64a1b7ef96019682101ca5ea9f3f",
+    "hygon/perf_random.json": "28620991d8d156d120930c3a54ab25707a1fb3c8da40df95f52c2a416b2685a4",
+    "hygon/pytest.xml": "1478c6ef02c7c6cc5c1e56e3fd086ab95891bce49cb1485681c615a052408e94"
+  }
+}

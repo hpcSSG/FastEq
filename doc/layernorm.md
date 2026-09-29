@@ -3,6 +3,10 @@
 FastEq fuses equivariant normalization for EquiformerV3 and EquiformerV2 layers,
 with GPU FP32 forward execution and first-order gradients on CUDA and HIP.
 
+The current-source Hygon scaling run includes a Separable parameter-gradient
+failure. The 218-test regression pass does not imply that every larger sampled
+shape passes; the exact result is recorded below.
+
 ## Supported layers
 
 Inputs have shape `[N, (L + 1)**2, C]`, where `N` is the number of atoms, `L` is
@@ -13,14 +17,12 @@ the `2*l + 1` components and `C` channels of degree `l`, after scalar centering.
 | Model | Native layer | Default normalization statistics |
 | --- | --- | --- |
 | EquiformerV3 | `EquivariantLayerNorm` | Each degree uses its own `q_l`. |
-| EquiformerV3 | `EquivariantMergeLayerNorm` | All degrees share `mean(q_0, ..., q_L)`. |
 | EquiformerV3 | `EquivariantSeparableLayerNorm` | Scalars use `q_0`; higher degrees share `mean(q_1, ..., q_L)`. |
 | EquiformerV2 | `EquivariantLayerNormArraySphericalHarmonics` | Scalars use `q_0`; higher degrees share `mean(q_1, ..., q_L)`. |
 
 The table uses the native defaults, including equal weighting of degrees where
 applicable. The adapter preserves the source layer's normalization options.
-Only scalar features (`l = 0`) are centered across channels; Merge can disable
-centering. Affine scales are learned per degree and channel and shared across
+Only scalar features (`l = 0`) are centered across channels. Affine scales are learned per degree and channel and shared across
 that degree's components. Bias applies only to scalars when the source has it.
 
 ## Fused operations
@@ -41,7 +43,7 @@ Group boundaries are device buffers, avoiding unsupported `constexpr` tuple
 indexing. Hardware lane width is read from the active Triton target; a
 32-channel tile is independent of warp/wavefront width. The implementation uses
 ordinary Triton expressions without CUDA libdevice calls or inline assembly.
-The model's `per_degree`, `scalar_high`, and `all` grouping remains explicit.
+The supported presets are `per_degree` (the default) and `scalar_high`.
 
 Only requested gradients are computed. Double backward and `create_graph=True`
 are unsupported. Source adapters default to `parameter_reduction="native"`.
@@ -66,161 +68,82 @@ Apply it to the individual normalization layers you want to replace. Both
 contiguous NKC storage and KNC storage viewed as `[N, K, C]` are supported,
 where `K = (L + 1)**2`. CUDA and HIP FP32 are supported execution targets.
 
-## Validation coverage
+## Current-source accuracy
 
-All four native layers in the table have been compared against their unmodified
-PyTorch FP32 implementations on NVIDIA H100 and Hygon BW/gfx936. Comparisons cover the output,
-input gradient, and all affine parameter gradients, including NKC and KNC
-storage. See the [native-layer comparison tests](../test/test_triton_equivariant_layer_norm_precision.py)
-and [backward tests](../test/test_triton_equivariant_layer_norm_backward.py).
+Both H100 `gxn70` GPU 5 and Hygon BW/gfx936 `a14r1n09` pass **218 regression
+tests, zero failures/errors/skips**, using the current source SHA-256
+`35d689624e48422801cfdb0b8461243f7a88ee012dc20122206433098a90da5d`.
+Software versions are in the [machine table](eqv3_validation.md#machines-and-software).
 
-This validation covers individual model layers. Full-model inference and
-training with this shared implementation have not been validated. eSEN has
-not been directly tested.
+The original unmodified V3 and V2 source layers are compared in FP32, including
+output, `dX` and all affine parameters, NKC/KNC layouts, irregular channels,
+large-N cancellation regressions and two SGD steps through supported layers.
+Ordinary elementwise tolerance is `atol=5e-5, rtol=5e-4`; existing stricter
+mathematical tests are retained. These are individual-layer tests, not
+full-model inference, training, force-loss or higher-order-autograd validation.
+eSEN has not been directly tested.
 
-## Validation record: 2026-09-15
+References:
 
-The shared implementation was developed from FastEq commit
-`40ba40e72bee769d74a869bb4a4ba820ee1c55c0`. Both machines tested the identical
-`fasteq/triton/fused_equivariant_layer_norm.py`, with SHA256:
+- EQv3 `layer_norm.py`, SHA-256 `41e00b377cbacef4713d88697c06e419f3b8c208d9fcc55be78b53fd5a23c2c6`.
+- Official EQv2 `layer_norm.py` at commit `d5ad4be729b56f74012ebb7f097f77c5b00a1004`, SHA-256 `fdd7955f1fc3ef4e0a0ccbfb761128b5b269ad09f50423428f77aee12a53480c`.
 
-```text
-f2bc0ea975eac5bf5a16b3297415cc37d896fb8a41d5375e04e57d7ed1461520
-```
+The separate current-source Hygon scaling/small-shape suite has **15/15 passes
+for per-degree LayerNorm and 14/15 for Separable LayerNorm**. At N=262,144,
+Lmax=3, C=128, Separable `affine_weight` has **two failing elements**, with a
+maximum tolerance ratio of **2.786550**. Outputs and input gradients pass.
+The N=524,288 sample passes, illustrating cancellation sensitivity rather
+than a monotonic size threshold. The failure remains unresolved in this
+source and is not replaced by an analytical-reference acceptance.
 
-The final logs and measurements below belong to this source hash. They exclude
-earlier experimental implementations and the original CUDA baseline. The
-baseline remains available in Git history; production does not select it as a
-backend fallback.
+## Current-source performance
 
-### Machines and software
+Hygon measurements use `[N,16,128]`, FP32, NKC, native parameter reduction,
+five warmups and 20 synchronized GPU-event samples. Times include the Torch
+reductions used in backward. All table points below pass their own comparisons;
+they do not remove the separate Separable failure at N=262,144.
 
-| Item | Hygon | NVIDIA |
-| --- | --- | --- |
-| Host | `a01r3n07` | `gxn70` |
-| Device | Hygon BW, `gfx936:sramecc+:xnack-` | H100 80GB HBM3, `sm_90` |
-| Reported device memory | 65,520 MiB | 81,089 MiB |
-| Compute units / SMs | 80 CUs | 132 SMs |
-| Wavefront / warp width | 64 | 32 |
-| Allocation | One DCU, Slurm job `836140`, partition `hx1hdnormal01` | GPU 7 on a shared machine; no exclusive reservation or locked clocks |
-| Torch | `2.7.1` | `2.11.0+cu128` |
-| HIP | `6.3.26045` | N/A |
-| Triton | HCU Triton `3.1.0` | `3.6.0` |
-| Full LayerNorm suite | **305 passed, 0 failed, 0 skipped** | **305 passed, 0 failed, 0 skipped** |
-| Pytest elapsed time | 227.87 s | 155.20 s |
+### EquivariantLayerNorm
 
-The Hygon allocation was released after the final suite and performance steps
-completed. Test durations describe these runs, not comparative hardware speed.
-Validation used an operator-only loader importing the production module while
-bypassing unrelated compiled package extensions. A clean package installation
-was not part of this run.
+| Device | N | Mode | Torch ms | FastEq ms | Speedup | Accuracy |
+| --- | --- | --- | --- | --- | --- | --- |
+| Hygon BW | 4,096 | Forward | 0.8077 | 0.3678 | 2.20x | PASS |
+| Hygon BW | 524,288 | Forward | 65.7555 | 22.7414 | 2.89x | PASS |
+| Hygon BW | 4,096 | Forward + backward | 2.6886 | 1.8550 | 1.45x | PASS |
+| Hygon BW | 524,288 | Forward + backward | 239.9429 | 153.5689 | 1.56x | PASS |
 
-### Reference sources and accuracy
+### EquivariantSeparableLayerNorm
 
-EquiformerV2 uses the unmodified official
-[`nets/equiformer_v2/layer_norm.py`](https://github.com/atomicarchitects/equiformer_v2/blob/d5ad4be729b56f74012ebb7f097f77c5b00a1004/nets/equiformer_v2/layer_norm.py)
-at commit `d5ad4be729b56f74012ebb7f097f77c5b00a1004`, SHA256
-`fdd7955f1fc3ef4e0a0ccbfb761128b5b269ad09f50423428f77aee12a53480c`.
-All 24 previously skipped V2 source-comparison cases ran and passed on both
-devices.
+| Device | N | Mode | Torch ms | FastEq ms | Speedup | Accuracy |
+| --- | --- | --- | --- | --- | --- | --- |
+| Hygon BW | 4,096 | Forward | 0.7069 | 0.3929 | 1.80x | PASS |
+| Hygon BW | 524,288 | Forward | 70.1496 | 25.0154 | 2.80x | PASS |
+| Hygon BW | 4,096 | Forward + backward | 2.1165 | 1.2658 | 1.67x | PASS |
+| Hygon BW | 524,288 | Forward + backward | 225.7688 | 86.4217 | 2.61x | PASS |
 
-EquiformerV3 uses the unmodified original file
-`experimental/models/equiformer_v3/layer_norm.py` from the Hygon source tree
-labelled `equiformer_v3-a7300c58df683dc99cb48027d5bfd4c887486c48`, SHA256
-`41e00b377cbacef4713d88697c06e419f3b8c208d9fcc55be78b53fd5a23c2c6`.
-The directory label was recorded; its Git commit was not independently verified.
-The file hash identifies the actual reference used.
+No H100 performance table is retained for this exact source: its available
+performance snapshot used a different implementation hash. The current H100
+218-test correctness report remains valid. The same rule excludes older V2
+performance numbers; current V2 correctness is covered by the regression suite.
 
-The three complete test modules were
-[`test_triton_equivariant_layer_norm.py`](../test/test_triton_equivariant_layer_norm.py),
-[`test_triton_equivariant_layer_norm_backward.py`](../test/test_triton_equivariant_layer_norm_backward.py),
-and [`test_triton_equivariant_layer_norm_precision.py`](../test/test_triton_equivariant_layer_norm_precision.py).
-They cover forward output, `dX`, all affine parameter gradients, NKC/KNC layouts,
-irregular channel widths, severe cancellation, small epsilon, and the precision
-regressions at N=32,768 / 131,072 / 262,144 / 524,288. These large-N checks are
-accuracy regressions, not a performance sweep to OOM.
+Both variants last run at N=524,288 in the FastEq sweep and stop before
+N=1,048,576 at the explicit 32-bit element-index bound for this shape. This is
+an implementation limit, not a measured FastEq OOM. Torch's actual allocation
+stops and all intermediate timings are in the per-variant boundary/raw files.
 
-Native Torch FP32 comparisons normally require elementwise:
+## Records and reproduction
 
-```text
-abs(actual - reference) <= 5e-5 + 5e-4 * abs(reference)
-```
-
-Existing stricter mathematical and backward regression tolerances are retained.
-Mean, moment, and rstd alignment tests now use the same tolerance on both
-backends; bitwise equality is not required. For native comparison cases that
-record `max_tolerance_ratio`, define the ratio as the maximum of
-`abs(actual-reference) / (5e-5 + 5e-4*abs(reference))`; a value at most 1 passes.
-The maxima below summarize those recorded properties (335 per device), not the
-separate tests with stricter tolerances:
-
-| Largest recorded tolerance ratio | Hygon | H100 |
-| --- | ---: | ---: |
-| Forward output | 0.013968 | 0.013116 |
-| Input gradient `dX` | 0.007151 | 0.007277 |
-| Affine parameter gradients | 0.277466 | 0.631784 |
-
-The largest parameter-gradient ratio occurred at V3 `EquivariantLayerNorm`,
-N=4096, NKC on Hygon, and V2 `EquivariantLayerNormArraySphericalHarmonics`,
-N=4096, NKC on H100. Exact values and test identifiers are recorded in
-[`validation.json`](layernorm_validation/2026-09-15/validation.json).
-
-Numerical diagnosis proceeded through statistics, `dX`, local parameter
-contributions, and final parameter reductions. A CUDA Merge N=262144 failure
-was localized to forward rstd: substituting the reference mean did not repair
-the parameter gradient, whereas substituting the reference rstd did. The
-shared weighted channel-first statistics now use two ordered FMA streams for
-small groups; larger generic groups retain tree summation to bound compilation
-size. Torch reductions preserve native FP32 agreement in cancellation cases.
-These changes apply on both devices.
-
-### Representative performance
-
-Measurements use **N=4096, Lmax=3, C=128**, shape `[4096, 16, 128]`, FP32 and
-NKC layout, with seed `20260914`. Each case has 5 warmups and 20 measured
-iterations; the tables show median GPU-event time in milliseconds. The
-baseline is the original eager Torch layer. Forward runs under `no_grad`;
-forward + backward computes `dX` and every affine parameter gradient, with no
-optimizer step.
-
-Within each device, both implementations use the same input, parameters, and
-upstream gradient. All representative cases passed output and gradient checks
-before their timings were recorded. The recorded harness measures Torch
-followed by the unified implementation for each operator and mode. These are
-representative measurements rather than randomized, repeated benchmark trials.
-Software versions and GPU random streams differ, and H100 was shared, so the
-tables support within-device implementation comparisons, not hardware rankings.
-
-“Unified” below means the shared Triton implementation including its Torch
-backward products and reductions. Speedup is Torch time divided by unified
-time; these numbers include the cost of the partial backward fusion split.
-
-#### Hygon BW: one DCU
-
-| Native layer | Torch forward (ms) | Unified forward (ms) | Speedup | Torch forward + backward (ms) | Unified forward + backward (ms) | Speedup |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| V3 LayerNorm | 0.8011 | 0.3758 | 2.13× | 2.7340 | 1.8670 | 1.46× |
-| V3 Merge | 0.6762 | 0.3222 | 2.10× | 2.1907 | 1.0563 | 2.07× |
-| V3 Separable | 0.7174 | 0.3911 | 1.83× | 2.1048 | 1.2849 | 1.64× |
-| V2 SphericalHarmonics | 0.6305 | 0.2951 | 2.14× | 2.4856 | 1.8120 | 1.37× |
-
-#### NVIDIA H100
-
-| Native layer | Torch forward (ms) | Unified forward (ms) | Speedup | Torch forward + backward (ms) | Unified forward + backward (ms) | Speedup |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| V3 LayerNorm | 0.2429 | 0.1233 | 1.97× | 1.0427 | 0.6991 | 1.49× |
-| V3 Merge | 0.2088 | 0.0997 | 2.09× | 0.8198 | 0.4563 | 1.80× |
-| V3 Separable | 0.1916 | 0.1291 | 1.48× | 0.7198 | 0.5266 | 1.37× |
-| V2 SphericalHarmonics | 0.2033 | 0.1096 | 1.85× | 0.9617 | 0.6991 | 1.38× |
-
-Raw timings, peak allocated memory, and the per-case correctness measurements
-are in [`perf_hip.json`](layernorm_validation/2026-09-15/perf_hip.json) and
-[`perf_cuda.json`](layernorm_validation/2026-09-15/perf_cuda.json). Final pytest
-logs are [`unified_hip.log`](layernorm_validation/2026-09-15/unified_hip.log) and
-[`unified_cuda.log`](layernorm_validation/2026-09-15/unified_cuda.log).
-
-This implementation has **not** had a new doubling-to-OOM performance sweep.
-The measurements above do not establish its maximum atom count or OOM boundary.
-GPU FP32, supported layouts, tile-size limits, and 32-bit indexing restrictions
-still apply; second-order gradients and full-model training remain unvalidated
-or unsupported as described above.
+[H100 regression](validation/layernorm/h100/summary.json),
+[H100 JUnit](validation/layernorm/h100/pytest.xml),
+[Hygon regression](validation/layernorm/hygon/summary.json), and
+[Hygon JUnit](validation/layernorm/hygon/pytest.xml) identify the implementation,
+tests and reference hashes.
+[LayerNorm timings](validation/norm/hygon/paired.csv),
+[LayerNorm accuracy](validation/norm/hygon/correctness.json),
+[Separable timings](validation/separable/hygon/paired.csv),
+[Separable accuracy](validation/separable/hygon/correctness.json), and
+[failed elements](validation/separable/hygon/failures.csv) preserve current-source
+scaling evidence. Full samples, errors and boundaries are in the adjacent
+raw-record files, indexed by [the manifest](validation/manifest.json).
+Use the [reproduction commands](validation/REPRODUCE.md) for the three current
+LayerNorm test modules and the scaling harness.

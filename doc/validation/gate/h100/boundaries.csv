@@ -1,0 +1,25 @@
+operator,mode,backend,last_success_n,next_n,stop,stage,reason
+gate,fwd,torch,1048576,2097152,OOM,warmup_memory_timing,"The following operation failed in the TorchScript interpreter.
+Traceback of TorchScript (most recent call last):
+  File ""<eval_with_key>.9"", line 48, in forward
+    einsum_5 = torch.functional.einsum('cb,cba->cba', reshape_12, reshape_4);  reshape_12 = reshape_4 = None
+    reshape_13 = einsum_5.reshape(getitem_3, 896);  einsum_5 = getitem_3 = None
+    cat = torch.cat([reshape_9, reshape_11, reshape_13], dim = 1);  reshape_9 = reshape_11 = reshape_13 = None
+          ~~~~~~~~~ <--- HERE
+    reshape_14 = cat.reshape(add_2);  cat = add_2 = None
+    return reshape_14
+RuntimeError: CUDA out of memory. Tried to allocate 15.00 GiB. GPU 0 has a total capacity of 79.19 GiB of which 12.58 GiB is free. Including non-PyTorch memory, this process has 66.60 GiB memory in use. Of the allocated memory 53.00 GiB is allocated by PyTorch, and 13.00 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+"
+gate,fwd,fused,524288,1048576,INDEX_GUARD,initialization,Harness stops before signed 32-bit row*stride overflow; source has no runtime guard
+gate,fwd_bwd,torch,1048576,2097152,OOM,warmup_memory_timing,"The following operation failed in the TorchScript interpreter.
+Traceback of TorchScript (most recent call last):
+  File ""<eval_with_key>.9"", line 48, in forward
+    einsum_5 = torch.functional.einsum('cb,cba->cba', reshape_12, reshape_4);  reshape_12 = reshape_4 = None
+    reshape_13 = einsum_5.reshape(getitem_3, 896);  einsum_5 = getitem_3 = None
+    cat = torch.cat([reshape_9, reshape_11, reshape_13], dim = 1);  reshape_9 = reshape_11 = reshape_13 = None
+          ~~~~~~~~~ <--- HERE
+    reshape_14 = cat.reshape(add_2);  cat = add_2 = None
+    return reshape_14
+RuntimeError: CUDA out of memory. Tried to allocate 15.00 GiB. GPU 0 has a total capacity of 79.19 GiB of which 5.58 GiB is free. Including non-PyTorch memory, this process has 73.60 GiB memory in use. Of the allocated memory 73.00 GiB is allocated by PyTorch, and 1.99 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)
+"
+gate,fwd_bwd,fused,524288,1048576,INDEX_GUARD,initialization,Harness stops before signed 32-bit row*stride overflow; source has no runtime guard

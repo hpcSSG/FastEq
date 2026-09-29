@@ -54,7 +54,7 @@ class EquivariantNormSpec:
         return len(self.stats_weights)
 
     @classmethod
-    def from_preset(cls, *, lmax, channels, grouping='all',
+    def from_preset(cls, *, lmax, channels, grouping='per_degree',
                     weighting='degree_balanced', center_scalar=True, eps=1e-5):
         if type(lmax) is not int or lmax < 0:
             raise ValueError('lmax must be a nonnegative integer')
@@ -62,8 +62,6 @@ class EquivariantNormSpec:
             sources = [(l,) for l in range(lmax + 1)]
         elif grouping == 'scalar_high':
             sources = [(0,)] + ([tuple(range(1, lmax + 1))] if lmax else [])
-        elif grouping == 'all':
-            sources = [tuple(range(lmax + 1))]
         else:
             raise ValueError('unknown grouping preset')
         if weighting not in ('component', 'degree_balanced', 'norm'):
@@ -426,7 +424,7 @@ def _backward_on_device(op, x, mean, rstd, weight0, weight_high, dy, needs, *, r
     split=weight_high is not None
     def empty(shape):return torch.empty(shape,device=x.device,dtype=x.dtype)
     dx=empty(x.shape) if nx else None
-    native=(op.parameter_reduction == 'native' and op.source_kind != 0)
+    native=(op.parameter_reduction == 'native' and op._from_reference)
     pw=empty((n,k if native and op.parameter_order=='expanded' else s.lmax+1,c)) if nw else None
     pb=empty((n,c)) if nb else None
     def ptr(v):return x if v is None else v
@@ -517,7 +515,7 @@ class TritonEquivariantNorm(torch.nn.Module):
         with torch.cuda.device(device):
             self.warp_size = triton.runtime.driver.active.get_current_target().warp_size
         self.parameter_order = parameter_order
-        self.source_kind = 0
+        self._from_reference = False
         self.reduction_order = reduction_order
         self.uniform = uniform
         self.group_bounds = tuple(bounds)
@@ -651,8 +649,6 @@ def from_reference(source, *, device=None, accumulation="fp64", parameter_reduct
         # V3 separable actually reduces channels before weighted components.
         if name == 'EquivariantSeparableLayerNorm':
             order = 'channels_first'
-    elif name == 'EquivariantMergeLayerNorm':
-        grouping, order, center = 'all', 'channels_first', source.centering
     else:
         raise NotImplementedError(f'no verified source adapter for {name}')
     weighting = ('degree_balanced' if source.normalization == 'component'
@@ -662,20 +658,17 @@ def from_reference(source, *, device=None, accumulation="fp64", parameter_reduct
     if weighting == 'degree_balanced':
         weights = [list(row) for row in spec.stats_weights]
         cached = source.balance_degree_weight.detach().reshape(-1).cpu()
-        for l in range(0 if grouping == 'all' else 1, source.lmax+1):
-            offset = l*l if grouping == 'all' else l*l-1
-            weights[spec.output_group[l]][l] = float(cached[offset])
+        for l in range(1, source.lmax+1):
+            weights[spec.output_group[l]][l] = float(cached[l*l-1])
         spec = EquivariantNormSpec(spec.lmax, spec.channels, tuple(map(tuple, weights)),
                                    spec.output_group, spec.center_scalar, spec.eps)
     if device is None:
         tensors = list(source.parameters()) + list(source.buffers())
         device = tensors[0].device if tensors else torch.device('cuda')
-    parameter_order = ('expanded' if name in ('EquivariantMergeLayerNorm', 'EquivariantSeparableLayerNorm')
+    parameter_order = ('expanded' if name == 'EquivariantSeparableLayerNorm'
                        else 'broadcast')
     op = TritonEquivariantNorm(spec, reduction_order=order, device=device,
                               parameter_order=parameter_order, accumulation=accumulation)
     op.parameter_reduction = parameter_reduction
-    op.source_kind = (1 if name in ("EquivariantLayerNorm", "EquivariantLayerNormArray")
-                      else 2 if name == "EquivariantLayerNormArraySphericalHarmonics"
-                      else 3 if name == "EquivariantMergeLayerNorm" else 4)
+    op._from_reference = True
     return _SourceAdapter(source, op)

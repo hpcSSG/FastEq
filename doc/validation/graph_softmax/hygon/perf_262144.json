@@ -1,0 +1,133 @@
+{
+  "host": "a14r1n06",
+  "device": "BW",
+  "torch": "2.7.1",
+  "triton": "3.1.0",
+  "target": "GPUTarget(backend='hip', arch='gfx936', warp_size=64)",
+  "sources": {
+    "graph_softmax.py": "df6315ecd5e179ee52e62a8b0da10401b04ed85bda1ef6be44c7034a87d280c8",
+    "graph_edge_layout.py": "d159a14695f5612e00975e27cdd09c14b6141ba1acb5ce80a7d312349f02a2f5"
+  },
+  "native_sha256": "643467db97b6168f387c1d63bcc4af88af5ea5aed979325ce37ecd4c906b17b9",
+  "N": 262144,
+  "E": 8388608,
+  "H": 8,
+  "topology": "interleaved",
+  "max_degree": 32,
+  "settings": {
+    "dtype": "FP32",
+    "rescale": "[E,1]",
+    "softcap": 3.0,
+    "eps": 1e-16,
+    "warmup": 5,
+    "repeat": 20,
+    "statistic": "median GPU events",
+    "sorted_resident": "upstream already keeps all features and gradients in node order; excludes feature permutation",
+    "pack_restore_cached": "includes feature packing, result restoration and all inverse gradient permutations; cached integer topology only"
+  },
+  "checks": {
+    "unsorted_triton": {
+      "output": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.023087428882718086,
+        "max_abs": 3.2782554626464844e-07
+      },
+      "dx": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.002246137475594878,
+        "max_abs": 1.7881393432617188e-07
+      },
+      "dr": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.01651817001402378,
+        "max_abs": 1.6689300537109375e-06
+      }
+    },
+    "sorted_resident": {
+      "output": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.023087428882718086,
+        "max_abs": 3.2782554626464844e-07
+      },
+      "dx": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.002246137475594878,
+        "max_abs": 1.7881393432617188e-07
+      },
+      "dr": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.01651817001402378,
+        "max_abs": 1.6689300537109375e-06
+      }
+    },
+    "pack_restore_cached": {
+      "output": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.023087428882718086,
+        "max_abs": 3.2782554626464844e-07
+      },
+      "dx": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.002246137475594878,
+        "max_abs": 1.7881393432617188e-07
+      },
+      "dr": {
+        "bad": 0,
+        "max_tolerance_ratio": 0.01651817001402378,
+        "max_abs": 1.6689300537109375e-06
+      }
+    }
+  },
+  "timings": {
+    "torch": {
+      "fwd": {
+        "gpu_ms": 7.205434322357178,
+        "min_ms": 7.181272983551025,
+        "max_ms": 7.334394931793213
+      },
+      "fwd_bwd": {
+        "gpu_ms": 17.376864433288574,
+        "min_ms": 17.30270004272461,
+        "max_ms": 17.491504669189453
+      }
+    },
+    "unsorted_triton": {
+      "fwd": {
+        "gpu_ms": 8.147031307220459,
+        "min_ms": 8.11263370513916,
+        "max_ms": 8.16655158996582
+      },
+      "fwd_bwd": {
+        "gpu_ms": 24.943016052246094,
+        "min_ms": 24.899171829223633,
+        "max_ms": 24.98764991760254
+      }
+    },
+    "sorted_resident": {
+      "fwd": {
+        "gpu_ms": 1.811119019985199,
+        "min_ms": 1.8047980070114136,
+        "max_ms": 1.8670380115509033
+      },
+      "fwd_bwd": {
+        "gpu_ms": 5.983594655990601,
+        "min_ms": 5.974233150482178,
+        "max_ms": 6.025754928588867
+      }
+    },
+    "pack_restore_cached": {
+      "fwd": {
+        "gpu_ms": 5.556953430175781,
+        "min_ms": 5.519995212554932,
+        "max_ms": 5.6011152267456055
+      },
+      "fwd_bwd": {
+        "gpu_ms": 14.096148014068604,
+        "min_ms": 14.043827056884766,
+        "max_ms": 14.254709243774414
+      }
+    }
+  },
+  "prepare_layout_wall_ms": 7.212247001007199,
+  "prepare_and_pack_restore_fwd_bwd_wall_ms": 21.271478850394487
+}

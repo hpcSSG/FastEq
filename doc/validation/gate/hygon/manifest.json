@@ -1,0 +1,53 @@
+{
+  "measurement_date": "2026-09-16",
+  "measurement_commit": "d37eacaf21b5048159a1211794efbb58941485a9",
+  "host": "a14r1n09",
+  "environment": {
+    "torch": "2.7.1",
+    "triton": "3.1.0",
+    "cuda": null,
+    "hip": "6.3.26045",
+    "gpu": "BW",
+    "uuid": "30303134-6331-6162-3563-313432313431",
+    "total_memory": 68702699520,
+    "free_before": 68365058048,
+    "visible_device": "0"
+  },
+  "implementation": {
+    "path": "fasteq/triton/fused_equivariant_gate.py",
+    "sha256": "3a9e8211dd2c16ed96f47cdcbfa30d860ef521cd23b63c69e432eacf46834858"
+  },
+  "original_eqv3_commit": "a7300c58df683dc99cb48027d5bfd4c887486c48",
+  "reference_audit": {
+    "experimental/models/equiformer_v3/layer_norm.py": {
+      "sha256": "41e00b377cbacef4713d88697c06e419f3b8c208d9fcc55be78b53fd5a23c2c6",
+      "matches_h100_git_verified_source": true
+    },
+    "experimental/models/equiformer_v3/softmax.py": {
+      "sha256": "643467db97b6168f387c1d63bcc4af88af5ea5aed979325ce37ecd4c906b17b9",
+      "matches_h100_git_verified_source": true
+    },
+    "experimental/models/equiformer_v3/drop.py": {
+      "sha256": "293b128aa1b407154aae2e1a8c77c16d6957161c1a65a4396d3d91f6f35a4b3f",
+      "matches_h100_git_verified_source": true
+    },
+    "experimental/models/equiformer_v3/activation.py": {
+      "sha256": "88d98a77849f479131cb4991a5a4124a44ecc03e46ed7f2e2d8e773ef826fdf7",
+      "matches_h100_git_verified_source": true
+    },
+    "experimental/models/equiformer_v3/transformer_block.py": {
+      "sha256": "aa162e86b466010fc22c9007108fb94a7fb4e1c816a84a989ee67183cb89177b",
+      "matches_h100_git_verified_source": true
+    }
+  },
+  "scope": "Current-source records only; original raw entries retained unchanged, other operators filtered out.",
+  "e3nn_version": "0.4.4",
+  "files_sha256": {
+    "paired.csv": "0ed20530fda07cff50922b373085510c4848dc844d1b37906c6c351d634747d2",
+    "failures.csv": "8d1e3fc70898f8c067428c0097d2671d2e1a28f46cb4a3fa64eb5ab3c294199b",
+    "raw_results.json.gz": "836d1288c3ac80654d0192f3d51c998a9d67b25859022cbddc2abd72a66c4efa",
+    "correctness.json": "dc5241118a0157c64fc6b9bcf104bb07ad04145ed74b3ed231d2904e62e9346e",
+    "extra_checks.json": "a9c5ba8aa6db965338fbfa47678b5c667c280a65d689b546cdcebcac3cfb90ef",
+    "boundaries.csv": "171faa3a0f8af83e373bd57d74fcadb91d3ef95fffeb1a6d00d7def1507392f9"
+  }
+}

@@ -1,0 +1,25 @@
+operator,mode,backend,last_success_n,next_n,stop,stage,reason
+gate,fwd,torch,1048576,2097152,OOM,warmup_memory_timing,"The following operation failed in the TorchScript interpreter.
+Traceback of TorchScript (most recent call last):
+  File ""<eval_with_key>.9"", line 48, in forward
+    einsum_5 = torch.functional.einsum('cb,cba->cba', reshape_12, reshape_4);  reshape_12 = reshape_4 = None
+    reshape_13 = einsum_5.reshape(getitem_3, 896);  einsum_5 = getitem_3 = None
+    cat = torch.cat([reshape_9, reshape_11, reshape_13], dim = 1);  reshape_9 = reshape_11 = reshape_13 = None
+          ~~~~~~~~~ <--- HERE
+    reshape_14 = cat.reshape(add_2);  cat = add_2 = None
+    return reshape_14
+RuntimeError: HIP out of memory. Tried to allocate 15.00 GiB. GPU 0 has a total capacity of 63.98 GiB of which 10.50 GiB is free. Of the allocated memory 53.00 GiB is allocated by PyTorch, and 1.99 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_HIP_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+"
+gate,fwd,fused,524288,1048576,INDEX_GUARD,initialization,Harness stops before signed 32-bit row*stride overflow; source has no runtime guard
+gate,fwd_bwd,torch,1048576,2097152,OOM,warmup_memory_timing,"The following operation failed in the TorchScript interpreter.
+Traceback of TorchScript (most recent call last):
+  File ""<eval_with_key>.9"", line 42, in forward
+    einsum_2 = torch.functional.einsum('dcb,dca->dcab', reshape_6, reshape_3);  einsum_2 = None
+    reshape_10 = reshape_6.reshape(getitem_3, 128);  reshape_6 = None
+    einsum_3 = torch.functional.einsum('cb,cba->cba', reshape_10, reshape_3);  reshape_10 = reshape_3 = None
+               ~~~~~~~~~~~~~~~~~~~~~~~ <--- HERE
+    reshape_11 = einsum_3.reshape(getitem_3, 640);  einsum_3 = None
+    einsum_4 = torch.functional.einsum('dcb,dca->dcab', reshape_7, reshape_4);  einsum_4 = None
+RuntimeError: HIP out of memory. Tried to allocate 5.00 GiB. GPU 0 has a total capacity of 63.98 GiB of which 2.50 GiB is free. Of the allocated memory 61.00 GiB is allocated by PyTorch, and 1.99 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_HIP_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+"
+gate,fwd_bwd,fused,524288,1048576,INDEX_GUARD,initialization,Harness stops before signed 32-bit row*stride overflow; source has no runtime guard

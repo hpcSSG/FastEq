@@ -1,0 +1,53 @@
+{
+  "measurement_date": "2026-09-15",
+  "measurement_commit": "3bc9a82d40ef646c3ce75f6f517e3f618fb12754",
+  "host": "gxn70",
+  "environment": {
+    "torch": "2.11.0+cu128",
+    "triton": "3.6.0",
+    "cuda": "12.8",
+    "hip": null,
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "uuid": "5701253b-7aa2-4bb7-3b69-15e0e7e72186",
+    "total_memory": 85028372480,
+    "free_before": 84478001152,
+    "visible_device": "5"
+  },
+  "implementation": {
+    "path": "fasteq/triton/fused_equivariant_dropout.py",
+    "sha256": "48444ccc2b51bf6268642fc071d4e04caa4e235354a1896aa051091db86abb3a"
+  },
+  "original_eqv3_commit": "a7300c58df683dc99cb48027d5bfd4c887486c48",
+  "reference_audit": {
+    "experimental/models/equiformer_v3/layer_norm.py": {
+      "sha256": "41e00b377cbacef4713d88697c06e419f3b8c208d9fcc55be78b53fd5a23c2c6",
+      "matches_git_head": true
+    },
+    "experimental/models/equiformer_v3/softmax.py": {
+      "sha256": "643467db97b6168f387c1d63bcc4af88af5ea5aed979325ce37ecd4c906b17b9",
+      "matches_git_head": true
+    },
+    "experimental/models/equiformer_v3/drop.py": {
+      "sha256": "293b128aa1b407154aae2e1a8c77c16d6957161c1a65a4396d3d91f6f35a4b3f",
+      "matches_git_head": true
+    },
+    "experimental/models/equiformer_v3/activation.py": {
+      "sha256": "88d98a77849f479131cb4991a5a4124a44ecc03e46ed7f2e2d8e773ef826fdf7",
+      "matches_git_head": true
+    },
+    "experimental/models/equiformer_v3/transformer_block.py": {
+      "sha256": "aa162e86b466010fc22c9007108fb94a7fb4e1c816a84a989ee67183cb89177b",
+      "matches_git_head": true
+    }
+  },
+  "scope": "Current-source records only; original raw entries retained unchanged, other operators filtered out.",
+  "e3nn_version": null,
+  "files_sha256": {
+    "paired.csv": "8bd10166f2f5b2fcbd5d0f892fd6841d413bf9c1af4ba9fdc6d20ff4900e5a38",
+    "failures.csv": "8d1e3fc70898f8c067428c0097d2671d2e1a28f46cb4a3fa64eb5ab3c294199b",
+    "raw_results.json.gz": "6bddb43ef66c7948a592cd31a46ea55123c5f3a64224c1d184346b673b498e7a",
+    "correctness.json": "8d6ede65196655795931ecdcf17512038d76a1ca7cbcaebacfc5eddf6264252c",
+    "extra_checks.json": "5306583bbb6077fe6a2de91391382947745cb440636d54ec6f7d301ce6d353b1",
+    "boundaries.csv": "e2c8e31aac07f5b6e091652c7ba3afca50ba5f154e9f6d0db095baf9b5f1ce8f"
+  }
+}

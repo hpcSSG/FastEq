@@ -30,7 +30,7 @@ from fasteq.triton.fused_equivariant_layer_norm import (
 
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-GROUPINGS = ("per_degree", "all", "scalar_high")
+GROUPINGS = ("per_degree", "scalar_high")
 
 
 def _layout(x, layout):
@@ -44,7 +44,7 @@ def _groups(lmax, grouping):
         return [(degree,) for degree in range(lmax + 1)]
     if grouping == "scalar_high":
         return [(0,)] + ([tuple(range(1, lmax + 1))] if lmax else [])
-    return [tuple(range(lmax + 1))]
+    raise ValueError(f"unsupported grouping: {grouping}")
 
 
 def _math_output(x, grouping, weighting, center, weight, bias, eps=1e-5):
@@ -86,7 +86,7 @@ def _plan(lmax, channels, grouping, weighting="degree_balanced", center=True):
     )
     return TritonEquivariantNorm(
         spec, device="cuda",
-        reduction_order="channels_first" if grouping == "all" else "components_first",
+        reduction_order="components_first",
     )
 
 
@@ -242,11 +242,6 @@ def test_backward_matches_fp64_and_fp32_math(
 
 NONDEFAULTS = (
     ("per_degree", "norm", True),
-    ("all", "component", True),
-    ("all", "norm", True),
-    ("all", "degree_balanced", False),
-    ("all", "component", False),
-    ("all", "norm", False),
     ("scalar_high", "component", True),
     ("scalar_high", "norm", True),
 )
@@ -258,8 +253,6 @@ NONDEFAULTS = (
 def test_backward_nondefault_statistics(layout, grouping, weighting, center):
     op = _plan(2, 7, grouping, weighting, center)
     x, weight, bias, grad_output = _inputs(layout=layout)
-    # The source merge class omits beta when scalar centering is disabled.
-    bias = bias if center else None
     _compare_math(op, x, weight, bias, grad_output, grouping=grouping,
                   weighting=weighting, center=center)
 
@@ -338,9 +331,9 @@ def test_backward_forward_with_stats_marks_auxiliary_outputs_nondifferentiable(g
 
 @GPU
 def test_backward_uncentered_stats_have_no_mean():
-    op = _plan(2, 7, "all", center=False)
+    op = _plan(2, 7, "per_degree", center=False)
     x, weight, _, grad_output = _inputs()
-    result, _ = _compare_math(op, x, weight, None, grad_output, grouping="all",
+    result, _ = _compare_math(op, x, weight, None, grad_output, grouping="per_degree",
                               center=False, with_stats=True)
     assert result.mean is None
     assert not result.moments.requires_grad and not result.rstd.requires_grad
@@ -361,7 +354,7 @@ def test_backward_rejects_higher_order_graphs_explicitly(grouping):
 
 SOURCE_CLASSES = (
     ("V3", "EquivariantLayerNorm"),
-    ("V3", "EquivariantMergeLayerNorm"),
+    ("V3", "EquivariantSeparableLayerNorm"),
     ("V2", "EquivariantLayerNormArraySphericalHarmonics"),
 )
 

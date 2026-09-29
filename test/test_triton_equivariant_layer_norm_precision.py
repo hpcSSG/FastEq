@@ -36,14 +36,14 @@ reference_forward = _reference_forward()
 
 
 GPU = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-GROUPINGS = ("per_degree", "all", "scalar_high")
+GROUPINGS = ("per_degree", "scalar_high")
 
 
 def _plan(grouping, channels):
     spec = EquivariantNormSpec.from_preset(lmax=3, channels=channels, grouping=grouping)
     return TritonEquivariantNorm(
         spec, device="cuda",
-        reduction_order="channels_first" if grouping == "all" else "components_first",
+        reduction_order="components_first",
     )
 
 
@@ -69,7 +69,7 @@ def _check_cancellation(n, grouping, record_property):
     # The endpoint blocks cancel exactly. Convert the actual FP32 small term
     # to FP64 before multiplying, so input quantization is not counted as error.
     total = dy[32, 0, 0].double() * (n - 64)
-    moment = .75 if grouping == "all" else 1.
+    moment = 1.
     rstd = torch.rsqrt(torch.tensor(moment + 1e-5, device="cuda", dtype=torch.float64))
     expected_gamma = torch.zeros(4, channels, device="cuda", dtype=torch.float64)
     for degree in (1, 2, 3):
@@ -93,7 +93,7 @@ def test_large_parameter_reduction_cancellation(grouping, record_property):
 @GPU
 def test_large_parameter_reduction_partial_final_tile(record_property):
     # One extra atom exercises masking in the last, incomplete reduction tile.
-    _check_cancellation(27649, "all", record_property)
+    _check_cancellation(27649, "scalar_high", record_property)
 
 
 def _backward_helpers():
@@ -136,7 +136,6 @@ def test_large_random_gradients_match_fp64(grouping, record_property):
 
 NATIVE_SOURCES = (
     ("V3", "EquivariantLayerNorm"),
-    ("V3", "EquivariantMergeLayerNorm"),
     ("V2", "EquivariantLayerNormArraySphericalHarmonics"),
     ("V3", "EquivariantSeparableLayerNorm"),
 )
@@ -366,7 +365,6 @@ def test_optional_original_source_shared_scale_degree_accumulation(
 
 @GPU
 @pytest.mark.parametrize("source_family,class_name,n,lmax,channels", (
-    ("V3", "EquivariantMergeLayerNorm", 17, 4, 512),
     ("V3", "EquivariantSeparableLayerNorm", 17, 5, 256),
     ("V3", "EquivariantLayerNorm", 108, 0, 8192),
     ("V2", "EquivariantLayerNormArraySphericalHarmonics", 108, 0, 8192),
@@ -457,12 +455,11 @@ def _native_comparison_metrics_chunked(actual, expected, chunk_elements=2**22):
 @pytest.mark.parametrize("class_name,n", (
     pytest.param("EquivariantLayerNorm", 32768, id="norm-32768"),
     pytest.param("EquivariantLayerNorm", 131072, id="norm-131072"),
-    pytest.param("EquivariantMergeLayerNorm", 262144, id="merge-262144"),
     pytest.param("EquivariantSeparableLayerNorm", 524288, id="separable-524288"),
 ))
 def test_optional_original_source_scaling_precision_regressions(
         class_name, n, record_property):
-    """Reproduce the four native-FP32 failures from the scaling benchmark."""
+    """Reproduce the retained native-FP32 failures from the scaling benchmark."""
     source_class = _backward_helpers()._load_source("V3", class_name)
     source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
     record_property("source/path", str(source_path.resolve()))
@@ -519,7 +516,7 @@ def test_generic_large_tile_skips_unused_source_schedules(record_property):
     torch.manual_seed(20260915)
     n, lmax, channels = 32, 180, 2
     spec = EquivariantNormSpec.from_preset(
-        lmax=lmax, channels=channels, grouping="all")
+        lmax=lmax, channels=channels, grouping="scalar_high")
     op = TritonEquivariantNorm(spec, device="cuda")
     x = torch.randn(n, (lmax + 1)**2, channels, device="cuda")
     weight = torch.randn(lmax + 1, channels, device="cuda")
@@ -535,7 +532,7 @@ def test_generic_large_tile_skips_unused_source_schedules(record_property):
 
 @GPU
 @pytest.mark.parametrize("class_name", (
-    "EquivariantLayerNorm", "EquivariantMergeLayerNorm"))
+    "EquivariantLayerNorm",))
 @pytest.mark.parametrize("offset", (1, 2, 3))
 def test_optional_original_source_scalar_pointer_alignment(
         class_name, offset, record_property):
@@ -571,61 +568,6 @@ def test_optional_original_source_scalar_pointer_alignment(
     record_property("input/pointer_mod16", x.data_ptr() % 16)
     # Statistics use the same elementwise tolerance on every GPU backend.
     torch.testing.assert_close(actual.mean, expected_mean,
-                               atol=5e-5,
-                               rtol=5e-4)
-
-    actual_gradients = torch.autograd.grad(actual.output, (x, *parameters), dy)
-    expected_output = source(x)
-    expected_gradients = torch.autograd.grad(expected_output, (x, *parameters), dy)
-    comparisons = [("forward", actual.output, expected_output)]
-    comparisons.extend(zip(("dX", *(f"parameter/{name}" for name in named)),
-                           actual_gradients, expected_gradients))
-    failures = []
-    for name, actual_value, expected_value in comparisons:
-        statistics = _native_comparison_metrics(actual_value, expected_value)
-        for metric, value in statistics.items():
-            record_property(f"{name}/{metric}", value)
-        if statistics["failures"]:
-            failures.append(f"{name}: {statistics}")
-    assert not failures, "\n".join(failures)
-
-
-@GPU
-@pytest.mark.parametrize("channels", (129, 257))
-def test_optional_original_source_uncentered_merge_knc_alignment(
-        channels, record_property):
-    """Without scalar centering, Merge's squared input retains KNC row order."""
-    source_class = _backward_helpers()._load_source("V3", "EquivariantMergeLayerNorm")
-    source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
-    record_property("source/path", str(source_path.resolve()))
-    record_property("source/sha256", hashlib.sha256(source_path.read_bytes()).hexdigest())
-    record_property("source/class", "EquivariantMergeLayerNorm")
-    record_property("reference", "original FP32 source forward and autograd")
-    source_path = Path(os.environ["FASTEQ_EQUIFORMER_V3_LAYER_NORM"])
-    record_property("source/path", str(source_path.resolve()))
-    record_property("source/sha256", hashlib.sha256(source_path.read_bytes()).hexdigest())
-    record_property("source/class", "EquivariantMergeLayerNorm")
-    record_property("reference", "original FP32 source forward and autograd")
-    torch.manual_seed(20260914)
-    source = source_class(3, channels, centering=False).cuda().train()
-    with torch.no_grad():
-        for parameter in source.parameters():
-            parameter.copy_(torch.randn_like(parameter))
-    x = torch.randn(17, 16, channels, device="cuda")
-    x = x.transpose(0, 1).contiguous().transpose(0, 1).detach().requires_grad_()
-    dy = torch.randn_like(x)
-    named = dict(source.named_parameters())
-    parameters = tuple(named.values())
-    actual = from_reference(source).forward_with_stats(x)
-    with torch.no_grad():
-        rows = x.square().mean(dim=2, keepdim=True)
-        moment = torch.einsum("ai,nic->nac", source.balance_degree_weight, rows).reshape(17, 1)
-        rstd = (moment + source.eps).pow(-0.5)
-    # Portable statistics do not require bitwise identity with source reductions.
-    torch.testing.assert_close(actual.moments, moment,
-                               atol=5e-5,
-                               rtol=5e-4)
-    torch.testing.assert_close(actual.rstd, rstd,
                                atol=5e-5,
                                rtol=5e-4)
 

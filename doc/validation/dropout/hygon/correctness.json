@@ -1,0 +1,41 @@
+{
+  "operator": "dropout",
+  "checks": 16,
+  "statuses": {
+    "PASS": 16
+  },
+  "atom_counts": [
+    1,
+    17,
+    256,
+    257,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+    262144,
+    524288,
+    1048576
+  ],
+  "components": {
+    "output": {
+      "max_abs": 0.0,
+      "max_tolerance_ratio": 0.0,
+      "failing_elements": 0.0,
+      "worst_ratio_n": 1024
+    },
+    "x": {
+      "max_abs": 0.0,
+      "max_tolerance_ratio": 0.0,
+      "failing_elements": 0.0,
+      "worst_ratio_n": 1024
+    }
+  },
+  "largest_passing_forward_n": 1048576,
+  "largest_passing_fwd_bwd_n": 1048576
+}
