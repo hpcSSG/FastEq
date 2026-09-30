@@ -1,90 +1,255 @@
-"""Permutation orbits in Python; projection-matrix assembly in Triton."""
+"""Triton math for basis reduction; native e3nn TensorProduct forward.
 
-import itertools
+The constructor explicitly binds the local Triton orthonormalize and
+reduce_permutation wrappers. Wigner construction, eigendecomposition, other
+Torch operations, and the generated TensorProduct execution remain native.
+"""
+
+import collections
 
 import torch
-import triton
-import triton.language as tl
+from torch import fx
 
-from e3nn.math._reduce import (
-    germinate_formulas,
-    reduce_permutation as _reference_reduce_permutation,
-)
+from e3nn.o3._irreps import Irrep, Irreps
+from e3nn.o3._tensor_product._tensor_product import TensorProduct
+from e3nn.o3._reduce import _wigner_nj, _get_ops, _INPUT, _TP
+from e3nn.util import explicit_default_types
+from e3nn.util.codegen import CodeGenMixin
+from e3nn.util.jit import compile_mode
+from ..math._reduce import germinate_formulas, reduce_permutation
+from ..math._linalg import orthonormalize
 
+@compile_mode("trace")
+class ReducedTensorProducts(CodeGenMixin, torch.nn.Module):
+    r"""reduce a tensor with symmetries into irreducible representations
 
-@triton.jit
-def _zero_projection_kernel(Q, N: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(Q + i, 0., i < N)
+    Parameters
+    ----------
+    formula : str
+        String made of letters ``-`` and ``=`` that represent the indices symmetries of the tensor.
+        For instance ``ij=ji`` means that the tensor has two indices and if they are exchanged, its value is the same.
+        ``ij=-ji`` means that the tensor change its sign if the two indices are exchanged.
 
+    filter_ir_out : list of `e3nn.o3.Irrep`, optional
+        Optional, list of allowed irrep in the output
 
-@triton.jit
-def _write_projection_kernel(INDICES, VALUES, Q, N: tl.constexpr, BLOCK: tl.constexpr):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    offset = tl.load(INDICES + i, i < N, other=0)
-    value = tl.load(VALUES + i, i < N, other=0.)
-    tl.store(Q + offset, value, i < N)
+    filter_ir_mid : list of `e3nn.o3.Irrep`, optional
+        Optional, list of allowed irrep in the intermediary operations
 
+    **kwargs : dict of `e3nn.o3.Irreps`
+        each letter present in the formula has to be present in the ``irreps`` dictionary, unless it can be inferred by the
+        formula. For instance if the formula is ``ij=ji`` you can provide the representation of ``i`` only:
+        ``ReducedTensorProducts('ij=ji', i='1o')``.
 
-def reduce_permutation(f0, formulas, dtype=None, device=None, **dims):
-    """Return the native permutation basis ``(Q, ret)``.
+    reduction_device : torch.device or str, optional
+        Device used for basis construction and the resulting module. CUDA
+        enables the supported Triton math paths. Defaults to the torch default
+        device. Calling .cuda() after CPU construction does not rerun reduction.
 
-    CUDA FP32/FP64 uses Triton for zeroing and writing Q. Dimension checks,
-    orbit enumeration, sorting, sign conventions and ret remain in Python.
-    Other devices/dtypes retain the original implementation. As in native
-    e3nn, formulas should be the closed signed group from germinate_formulas.
+    Attributes
+    ----------
+    irreps_in : list of `e3nn.o3.Irreps`
+        input representations
+
+    irreps_out : `e3nn.o3.Irreps`
+        output representation
+
+    change_of_basis : `torch.Tensor`
+        tensor of shape ``(irreps_out.dim, irreps_in[0].dim, ..., irreps_in[-1].dim)``
+
+    Examples
+    --------
+    >>> tp = ReducedTensorProducts('ij=-ji', i='1o')
+    >>> x = torch.tensor([1.0, 0.0, 0.0])
+    >>> y = torch.tensor([0.0, 1.0, 0.0])
+    >>> tp(x, y) + tp(y, x)
+    tensor([0., 0., 0.])
+
+    >>> tp = ReducedTensorProducts('ijkl=jikl=ikjl=ijlk', i="1e")
+    >>> tp.irreps_out
+    1x0e+1x2e+1x4e
+
+    >>> tp = ReducedTensorProducts('ij=ji', i='1o')
+    >>> x, y = torch.randn(2, 3)
+    >>> a = torch.einsum('zij,i,j->z', tp.change_of_basis, x, y)
+    >>> b = tp(x, y)
+    >>> assert torch.allclose(a, b, atol=1e-3, rtol=1e-3)
     """
-    # Resolve torch's default device/dtype, including set_default_device.
-    prototype = torch.empty((), dtype=dtype, device=device)
-    if prototype.device.type != "cuda" or prototype.dtype not in (torch.float32, torch.float64):
-        return _reference_reduce_permutation(f0, formulas, dtype=dtype, device=device, **dims)
 
-    for _s, p in formulas:
-        f = "".join(f0[i] for i in p)
-        for i, j in zip(f0, f):
-            if i in dims and j in dims and dims[i] != dims[j]:
-                raise RuntimeError(f"dimension of {i} and {j} should be the same")
-            if i in dims:
-                dims[j] = dims[i]
-            if j in dims:
-                dims[i] = dims[j]
-    for i in f0:
-        if i not in dims:
-            raise RuntimeError(f"index {i} has no dimension associated to it")
-    dimensions = [dims[i] for i in f0]
+    # pylint: disable=abstract-method
 
-    full_base = list(itertools.product(*(range(d) for d in dimensions)))
-    base = set()
-    for x in full_base:
-        xs = {(s, tuple(x[i] for i in p)) for s, p in formulas}
-        if (-1, x) not in xs:
-            base.add(frozenset({frozenset(xs), frozenset({(-s, x) for s, x in xs})}))
-    base = sorted([sorted([sorted(xs) for xs in x]) for x in base])
+    def __init__(self, formula, filter_ir_out=None, filter_ir_mid=None, eps: float = 1e-9, *, reduction_device=None, **irreps) -> None:
+        super().__init__()
+        _, reduction_device = explicit_default_types(None, reduction_device)
 
-    ret = []
-    # Deduplicate flattened destinations with last-write semantics, matching
-    # native sequential assignments even if a caller supplies conflicting signs.
-    entries = {}
-    width = len(full_base)
-    for i, orbit in enumerate(base):
-        orbit = max(orbit, key=lambda xs: sum(s for s, x in xs))
-        ret.append(orbit)
-        for s, e in orbit:
-            j = 0
-            for k, d in zip(e, dimensions):
-                j = j * d + k
-            entries[i * width + j] = s / len(orbit) ** 0.5
+        if filter_ir_out is not None:
+            try:
+                filter_ir_out = [Irrep(ir) for ir in filter_ir_out]
+            except ValueError:
+                raise ValueError(f"filter_ir_out (={filter_ir_out}) must be an iterable of e3nn.o3.Irrep")
 
-    Q = prototype.new_empty((len(base), width))
-    if Q.numel():
-        _zero_projection_kernel[(triton.cdiv(Q.numel(), 256),)](Q, Q.numel(), 256)
-    if entries:
-        indices = torch.tensor(list(entries), dtype=torch.int64, device=Q.device)
-        values = torch.tensor(list(entries.values()), dtype=Q.dtype, device=Q.device)
-        _write_projection_kernel[(triton.cdiv(len(entries), 256),)](
-            indices, values, Q, len(entries), 256,
+        if filter_ir_mid is not None:
+            try:
+                filter_ir_mid = [Irrep(ir) for ir in filter_ir_mid]
+            except ValueError:
+                raise ValueError(f"filter_ir_mid (={filter_ir_mid}) must be an iterable of e3nn.o3.Irrep")
+
+        f0, formulas = germinate_formulas(formula)
+
+        irreps = {i: Irreps(irs) for i, irs in irreps.items()}
+
+        for i in irreps:
+            if len(i) != 1:
+                raise TypeError(f"got an unexpected keyword argument '{i}'")
+
+        for _sign, p in formulas:
+            f = "".join(f0[i] for i in p)
+            for i, j in zip(f0, f):
+                if i in irreps and j in irreps and irreps[i] != irreps[j]:
+                    raise RuntimeError(f"irreps of {i} and {j} should be the same")
+                if i in irreps:
+                    irreps[j] = irreps[i]
+                if j in irreps:
+                    irreps[i] = irreps[j]
+
+        for i in f0:
+            if i not in irreps:
+                raise RuntimeError(f"index {i} has no irreps associated to it")
+
+        for i in irreps:
+            if i not in f0:
+                raise RuntimeError(f"index {i} has an irreps but does not appear in the fomula")
+
+        base_perm, _ = reduce_permutation(
+            f0, formulas, dtype=torch.float64, device=reduction_device,
+            **{i: irs.dim for i, irs in irreps.items()}
         )
-    return Q.reshape(len(base), *dimensions), ret
+
+        Ps = collections.defaultdict(list)
+
+        for ir, path, base_o3 in _wigner_nj(
+            *[irreps[i] for i in f0], filter_ir_mid=filter_ir_mid,
+            dtype=torch.float64, device=reduction_device
+        ):
+            if filter_ir_out is None or ir in filter_ir_out:
+                # P = base_o3.flatten(1) @ base_perm.flatten(1).T
+                # if P.norm() > eps:  # if this Irrep is present in the premutation basis we keep it
+                Ps[ir].append((path, base_o3))
+
+        outputs = []
+        change_of_basis = []
+        irreps_out = []
+
+        P = base_perm.flatten(1)  # [permutation basis, input basis] (a,omega)
+        PP = P @ P.T  # (a,a)
+
+        for ir in Ps:
+            mul = len(Ps[ir])
+            paths = [path for path, _ in Ps[ir]]
+            base_o3 = torch.stack([R for _, R in Ps[ir]])
+
+            R = base_o3.flatten(2)  # [multiplicity, ir, input basis] (u,j,omega)
+
+            proj_s = []  # list of projectors into vector space
+            for j in range(ir.dim):
+                # Solve X @ R[:, j] = Y @ P, but keep only X
+                RR = R[:, j] @ R[:, j].T  # (u,u)
+                RP = R[:, j] @ P.T  # (u,a)
+
+                prob = torch.cat([torch.cat([RR, -RP], dim=1), torch.cat([-RP.T, PP], dim=1)], dim=0)
+                eigenvalues, eigenvectors = torch.linalg.eigh(prob)
+                X = eigenvectors[:, eigenvalues < eps][:mul].T  # [solutions, multiplicity]
+                proj_s.append(X.T @ X)
+
+                break  # do not check all components because too time expensive
+
+            for p in proj_s:
+                assert (p - proj_s[0]).abs().max() < eps, f"found different solutions for irrep {ir}"
+
+            # look for an X such that X.T @ X = Projector
+            X, _ = orthonormalize(proj_s[0], eps)
+
+            for x in X:
+                C = torch.einsum("u,ui...->i...", x, base_o3)
+                correction = (ir.dim / C.pow(2).sum()) ** 0.5
+                C = correction * C
+
+                outputs.append([((correction * v).item(), p) for v, p in zip(x, paths) if v.abs() > eps])
+                change_of_basis.append(C)
+                irreps_out.append((1, ir))
+
+        dtype, _ = explicit_default_types(None, None)
+        self.register_buffer("change_of_basis", torch.cat(change_of_basis).to(dtype=dtype))
+
+        tps = set()
+        for vp_list in outputs:
+            for v, p in vp_list:
+                for op in _get_ops(p):
+                    tps.add(op)
+
+        root = torch.nn.Module()
+
+        tps = list(tps)
+        for i, op in enumerate(tps):
+            tp = TensorProduct(op[0], op[1], op[2], [(0, 0, 0, "uuu", False)])
+            setattr(root, f"tp{i}", tp)
+
+        graph = fx.Graph()
+        tracer = torch.fx.proxy.GraphAppendingTracer(graph)
+        inputs = [fx.Proxy(graph.placeholder(f"x{i}", torch.Tensor), tracer) for i in f0]
+
+        self.irreps_in = [irreps[i] for i in f0]
+        self.irreps_out = Irreps(irreps_out).simplify()
+
+        values = {}
+
+        def evaluate(path):
+            if path in values:
+                return values[path]
+
+            if isinstance(path, _INPUT):
+                out = inputs[path.tensor]
+                if (path.start, path.stop) != (0, self.irreps_in[path.tensor].dim):
+                    out = out.narrow(-1, path.start, path.stop - path.start)
+            if isinstance(path, _TP):
+                x1 = evaluate(path.args[0]).node
+                x2 = evaluate(path.args[1]).node
+                out = fx.Proxy(graph.call_module(f"tp{tps.index(path.op)}", (x1, x2)), tracer)
+            values[path] = out
+            return out
+
+        outs = []
+        for vp_list in outputs:
+            v, p = vp_list[0]
+            out = evaluate(p)
+            if abs(v - 1.0) > eps:
+                out = v * out
+            for v, p in vp_list[1:]:
+                t = evaluate(p)
+                if abs(v - 1.0) > eps:
+                    t = v * t
+                out = out + t
+            outs.append(out)
+
+        out = torch.cat(outs, dim=-1)
+        graph.output(out.node)
+        graphmod = fx.GraphModule(root, graph, "main")
+
+        self._codegen_register({"main": graphmod})
+        # TensorProduct submodules were constructed through native e3nn; move
+        # their buffers and the generated graph to the same execution device.
+        self.to(device=reduction_device)
+
+    def __repr__(self) -> str:
+        return (
+            f"ReducedTensorProducts(\n"
+            f"    in: {' times '.join(map(repr, self.irreps_in))}\n"
+            f"    out: {self.irreps_out}\n"
+            ")"
+        )
+
+    def forward(self, *xs):
+        return self.main(*xs)
 
 
-__all__ = ["germinate_formulas", "reduce_permutation"]
+__all__ = ["_wigner_nj", "_get_ops", "ReducedTensorProducts"]
