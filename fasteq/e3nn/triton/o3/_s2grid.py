@@ -14,12 +14,14 @@ from .._common import check_gpu, grid
 
 @triton.jit
 def _quadrature_kernel(W, B: tl.constexpr, K: tl.constexpr):
-    j = tl.program_id(0)
-    k = tl.arange(0, K)
+    dtype = W.dtype.element_ty
+    index = tl.program_id(0)
+    j = index.to(dtype)
+    k = tl.arange(0, K).to(dtype)
     t = math.pi * (2. * j + 1.) / (4. * B)
-    v = tl.where(k < B, tl.sin((2. * k + 1.) * t) / (2. * k + 1.), 0.)
-    weight = (2. / B) * tl.sin(t) * tl.sum(v, 0) / (2. * (2 * B)**2)
-    tl.store(W + j, weight)
+    v = tl.where(k < B, libdevice.sin((2. * k + 1.) * t) / (2. * k + 1.), 0.)
+    weight = (2. / B) * libdevice.sin(t) * tl.sum(v, 0) / (2. * (2 * B)**2)
+    tl.store(W + index, weight)
 
 
 def _quadrature_weights(b, dtype=None, device=None):
@@ -32,8 +34,9 @@ def _quadrature_weights(b, dtype=None, device=None):
 @triton.jit
 def _grid_kernel(BETA, ALPHA, NB: tl.constexpr, NA: tl.constexpr, BLOCK: tl.constexpr):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    tl.store(BETA + i, (i + 0.5) / NB * math.pi, i < NB)
-    tl.store(ALPHA + i, i / NA * (2. * math.pi), i < NA)
+    position = i.to(BETA.dtype.element_ty)
+    tl.store(BETA + i, (position + 0.5) / NB * math.pi, i < NB)
+    tl.store(ALPHA + i, position / NA * (2. * math.pi), i < NA)
 
 
 def s2_grid(res_beta, res_alpha, dtype=None, device=None):
@@ -109,7 +112,7 @@ def _rfft_dft_kernel(X, OUT, RES: tl.constexpr, L: tl.constexpr,
     row, m = idx // width, idx % width - L
     t = tl.arange(0, K)
     x = tl.load(X + row * RES + t, t < RES, other=0)
-    angle = t.to(x.dtype) * (6.283185307179586 * tl.abs(m) / RES)
+    angle = t.to(x.dtype) * tl.abs(m).to(x.dtype) * (6.283185307179586 / RES)
     if m < 0:
         v = 1.4142135623730951 * tl.sum(x * libdevice.sin(angle), 0)
     elif m > 0:
@@ -142,7 +145,7 @@ def _irfft_dft_kernel(X, OUT, RES: tl.constexpr, L: tl.constexpr,
     mask = k <= L
     xp = tl.load(X + row * (2 * L + 1) + L + k, mask, other=0)
     xn = tl.load(X + row * (2 * L + 1) + L - k, mask, other=0)
-    angle = k.to(xp.dtype) * (6.283185307179586 * a / RES)
+    angle = k.to(xp.dtype) * a.to(xp.dtype) * (6.283185307179586 / RES)
     value = tl.load(X + row * (2 * L + 1) + L)
     value += 1.4142135623730951 * tl.sum(
         xp * libdevice.cos(angle) + xn * libdevice.sin(angle), 0

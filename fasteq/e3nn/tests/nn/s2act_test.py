@@ -1,6 +1,7 @@
 """GPU cases adapted from tests/nn, excluding models and tensor products."""
 
 import importlib
+import itertools
 import os
 
 import pytest
@@ -24,14 +25,17 @@ def close(actual, expected, tol=3e-5):
         torch.testing.assert_close(actual, expected, rtol=tol, atol=tol, equal_nan=True)
 
 
+@pytest.mark.parametrize("act,normalization,p_val,p_arg", itertools.product(
+    [torch.tanh, lambda x: x ** 2], ["norm", "component"], [-1, 1], [-1, 1]))
 @pytest.mark.parametrize("random_rot", [False, True])
-def test_s2_activation_parity_and_random_rotation(random_rot):
-    args = ("1x0e+1x1o", torch.tanh, 8)
+def test_s2_activation_parity_and_random_rotation(act, normalization, p_val, p_arg, random_rot):
+    irreps = f"1x0{'e' if p_val > 0 else 'o'}+1x1{'e' if p_val * p_arg > 0 else 'o'}"
+    args = (irreps, act, 8)
     # e3nn's wigner_D builds CPU generators, so its random rotation path
     # currently requires CPU angles. Keep the CUDA projection case separate.
     device = "cpu" if random_rot else "cuda"
-    actual = optimized.S2Activation(*args, random_rot=random_rot).to(device)
-    expected = reference.S2Activation(*args, random_rot=random_rot).to(device)
+    actual = optimized.S2Activation(*args, normalization=normalization, random_rot=random_rot).to(device)
+    expected = reference.S2Activation(*args, normalization=normalization, random_rot=random_rot).to(device)
     assert actual.irreps_out == expected.irreps_out
     x = torch.randn(2, 4, device=device)
     torch.manual_seed(71)

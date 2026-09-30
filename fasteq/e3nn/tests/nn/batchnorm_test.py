@@ -24,11 +24,12 @@ def close(actual, expected, tol=3e-5):
         torch.testing.assert_close(actual, expected, rtol=tol, atol=tol, equal_nan=True)
 
 
-@pytest.mark.parametrize("affine,reduce,instance", [
-    (True, "mean", False), (False, "max", False), (True, "mean", True),
-])
-def test_batchnorm_train_updates_and_eval(affine, reduce, instance):
-    kwargs = dict(affine=affine, reduce=reduce, instance=instance)
+@pytest.mark.parametrize("affine", [True, False])
+@pytest.mark.parametrize("reduce", ["mean", "max"])
+@pytest.mark.parametrize("normalization", ["norm", "component"])
+@pytest.mark.parametrize("instance", [True, False])
+def test_batchnorm_train_updates_and_eval(affine, reduce, normalization, instance):
+    kwargs = dict(affine=affine, reduce=reduce, normalization=normalization, instance=instance)
     actual = optimized.BatchNorm("2x0e+1x1o", **kwargs).cuda()
     expected = reference.BatchNorm("2x0e+1x1o", **kwargs).cuda()
     expected.load_state_dict(actual.state_dict())
@@ -54,4 +55,3 @@ def test_batchnorm_affine_gradient_fallback():
     gb = torch.autograd.grad(b, (x, expected.weight, expected.bias))
     for lhs, rhs in zip(ga, gb):
         close(lhs, rhs)
-

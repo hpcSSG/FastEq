@@ -33,3 +33,22 @@ def test_wigner_reference_symmetry_and_orthogonality():
     a = torch.tensor(0.4)
     D = module.wigner_D(2, a, a * 2, -a)
     torch.testing.assert_close(D @ D.T, torch.eye(5), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("l1,l2,l3", [
+    (1, 2, 3), (2, 3, 4), (3, 4, 5), (1, 1, 1),
+    (1, 1, 0), (1, 0, 1), (0, 1, 1), (2, 2, 2),
+])
+def test_wigner_3j_parameter_grid(l1, l2, l3):
+    module = importlib.import_module(PREFIX + ".o3._wigner")
+    got = module.wigner_3j(l1, l2, l3, device="cuda")
+    want = o3.wigner_3j(l1, l2, l3, device="cuda")
+    torch.testing.assert_close(got, want)
+
+
+@pytest.mark.parametrize("j", [0, 0.5, 1, 1.5, 2, 2.5])
+def test_su2_generators_parameter_grid(j):
+    module = importlib.import_module(PREFIX + ".o3._wigner")
+    got = module.su2_generators(j)
+    want = o3.su2_generators(j)
+    torch.testing.assert_close(got, want)

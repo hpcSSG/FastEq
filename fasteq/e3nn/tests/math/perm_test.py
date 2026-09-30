@@ -21,7 +21,7 @@ soft_unit_step = importlib.import_module(PREFIX + ".math._soft_unit_step").soft_
 natural_representation = importlib.import_module(PREFIX + ".math.perm").natural_representation
 
 
-@pytest.mark.parametrize("n", [0, 1, 3, 7, 15])
+@pytest.mark.parametrize("n", [0, 1, 2, 3, 4, 5, 7, 15])
 def test_natural_permutation_representation_and_composition(n):
     # Adapted from tests/math/perm_test.py; use a deterministic permutation.
     p = tuple(reversed(range(n)))
@@ -48,4 +48,3 @@ def test_direct_sum_three_rectangular_blocks(dtype):
     assert actual.shape == (2, 3, 6, 7)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual[..., 3:, 5:], c, rtol=0, atol=0)
-

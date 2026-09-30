@@ -47,3 +47,23 @@ def test_bias_and_gradient_fallback():
     ga, = torch.autograd.grad(out_a.sum(), x, retain_graph=True)
     gb, = torch.autograd.grad(out_b.sum(), x)
     torch.testing.assert_close(ga, gb, rtol=3e-5, atol=3e-5)
+
+
+# The upstream linear_like_tp test uses seven input and seven output irreps.
+# Fixed samples keep the full 7 * 7 grid reproducible across runs.
+INPUT_IRREPS = ["5x0e", "1e+2e+4x1e+3x3o", "2x1o+0x3e",
+                "1x0e+2x1o", "3x2e", "1x0o+1x3o", "2x0e+1x2e"]
+OUTPUT_IRREPS = ["5x0e", "1e+2e+3x3o+3x1e", "2x1o+0x3e",
+                 "1x0e+1x1o", "2x2e", "2x0o+1x3o", "1x0e+2x2e"]
+
+
+@pytest.mark.parametrize("irreps_in", INPUT_IRREPS)
+@pytest.mark.parametrize("irreps_out", OUTPUT_IRREPS)
+def test_linear_irreps_parameter_grid(irreps_in, irreps_out):
+    module = importlib.import_module(PREFIX + ".o3._linear")
+    actual = module.Linear(irreps_in, irreps_out).cuda()
+    expected = o3.Linear(irreps_in, irreps_out).cuda()
+    expected.load_state_dict(actual.state_dict())
+    x = torch.randn(2, actual.irreps_in.dim, device="cuda")
+    with torch.no_grad():
+        torch.testing.assert_close(actual(x), expected(x), rtol=3e-5, atol=3e-5)

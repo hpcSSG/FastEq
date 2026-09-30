@@ -35,14 +35,14 @@ def _coefficients(ls):
             orders.append(m)
             degrees.append(degree)
     terms = max(map(len, entries))
-    def padded(fn):
+    def padded(fn, dtype):
         return torch.tensor([
             [fn(k, v) for k, v in e.items()] + [0] * (terms - len(e))
             for e in entries
-        ])
-    return (padded(lambda k, v: float(v)).to(torch.float64),
-            padded(lambda k, v: k[0]).to(torch.int32),
-            padded(lambda k, v: k[1]).to(torch.int32),
+        ], dtype=dtype)
+    return (padded(lambda k, v: float(v), torch.float64),
+            padded(lambda k, v: k[0], torch.int32),
+            padded(lambda k, v: k[1], torch.int32),
             torch.tensor(orders, dtype=torch.int32),
             torch.tensor(degrees, dtype=torch.int32), terms)
 
@@ -52,8 +52,8 @@ def _alpha_kernel(A, OUT, N: tl.constexpr, L: tl.constexpr, BLOCK: tl.constexpr)
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     a = tl.load(A + i // (2 * L + 1), i < N * (2 * L + 1), other=0)
     m = i % (2 * L + 1) - L
-    value = tl.where(m < 0, 1.4142135623730951 * tl.sin(-m * a),
-                     tl.where(m > 0, 1.4142135623730951 * tl.cos(m * a), 1.))
+    value = tl.where(m < 0, 1.4142135623730951 * libdevice.sin(-m * a),
+                     tl.where(m > 0, 1.4142135623730951 * libdevice.cos(m * a), 1.))
     tl.store(OUT + i, value, i < N * (2 * L + 1))
 
 
@@ -106,18 +106,18 @@ def _fused_kernel(A, B, C, ZP, YP, ORD, DEG, OUT, WIDTH: tl.constexpr,
     k = tl.arange(0, K)
     a = tl.load(A + row)
     b = tl.load(B + row)
-    z, y = tl.cos(b), tl.sin(b)
+    z, y = libdevice.cos(b), libdevice.sin(b)
     coef = tl.load(C + col * TERMS + k, k < TERMS, other=0).to(b.dtype)
     zp = tl.load(ZP + col * TERMS + k, k < TERMS, other=0)
     yp = tl.load(YP + col * TERMS + k, k < TERMS, other=0)
     p = tl.sum(coef * libdevice.pow(z, zp.to(z.dtype)) * libdevice.pow(y, yp.to(y.dtype)), 0)
     m = tl.load(ORD + col)
     l = tl.load(DEG + col)
-    angular = tl.where(m < 0, 1.4142135623730951 * tl.sin(-m * a),
-                       tl.where(m > 0, 1.4142135623730951 * tl.cos(m * a), 1.))
+    angular = tl.where(m < 0, 1.4142135623730951 * libdevice.sin(-m * a),
+                       tl.where(m > 0, 1.4142135623730951 * libdevice.cos(m * a), 1.))
     value = p * angular
     if NORMALIZATION == 1:
-        value = value * 3.544907701811032 / tl.sqrt(2. * l + 1.)
+        value = value * 3.544907701811032 / libdevice.sqrt(2. * l.to(b.dtype) + 1.)
     elif NORMALIZATION == 2:
         value = value * 3.544907701811032
     tl.store(OUT + idx, value)

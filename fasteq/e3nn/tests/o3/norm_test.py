@@ -35,3 +35,15 @@ def test_norm_forward_and_zero_gradient(squared, irreps):
     ga, = torch.autograd.grad(actual(zeros).sum(), zeros, retain_graph=True)
     gb, = torch.autograd.grad(expected(zeros).sum(), zeros)
     torch.testing.assert_close(ga, gb)
+
+
+@pytest.mark.parametrize("squared", [True, False])
+@pytest.mark.parametrize("irreps_in", ["", "5x0e", "1e+2e+4x1e+3x3o",
+                                      "1x0e+2x1o", "3x2e", "1x0o+1x3o",
+                                      "2x0e+1x2e"])
+def test_norm_irreps_parameter_grid(irreps_in, squared):
+    module = importlib.import_module(PREFIX + ".o3._norm")
+    actual = module.Norm(irreps_in, squared=squared).cuda()
+    expected = o3.Norm(irreps_in, squared=squared).cuda()
+    x = torch.randn(3, actual.irreps_in.dim, device="cuda")
+    torch.testing.assert_close(actual(x), expected(x), rtol=3e-5, atol=3e-5)

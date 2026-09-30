@@ -25,8 +25,8 @@ def close(actual, expected, tol=3e-5):
 
 
 @pytest.mark.parametrize("irreps,acts", [
-    ("6x0o", [torch.abs]),
-    ("3x0e", [torch.tanh]),
+    ("256x0o", [torch.abs]),
+    ("37x0e", [torch.tanh]),
     ("4x0e+3x0o", [torch.nn.functional.silu, torch.abs]),
     ("2x0e+1x1o+2x0o", [torch.sigmoid, None, torch.abs]),
 ])

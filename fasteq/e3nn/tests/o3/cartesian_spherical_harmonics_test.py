@@ -23,7 +23,7 @@ so3 = importlib.import_module(PREFIX + ".o3._so3grid")
 
 
 
-@pytest.mark.parametrize("l", [0, 1, 2, 3])
+@pytest.mark.parametrize("l", range(12))
 def test_cartesian_spherical_harmonics_reference_and_gradient(l):
     module = importlib.import_module(PREFIX + ".o3._spherical_harmonics")
     assert module.spherical_harmonics is o3.spherical_harmonics

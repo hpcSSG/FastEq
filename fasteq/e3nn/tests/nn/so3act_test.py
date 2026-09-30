@@ -24,7 +24,7 @@ def close(actual, expected, tol=3e-5):
         torch.testing.assert_close(actual, expected, rtol=tol, atol=tol, equal_nan=True)
 
 
-@pytest.mark.parametrize("aspect_ratio", [1, 2])
+@pytest.mark.parametrize("aspect_ratio", [1, 2, 3, 4])
 def test_so3_activation_grid_roundtrip(aspect_ratio):
     args = (1, 1, torch.tanh, 3)
     actual = optimized.SO3Activation(*args, aspect_ratio=aspect_ratio).cuda()
@@ -33,3 +33,12 @@ def test_so3_activation_grid_roundtrip(aspect_ratio):
     with torch.no_grad():
         close(actual(x), expected(x), 5e-4)
 
+
+@pytest.mark.parametrize("lmax", [1, 2, 3, 4])
+@pytest.mark.parametrize("act", [torch.tanh, lambda x: x ** 2])
+def test_so3_activation_degree_and_nonlinearity(lmax, act):
+    actual = optimized.SO3Activation(lmax, lmax, act, 6).cuda()
+    expected = reference.SO3Activation(lmax, lmax, act, 6).cuda()
+    x = torch.randn(2, actual.grid_in.D.shape[-1], device="cuda")
+    with torch.no_grad():
+        close(actual(x), expected(x), 5e-4)

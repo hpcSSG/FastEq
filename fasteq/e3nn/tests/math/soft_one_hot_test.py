@@ -36,3 +36,24 @@ def test_one_hot_outside_and_ends(dtype, basis, cutoff):
     if cutoff and basis not in ("gaussian", "bessel"):
         assert torch.count_nonzero(actual.reshape(-1, 5)[[0, 1, 6, 7]]) == 0
 
+
+@pytest.mark.parametrize("basis", ["gaussian", "cosine", "fourier", "bessel", "smooth_finite"])
+def test_one_hot_zero_out_parameter_grid(basis):
+    x = torch.cat((torch.linspace(-2., -1.1, 20, device="cuda"),
+                   torch.linspace(2.1, 3., 20, device="cuda")))
+    args = (-1., 2., 5, basis, True)
+    torch.testing.assert_close(one_hot(x, *args), reference.soft_one_hot_linspace(x, *args),
+                               rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("basis", ["gaussian", "cosine", "fourier", "smooth_finite"])
+@pytest.mark.parametrize("cutoff", [True, False])
+def test_one_hot_normalized_parameter_grid(basis, cutoff):
+    x = torch.linspace(-14., 105., 50, device="cuda")
+    args = (-20., 120., 12, basis, cutoff)
+    got = one_hot(x, *args)
+    want = reference.soft_one_hot_linspace(x, *args)
+    torch.testing.assert_close(got, want, rtol=2e-4, atol=2e-4)
+    norm = got.square().sum(-1)
+    assert norm.min() > 0.4
+    assert norm.max() < 2.
