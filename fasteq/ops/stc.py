@@ -835,6 +835,9 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         # when the original x0 input participates in autograd.
         x0_g = x0[i0_i64].contiguous()
 
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         key = _make_stc_bwd_tune_key(
             idx_lists_tensor, coeffs_tensor, V=V, U=U,
             dtype=x1.dtype, path_lens=None, pad_value=int(pad_value),
@@ -890,6 +893,10 @@ class FastSTCBackwardFunction(torch.autograd.Function):
         ctx.pad_value = int(pad_value)
         ctx.use_multiwarp_candidates = bool(use_multiwarp_candidates)
         ctx.need_grad_x0 = need_grad_x0
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        print(f"<< fasteq  stc uniform1d-lars backward-forward cost: {end_time - start_time:.3f} ms >>")
 
         return (gx1, gx0) if need_grad_x0 else gx1
 
@@ -950,11 +957,19 @@ class FastSTCBackwardFunction(torch.autograd.Function):
                 key, candidates, grad_out_3d, x1, x0, i0_i64,
                 grad_grad_x0_3d, grad_grad_x1_3d, int(ctx.num_out_segments),
             )
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+        
         d_go_3d, d_x1, d_x0 = mod.run(
             grad_out_3d, x1.contiguous(), x0.contiguous(),
             i0_i64, grad_grad_x0_3d, grad_grad_x1_3d,
             int(ctx.num_out_segments),
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        print(f"<< fasteq  stc uniform1d-lars backward-backward cost: {end_time - start_time:.3f} ms >>")
 
         # The CUDA kernel already performs gather-backward reduction:
         # d_x0.shape == x0.shape, even when B != x0.size(0).
@@ -994,8 +1009,8 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
         pad_value: int = STC_PAD_VALUE,
         use_multiwarp_candidates: bool = False,
     ):
-        #torch.cuda.synchronize()
-        #start_time = time.perf_counter() * 1000
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
 
         use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(use_multiwarp_candidates)
         x0_g = x0[i0]
@@ -1056,9 +1071,9 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
 
         out = out.view(out.shape[0], -1)
 
-        #torch.cuda.synchronize()
-        #end_time = time.perf_counter() * 1000
-        #print(f"<< fasteq stc uniform1d-lars forward cost: {end_time - start_time:.3f} ms >>")
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        print(f"<< fasteq stc uniform1d-lars forward cost: {end_time - start_time:.3f} ms >>")
 
         ctx.save_for_backward(x1, x0, i0, coeffs_tensor, paths_tensor, path_lens_tensor, idx_lists_tensor)
         ctx.num_out_segments = int(num_out_segments)
@@ -1075,11 +1090,18 @@ class FastSymmetricTensorContractionUniform1dFunction(torch.autograd.Function):
             int(ctx.num_out_segments), int(ctx.pad_value),
             bool(ctx.use_multiwarp_candidates), need_grad_x0,
         )
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000
+
         if need_grad_x0:
             grad_x1, grad_x0 = FastSTCBackwardFunction.apply(*backward_args)
         else:
             grad_x1 = FastSTCBackwardFunction.apply(*backward_args)
             grad_x0 = None
+        
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000
+        print(f"<< fasteq stc uniform1d-lars backward cost: {end_time - start_time:.3f} ms >>")
         return grad_x1, grad_x0, None, None, None, None, None, None, None
 
 

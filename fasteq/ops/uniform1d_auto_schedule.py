@@ -3387,14 +3387,14 @@ def emit_launcher(
     #   B is number of source-index entries.
     #
     # dense mode:
-    #   B comes from w.size(0), where w is either [1,Iw,U] or [B,Iw,U].
+    #   B comes from x_all.size(0); w may be shared across all B rows.
     # ------------------------------------------------------------------
     if use_scatter:
         b_expr = "dst_idx.size(0)"
     elif use_x_src or use_y_src:
         b_expr = "src_idx.size(0)"
     else:
-        b_expr = "w.size(0)"
+        b_expr = "x_all.size(0)"
 
     return rf'''
 
@@ -4353,6 +4353,47 @@ def _bwd_label_index_expr(
     raise ValueError(f"Bad backward label kind: {kind}")
 
 
+def _cuda_scalar_warp_sum_preamble() -> str:
+    """CUDA-only reduction for full or contiguous partial 32-lane tiles."""
+    return r"""
+#if !defined(USE_ROCM) && !defined(__HIP_PLATFORM_AMD__)
+#ifndef FASTEQ_CUDA_SCALAR_WARP_SUM_DEFINED
+#define FASTEQ_CUDA_SCALAR_WARP_SUM_DEFINED
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t fasteq_cuda_warp_sum(scalar_t value) {
+    const unsigned mask = __activemask();
+    const int lane = (int)threadIdx.x & 31;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const scalar_t other = __shfl_down_sync(mask, value, offset, 32);
+        const int source_lane = lane + offset;
+        if (source_lane < 32 && ((mask >> source_lane) & 1u)) {
+            value += other;
+        }
+    }
+    return value;
+}
+#endif
+#endif
+"""
+
+
+def _emit_backend_gradient_atomic(ap, pointer: str, value: str, *, scalar_channel: bool) -> None:
+    """Scalar channels reduce on CUDA; HIP and vector channels use per-lane atomics."""
+    if not scalar_channel:
+        ap(f"            atomicAdd({pointer}, {value});")
+        return
+    ap("            {")
+    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+    ap(f"                atomicAdd({pointer}, {value});")
+    ap("#else")
+    ap(f"                const scalar_t warp_sum = fasteq_cuda_warp_sum({value});")
+    ap("                if (((int)threadIdx.x & 31) == 0) {")
+    ap(f"                    atomicAdd({pointer}, warp_sum);")
+    ap("                }")
+    ap("#endif")
+    ap("            }")
+
+
 def emit_fused_bwd_kernel_from_lars_schedule(
     schedule_result: ScheduleResult,
     *,
@@ -4531,11 +4572,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         elif kind == "gx":
             ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
         elif kind == "gy":
-            # Portable correctness path for scalar-y and vector-y:
-            # each valid u lane contributes directly.  This deliberately avoids
-            # warp/wavefront shuffle semantics (CUDA warp32 vs HIP wave32/wave64)
-            # and is also correct for a partial final 32-lane tile.
-            ap(f"            atomicAdd(&grad_y[{expr}], {value_expr});")
+            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", value_expr, scalar_channel=mode_scalar_y)
         else:
             raise ValueError(f"Bad backward accumulator kind: {kind}")
 
@@ -4568,8 +4605,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("")
     ap("using GPU_Guard = c10::DeviceGuard;")
     ap("")
-    ap("// grad_y scalar reduction intentionally uses per-lane atomicAdd.")
-    ap("// No warp/wavefront shuffle is used, so CUDA and HIP share one path.")
+    ap(_cuda_scalar_warp_sum_preamble())
     ap("")
 
     ap("template <typename scalar_t, typename index_t>")
@@ -4777,9 +4813,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             elif kind == "gx":
                 ap(f"            atomicAdd(&grad_x[{expr}], {reg});")
             elif kind == "gy":
-                # One atomic contribution per valid u lane.  Do not reduce with
-                # hardware warp/wavefront shuffle here.
-                ap(f"            atomicAdd(&grad_y[{expr}], {reg});")
+                _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", str(reg), scalar_channel=mode_scalar_y)
             else:
                 raise ValueError("store_acc expects a backward output label")
 
@@ -4825,8 +4859,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ky_dim=ky_dim,
             v_dim=v_dim,
         )
-        # Portable per-lane accumulation; valid for both scalar-y and vector-y.
-        ap(f"            atomicAdd(&grad_y[{expr}], gy_acc_k_{gy_idx});")
+        _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", f"gy_acc_k_{gy_idx}", scalar_channel=mode_scalar_y)
 
     ap("        }")
     ap("    }")
@@ -5350,7 +5383,7 @@ def emit_lars_bwd_split_preamble() -> str:
 
 using GPU_Guard = c10::DeviceGuard;
 
-// grad_y scalar reduction intentionally uses per-lane atomicAdd.
+// CUDA scalar gradients use warp sums; HIP uses per-lane atomics.
 // This avoids any dependency on CUDA warp32 / HIP wave32-or-wave64 semantics.
 
 static inline bool mul_fits_int32_bwd_split(int64_t a, int64_t b) {
@@ -5379,7 +5412,7 @@ static inline bool should_use_int32_index_bwd_split(
     bool go_ok = mul3_fits_int32_bwd_split(go_dim0, (int64_t)V, (int64_t)U);
     return w_ok && x_ok && y_ok && go_ok;
 }
-'''
+''' + _cuda_scalar_warp_sum_preamble()
 
 
 def emit_lars_bwd_split_kernel_from_schedule(
@@ -5494,8 +5527,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         elif grad_kind == "gx":
             ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
         else:
-            # Portable correctness path: one atomic contribution per valid u lane.
-            ap(f"            atomicAdd(&grad_y[{expr}], {value_expr});")
+            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", value_expr, scalar_channel=mode_scalar_y)
 
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
@@ -5709,8 +5741,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 ky_dim=ky_dim,
                 v_dim=v_dim,
             )
-            # Portable correctness path: one atomic contribution per valid u lane.
-            ap(f"            atomicAdd(&grad_y[{expr}], {acc_expr});")
+            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", acc_expr, scalar_channel=mode_scalar_y)
         else:
             raise ValueError(f"Bad grad_kind: {grad_kind}")
 
@@ -6553,7 +6584,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
     profile_print: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
-    split_backward: Union[bool, str] = "auto",
+    split_backward: Union[bool, str] = "fused",
     split_path_threshold: int = 256,
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
@@ -6583,11 +6614,11 @@ def generate_code_uniform1d_bwd_with_scheduler(
         path_count=ctx.P,
         split_path_threshold=split_path_threshold,
     )
-    # Partial gx/gy specializations omit their kernel, allocation, and atomic
+    """ # Partial gx/gy specializations omit their kernel, allocation, and atomic
     # reduction. Route them through split codegen so the fused all-gradient
     # schedule cannot retain hidden gradient work.
     if not need_grad_x or not need_grad_y:
-        use_split_backward = True
+        use_split_backward = True """
 
     common_kwargs = dict(
         ctx=ctx,
@@ -6919,6 +6950,7 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
     ap("#endif")
     ap("")
     ap("using GPU_Guard = c10::DeviceGuard;")
+    ap(_cuda_scalar_warp_sum_preamble())
     ap("")
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
@@ -7029,7 +7061,7 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
                 if bool(inst_need_gx):
                     t_dy.append(f"({rggx} * {rgo} * {rw})")
                 if t_dy:
-                    ap(f"            atomicAdd(&d_y[{output_index('dy', int(yk))}], scalar_t({c}) * ({' + '.join(t_dy)}));")
+                    _emit_backend_gradient_atomic(ap, f"&d_y[{output_index('dy', int(yk))}]", f"scalar_t({c}) * ({' + '.join(t_dy)})", scalar_channel=mode_scalar_y)
         elif inst.op == "release":
             pass
         else:
@@ -8584,18 +8616,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
     ap("using GPU_Guard = c10::DeviceGuard;")
     ap("")
 
-    ap("template <typename scalar_t>")
-    ap("__device__ __forceinline__ scalar_t warp_sum_xor_baseline_bwd(scalar_t v) {")
-    ap("    for (int offset = 16; offset > 0; offset >>= 1) {")
-    ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
-    ap("        v += __shfl_xor(v, offset);")
-    ap("#else")
-    ap("        v += __shfl_xor_sync(0xffffffff, v, offset);")
-    ap("#endif")
-    ap("    }")
-    ap("    return v;")
-    ap("}")
-    ap("")
+    ap(_cuda_scalar_warp_sum_preamble())
 
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
@@ -8887,23 +8908,7 @@ def emit_fused_bwd_kernel_baseline_unrolled(
                 v_dim=v_dim,
             )
             value = f"gy_acc_b{block_id}_t{target_slot}"
-            if mode_scalar_y:
-                reduced = f"gy_sum_b{block_id}_t{target_slot}"
-                ap(
-                    f"                const scalar_t {reduced} = "
-                    f"warp_sum_xor_baseline_bwd({value});"
-                )
-                ap("                if (lane == 0) {")
-                ap(
-                    f"                    atomicAdd(&grad_y[{gy_expr}], "
-                    f"{reduced});"
-                )
-                ap("                }")
-            else:
-                ap(
-                    f"                atomicAdd(&grad_y[{gy_expr}], "
-                    f"{value});"
-                )
+            _emit_backend_gradient_atomic(ap, f"&grad_y[{gy_expr}]", value, scalar_channel=mode_scalar_y)
 
         ap("            }")
     ap("        }")
@@ -9552,7 +9557,7 @@ class TritonEmitter:
             lines += ["        dst_idx = w"]
         lines += [
             "        V = int(args[p])",
-            "        B = int(src_idx.numel()) if " + ("True" if (use_x_src or use_y_src) else "False") + " else int(w.size(0))",
+            "        B = " + ("int(src_idx.numel())" if (use_x_src or use_y_src) else ("int(dst_idx.numel())" if use_scatter else "int(x.size(0))")),
             "        WB, Iw, U = int(w.size(0)), int(w.size(1)), int(w.size(2))",
             "        Ix, Ky = int(x.size(1)), int(y.size(1))",
             ("        out_rows = int(x.size(0))" if use_scatter else "        out_rows = B"),
@@ -9680,7 +9685,7 @@ class TritonEmitter:
             lines.append("        dst_idx = w")
         lines += [
             "        V = int(args[p])",
-            "        B = int(src_idx.numel()) if " + ("True" if (use_x_src or use_y_src) else "False") + " else int(grad_out.size(0))",
+            "        B = " + ("int(src_idx.numel())" if (use_x_src or use_y_src) else ("int(dst_idx.numel())" if use_scatter else "int(grad_out.size(0))")),
             "        WB, Iw, U = int(w.size(0)), int(w.size(1)), int(w.size(2))",
             "        Ix, Ky = int(x.size(1)), int(y.size(1))",
             f"        BLOCK_U = {int(block_u)}",
@@ -9832,7 +9837,7 @@ class TritonEmitter:
             lines += ["        dst_idx = w"]
         lines += [
             "        V = int(args[p])",
-            "        B = int(src_idx.numel()) if " + ("True" if (use_x_src or use_y_src) else "False") + " else int(w.size(0))",
+            "        B = " + ("int(src_idx.numel())" if (use_x_src or use_y_src) else ("int(dst_idx.numel())" if use_scatter else "int(x.size(0))")),
             "        WB, Iw, U = int(w.size(0)), int(w.size(1)), int(w.size(2))",
             "        Ix, Ky = int(x.size(1)), int(y.size(1))",
             "        dgo = torch.zeros_like(grad_out)",

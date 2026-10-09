@@ -78,14 +78,14 @@ _META_INT32_TENSOR_CACHE: Dict[Tuple[Any, ...], torch.Tensor] = {}
 # -----------------------------------------------------------------------------
 # Default auto-warp tuning policy
 # -----------------------------------------------------------------------------
-_DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = False
-_DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = False
+_DEFAULT_UNIFORM1D_FWD_TUNE_ENABLED = True
+_DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED = True
 _DEFAULT_UNIFORM1D_TUNE_WARMUP = 3
 _DEFAULT_UNIFORM1D_TUNE_REPEAT = 10
 # Shared by Uniform1D and STC. Set once before model execution.
 # False: one base implementation, no variant search or benchmarking.
 # True: generate multi-warp variants and select by benchmark.
-ENABLE_JIT_CANDIDATES = False
+ENABLE_JIT_CANDIDATES = True
 
 # Fallbacks are used only when importing or smoke-testing without a visible GPU.
 # Normal runtime tuning obtains these values from torch.cuda.get_device_properties().
@@ -2089,38 +2089,31 @@ def _build_double_bwd_jit_candidates(
 # -----------------------------------------------------------------------------
 # runtime dispatch
 # -----------------------------------------------------------------------------
-def _call_fwd_module(
-    mod,
-    *,
-    w,
-    x,
-    y,
-    src_idx,
-    dst_idx,
-    out_seg_num,
-    fused_scatter: bool,
-):
+def _call_fwd_module(mod, *, w, x, y, src_idx, dst_idx,
+                     out_seg_num, fused_scatter: bool):
+    # Generated launchers omit the source argument in dense mode.
+    args = [w, x, y]
+    if src_idx is not None:
+        args.append(src_idx)
     if fused_scatter:
-        return mod.run(w, x, y, src_idx, dst_idx, out_seg_num)
-    return mod.run(w, x, y, src_idx, out_seg_num)
+        args.append(dst_idx)
+    args.append(int(out_seg_num))
+    return mod.run(*args)
 
 
 
-def _call_bwd_module(
-    mod,
-    *,
-    w,
-    x,
-    y,
-    grad_out,
-    src_idx,
-    dst_idx,
-    out_seg_num,
-    fused_scatter: bool,
-):
+
+def _call_bwd_module(mod, *, w, x, y, grad_out, src_idx, dst_idx,
+                     out_seg_num, fused_scatter: bool):
+    # Generated launchers omit the source argument in dense mode.
+    args = [w, x, y, grad_out]
+    if src_idx is not None:
+        args.append(src_idx)
     if fused_scatter:
-        return mod.run(w, x, y, grad_out, src_idx, dst_idx, out_seg_num)
-    return mod.run(w, x, y, grad_out, src_idx, out_seg_num)
+        args.append(dst_idx)
+    args.append(int(out_seg_num))
+    return mod.run(*args)
+
 
 
 
@@ -2383,6 +2376,22 @@ def _select_best_double_bwd_module(
         ),
     )
 
+def _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices):
+    """Dense support: w is shared or per row; x and y are per row.
+
+    Keep existing indexed behavior unchanged. x/y singleton broadcasting is
+    not implemented by these generated kernels and must not silently run.
+    """
+    if input_indices:
+        return
+    batch = int(output_indices[0].numel()) if 0 in output_indices else int(x.size(0))
+    if int(x.size(0)) != batch or int(y.size(0)) != batch:
+        raise ValueError("Dense Uniform1D requires x and y batch dimensions to equal "
+                         "the computation batch; singleton x/y broadcasting is unsupported")
+    if int(w.size(0)) not in (1, batch):
+        raise ValueError("Dense Uniform1D requires w batch dimension to be 1 or batch")
+
+
 def _run_fwd(
     *,
     w,
@@ -2401,6 +2410,9 @@ def _run_fwd(
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
@@ -2420,7 +2432,7 @@ def _run_fwd(
         elif use_y_src:
             src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
         else:
-            raise RuntimeError("Input_indices 1 and 2 all empty")
+            src_idx = None
         dst_idx = (
             _as_int32_meta_tensor(output_indices[0]).contiguous()
             if fused_scatter else None
@@ -2472,7 +2484,7 @@ def _run_fwd(
     elif use_y_src:
         src_idx = input_indices[2].to(torch.int32)
     else:
-        raise RuntimeError("Input_indices 1 and 2 all empty")
+        src_idx = None
 
     if fused_scatter:
         dst_idx = output_indices[0].to(torch.int32)
@@ -2525,6 +2537,9 @@ def _run_bwd(
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
@@ -2539,7 +2554,7 @@ def _run_bwd(
         elif use_y_src:
             src_idx = _as_int32_meta_tensor(input_indices[2]).contiguous()
         else:
-            raise RuntimeError("Input_indices 1 and 2 all empty")
+            src_idx = None
         dst_idx = (
             _as_int32_meta_tensor(output_indices[0]).contiguous()
             if fused_scatter else None
@@ -2600,7 +2615,6 @@ def _run_bwd(
         src_idx = input_indices[2].to(torch.int32)
     else:
         src_idx = None
-        raise RuntimeError("Input_indices 1 and 2 all empty")
 
     grad_out = grad_out.view(-1, out_seg_num, u_dim)
 
@@ -2618,6 +2632,9 @@ def _run_bwd(
         fused_scatter=fused_scatter,
     )
 
+    torch.cuda.synchronize()
+    start_time = time.perf_counter() * 1000.0
+
     out =  _call_bwd_module(
         best_mod,
         w=w, x=x, y=y, grad_out=grad_out,
@@ -2625,6 +2642,15 @@ def _run_bwd(
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
+    print(f"best_tag:{best_tag}, tune_key:{tune_key}")
+    print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
+    print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
+
+
+    torch.cuda.synchronize()
+    end_time = time.perf_counter() * 1000.0
+    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>")
+
     
     return out
 
@@ -2657,6 +2683,9 @@ def _run_double_bwd(
     grad_y,
     use_multiwarp_candidates: Optional[bool] = None,
 ):
+    input_indices = {} if input_indices is None else input_indices
+    output_indices = {} if output_indices is None else output_indices
+    _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
     use_multiwarp_candidates = _resolve_multiwarp_candidates_enabled(
         use_multiwarp_candidates
     )
@@ -2797,6 +2826,10 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
                 need_grad_x,
                 need_grad_y,
                 use_multiwarp_candidates):
+        
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
+
         result = _run_bwd(
             grad_out=grad_out, w=w, x=x, y=y,
             i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
@@ -2809,6 +2842,11 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             grad_y=bool(need_grad_y),
             use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused backward-forward cost: {end_time - start_time:.3f} ms >>")
+
         result_iter = iter(result)
         gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
         gx = next(result_iter) if bool(need_grad_x) else x.new_empty((0,))
@@ -2840,6 +2878,11 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_grad_w, grad_grad_x, grad_grad_y):
         grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
+        
+
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
+
         result = _run_double_bwd(
             grad_out=grad_out,
             w=w, x=x, y=y,
@@ -2862,6 +2905,10 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             grad_y=ctx.need_grad_y,
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused backward-backward cost: {end_time - start_time:.3f} ms >>")
         
         result_iter = iter(result)
         d_go = next(result_iter)
@@ -2931,7 +2978,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             mode = "u,u,u,u"
 
         P = i_list.numel()
-        #print(f"[uniform1d][forward] P={P}, u_dim={u_dim}")
 
         torch.cuda.synchronize()
         start_time = time.perf_counter() * 1000.0
@@ -2989,6 +3035,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         w, x, y = ctx.saved_tensors
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
+        torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0
+
         gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(
             grad_out, w, x, y,
             ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
@@ -2998,6 +3047,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             ctx.mode, ctx.need_grad_w, ctx.need_grad_x, ctx.need_grad_y,
             bool(ctx.use_multiwarp_candidates),
         )
+
+        torch.cuda.synchronize()
+        end_time = time.perf_counter() * 1000.0
+        print(f"<< fasteq uniform1d fused backward cost: {end_time - start_time:.3f} ms >>")
+
         grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if ctx.need_grad_w else None
         grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps) if ctx.need_grad_x else None
         grad_y = gy3.view(-1, ctx.y_seg_num * ctx.y_irreps) if ctx.need_grad_y else None
