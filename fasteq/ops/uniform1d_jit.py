@@ -2632,8 +2632,8 @@ def _run_bwd(
         fused_scatter=fused_scatter,
     )
 
-    torch.cuda.synchronize()
-    start_time = time.perf_counter() * 1000.0
+    """ torch.cuda.synchronize()
+    start_time = time.perf_counter() * 1000.0 """
 
     out =  _call_bwd_module(
         best_mod,
@@ -2642,14 +2642,10 @@ def _run_bwd(
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
-    print(f"best_tag:{best_tag}, tune_key:{tune_key}")
-    print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
-    print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
 
-
-    torch.cuda.synchronize()
+    """ torch.cuda.synchronize()
     end_time = time.perf_counter() * 1000.0
-    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>")
+    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>") """
 
     
     return out
@@ -2827,8 +2823,8 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
                 need_grad_y,
                 use_multiwarp_candidates):
         
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
 
         result = _run_bwd(
             grad_out=grad_out, w=w, x=x, y=y,
@@ -2843,9 +2839,9 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward-forward cost: {end_time - start_time:.3f} ms >>")
+        print(f"<< fasteq uniform1d fused backward-forward cost: {end_time - start_time:.3f} ms >>") """
 
         result_iter = iter(result)
         gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
@@ -2880,8 +2876,8 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
         
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
 
         result = _run_double_bwd(
             grad_out=grad_out,
@@ -2906,9 +2902,9 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward-backward cost: {end_time - start_time:.3f} ms >>")
+        print(f"<< fasteq uniform1d fused backward-backward cost: {end_time - start_time:.3f} ms >>") """
         
         result_iter = iter(result)
         d_go = next(result_iter)
@@ -2979,8 +2975,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         P = i_list.numel()
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
 
         out = _run_fwd(
             w=w,
@@ -3001,9 +2997,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         out = out.view(-1, out_seg_num * u_dim)
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>") """
 
         ctx.save_for_backward(w, x, y)
         ctx.i_list = i_list
@@ -3035,8 +3031,8 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         w, x, y = ctx.saved_tensors
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
 
         gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(
             grad_out, w, x, y,
@@ -3048,9 +3044,9 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             bool(ctx.use_multiwarp_candidates),
         )
 
-        torch.cuda.synchronize()
+        """ torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward cost: {end_time - start_time:.3f} ms >>")
+        print(f"<< fasteq uniform1d fused backward cost: {end_time - start_time:.3f} ms >>") """
 
         grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if ctx.need_grad_w else None
         grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps) if ctx.need_grad_x else None

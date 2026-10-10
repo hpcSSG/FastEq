@@ -6584,7 +6584,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
     profile_print: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
-    split_backward: Union[bool, str] = "fused",
+    split_backward: Union[bool, str] = "auto",
     split_path_threshold: int = 256,
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
@@ -6614,11 +6614,11 @@ def generate_code_uniform1d_bwd_with_scheduler(
         path_count=ctx.P,
         split_path_threshold=split_path_threshold,
     )
-    """ # Partial gx/gy specializations omit their kernel, allocation, and atomic
+    # Partial gx/gy specializations omit their kernel, allocation, and atomic
     # reduction. Route them through split codegen so the fused all-gradient
     # schedule cannot retain hidden gradient work.
     if not need_grad_x or not need_grad_y:
-        use_split_backward = True """
+        use_split_backward = True
 
     common_kwargs = dict(
         ctx=ctx,
