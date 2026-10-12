@@ -2642,8 +2642,12 @@ def _run_bwd(
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
+    """ print(f"best_tag:{best_tag}, tune_key:{tune_key}")
+    print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
+    print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
 
-    """ torch.cuda.synchronize()
+
+    torch.cuda.synchronize()
     end_time = time.perf_counter() * 1000.0
     print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>") """
 
