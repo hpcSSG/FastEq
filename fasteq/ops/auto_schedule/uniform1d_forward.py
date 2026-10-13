@@ -43,6 +43,13 @@ from .schedulers import (
 )
 
 
+def _dense_forward_writeback_enabled() -> bool:
+    """Codegen-time switch; rebuild/restart to compare generated variants."""
+    return os.environ.get("FASTEQ_DENSE_FWD_WRITEBACK", "1").strip().lower() not in (
+        "0", "false", "off", "no"
+    )
+
+
 def emit_launcher(
     bundle_name: str,
     mode: str = "u,u,,u",
@@ -50,6 +57,7 @@ def emit_launcher(
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
+    schedule_result: Optional[ScheduleResult] = None,
 ) -> str:
     if mode == "u,u,,u":
         y_comment = "[B,Ky,1] or [S,Ky,1]"
@@ -100,6 +108,15 @@ def emit_launcher(
         out_alloc = "    auto out = torch::zeros({S, V, U}, w.options());"
     else:
         out_alloc = "    auto out = torch::zeros({B, V, U}, w.options());"
+
+    if _dense_forward_writeback_enabled() and schedule_result is not None and not (use_x_src or use_y_src or use_scatter):
+        summary = schedule_result.placement_summary
+        count = summary.get("fully_written_segment_counts", {}).get("out")
+        if summary.get("exclusive_outputs") and count is not None:
+            out_alloc = (
+                f"    auto out = (V == {int(count)}) ? torch::empty({{B, V, U}}, w.options())"
+                " : torch::zeros({B, V, U}, w.options());"
+            )
 
     blist_logic = ""
 
@@ -256,6 +273,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
+        use_x_src or use_y_src or use_scatter
+    )
     has_placed = any(
         inst.op == "fma_u1d_placed" for inst in schedule_result.instructions
     )
@@ -327,6 +347,8 @@ def emit_fused_fwd_kernel_from_lars_schedule(
         )
         if use_scatter:
             ap(f"            atomicAdd(&out[{expr}], {value_expr});")
+        elif exclusive:
+            ap(f"            out[{expr}] = {value_expr};")
         else:
             ap(f"            out[{expr}] += {value_expr};")
 
@@ -681,6 +703,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
         schedule_result,
         schedule_kind="fwd",
         config=resolved_placement,
+        exclusive_outputs=_dense_forward_writeback_enabled() and not (input_indices or output_indices),
     )
     dump_lars_variable_stats(
         schedule_result,
@@ -721,6 +744,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
         use_x_src=use_x_src,
         use_y_src=use_y_src,
         use_scatter=use_scatter,
+        schedule_result=schedule_result,
     )
 
     if out_path:

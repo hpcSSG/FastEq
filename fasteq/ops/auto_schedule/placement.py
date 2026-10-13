@@ -249,6 +249,7 @@ def apply_lars_lifetime_placement(
     *,
     schedule_kind: str,
     config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    exclusive_outputs: bool = False,
 ) -> ScheduleResult:
     """Analyze use/lifetime and rewrite a LARS schedule with tiered placement.
 
@@ -256,7 +257,13 @@ def apply_lars_lifetime_placement(
       * use_count <= direct_use_threshold: inline global read/direct writeback;
       * low-frequency and long-lived: one private shared-memory slot per thread;
       * everything else: a linear-scan reused scalar register.
+
+    exclusive_outputs keeps output accumulators live until their final use,
+    including single-use targets. Emitters may then use dense-row stores when
+    no source/destination indirection is enabled. Input placement is unchanged.
     """
+    if exclusive_outputs and not (schedule_kind in ("fwd", "bwd_fused") or schedule_kind.startswith("bwd_split:")):
+        raise ValueError("exclusive_outputs is supported only for Uniform1D forward/backward")
     cfg = _resolve_lars_placement_config(config)
     if not cfg.enabled:
         return schedule_result
@@ -316,7 +323,7 @@ def apply_lars_lifetime_placement(
         # classification uses scheduled path frequency, because one fused
         # backward path may reference the same loaded operand in 2-3 gradient
         # expressions without requiring additional lifetime state.
-        if accesses <= int(cfg.direct_use_threshold):
+        if accesses <= int(cfg.direct_use_threshold) and not (exclusive_outputs and var["role"] == "accumulator"):
             var["placement"] = "direct"
         else:
             if var["role"] == "input":
@@ -585,6 +592,18 @@ def apply_lars_lifetime_placement(
             "max_shared_slots": cfg.max_shared_slots,
         },
     }
+    if exclusive_outputs:
+        summary["exclusive_outputs"] = True
+        written: Dict[str, Set[int]] = defaultdict(set)
+        for var in variables:
+            if var["role"] == "accumulator":
+                written[str(var["kind"])].add(int(var["index"]))
+        # A contiguous prefix is complete only if it matches the runtime segment
+        # dimension. Gapped/negative sets cannot justify an uninitialized tensor.
+        summary["fully_written_segment_counts"] = {
+            kind: len(indices) for kind, indices in written.items()
+            if indices and indices == set(range(len(indices)))
+        }
     profile = dict(schedule_result.profile)
     profile["placement"] = summary
     profile["variable_stats"] = variable_stats

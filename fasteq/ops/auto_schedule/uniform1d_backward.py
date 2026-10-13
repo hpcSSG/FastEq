@@ -51,6 +51,49 @@ from .schedulers import (
 )
 
 
+def _dense_gradient_allocation(schedule_result: Optional[ScheduleResult], kind: str,
+                               tensor: str, default_statement: str) -> str:
+    """Skip memset only for complete final stores, with runtime shape guards."""
+    if os.environ.get("FASTEQ_DENSE_BWD_SKIP_ZERO", "1").strip().lower() in ("0", "false", "off", "no"):
+        return default_statement
+    if schedule_result is None:
+        return default_statement
+    summary = schedule_result.placement_summary
+    count = summary.get("fully_written_segment_counts", {}).get("grad_" + kind[1])
+    if not summary.get("exclusive_outputs") or count is None:
+        return default_statement
+    if kind == "gw":
+        condition = f"(WB != 1 || B == 1) && w.size(1) == {int(count)}"
+    else:
+        condition = f"{tensor}.size(0) == B && {tensor}.size(1) == {int(count)}"
+    return (f"    auto grad_{kind[1]} = ({condition}) ? torch::empty_like({tensor})"
+            f" : torch::zeros_like({tensor});\n")
+
+
+def _emit_gradient_writeback(ap, kind: str, index_expr: str, value_expr: str, *,
+                             exclusive: bool, scalar_y: bool) -> None:
+    """Emit one final gradient write; scalar-y and broadcast weights still sum."""
+    pointer = f"&grad_{kind[1]}[{index_expr}]"
+    if kind == "gw":
+        if exclusive:
+            ap("            if (WB == 1 && B > 1) {")
+            ap(f"                atomicAdd({pointer}, {value_expr});")
+            ap("            } else {")
+            ap(f"                grad_w[{index_expr}] = {value_expr};")
+            ap("            }")
+        else:
+            ap(f"            grad_w[{index_expr}] = {value_expr};")
+    elif kind == "gx" or (kind == "gy" and not scalar_y):
+        if exclusive:
+            ap(f"            grad_{kind[1]}[{index_expr}] = {value_expr};")
+        else:
+            ap(f"            atomicAdd({pointer}, {value_expr});")
+    elif kind == "gy":
+        _emit_backend_gradient_atomic(ap, pointer, value_expr, scalar_channel=True)
+    else:
+        raise ValueError(f"Bad backward gradient kind: {kind}")
+
+
 def emit_fused_bwd_kernel_from_lars_schedule(
     schedule_result: ScheduleResult,
     *,
@@ -83,6 +126,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
+        use_x_src or use_y_src or use_scatter
+    )
 
     # ------------------------------------------------------------------
     # Mixed accumulator placement for backward gradients.
@@ -225,11 +271,11 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         if kind == "gw":
             if not need_grad_w:
                 raise ValueError("grad_w writeback requested with need_grad_w=False")
-            ap(f"            grad_w[{expr}] = {value_expr};")
+            _emit_gradient_writeback(ap, "gw", expr, str(value_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         elif kind == "gx":
-            ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
+            _emit_gradient_writeback(ap, "gx", expr, str(value_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         elif kind == "gy":
-            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", value_expr, scalar_channel=mode_scalar_y)
+            _emit_gradient_writeback(ap, "gy", expr, value_expr, exclusive=exclusive, scalar_y=mode_scalar_y)
         else:
             raise ValueError(f"Bad backward accumulator kind: {kind}")
 
@@ -466,11 +512,11 @@ def emit_fused_bwd_kernel_from_lars_schedule(
                 # grad_w is owned by the current w_row in this generated
                 # backward path, matching the baseline fused implementation:
                 # use a plain store rather than atomicAdd.
-                ap(f"            grad_w[{expr}] = {reg};")
+                _emit_gradient_writeback(ap, "gw", expr, str(reg), exclusive=exclusive, scalar_y=mode_scalar_y)
             elif kind == "gx":
-                ap(f"            atomicAdd(&grad_x[{expr}], {reg});")
+                _emit_gradient_writeback(ap, "gx", expr, str(reg), exclusive=exclusive, scalar_y=mode_scalar_y)
             elif kind == "gy":
-                _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", str(reg), scalar_channel=mode_scalar_y)
+                _emit_gradient_writeback(ap, "gy", expr, str(reg), exclusive=exclusive, scalar_y=mode_scalar_y)
             else:
                 raise ValueError("store_acc expects a backward output label")
 
@@ -516,7 +562,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             ky_dim=ky_dim,
             v_dim=v_dim,
         )
-        _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", f"gy_acc_k_{gy_idx}", scalar_channel=mode_scalar_y)
+        _emit_gradient_writeback(ap, "gy", expr, f"gy_acc_k_{gy_idx}", exclusive=exclusive, scalar_y=mode_scalar_y)
 
     ap("        }")
     ap("    }")
@@ -652,6 +698,7 @@ def emit_lars_bwd_launcher(
     use_x_src: bool,
     use_y_src: bool,
     use_scatter: bool,
+    schedule_result: Optional[ScheduleResult] = None,
 ) -> str:
     if mode == "u,u,,u":
         y_comment = "[B,Ky,1] or [S,Ky,1]"
@@ -708,6 +755,12 @@ def emit_lars_bwd_launcher(
     launch_dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()," if use_scatter else "nullptr,"
 
     grad_w_alloc = "    auto grad_w = torch::zeros_like(w);\n" if need_grad_w else ""
+    allocation_schedule = schedule_result if not (use_x_src or use_y_src or use_scatter) else None
+    if need_grad_w:
+        grad_w_alloc = _dense_gradient_allocation(allocation_schedule, "gw", "w", grad_w_alloc)
+    grad_x_alloc = _dense_gradient_allocation(allocation_schedule, "gx", "x", "    auto grad_x = torch::zeros_like(x);\n")
+    if mode == "u,u,u,u":
+        gy_alloc = _dense_gradient_allocation(allocation_schedule, "gy", "y", gy_alloc).rstrip("\n")
     grad_w_launch_arg = "                (scalar_t*)grad_w.data_ptr<scalar_t>(),\n" if need_grad_w else ""
     ret_expr = "return {grad_w, grad_x, grad_y};" if need_grad_w else "return {grad_x, grad_y};"
 
@@ -756,8 +809,7 @@ std::vector<torch::Tensor> launcher_{bundle_name}(
 {dst_numel_check}
 
 {blist_logic}
-{grad_w_alloc}    auto grad_x = torch::zeros_like(x);
-{gy_alloc}
+{grad_w_alloc}{grad_x_alloc}{gy_alloc}
 
     GPU_Guard device_guard(w.device());
     gpuStream_t stream = getCurrentGPUStream(w.device().index());
@@ -875,6 +927,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
+    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
+        use_x_src or use_y_src or use_scatter
+    )
 
     target_use: Counter[int] = Counter()
     first_seen: Dict[int, int] = {}
@@ -956,11 +1011,11 @@ def emit_lars_bwd_split_kernel_from_schedule(
             v_dim=v_dim,
         )
         if grad_kind == "gw":
-            ap(f"            grad_w[{expr}] = {value_expr};")
+            _emit_gradient_writeback(ap, "gw", expr, str(value_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         elif grad_kind == "gx":
-            ap(f"            atomicAdd(&grad_x[{expr}], {value_expr});")
+            _emit_gradient_writeback(ap, "gx", expr, str(value_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         else:
-            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", value_expr, scalar_channel=mode_scalar_y)
+            _emit_gradient_writeback(ap, "gy", expr, value_expr, exclusive=exclusive, scalar_y=mode_scalar_y)
 
     ap("template <typename scalar_t, typename index_t>")
     ap(f"__global__ void {kernel_name}(")
@@ -1152,7 +1207,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 ky_dim=ky_dim,
                 v_dim=v_dim,
             )
-            ap(f"            grad_w[{expr}] = {acc_expr};")
+            _emit_gradient_writeback(ap, "gw", expr, str(acc_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         elif grad_kind == "gx":
             expr = _bwd_label_index_expr(
                 "gx", int(idx),
@@ -1163,7 +1218,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 ky_dim=ky_dim,
                 v_dim=v_dim,
             )
-            ap(f"            atomicAdd(&grad_x[{expr}], {acc_expr});")
+            _emit_gradient_writeback(ap, "gx", expr, str(acc_expr), exclusive=exclusive, scalar_y=mode_scalar_y)
         elif grad_kind == "gy":
             expr = _bwd_label_index_expr(
                 "gy", int(idx),
@@ -1174,7 +1229,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 ky_dim=ky_dim,
                 v_dim=v_dim,
             )
-            _emit_backend_gradient_atomic(ap, f"&grad_y[{expr}]", acc_expr, scalar_channel=mode_scalar_y)
+            _emit_gradient_writeback(ap, "gy", expr, acc_expr, exclusive=exclusive, scalar_y=mode_scalar_y)
         else:
             raise ValueError(f"Bad grad_kind: {grad_kind}")
 
@@ -1305,6 +1360,7 @@ def emit_lars_bwd_split_launcher(
     gradw_kernel: Optional[str],
     gradx_kernel: Optional[str],
     grady_kernel: Optional[str],
+    gradient_schedules: Optional[Dict[str, ScheduleResult]] = None,
 ) -> str:
     if mode == "u,u,,u":
         y_comment = "[B,Ky,1] or [S,Ky,1]"
@@ -1361,6 +1417,13 @@ def emit_lars_bwd_split_launcher(
     launch_dst_arg = "(const int32_t*)dst_idx.data_ptr<int32_t>()," if use_scatter else "nullptr,"
 
     grad_w_alloc = "    auto grad_w = torch::zeros_like(w);\n" if need_grad_w else ""
+    allocation_schedules = gradient_schedules or {}
+    if use_x_src or use_y_src or use_scatter:
+        allocation_schedules = {}
+    if need_grad_w:
+        grad_w_alloc = _dense_gradient_allocation(allocation_schedules.get("gw"), "gw", "w", grad_w_alloc)
+    if need_grad_y and mode == "u,u,u,u":
+        gy_alloc = _dense_gradient_allocation(allocation_schedules.get("gy"), "gy", "y", gy_alloc).rstrip("\n")
     grad_w_launch = ""
     if need_grad_w:
         assert gradw_kernel is not None
@@ -1391,6 +1454,8 @@ def emit_lars_bwd_split_launcher(
                 B, WB, Iw, Ix, Ky, V, U, S, stream);
 '''
     grad_x_alloc = "    auto grad_x = torch::zeros_like(x);\n" if need_grad_x else ""
+    if need_grad_x:
+        grad_x_alloc = _dense_gradient_allocation(allocation_schedules.get("gx"), "gx", "x", grad_x_alloc)
     grad_x_launch = ""
     if need_grad_x:
         assert gradx_kernel is not None
@@ -1701,6 +1766,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 schedule_result,
                 schedule_kind=f"bwd_split:{gkind}",
                 config=resolved_placement,
+                exclusive_outputs=not (ctx.input_indices or ctx.output_indices),
             )
             stats_path = None
             if resolved_placement.stats_path:
@@ -1747,6 +1813,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 gradw_kernel=kernel_names.get("gw"),
                 gradx_kernel=kernel_names.get("gx"),
                 grady_kernel=kernel_names.get("gy"),
+                gradient_schedules=schedules,
             )
         )
         code = "\n".join(code_parts)
@@ -1835,6 +1902,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         schedule_result,
         schedule_kind="bwd_fused",
         config=resolved_placement,
+        exclusive_outputs=not (ctx.input_indices or ctx.output_indices),
     )
     dump_lars_variable_stats(
         schedule_result,
@@ -1875,6 +1943,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         use_x_src=ctx.use_x_src,
         use_y_src=ctx.use_y_src,
         use_scatter=ctx.use_scatter,
+        schedule_result=schedule_result,
     )
 
     _write_codegen_candidate(
@@ -2025,11 +2094,11 @@ def generate_code_uniform1d_bwd_with_scheduler(
         path_count=ctx.P,
         split_path_threshold=split_path_threshold,
     )
-    # Partial gx/gy specializations omit their kernel, allocation, and atomic
+    """ # Partial gx/gy specializations omit their kernel, allocation, and atomic
     # reduction. Route them through split codegen so the fused all-gradient
     # schedule cannot retain hidden gradient work.
     if not need_grad_x or not need_grad_y:
-        use_split_backward = True
+        use_split_backward = True """
 
     common_kwargs = dict(
         ctx=ctx,

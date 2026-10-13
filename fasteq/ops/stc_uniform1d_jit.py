@@ -508,7 +508,7 @@ def _load_jit_module_file(*, module_name: str, code: Optional[str], build_dir: P
             name=module_name,
             sources=[str(cu_path)],
             extra_cflags=["-O3"],
-            extra_cuda_cflags=["-O3", "--ptxas-options=-v"],
+            extra_cuda_cflags=["-O3"],
             build_directory=str(build_dir),
             verbose=verbose,
             with_cuda=True,

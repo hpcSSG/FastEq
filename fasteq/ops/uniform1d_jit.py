@@ -588,7 +588,7 @@ def _load_jit_module(
             name=module_name,
             sources=[str(cu_path)],
             extra_cflags=extra_cflags or ["-O3"],
-            extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--ptxas-options=-v"],
+            extra_cuda_cflags=extra_cuda_cflags or ["-O3"],
             #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--use_fast_math", "-lineinfo"],
             #extra_cuda_cflags=extra_cuda_cflags or ["-O3", "--offload-arch=gfx936"],
             extra_include_paths=[str(src_dir)],
