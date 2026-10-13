@@ -1616,20 +1616,28 @@ def _resolve_split_backward(
     *,
     path_count: int,
     split_path_threshold: int,
+    need_grad_x: bool = True,
+    need_grad_y: bool = True,
 ) -> bool:
+    """Resolve strategy while respecting the current fused gx/gy capability.
+
+    New flags default to True so existing callers keep their previous behavior.
+    Invalid strategy names remain errors, including partial-gradient requests.
+    """
+    force_split = not bool(need_grad_x) or not bool(need_grad_y)
     if isinstance(split_backward, str):
         split_mode = split_backward.lower()
         if split_mode in ("auto",):
-            return int(path_count) > int(split_path_threshold)
+            return force_split or int(path_count) > int(split_path_threshold)
         if split_mode in ("split", "true", "always", "on", "yes"):
             return True
         if split_mode in ("fused", "false", "never", "off", "no"):
-            return False
+            return force_split
         raise ValueError(
             "split_backward must be bool or one of "
             "'auto', 'split'/'always'/'on', 'fused'/'never'/'off'"
         )
-    return bool(split_backward)
+    return force_split or bool(split_backward)
 
 
 def _write_codegen_candidate(
@@ -1872,7 +1880,30 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     """
 
     if not need_grad_x or not need_grad_y:
-        raise ValueError("partial gx/gy backward must use split codegen")
+        # Also protect direct callers that bypass the unified dispatcher.
+        return _generate_code_uniform1d_bwd_split_from_context(
+            ctx=ctx,
+            u_dim=u_dim,
+            iw_dim=iw_dim,
+            ix_dim=ix_dim,
+            ky_dim=ky_dim,
+            v_dim=v_dim,
+            mode=mode,
+            need_grad_w=need_grad_w,
+            need_grad_x=need_grad_x,
+            need_grad_y=need_grad_y,
+            out_path=out_path,
+            kernel_name=kernel_name,
+            return_schedule=return_schedule,
+            profile=profile,
+            profile_interval=profile_interval,
+            profile_seconds=profile_seconds,
+            profile_print=profile_print,
+            enable_secondary_affinity=enable_secondary_affinity,
+            topk_candidates=topk_candidates,
+            block_size=block_size,
+            placement_config=placement_config,
+        )
     grad_tag = "full" if need_grad_w else "nogradw"
     cand_name = "lars_bwd_all_inputs_accall"
 
@@ -2093,12 +2124,9 @@ def generate_code_uniform1d_bwd_with_scheduler(
         split_backward,
         path_count=ctx.P,
         split_path_threshold=split_path_threshold,
+        need_grad_x=need_grad_x,
+        need_grad_y=need_grad_y,
     )
-    """ # Partial gx/gy specializations omit their kernel, allocation, and atomic
-    # reduction. Route them through split codegen so the fused all-gradient
-    # schedule cannot retain hidden gradient work.
-    if not need_grad_x or not need_grad_y:
-        use_split_backward = True """
 
     common_kwargs = dict(
         ctx=ctx,
