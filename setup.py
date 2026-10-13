@@ -1,271 +1,265 @@
 import os
+import shlex
+import shutil
+import subprocess
 import sys
 import sysconfig
-import subprocess
-import shutil
-from pathlib import Path
-from setuptools import setup, find_packages, Extension
-from setuptools.command.build_ext import build_ext
 from enum import Enum, auto
+from pathlib import Path
+
+from setuptools import Extension, find_packages, setup
+from setuptools.command.build_ext import build_ext
+
+
+ROOT = Path(__file__).resolve().parent
+
 
 class Backend(Enum):
     """Supported compute backends."""
+
+    NONE = auto()
     CUDA = auto()
     HIP = auto()
     SYCL = auto()
 
 
 def detect_backend() -> Backend:
-    """
-    Detect the available compute backend.
-    Priority: Environment variable > Auto-detection
-    
-    Environment variable FASTEQ_BACKEND can be set to:
-    - 'cuda' : Force CUDA backend
-    - 'hip'  : Force HIP/ROCm backend
-    - 'sycl' : Force SYCL/oneAPI backend
-    """
-    # Check environment variable first
-    env_backend = os.environ.get("FASTEQ_BACKEND", "").strip().lower()
-    if env_backend:
-        backend_map = {
-            "cuda": Backend.CUDA,
-            "hip": Backend.HIP,
-            "rocm": Backend.HIP,
-            "sycl": Backend.SYCL,
-            "oneapi": Backend.SYCL,
-        }
-        if env_backend in backend_map:
-            print(f"[FastEq] Using backend from environment: {env_backend.upper()}")
-            return backend_map[env_backend]
+    """Default to a pure Python build; enable detection explicitly with auto."""
+    value = os.environ.get("FASTEQ_BACKEND", "none").strip().lower()
+    aliases = {
+        "": Backend.NONE,
+        "none": Backend.NONE,
+        "cuda": Backend.CUDA,
+        "hip": Backend.HIP,
+        "rocm": Backend.HIP,
+        "sycl": Backend.SYCL,
+        "oneapi": Backend.SYCL,
+    }
+    if value in aliases:
+        backend = aliases[value]
+    elif value == "auto":
+        backend = Backend.NONE
+        checks = (
+            (Backend.CUDA, ("nvcc",), ("CUDA_HOME", "CUDA_PATH")),
+            (Backend.HIP, ("hipcc",), ("ROCM_PATH", "ROCM_HOME", "HIP_PATH")),
+            (Backend.SYCL, ("icpx", "dpcpp"), ("ONEAPI_ROOT", "CMPLR_ROOT")),
+        )
+        # Prefer available compiler executables over environment hints.
+        for candidate, compilers, _ in checks:
+            if any(shutil.which(compiler) for compiler in compilers):
+                backend = candidate
+                break
         else:
-            print(f"[FastEq] Warning: Unknown backend '{env_backend}', auto-detecting...")
-    
-    # Auto-detection
-    # 1. Check for CUDA (nvcc)
-    if shutil.which("nvcc"):
-        print("[FastEq] Detected CUDA (nvcc found)")
-        return Backend.CUDA
-    
-    # 2. Check for HIP/ROCm (hipcc)
-    if shutil.which("hipcc"):
-        print("[FastEq] Detected HIP/ROCm (hipcc found)")
-        return Backend.HIP
-    
-    # 3. Check for SYCL/oneAPI (icpx or dpcpp)
-    if shutil.which("icpx") or shutil.which("dpcpp"):
-        print("[FastEq] Detected SYCL/oneAPI (icpx/dpcpp found)")
-        return Backend.SYCL
-    
-    # 4. Check environment hints
-    if os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH"):
-        print("[FastEq] Detected CUDA from environment variables")
-        return Backend.CUDA
-    
-    if os.environ.get("ROCM_PATH") or os.environ.get("HIP_PATH"):
-        print("[FastEq] Detected HIP/ROCm from environment variables")
-        return Backend.HIP
-    
-    if os.environ.get("ONEAPI_ROOT") or os.environ.get("CMPLR_ROOT"):
-        print("[FastEq] Detected SYCL/oneAPI from environment variables")
-        return Backend.SYCL
-    
-    # Default to CUDA
-    print("[FastEq] No backend detected, defaulting to CUDA")
-    return Backend.CUDA
+            for candidate, _, hints in checks:
+                if any(os.environ.get(hint, "").strip() for hint in hints):
+                    backend = candidate
+                    break
+    else:
+        raise ValueError(
+            f"Unsupported FASTEQ_BACKEND={value!r}. "
+            "Expected none, auto, cuda, hip, rocm, sycl, or oneapi."
+        )
+
+    print(f"[FastEq] Backend: {backend.name.lower()}")
+    if backend == Backend.NONE:
+        print("[FastEq] Skipping extension compilation.")
+    return backend
 
 
 def get_backend_config(backend: Backend) -> dict:
-    """Get configuration for the specified backend."""
-
-    rocm_path = ""
-    if backend == Backend.HIP:
-        # Ensure ROCM_PATH is set
-        if "ROCM_PATH" in os.environ:
-            rocm_path = os.environ["ROCM_PATH"]
-        else :
-            rocm_path = "/opt/rocm"
-        print(f"[FastEq] Using ROCm path: {rocm_path}")
-
-        
-    configs = {
-        Backend.CUDA: {
-            "name": "cuda",
-            "source_dir": "fasteq/cuda",
-            "lib_prefix": "_cuda",
-            "description": "FastEq CUDA extensions",
-            "arch_env": "FASTEQ_CUDA_ARCH",
-            "arch_cmake_var": "CMAKE_CUDA_ARCHITECTURES",
-            "extra_cmake_args": [],
-        },
-        Backend.HIP: {
-            "name": "hip",
-            "source_dir": "fasteq/hip",
-            "lib_prefix": "_hip",
-            "description": "FastEq HIP/ROCm extensions",
-            "arch_env": "FASTEQ_HIP_ARCH",
-            "arch_cmake_var": "CMAKE_HIP_ARCHITECTURES",
-            "extra_cmake_args": [
-                "-DCMAKE_CXX_COMPILER=hipcc",
-                # f"-DROCM_PATH = {rocm_path}",
-            ],
-        },
-        Backend.SYCL: {
-            "name": "sycl",
-            "source_dir": "fasteq/sycl",
-            "lib_prefix": "_sycl",
-            "description": "FastEq SYCL/oneAPI extensions",
-            "arch_env": "FASTEQ_SYCL_ARCH",
-            "arch_cmake_var": "SYCL_TARGETS",
-            "extra_cmake_args": [
-                "-DCMAKE_CXX_COMPILER=icpx",
-            ],
-        },
+    if backend == Backend.NONE:
+        return {"description": "FastEq (Pure Python, no extensions compiled)"}
+    name = backend.name.lower()
+    return {
+        "name": name,
+        "source_dir": f"fasteq/{name}",
+        "lib_prefix": f"_{name}",
+        "description": f"FastEq {backend.name} extensions",
+        "arch_env": f"FASTEQ_{backend.name}_ARCH",
+        "arch_cmake_var": {
+            Backend.CUDA: "CMAKE_CUDA_ARCHITECTURES",
+            Backend.HIP: "CMAKE_HIP_ARCHITECTURES",
+            Backend.SYCL: "SYCL_TARGETS",
+        }[backend],
     }
-    return configs[backend]
+
+
+def default_jobs() -> int:
+    """Use process CPU affinity when available, with a conservative cap."""
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    return max(1, min(cpus, 8))
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, sourcedir: str, backend: Backend):
+    def __init__(self, name: str, sourcedir: Path, backend: Backend):
         super().__init__(name, sources=[])
-        self.sourcedir = str(Path(sourcedir).resolve())
+        self.sourcedir = str(sourcedir.resolve())
         self.backend = backend
 
 
 class CMakeBuild(build_ext):
     def run(self):
-        try:
-            subprocess.check_output(["cmake", "--version"])
-        except Exception as e:
-            raise RuntimeError("CMake is required to build this project.") from e
+        self.cmake = shutil.which("cmake")
+        if not self.cmake:
+            raise RuntimeError("CMake is required to build FastEq extensions.")
         super().run()
 
     def build_extension(self, ext: CMakeExtension):
-        ext_fullpath = Path(self.get_ext_fullpath(ext.name)).resolve()
-        extdir = ext_fullpath.parent
-        extdir.mkdir(parents=True, exist_ok=True)
-
+        config = get_backend_config(ext.backend)
         cfg = "Debug" if self.debug else "Release"
-        build_temp = Path(self.build_temp) / ext.name.replace(".", "_")
-        build_temp.mkdir(parents=True, exist_ok=True)
-
-        python_exe = sys.executable
-        backend_config = get_backend_config(ext.backend)
-
-        cmake_args = [
-            f"-DCMAKE_BUILD_TYPE={cfg}",
-            f"-DPython3_EXECUTABLE={python_exe}",
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
-        ]
-
-        # Add backend-specific cmake args
-        cmake_args.extend(backend_config["extra_cmake_args"])
-
-        # Handle architecture settings
-        arch_env = backend_config["arch_env"]
-        arch_cmake_var = backend_config["arch_cmake_var"]
-        arch = os.environ.get(arch_env, "").strip()
-        if arch:
-            cmake_args.append(f"-D{arch_cmake_var}={arch}")
-
-        # Generator
-        if os.environ.get("CMAKE_GENERATOR", "").strip() == "":
-            # Use Ninja if available
-            if shutil.which("ninja"):
-                cmake_args += ["-GNinja"]
-
-        build_args = ["--config", cfg]
-        
-        # Parallel build
-        jobs = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "")
-        if not jobs:
-            if hasattr(self, "parallel") and self.parallel:
-                jobs = str(self.parallel)
-        if jobs:
-            build_args += ["-j", jobs]
-        else:
-            build_args += ["-j", "255"]
-
-        # Configure
-        print(f"[FastEq] Configuring {backend_config['name'].upper()} build...")
-        print("CMake args:", " ".join(cmake_args))
-        subprocess.check_call(
-            ["cmake", ext.sourcedir,  # 显式指定使用系统的错误输出
-              *cmake_args],
-            cwd=str(build_temp),
-        )
-
-        
-        # Build
-        print(f"[FastEq] Building {backend_config['name'].upper()} extension...")
-        subprocess.check_call(
-            ["cmake", "--build", ".", *build_args],
-            cwd=str(build_temp),
-        )
-
-        # Find and copy built library
-        expected = ext_fullpath
-        expected_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-
-        lib_prefix = backend_config["lib_prefix"]
-        candidates = []
-        for pat in [f"{lib_prefix}.so", f"{lib_prefix}.pyd", f"{lib_prefix}.dylib"]:
-            p = extdir / pat
-            if p.exists():
-                candidates.append(p)
-        if not candidates:
-            candidates = list(extdir.glob(f"{lib_prefix}*"))
-
-        if not candidates:
-            raise RuntimeError(f"Cannot find built library in {extdir}")
-
-        built = max(candidates, key=lambda p: p.stat().st_mtime)
-
+        expected = Path(self.get_ext_fullpath(ext.name)).resolve()
         expected.parent.mkdir(parents=True, exist_ok=True)
-        if built.resolve() != expected.resolve():
-            self.copy_file(str(built), str(expected))
 
-        if expected.suffix != Path(expected_suffix).suffix and not expected.exists():
-            alt = expected.with_suffix(Path(expected_suffix).suffix)
-            if built.exists():
-                self.copy_file(str(built), str(alt))
+        # Separate build caches by extension, Python ABI, and configuration.
+        abi = sys.implementation.cache_tag or "python"
+        build_dir = (
+            Path(self.build_temp)
+            / f"{ext.name.replace('.', '_')}-{abi}-{cfg.lower()}"
+        ).resolve()
+        output_dir = build_dir / "artifacts"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        extra_args = shlex.split(os.environ.get("CMAKE_ARGS", ""))
+
+        def has_definition(name):
+            return any(
+                arg.startswith(f"-D{name}=") or arg.startswith(f"-D{name}:")
+                for arg in extra_args
+            )
+
+        defaults = []
+        if ext.backend == Backend.HIP:
+            rocm_value = next(
+                (os.environ[key].strip() for key in
+                 ("ROCM_PATH", "ROCM_HOME", "HIP_PATH")
+                 if os.environ.get(key, "").strip()),
+                "",
+            )
+            if rocm_value:
+                rocm = Path(rocm_value).expanduser().resolve()
+                if not rocm.is_dir():
+                    raise RuntimeError(f"ROCm/DTK directory does not exist: {rocm}")
+                defaults.append(f"-DFASTEQ_ROCM_ROOT={rocm}")
+                # Native CMake HIP language requires Clang, not hipcc.
+                # Respect user compiler and toolchain selections.
+                if (not has_definition("CMAKE_TOOLCHAIN_FILE")
+                        and not os.environ.get("CMAKE_TOOLCHAIN_FILE")):
+                    clang = next(
+                        (path for path in (rocm / "llvm/bin/clang++",
+                                          rocm / "bin/clang++")
+                         if path.is_file() and os.access(path, os.X_OK)),
+                        None,
+                    )
+                    if clang:
+                        if (not has_definition("CMAKE_HIP_COMPILER")
+                                and not os.environ.get("HIPCXX")):
+                            defaults.append(f"-DCMAKE_HIP_COMPILER={clang}")
+                        if (not has_definition("CMAKE_CXX_COMPILER")
+                                and not os.environ.get("CXX")):
+                            defaults.append(f"-DCMAKE_CXX_COMPILER={clang}")
+                print(f"[FastEq] ROCm/DTK root: {rocm}")
+        elif ext.backend == Backend.SYCL:
+            if not has_definition("CMAKE_CXX_COMPILER") and not os.environ.get("CXX"):
+                compiler = shutil.which("icpx") or shutil.which("dpcpp")
+                if not compiler:
+                    raise RuntimeError("SYCL requires icpx or dpcpp, or an explicit compiler.")
+                defaults.append(f"-DCMAKE_CXX_COMPILER={compiler}")
+
+        generator = []
+        if (not (build_dir / "CMakeCache.txt").exists()
+                and not os.environ.get("CMAKE_GENERATOR", "").strip()
+                and not any(arg == "-G" or arg.startswith("-G") for arg in extra_args)
+                and shutil.which("ninja")):
+            generator = ["-G", "Ninja"]
+
+        cmake_args = [*generator, f"-DCMAKE_BUILD_TYPE={cfg}", *defaults, *extra_args]
+        arch = os.environ.get(config["arch_env"], "").strip()
+        if arch:
+            # FASTEQ_*_ARCH takes precedence over CMAKE_ARGS.
+            cmake_args.append(f"-D{config['arch_cmake_var']}={arch}")
+
+        # These settings must match setuptools and the active Python interpreter.
+        suffix = sysconfig.get_config_var("EXT_SUFFIX")
+        if not suffix:
+            raise RuntimeError("Python EXT_SUFFIX is unavailable.")
+        cmake_args += [
+            f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={output_dir}",
+            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY_{cfg.upper()}={output_dir}",
+        ]
+        if ext.backend == Backend.HIP:
+            cmake_args += [
+                f"-DFASTEQ_EXTENSION_NAME={config['lib_prefix']}",
+                f"-DFASTEQ_EXTENSION_SUFFIX={suffix}",
+            ]
+
+        cmake = getattr(self, "cmake", None) or shutil.which("cmake")
+        if not cmake:
+            raise RuntimeError("CMake is required to build FastEq extensions.")
+        print(f"[FastEq] Configuring {config['name'].upper()} ({cfg})")
+        subprocess.check_call([
+            cmake, "-S", ext.sourcedir, "-B", str(build_dir), *cmake_args
+        ])
+
+        # Remove only known output files to prevent accepting a stale artifact.
+        names = [expected.name]
+        if ext.backend != Backend.HIP:
+            # Compatibility with existing CUDA/SYCL CMake files.
+            names.extend(f"{config['lib_prefix']}{ending}"
+                         for ending in (".so", ".pyd", ".dylib"))
+        candidates = list(dict.fromkeys(output_dir / name for name in names))
+        for path in candidates:
+            if path.is_file():
+                path.unlink()
+
+        build_args = [cmake, "--build", str(build_dir), "--config", cfg]
+        if ext.backend == Backend.HIP:
+            build_args += ["--target", "_hip"]
+        # Leave CMake's environment-controlled parallelism intact.
+        if not os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "").strip():
+            build_args += ["--parallel", str(self.parallel or default_jobs())]
+        print(f"[FastEq] Building {config['name'].upper()} extension")
+        subprocess.check_call(build_args)
+
+        built = next((path for path in candidates if path.is_file()), None)
+        if built is None:
+            raise RuntimeError(
+                "Expected extension output was not produced. Checked: "
+                + ", ".join(str(path) for path in candidates)
+            )
+        # Copy the artifact produced by this build regardless of timestamps.
+        shutil.copy2(built, expected)
 
 
 def get_ext_modules():
-    """Get extension modules based on detected backend."""
     backend = detect_backend()
     config = get_backend_config(backend)
-    
-    ROOT = Path(__file__).resolve().parent
+    if backend == Backend.NONE:
+        return [], config
     source_dir = ROOT / config["source_dir"]
-    
-    if not source_dir.exists():
-        raise RuntimeError(
-            f"Source directory for {config['name'].upper()} backend not found: {source_dir}\n"
-            f"Please ensure the {config['name']} implementation exists."
-        )
-    
-    ext_name = f"fasteq.{config['name']}.{config['lib_prefix']}"
-    
-    return [
-        CMakeExtension(ext_name, sourcedir=str(source_dir), backend=backend)
-    ], config
+    if not (source_dir / "CMakeLists.txt").is_file():
+        raise RuntimeError(f"Backend CMakeLists.txt not found: {source_dir}")
+    name = f"fasteq.{config['name']}.{config['lib_prefix']}"
+    return [CMakeExtension(name, source_dir, backend)], config
 
 
 def main():
-    ext_modules, config = get_ext_modules()
-    
-    setup(
+    extensions, config = get_ext_modules()
+    kwargs = dict(
         name="fasteq",
         version="0.3.0",
         description=config["description"],
         python_requires=">=3.10",
         packages=find_packages(where="."),
         include_package_data=True,
-        ext_modules=ext_modules,
-        cmdclass={"build_ext": CMakeBuild},
         zip_safe=False,
     )
+    if extensions:
+        kwargs.update(ext_modules=extensions, cmdclass={"build_ext": CMakeBuild})
+    setup(**kwargs)
 
 
 if __name__ == "__main__":
