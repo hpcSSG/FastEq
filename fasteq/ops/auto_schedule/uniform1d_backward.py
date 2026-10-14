@@ -1611,35 +1611,6 @@ def _prepare_uniform1d_bwd_codegen_context(
     )
 
 
-def _resolve_split_backward(
-    split_backward: Union[bool, str],
-    *,
-    path_count: int,
-    split_path_threshold: int,
-    need_grad_x: bool = True,
-    need_grad_y: bool = True,
-) -> bool:
-    """Resolve strategy while respecting the current fused gx/gy capability.
-
-    New flags default to True so existing callers keep their previous behavior.
-    Invalid strategy names remain errors, including partial-gradient requests.
-    """
-    force_split = not bool(need_grad_x) or not bool(need_grad_y)
-    if isinstance(split_backward, str):
-        split_mode = split_backward.lower()
-        if split_mode in ("auto",):
-            return force_split or int(path_count) > int(split_path_threshold)
-        if split_mode in ("split", "true", "always", "on", "yes"):
-            return True
-        if split_mode in ("fused", "false", "never", "off", "no"):
-            return force_split
-        raise ValueError(
-            "split_backward must be bool or one of "
-            "'auto', 'split'/'always'/'on', 'fused'/'never'/'off'"
-        )
-    return force_split or bool(split_backward)
-
-
 def _write_codegen_candidate(
     *,
     out_path: str,
@@ -1732,6 +1703,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
         cfg["auto_fallback_when_full"] = False
         cfg["effective_live_need"] = int(max_effective_need)
         cfg["split_backward"] = True
+        cfg["path_split"] = True
 
         base_kernel_name = _bwd_base_kernel_name(
             kernel_name=kernel_name,
@@ -1994,6 +1966,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
                 "auto_fallback_when_full": False,
                 "need_grad_w": bool(need_grad_w),
                 "split_backward": False,
+                "path_split": False,
             },
             "profile": schedule_result.profile,
         }
@@ -2032,7 +2005,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
 ):
     """
     Backward-compatible wrapper.  New code should call
-    generate_code_uniform1d_bwd_with_scheduler(..., split_backward=True).
+    generate_code_uniform1d_bwd_with_scheduler(..., path_split_space=(True,)).
     """
     return generate_code_uniform1d_bwd_with_scheduler(
         i_list=i_list,
@@ -2063,7 +2036,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         profile_print=profile_print,
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
-        split_backward=True,
+        path_split_space=(True,),
         placement_config=placement_config,
     )
 
@@ -2095,18 +2068,20 @@ def generate_code_uniform1d_bwd_with_scheduler(
     profile_print: bool = False,
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
-    split_backward: Union[bool, str] = "fused",
-    split_path_threshold: int = 256,
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    path_split_space: Sequence[bool] = (False, True),
+    generate_candidates: bool = True,
 ):
     """
     Unified LARS backward code generator.
 
-    split_backward controls implementation strategy:
-      - False / "fused": one fused LARS backward kernel.
-      - True / "split": independent grad_w, grad_x and grad_y kernels.
-      - "auto": split when path_count > split_path_threshold.
+    Search path_split as a scheduling dimension (False=fused, True=split).
+    Unsupported partial-gradient fused candidates are filtered before scheduling.
+    neither filters the candidate space. The dedicated split wrapper still emits
+    split only. With generate_candidates=False, emit the first legal candidate.
+    Multiple candidates return (tag, source) pairs, or schedule dictionaries when
+    return_schedule=True; a single candidate retains the historical return type.
     """
     ctx = _prepare_uniform1d_bwd_codegen_context(
         i_list=i_list,
@@ -2120,13 +2095,20 @@ def generate_code_uniform1d_bwd_with_scheduler(
         path_semantics=path_semantics,
     )
 
-    use_split_backward = _resolve_split_backward(
-        split_backward,
-        path_count=ctx.P,
-        split_path_threshold=split_path_threshold,
-        need_grad_x=need_grad_x,
-        need_grad_y=need_grad_y,
-    )
+    if not (need_grad_w or need_grad_x or need_grad_y):
+        raise ValueError("at least one backward gradient must be requested")
+    strategies = []
+    for path_split in path_split_space:
+        if not isinstance(path_split, bool):
+            raise ValueError("path_split_space entries must be bool")
+        if not path_split and not (need_grad_x and need_grad_y):
+            continue
+        if path_split not in strategies:
+            strategies.append(path_split)
+    if not strategies:
+        raise ValueError("path_split_space contains no legal backward candidate")
+    if not generate_candidates:
+        strategies = strategies[:1]
 
     common_kwargs = dict(
         ctx=ctx,
@@ -2139,9 +2121,9 @@ def generate_code_uniform1d_bwd_with_scheduler(
         need_grad_w=need_grad_w,
         need_grad_x=need_grad_x,
         need_grad_y=need_grad_y,
-        out_path=out_path,
+        out_path="",
         kernel_name=kernel_name,
-        return_schedule=return_schedule,
+        return_schedule=True,
         profile=profile,
         profile_interval=profile_interval,
         profile_seconds=profile_seconds,
@@ -2152,7 +2134,14 @@ def generate_code_uniform1d_bwd_with_scheduler(
         placement_config=placement_config,
     )
 
-    if use_split_backward:
-        return _generate_code_uniform1d_bwd_split_from_context(**common_kwargs)
-
-    return _generate_code_uniform1d_bwd_fused_from_context(**common_kwargs)
+    candidates = []
+    for path_split in strategies:
+        generate = (_generate_code_uniform1d_bwd_split_from_context if path_split
+                    else _generate_code_uniform1d_bwd_fused_from_context)
+        result = generate(**common_kwargs)
+        _write_codegen_candidate(
+            out_path=out_path, candidate_count=len(strategies),
+            cand_name=result["name"], code=result["code"],
+        )
+        candidates.append(result if return_schedule else (result["name"], result["code"]))
+    return _finalize_codegen_candidates(candidates, return_schedule=return_schedule)
