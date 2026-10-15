@@ -1,0 +1,12 @@
+# Historical environment from env-kunpeng.md (2026-10-14).
+# Constraints only: this is not a complete lockfile or a new-branch validation.
+# Python: CPython 3.9.25, Linux aarch64. Install the site's CPU torch build first.
+torch==2.2.2
+e3nn==0.4.4
+numpy==1.26.3
+scipy==1.13.1
+ase==3.26.0
+mace-torch==0.3.13
+torch-geometric==2.6.1
+matscipy==1.1.1
+ninja==1.13.2

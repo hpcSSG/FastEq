@@ -1,0 +1,11 @@
+{
+  "source": "kunpeng_cpu_mace_evd_package/kunpeng_cpu_mace_evd/native_cpu_ops",
+  "sha256": {
+    "native_equiv_cpu.cpp": "ef900fc1c6fc33857c94c0d62e02168726098c88a5a025ba4a510324acf878ad",
+    "benchmark_native_vs_e3nn.py": "8ad12e95e63574ff8d3dcc0550822e17dd76f02c047d765bb4c18bb8d978de30",
+    "mace_runtime.py": "a7391c192b9d08665031639c181e5a0636e839dc94089b9b567d788c3b41594c",
+    "sitecustomize.py": "1b23186ab672d132c07aeeba0c9a8b64d143919245a936f83ce6fafd04dcc44a",
+    "inference_e3nn_results.txt": "82a32ca65d6a3eee7bb991d865da8bd8095abeae759f8f9b7e8b520b6b50e435"
+  },
+  "kernel_copy": "fasteq-kunpeng/cpu/src/native_equiv_cpu.cpp"
+}

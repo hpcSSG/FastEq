@@ -7,6 +7,12 @@ FastEq accelerates the geometric and equivariant computations at the core of ato
 The project combines structure-aware kernel generation with Triton-based operator fusion. Its integration effort targets PyTorch workflows and interfaces used by e3nn and cuEquivariance, with cross-platform development.
 
 
+For the experimental Kunpeng 920 / Kylin Linux CPU implementation, see the
+[Kunpeng CPU subproject](kunpeng-cpu/README.md). It has its own installation
+configuration and requires a separate Python environment. Target-server
+validation of the reorganized package is pending; see its
+[review notes](kunpeng-cpu/fasteq-kunpeng/docs/REVIEW.md) for known issues.
+
 ## Highlights
 
 - **Structure-aware tensor products.** Exploit Clebsch–Gordan selection rules, specialize nonzero computation paths, and reuse intermediate values across paths.

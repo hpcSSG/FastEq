@@ -1,0 +1,6 @@
+include README.md VERSION LICENSES NOTICE.md
+include requirements.txt
+recursive-include fasteq-kunpeng/docs *.md *.json
+recursive-include fasteq-kunpeng/cpu/src *.cpp
+recursive-include test *.py *.md *.txt *.sh
+recursive-include 3rdparty *.py *.md

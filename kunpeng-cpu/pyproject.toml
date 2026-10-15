@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fasteq"
+version = "0.2.0+kunpeng.1"
+description = "FastEq-style native CPU equivariant operators for Kunpeng"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.2.2", "e3nn>=0.4.4", "ninja"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+mace = ["mace-torch"]
+
+[tool.setuptools]
+packages = ["fasteq", "fasteq.cpu", "fasteq.ops", "fasteq.integrations"]
+
+[tool.setuptools.package-dir]
+fasteq = "fasteq-kunpeng"
+"fasteq.integrations" = "3rdparty/mace/integrations"
+
+[tool.setuptools.package-data]
+"fasteq.cpu" = ["src/*.cpp"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]

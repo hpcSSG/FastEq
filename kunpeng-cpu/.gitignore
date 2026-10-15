@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.so
+*.o
+*.pyd
+*.egg-info/
+build/
+dist/
+.build*/
+.pytest_cache/
+.venv/
+*.log
+
+# Keep required inputs and historical reports despite the parent *.txt rule.
+!/requirements.txt
+!/test/constraints-kunpeng.txt
+!/test/results/inference_e3nn_results.txt
+!/test/results/environment/kunpeng_env_cn19793_1886300.txt

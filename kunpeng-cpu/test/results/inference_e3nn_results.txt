@@ -1,0 +1,15 @@
+cuequivariance or cuequivariance_torch is not available. Cuequivariance acceleration will be disabled.
+native extension: /home/share/wangsen/mace_cpu_test/native_cpu_ops/.build_kunpeng/native_equiv_cpu/native_equiv_cpu.so
+============================================================================================================================================================================
+All timings are ms/call. fwd is forward only; fwd+bwd includes autograd graph construction and grad_x.
+============================================================================================================================================================================
+SH lmax=3                  B=   19 T=37 | fwd e3nn/native=  1.4096/  0.0064 ms (220.00x) | fwd+bwd=  4.4176/  0.3470 ms (12.73x) | err abs/rel=1.79e-07/2.75e-07 grad abs/rel=1.43e-06/2.90e-07
+FCTP C=32 E=10             B=   19 T=37 | fwd e3nn/native=  5.5780/  0.1557 ms (35.82x) | fwd+bwd= 12.0651/  1.2055 ms (10.01x) | err abs/rel=3.58e-07/2.89e-07 grad abs/rel=2.98e-07/2.09e-07
+Linear C=32                B=   19 T=37 | fwd e3nn/native=  1.3205/  0.0837 ms (15.77x) | fwd+bwd=  8.0261/  1.0524 ms ( 7.63x) | err abs/rel=4.77e-07/1.12e-07 grad abs/rel=9.54e-07/2.26e-07
+SC corr=3 C=32 I=16 K=23   B=   19 T=37 | fwd e3nn/native= 15.6270/  1.2632 ms (12.37x) | fwd+bwd= 15.9301/  4.8327 ms ( 3.30x) | err abs/rel=1.53e-05/1.59e-07 grad abs/rel=1.91e-05/1.49e-07
+SC fused C=32 I=16 K=23    B=   19 T=37 | fwd e3nn/native=  6.1360/  0.1400 ms (43.83x) | fwd+bwd= 15.3790/  1.3928 ms (11.04x) | err abs/rel=7.63e-05/1.26e-07 grad abs/rel=9.16e-05/1.47e-07
+SH lmax=3                  B=  172 T=37 | fwd e3nn/native=  2.0169/  0.0121 ms (166.55x) | fwd+bwd=  6.8535/  0.4479 ms (15.30x) | err abs/rel=2.98e-07/4.34e-07 grad abs/rel=2.86e-06/2.70e-07
+FCTP C=32 E=10             B=  172 T=37 | fwd e3nn/native= 21.5486/  3.0843 ms ( 6.99x) | fwd+bwd= 39.5233/  8.5273 ms ( 4.63x) | err abs/rel=4.77e-07/2.96e-07 grad abs/rel=4.77e-07/3.59e-07
+Linear C=32                B=  172 T=37 | fwd e3nn/native=  5.6386/  2.2011 ms ( 2.56x) | fwd+bwd= 11.2248/  4.5209 ms ( 2.48x) | err abs/rel=7.15e-07/1.61e-07 grad abs/rel=1.19e-06/2.47e-07
+SC corr=3 C=32 I=16 K=23   B=  172 T=37 | fwd e3nn/native= 16.4378/  2.3112 ms ( 7.11x) | fwd+bwd= 35.9641/ 10.6447 ms ( 3.38x) | err abs/rel=1.91e-05/1.79e-07 grad abs/rel=2.29e-05/1.53e-07
+SC fused C=32 I=16 K=23    B=  172 T=37 | fwd e3nn/native= 13.3412/  1.2633 ms (10.56x) | fwd+bwd= 26.6981/  4.0819 ms ( 6.54x) | err abs/rel=1.22e-04/7.46e-08 grad abs/rel=9.16e-05/1.02e-07
