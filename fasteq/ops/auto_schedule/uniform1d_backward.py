@@ -94,6 +94,155 @@ def _emit_gradient_writeback(ap, kind: str, index_expr: str, value_expr: str, *,
         raise ValueError(f"Bad backward gradient kind: {kind}")
 
 
+def _normalize_bwd_accumulator_scope(scope, *, scalar_y=True) -> Dict[str, str]:
+    """Resolve loop scope separately from register/shared lifetime placement."""
+    if scope is None:
+        scope = {"gy": "outer"} if scalar_y else "inner"
+    if isinstance(scope, str):
+        values = {kind: scope for kind in ("gw", "gx", "gy")}
+    elif isinstance(scope, dict):
+        values = {kind: "inner" for kind in ("gw", "gx", "gy")}
+        aliases = {"grad_w": "gw", "grad_x": "gx", "grad_y": "gy"}
+        for key, value in scope.items():
+            key = aliases.get(key, key)
+            if key not in values:
+                raise ValueError(f"Unknown backward accumulator kind: {key!r}")
+            values[key] = value
+    else:
+        raise ValueError("accumulator_scope must be 'inner', 'outer', or a gradient mapping")
+    if any(value not in ("inner", "outer") for value in values.values()):
+        raise ValueError("accumulator_scope values must be 'inner' or 'outer'")
+    return values
+
+
+def _bwd_accumulator_scope_tag(scope) -> str:
+    selected = [kind for kind, value in _normalize_bwd_accumulator_scope(scope).items()
+                if value == "outer"]
+    return "_outer_" + "_".join(selected) if selected else ""
+
+
+class _BwdOuterAccumulators:
+    """Pin selected semantic outputs across u iterations, never recycled r/s tokens.
+
+    Scalar y reduces over u. Channel-valued gradients instead keep an independent
+    named scalar for each thread's channel iteration; merging them is incorrect.
+    """
+    def __init__(self, schedule, scope, *, scalar_y, u_dim, block_size,
+                 need_grad_w=True, grad_kind=None):
+        self.scopes = _normalize_bwd_accumulator_scope(scope, scalar_y=scalar_y)
+        self.scalar_y = scalar_y
+        self.u_dim = u_dim
+        self.block_size = block_size
+        self.targets = set()
+        self.token_targets = {}
+        for inst in schedule.instructions:
+            if inst.op in ("bwd_fma_placed", "bwd_fma_resident"):
+                wi, xj, yk = map(int, inst.args[:3])
+                self.targets.update({("gx", xj), ("gy", yk)})
+                if need_grad_w and bool(inst.args[-1]):
+                    self.targets.add(("gw", wi))
+            elif inst.op in ("bwd_split_fma_placed", "bwd_split_fma_resident"):
+                self.targets.add((str(inst.args[0]), int(inst.args[1])))
+            elif inst.op in ("init_acc", "load_acc"):
+                self.targets.add(_parse_bwd_lars_label_ref(inst.args[1]))
+            elif inst.op in ("store_acc", "store_acc_placed"):
+                self.targets.add(_parse_bwd_lars_label_ref(inst.args[0]))
+        self.targets = sorted((kind, int(idx)) for kind, idx in self.targets
+                              if kind in self.scopes and self.scopes[kind] == "outer"
+                              and (kind != "gw" or need_grad_w)
+                              and (grad_kind is None or kind == grad_kind))
+        self.channel_targets = [(kind, idx) for kind, idx in self.targets
+                                if not (kind == "gy" and scalar_y)]
+        if self.channel_targets and (u_dim is None or int(u_dim) <= 0):
+            raise ValueError("outer channel accumulators require a positive static u_dim")
+        self.slots = ((int(u_dim) + block_size - 1) // block_size
+                      if self.channel_targets else 0)
+        if self.targets:
+            schedule.placement_summary["accumulator_scope"] = dict(self.scopes)
+            schedule.placement_summary["outer_accumulator_scalars_per_thread"] = (
+                len(self.channel_targets) * self.slots +
+                sum(kind == "gy" and scalar_y for kind, _ in self.targets))
+
+    def has(self, kind, idx):
+        return (kind, int(idx)) in self.targets
+
+    def name(self, kind, idx, slot=None):
+        return f"{kind}_outer_{int(idx)}" + (f"_slot_{slot}" if slot is not None else "")
+
+    def declare(self, ap):
+        for kind, idx in self.targets:
+            if kind == "gy" and self.scalar_y:
+                ap(f"    scalar_t {self.name(kind, idx)} = scalar_t(0);")
+            else:
+                for slot in range(self.slots):
+                    ap(f"    scalar_t {self.name(kind, idx, slot)} = scalar_t(0);")
+
+    def bind(self, token, kind, idx):
+        self.token_targets[str(token)] = (kind, int(idx))
+
+    def update(self, ap, kind, idx, value):
+        if not self.has(kind, idx):
+            return False
+        if kind == "gy" and self.scalar_y:
+            ap(f"            {self.name(kind, idx)} += {value};")
+        else:
+            for slot in range(self.slots):
+                ap(f"            if (u / (int)blockDim.x == {slot}) {{")
+                ap(f"                {self.name(kind, idx, slot)} += {value};")
+                ap("            }")
+        return True
+
+    def launch_guard(self, ap):
+        if self.channel_targets:
+            ap(f'    TORCH_CHECK(U == {int(self.u_dim)}, "outer channel accumulator U specialization mismatch");')
+
+    def epilogue(self, ap, index_expr, exclusive):
+        if not self.targets:
+            return
+        ap("    // outer accumulator epilogue: all lanes reconverge before shuffle")
+        scalar_targets = [(kind, idx) for kind, idx in self.targets
+                          if kind == "gy" and self.scalar_y]
+        if scalar_targets:
+            ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+            # HIP retains lane-wise atomic accumulation; no CUDA warp assumptions.
+            ap("    if (warp_id * 32 + lane < U) {")
+            for kind, idx in scalar_targets:
+                ap(f"        atomicAdd(&grad_y[{index_expr(kind, idx)}], {self.name(kind, idx)});")
+            ap("    }")
+            ap("#else")
+            ap("    #pragma unroll")
+            ap("    for (int offset = 16; offset > 0; offset >>= 1) {")
+            for kind, idx in scalar_targets:
+                name = self.name(kind, idx)
+                ap(f"        {name} += __shfl_down_sync(0xffffffffu, {name}, offset, 32);")
+            ap("    }")
+            ap("    if (lane == 0 && warp_id * 32 < U) {")
+            for kind, idx in scalar_targets:
+                # y may be gathered and several warps may own one edge: keep atomic.
+                ap(f"        atomicAdd(&grad_y[{index_expr(kind, idx)}], {self.name(kind, idx)});")
+            ap("    }")
+            ap("#endif")
+        for slot in range(self.slots):
+            ap("    {")
+            ap(f"        const int u = tid + {slot} * (int)blockDim.x;")
+            ap("        if (u < U) {")
+            for kind, idx in self.channel_targets:
+                expr = index_expr(kind, idx)
+                value = self.name(kind, idx, slot)
+                if kind == "gw":
+                    # Broadcast weights are shared across edges even without indexing.
+                    ap("            if (WB == 1 && B > 1) {")
+                    ap(f"                atomicAdd(&grad_w[{expr}], {value});")
+                    ap("            } else {")
+                    ap(f"                grad_w[{expr}] = {value};")
+                    ap("            }")
+                else:
+                    _emit_gradient_writeback(ap, kind, expr, value,
+                                             exclusive=exclusive, scalar_y=self.scalar_y)
+            ap("        }")
+            ap("    }")
+
+
 def emit_fused_bwd_kernel_from_lars_schedule(
     schedule_result: ScheduleResult,
     *,
@@ -109,6 +258,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ) -> str:
     """
     Emit CUDA/HIP-compatible fused backward code from a backward LARS schedule.
@@ -124,6 +274,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         raise ValueError(f"Unsupported mode: {mode}")
 
     mode_scalar_y = mode == "u,u,,u"
+    outer = _BwdOuterAccumulators(
+        schedule_result, accumulator_scope, scalar_y=mode_scalar_y,
+        u_dim=u_dim, block_size=block_size, need_grad_w=need_grad_w)
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
     exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
@@ -210,6 +363,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         raise ValueError(f"Bad accumulator kind: {kind}")
 
     def _emit_bwd_acc_update(kind: str, idx: int, value_expr: str) -> None:
+        if outer.update(ap, kind, idx, value_expr):
+            return
         if _is_reg_acc(kind, idx):
             ap(f"            {_reg_acc_name(kind, idx)} += {value_expr};")
         else:
@@ -259,6 +414,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         raise ValueError(f"Bad backward accumulator token: {token!r}")
 
     def emit_grad_writeback(kind: str, idx: int, value_expr: str, suffix: str) -> None:
+        if outer.has(kind, idx):
+            return
         expr = _bwd_label_index_expr(
             kind, int(idx),
             mode_scalar_y=mode_scalar_y,
@@ -280,6 +437,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             raise ValueError(f"Bad backward accumulator kind: {kind}")
 
     def emit_placed_update(kind: str, idx: int, token: str, value_expr: str, suffix: str) -> None:
+        if outer.update(ap, kind, idx, value_expr):
+            return
         if str(token).startswith("d:"):
             emit_grad_writeback(kind, idx, value_expr, suffix)
         else:
@@ -388,6 +547,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
     ap("")
 
+    outer.declare(ap)
     ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
@@ -396,10 +556,16 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     if reg_count:
         ap("")
     for gw_idx in resident_gw_indices_sorted:
+        if outer.has("gw", gw_idx):
+            continue
         ap(f"            scalar_t gw_acc_i_{gw_idx} = scalar_t(0);")
     for gx_idx in resident_gx_indices_sorted:
+        if outer.has("gx", gx_idx):
+            continue
         ap(f"            scalar_t gx_acc_j_{gx_idx} = scalar_t(0);")
     for gy_idx in resident_gy_indices_sorted:
+        if outer.has("gy", gy_idx):
+            continue
         ap(f"            scalar_t gy_acc_k_{gy_idx} = scalar_t(0);")
     if resident_gw_indices_sorted or resident_gx_indices_sorted or resident_gy_indices_sorted:
         ap("")
@@ -434,7 +600,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             kind, _idx = _parse_bwd_lars_label_ref(ref)
             if kind not in BWD_OUTPUT_KINDS:
                 raise ValueError("backward init_acc expects grad_w/grad_x/grad_y")
-            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+            outer.bind(token, kind, _idx)
+            if not outer.has(kind, _idx):
+                ap(f"            {acc_expr(str(token))} = scalar_t(0);")
 
         elif inst.op == "bwd_fma_placed":
             wi, xj, yk, gw_token, gx_token, gy_token, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
@@ -474,7 +642,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             kind, _idx = _parse_bwd_lars_label_ref(ref)
             if kind not in BWD_OUTPUT_KINDS:
                 raise ValueError("load_acc expects a backward output label")
-            ap(f"            {reg} = scalar_t(0);")
+            outer.bind(reg, kind, _idx)
+            if not outer.has(kind, _idx):
+                ap(f"            {reg} = scalar_t(0);")
 
         elif inst.op == "bwd_fma_resident":
             wi, xj, yk, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
@@ -489,14 +659,20 @@ def emit_fused_bwd_kernel_from_lars_schedule(
             # output accumulators inside the LARS register file.
             rgw, rgx, rgy, rw, rx, ry, rgo, coeff, inst_need_grad_w = inst.args
             c = _fmt_lars_float(float(coeff))
+            legacy_updates = [(rgx, f"scalar_t({c}) * ({rw} * {rgo}) * {ry}"),
+                              (rgy, f"scalar_t({c}) * ({rw} * {rgo}) * {rx}")]
             if bool(inst_need_grad_w):
-                ap(f"            {rgw} += scalar_t({c}) * {rgo} * {rx} * {ry};")
-            ap(f"            {rgx} += scalar_t({c}) * ({rw} * {rgo}) * {ry};")
-            ap(f"            {rgy} += scalar_t({c}) * ({rw} * {rgo}) * {rx};")
+                legacy_updates.insert(0, (rgw, f"scalar_t({c}) * {rgo} * {rx} * {ry}"))
+            for token, value in legacy_updates:
+                target = outer.token_targets.get(str(token))
+                if target is None or not outer.update(ap, *target, value):
+                    ap(f"            {token} += {value};")
 
         elif inst.op == "store_acc":
             ref, reg = inst.args
             kind, idx = _parse_bwd_lars_label_ref(ref)
+            if outer.has(kind, idx):
+                continue
             expr = _bwd_label_index_expr(
                 kind, idx,
                 mode_scalar_y=mode_scalar_y,
@@ -531,6 +707,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     # Register-resident writeback.
     for gw_idx in resident_gw_indices_sorted:
+        if outer.has("gw", gw_idx):
+            continue
         expr = _bwd_label_index_expr(
             "gw", int(gw_idx),
             mode_scalar_y=mode_scalar_y,
@@ -542,6 +720,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         )
         ap(f"            grad_w[{expr}] = gw_acc_i_{gw_idx};")
     for gx_idx in resident_gx_indices_sorted:
+        if outer.has("gx", gx_idx):
+            continue
         expr = _bwd_label_index_expr(
             "gx", int(gx_idx),
             mode_scalar_y=mode_scalar_y,
@@ -553,6 +733,8 @@ def emit_fused_bwd_kernel_from_lars_schedule(
         )
         ap(f"            atomicAdd(&grad_x[{expr}], gx_acc_j_{gx_idx});")
     for gy_idx in resident_gy_indices_sorted:
+        if outer.has("gy", gy_idx):
+            continue
         expr = _bwd_label_index_expr(
             "gy", int(gy_idx),
             mode_scalar_y=mode_scalar_y,
@@ -566,6 +748,9 @@ def emit_fused_bwd_kernel_from_lars_schedule(
 
     ap("        }")
     ap("    }")
+    outer.epilogue(ap, lambda kind, idx: _bwd_label_index_expr(
+        kind, idx, mode_scalar_y=mode_scalar_y, u_dim=u_dim,
+        iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim), exclusive)
     ap("}")
     ap("")
 
@@ -612,6 +797,7 @@ def emit_fused_bwd_kernel_from_lars_schedule(
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
+    outer.launch_guard(ap)
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
     ap(f"    size_t lars_shared_bytes = (size_t){shared_slots} * (size_t)block.x * sizeof(scalar_t);")
@@ -915,6 +1101,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ky_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ) -> str:
     if grad_kind not in BWD_SPLIT_KINDS:
         raise ValueError(f"grad_kind must be one of {sorted(BWD_SPLIT_KINDS)}, got {grad_kind!r}")
@@ -925,6 +1112,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
         raise ValueError(f"Unsupported mode: {mode}")
 
     mode_scalar_y = mode == "u,u,,u"
+    outer = _BwdOuterAccumulators(
+        schedule_result, accumulator_scope, scalar_y=mode_scalar_y,
+        u_dim=u_dim, block_size=block_size, grad_kind=grad_kind)
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
     exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
@@ -954,6 +1144,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
         return _split_grad_acc_name(grad_kind, int(idx))
 
     def _emit_acc_update(idx: int, value_expr: str) -> None:
+        if outer.update(ap, grad_kind, idx, value_expr):
+            return
         if _is_reg_target(idx):
             ap(f"            {_target_acc_name(idx)} += {value_expr};")
 
@@ -1000,6 +1192,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
         raise ValueError(f"Bad split backward accumulator token: {token!r}")
 
     def emit_placed_writeback(idx: int, value_expr: str, suffix: str) -> None:
+        if outer.has(grad_kind, idx):
+            return
         out_kind = {"gw": "gw", "gx": "gx", "gy": "gy"}[grad_kind]
         expr = _bwd_label_index_expr(
             out_kind, int(idx),
@@ -1101,6 +1295,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
         ap("    const index_t go_base = (index_t)go_row * (index_t)V * (index_t)U;")
     ap("")
 
+    outer.declare(ap)
     ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
@@ -1109,6 +1304,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
     if reg_count:
         ap("")
     for idx in reg_targets_sorted:
+        if outer.has(grad_kind, idx):
+            continue
         ap(f"            scalar_t {_target_acc_name(idx)} = scalar_t(0);")
     if reg_targets_sorted:
         ap("")
@@ -1144,7 +1341,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
             expected = {"gw": "gw", "gx": "gx", "gy": "gy"}[grad_kind]
             if kind != expected:
                 raise ValueError(f"split init_acc expects {expected}, got {kind}")
-            ap(f"            {acc_expr(str(token))} = scalar_t(0);")
+            if not outer.has(kind, _idx):
+                ap(f"            {acc_expr(str(token))} = scalar_t(0);")
 
         elif inst.op == "bwd_split_fma_placed":
             ikind, target_idx, target_token, rw, rx, ry, rgo, coeff = inst.args
@@ -1157,7 +1355,9 @@ def emit_lars_bwd_split_kernel_from_schedule(
                 value = f"scalar_t({c}) * ({operand_expr(str(rw))} * {operand_expr(str(rgo))}) * {operand_expr(str(ry))}"
             else:
                 value = f"scalar_t({c}) * ({operand_expr(str(rw))} * {operand_expr(str(rgo))}) * {operand_expr(str(rx))}"
-            if str(target_token).startswith("d:"):
+            if outer.update(ap, grad_kind, int(target_idx), value):
+                pass
+            elif str(target_token).startswith("d:"):
                 emit_placed_writeback(int(target_idx), value, f"direct_{grad_kind}_{inst_id}")
             else:
                 ap(f"            {acc_expr(str(target_token))} += {value};")
@@ -1234,9 +1434,14 @@ def emit_lars_bwd_split_kernel_from_schedule(
             raise ValueError(f"Bad grad_kind: {grad_kind}")
 
     for idx in reg_targets_sorted:
+        if outer.has(grad_kind, idx):
+            continue
         _emit_writeback(int(idx), _target_acc_name(int(idx)))
     ap("        }")
     ap("    }")
+    outer.epilogue(ap, lambda kind, idx: _bwd_label_index_expr(
+        kind, idx, mode_scalar_y=mode_scalar_y, u_dim=u_dim,
+        iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim), exclusive)
     ap("}")
     ap("")
 
@@ -1257,6 +1462,7 @@ def emit_lars_bwd_split_kernel_from_schedule(
     ap("    int B, int WB, int Iw, int Ix, int Ky, int V, int U, int S,")
     ap("    gpuStream_t stream)")
     ap("{")
+    outer.launch_guard(ap)
     ap(f"    dim3 block({block_size});")
     ap("    dim3 grid(B);")
     ap(f"    size_t lars_shared_bytes = (size_t){shared_slots} * (size_t)block.x * sizeof(scalar_t);")
@@ -1679,8 +1885,10 @@ def _generate_code_uniform1d_bwd_split_from_context(
     topk_candidates: Optional[int],
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ):
     """Internal split-backward implementation.  The public entry is the unified wrapper."""
+    accumulator_scope = _normalize_bwd_accumulator_scope(accumulator_scope, scalar_y=(mode == "u,u,,u"))
     resolved_placement = _resolve_lars_placement_config(placement_config)
     # One split candidate is emitted.  Lifetime placement is applied independently
     # to each gradient kernel after LARS chooses its path order.
@@ -1699,7 +1907,9 @@ def _generate_code_uniform1d_bwd_split_from_context(
 
     for cfg_in in configs:
         cfg = dict(cfg_in)
-        cand_name = str(cfg["name"])
+        cand_name = str(cfg["name"]) + _bwd_accumulator_scope_tag(accumulator_scope)
+        cfg["name"] = cand_name
+        cfg["accumulator_scope"] = dict(accumulator_scope)
         cfg["auto_fallback_when_full"] = False
         cfg["effective_live_need"] = int(max_effective_need)
         cfg["split_backward"] = True
@@ -1777,6 +1987,7 @@ def _generate_code_uniform1d_bwd_split_from_context(
                     ky_dim=ky_dim,
                     v_dim=v_dim,
                     block_size=int(block_size),
+                    accumulator_scope=accumulator_scope,
                 )
             )
 
@@ -1843,6 +2054,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
     topk_candidates: Optional[int],
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ):
     """
     Generate one fused backward LARS candidate.
@@ -1874,10 +2086,12 @@ def _generate_code_uniform1d_bwd_fused_from_context(
             enable_secondary_affinity=enable_secondary_affinity,
             topk_candidates=topk_candidates,
             block_size=block_size,
+            accumulator_scope=accumulator_scope,
             placement_config=placement_config,
         )
     grad_tag = "full" if need_grad_w else "nogradw"
-    cand_name = "lars_bwd_all_inputs_accall"
+    accumulator_scope = _normalize_bwd_accumulator_scope(accumulator_scope, scalar_y=(mode == "u,u,,u"))
+    cand_name = "lars_bwd_all_inputs_accall" + _bwd_accumulator_scope_tag(accumulator_scope)
 
     scheduler = LARSUniform1DBwdScheduler(
         paths=ctx.bwd_paths,
@@ -1937,6 +2151,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         ky_dim=ky_dim,
         v_dim=v_dim,
         block_size=int(block_size),
+        accumulator_scope=accumulator_scope,
     )
 
     code = code + "\n" + emit_lars_bwd_launcher(
@@ -1967,6 +2182,7 @@ def _generate_code_uniform1d_bwd_fused_from_context(
                 "need_grad_w": bool(need_grad_w),
                 "split_backward": False,
                 "path_split": False,
+                "accumulator_scope": dict(accumulator_scope),
             },
             "profile": schedule_result.profile,
         }
@@ -2002,6 +2218,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
     enable_secondary_affinity: bool = False,
     topk_candidates: Optional[int] = 128,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ):
     """
     Backward-compatible wrapper.  New code should call
@@ -2037,6 +2254,7 @@ def generate_code_uniform1d_bwd_split_with_scheduler(
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         path_split_space=(True,),
+        accumulator_scope=accumulator_scope,
         placement_config=placement_config,
     )
 
@@ -2072,9 +2290,20 @@ def generate_code_uniform1d_bwd_with_scheduler(
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
     path_split_space: Sequence[bool] = (False, True),
     generate_candidates: bool = True,
+    accumulator_scope: Union[str, Dict[str, str], None] = None,
 ):
     """
     Unified LARS backward code generator.
+
+    accumulator_scope: None (default: scalar gy outer, other outputs inner),
+    "inner" (explicit legacy policy), "outer" (all outputs), or
+    {"gy": "outer", "gx": "inner", "gw": "inner"}. grad_y/grad_x/grad_w aliases
+    are accepted. Scalar-y outer accumulators sum across channel iterations and
+    reduce after the loop. Channel-valued outer accumulators preserve separate
+    named scalars per iteration and require a positive static u_dim; launchers
+    check runtime U. Scope tags distinguish candidates and kernel symbols.
+    This controls emitter lifetime; it does not change the LARS path-order cost
+    model or add scope values to the automatic candidate search space.
 
     Search path_split as a scheduling dimension (False=fused, True=split).
     Unsupported partial-gradient fused candidates are filtered before scheduling.
@@ -2131,6 +2360,7 @@ def generate_code_uniform1d_bwd_with_scheduler(
         enable_secondary_affinity=enable_secondary_affinity,
         topk_candidates=topk_candidates,
         block_size=int(block_size),
+        accumulator_scope=accumulator_scope,
         placement_config=placement_config,
     )
 
