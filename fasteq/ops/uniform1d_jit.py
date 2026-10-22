@@ -41,7 +41,8 @@ from .auto_schedule.multi_size_tuning import (
 )
 
 
-# Triton register-only runtime caches.  CUDA/HIP remains the default backend.
+# Python GPU module caches. Keys include backend and generated configuration.
+# CUDA/HIP remains the default backend.
 _TRITON_FWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
 _TRITON_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
 _TRITON_DOUBLE_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
@@ -51,11 +52,77 @@ def _fasteq_codegen_backend() -> str:
     backend = os.environ.get("FASTEQ_CODEGEN_BACKEND", "cuda").strip().lower()
     if backend in ("cuda", "hip", "cpp", "native"):
         return "native"
-    if backend == "triton":
-        return "triton"
+    if backend in ("triton", "gluon"):
+        return backend
     raise ValueError(
-        f"Unsupported FASTEQ_CODEGEN_BACKEND={backend!r}; expected cuda/native or triton"
+        f"Unsupported FASTEQ_CODEGEN_BACKEND={backend!r}; expected cuda/native, triton, or gluon"
     )
+
+def _python_codegen_builder(backend: str, phase: str):
+    """Resolve Gluon lazily so native/Triton do not require Gluon imports."""
+    if backend == "triton":
+        return {
+            "fwd": build_triton_uniform1d_fwd_module,
+            "bwd": build_triton_uniform1d_bwd_module,
+            "double_bwd": build_triton_uniform1d_double_bwd_module,
+        }[phase]
+    if backend == "gluon":
+        from .auto_schedule.gluon_backend import (
+            build_gluon_uniform1d_fwd_module,
+            build_gluon_uniform1d_bwd_module,
+            build_gluon_uniform1d_double_bwd_module,
+        )
+        return {
+            "fwd": build_gluon_uniform1d_fwd_module,
+            "bwd": build_gluon_uniform1d_bwd_module,
+            "double_bwd": build_gluon_uniform1d_double_bwd_module,
+        }[phase]
+    raise ValueError(f"Not a Python codegen backend: {backend!r}")
+
+
+def _python_codegen_options(backend: str, phase: str):
+    """Return builder kwargs and a stable configuration key for module caching.
+
+    FASTEQ_GLUON_OPTIONS is a JSON object, e.g.
+    {"block_u":128,"num_warps":4,"placement_config":{"max_shared_slots":12}}.
+    The supplied placement pass supports fwd/bwd but not double-bwd records;
+    shared_inputs remains available for double backward.
+    """
+    if backend == "triton":
+        return {}, ""
+    if backend != "gluon":
+        raise ValueError(f"Not a Python codegen backend: {backend!r}")
+    raw = os.environ.get("FASTEQ_GLUON_OPTIONS", "").strip() or "{}"
+    try:
+        options = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("FASTEQ_GLUON_OPTIONS must be a JSON object") from exc
+    if not isinstance(options, dict):
+        raise ValueError("FASTEQ_GLUON_OPTIONS must be a JSON object")
+    allowed = {"block_u", "num_warps", "placement_config", "shared_inputs",
+               "preserve_shared", "scheduler_options"}
+    unknown = set(options) - allowed
+    if unknown:
+        raise ValueError(f"Unknown FASTEQ_GLUON_OPTIONS keys: {sorted(unknown)}")
+    options.setdefault("block_u", 128)
+    options.setdefault("num_warps", 4)
+    for name in ("block_u", "num_warps"):
+        value = options[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value & (value - 1):
+            raise ValueError(f"FASTEQ_GLUON_OPTIONS {name} must be a positive power of two")
+    for name in ("placement_config", "scheduler_options"):
+        if name in options and options[name] is not None and not isinstance(options[name], dict):
+            raise ValueError(f"FASTEQ_GLUON_OPTIONS {name} must be an object or null")
+    if "shared_inputs" in options:
+        refs = options["shared_inputs"]
+        if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
+            raise ValueError("FASTEQ_GLUON_OPTIONS shared_inputs must be a list of strings")
+    if "preserve_shared" in options and not isinstance(options["preserve_shared"], bool):
+        raise ValueError("FASTEQ_GLUON_OPTIONS preserve_shared must be a boolean")
+    if phase == "double_bwd":
+        options.pop("placement_config", None)
+    return options, json.dumps(options, sort_keys=True, separators=(",", ":"))
+
 
 # -----------------------------------------------------------------------------
 # JIT cache
@@ -2464,8 +2531,10 @@ def _run_fwd(
     ky_dim = int(y.size(1))
     v_dim = int(out_seg_num)
 
-    if _fasteq_codegen_backend() == "triton":
-        print("[JIT][FWD] using triton backend for forward pass")
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "fwd")
+        print(f"[JIT][FWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         fused_scatter = 0 in output_indices
@@ -2480,18 +2549,21 @@ def _run_fwd(
             if fused_scatter else None
         )
         key = _make_candidate_fast_key(
-            kind="TRITON_FWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            kind=f"{codegen_backend.upper()}_FWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
             ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
             dtype_str=dtype_str, use_multiwarp_candidates=False,
         )
+        key = (codegen_backend, backend_options_key, key)
         mod = _TRITON_FWD_MODULE_CACHE.get(key)
         if mod is None:
-            mod = build_triton_uniform1d_fwd_module(
+            builder = _python_codegen_builder(codegen_backend, "fwd")
+            mod = builder(
                 i_list, j_list, k_list, v_list, coeff_list,
                 input_indices=input_indices, output_indices=output_indices,
                 u_dim=u_dim, mode=mode,
+                **backend_options,
             )
             _TRITON_FWD_MODULE_CACHE[key] = mod
         return _call_fwd_module(
@@ -2593,6 +2665,9 @@ def _run_bwd(
     use_multiwarp_candidates: Optional[bool] = None,
 ):
 
+    """ torch.cuda.synchronize()
+    start_time = time.perf_counter() * 1000.0 """
+
     input_indices = {} if input_indices is None else input_indices
     output_indices = {} if output_indices is None else output_indices
     _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices)
@@ -2600,8 +2675,10 @@ def _run_bwd(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
-    if _fasteq_codegen_backend() == "triton":
-        print("[JIT][BWD] using triton backend for backward pass")
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "bwd")
+        print(f"[JIT][BWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         fused_scatter = 0 in output_indices
@@ -2617,21 +2694,24 @@ def _run_bwd(
         )
         grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
         key = _make_candidate_fast_key(
-            kind="TRITON_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            kind=f"{codegen_backend.upper()}_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
             ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
             dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x, grad_y=grad_y,
             use_multiwarp_candidates=False,
         )
+        key = (codegen_backend, backend_options_key, key)
         mod = _TRITON_BWD_MODULE_CACHE.get(key)
         if mod is None:
-            mod = build_triton_uniform1d_bwd_module(
+            builder = _python_codegen_builder(codegen_backend, "bwd")
+            mod = builder(
                 i_list, j_list, k_list, v_list, coeff_list,
                 input_indices=input_indices, output_indices=output_indices,
                 u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
                 v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
                 need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+                **backend_options,
             )
             _TRITON_BWD_MODULE_CACHE[key] = mod
         return _call_bwd_module(
@@ -2689,9 +2769,6 @@ def _run_bwd(
         use_x_src=use_x_src, use_y_src=use_y_src,
     )
 
-    torch.cuda.synchronize()
-    start_time = time.perf_counter() * 1000.0
-
     out =  _call_bwd_module(
         best_mod,
         w=w, x=x, y=y, grad_out=grad_out,
@@ -2699,14 +2776,16 @@ def _run_bwd(
         out_seg_num=out_seg_num,
         fused_scatter=fused_scatter,
     )
-    print(f"best_tag:{best_tag}, tune_key:{tune_key}")
-    print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
-    print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
+    #print(f"best_tag:{best_tag}, tune_key:{tune_key}")
+    #print(f"x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
+    #print(f"src_idx:{src_idx}, dst_idx:{dst_idx}, out_seg_num:{out_seg_num}, fused_scatter:{fused_scatter}")
 
 
-    torch.cuda.synchronize()
+    """ torch.cuda.synchronize()
     end_time = time.perf_counter() * 1000.0
-    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>")
+    print(f"<< fasteq uniform1d _call_bwd_module cost: {end_time - start_time:.3f} ms >>") """
+
+    #print(f"uniform1d bwd x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
 
     
     return _validate_backward_result(out, grad_w, grad_x, grad_y)
@@ -2747,8 +2826,10 @@ def _run_double_bwd(
         use_multiwarp_candidates
     )
     dtype_str = _get_scalar_t_str(w)
-    if _fasteq_codegen_backend() == "triton":
-        print("[JIT][BWD] using triton backend for backward pass")
+    codegen_backend = _fasteq_codegen_backend()
+    if codegen_backend in ("triton", "gluon"):
+        backend_options, backend_options_key = _python_codegen_options(codegen_backend, "double_bwd")
+        print(f"[JIT][DOUBLE_BWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         use_src = use_x_src or use_y_src
@@ -2771,20 +2852,23 @@ def _run_double_bwd(
         if bool(grad_y):
             grad_grad_y = torch.zeros_like(y) if grad_grad_y is None else grad_grad_y.contiguous()
         key = _make_candidate_fast_key(
-            kind="TRITON_DOUBLE_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
+            kind=f"{codegen_backend.upper()}_DOUBLE_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim,
             ky_dim=ky_dim, v_dim=v_dim, mode=mode, dtype_str=dtype_str,
             grad_w=grad_w, grad_x=grad_x, grad_y=grad_y, use_multiwarp_candidates=False,
         )
+        key = (codegen_backend, backend_options_key, key)
         mod = _TRITON_DOUBLE_BWD_MODULE_CACHE.get(key)
         if mod is None:
-            mod = build_triton_uniform1d_double_bwd_module(
+            builder = _python_codegen_builder(codegen_backend, "double_bwd")
+            mod = builder(
                 i_list, j_list, k_list, v_list, coeff_list,
                 input_indices=input_indices, output_indices=output_indices,
                 u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
                 v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
                 need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
+                **backend_options,
             )
             _TRITON_DOUBLE_BWD_MODULE_CACHE[key] = mod
         return _call_double_bwd_module(
@@ -2884,9 +2968,6 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
                 need_grad_x,
                 need_grad_y,
                 use_multiwarp_candidates):
-        
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
 
         result = _run_bwd(
             grad_out=grad_out, w=w, x=x, y=y,
@@ -2900,10 +2981,6 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             grad_y=bool(need_grad_y),
             use_multiwarp_candidates=bool(use_multiwarp_candidates),
         )
-
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward-forward cost: {end_time - start_time:.3f} ms >>")
 
         result_iter = iter(result)
         gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
@@ -2994,7 +3071,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         output_indices,
         meta,
         use_multiwarp_candidates,
-    ):
+    ):  
+
+        """ torch.cuda.synchronize()
+        start_time = time.perf_counter() * 1000.0 """
+
         # Capture the public input's autograd requirement before reshaping.
         # This flag is part of both backward and double-backward JIT signatures.
         need_grad_w = bool(ctx.needs_input_grad[0])
@@ -3037,9 +3118,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         P = i_list.numel()
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
-
+        
         out = _run_fwd(
             w=w,
             x=x,
@@ -3059,9 +3138,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         out = out.view(-1, out_seg_num * u_dim)
 
-        torch.cuda.synchronize()
+        """  torch.cuda.synchronize()
         end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>")
+        print(f"<< fasteq uniform1d fused forward cost: {end_time - start_time:.3f} ms >>") """
+
+        #print(f"uniform1d fwd x:{x.shape}, y:{y.shape}, w:{w.shape}")
 
         ctx.save_for_backward(w, x, y)
         ctx.i_list = i_list
@@ -3093,9 +3174,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         w, x, y = ctx.saved_tensors
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
-
         gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(
             grad_out, w, x, y,
             ctx.i_list, ctx.j_list, ctx.k_list, ctx.v_list, ctx.coeff_list,
@@ -3105,10 +3183,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
             ctx.mode, ctx.need_grad_w, ctx.need_grad_x, ctx.need_grad_y,
             bool(ctx.use_multiwarp_candidates),
         )
-
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward cost: {end_time - start_time:.3f} ms >>")
 
         grad_w = gw3.view(-1, ctx.w_seg_num * ctx.w_irreps) if ctx.need_grad_w else None
         grad_x = gx3.view(-1, ctx.x_seg_num * ctx.x_irreps) if ctx.need_grad_x else None

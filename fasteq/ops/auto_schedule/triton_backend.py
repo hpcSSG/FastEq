@@ -88,6 +88,15 @@ def _triton_source_preamble() -> List[str]:
     ]
 
 
+def _triton_validate_num_warps(num_warps: int) -> int:
+    """Validate the launch configuration supplied by a caller or tuner."""
+    if isinstance(num_warps, bool) or not isinstance(num_warps, int):
+        raise TypeError("num_warps must be an integer")
+    if num_warps <= 0 or num_warps & (num_warps - 1):
+        raise ValueError("num_warps must be a positive power of two")
+    return num_warps
+
+
 def _triton_emit_zero(lines: List[str], name: str, indent: str = "    ") -> None:
     lines.append(f"{indent}if IS_FP64:")
     lines.append(f"{indent}    {name} = tl.zeros((BLOCK_U,), dtype=tl.float64)")
@@ -124,8 +133,8 @@ def _triton_bind_run_entry(module):
     return module
 
 
-def load_triton_module_from_source(source):
-    """Load file-backed Triton source and return a module with callable run."""
+def load_triton_module_from_source(source, *, module_prefix="fasteq_triton"):
+    """Load source with a backend-specific cache filename and module name."""
     import importlib.util
     import hashlib
     import pathlib
@@ -138,7 +147,7 @@ def load_triton_module_from_source(source):
         os.environ.get("FASTEQ_TRITON_CACHE", pathlib.Path.home() / ".cache/fasteq/triton")
     )
     cache_root.mkdir(parents=True, exist_ok=True)
-    module_name = f"fasteq_triton_{key[:16]}"
+    module_name = f"{module_prefix}_{key[:16]}"
     py_file = cache_root / (module_name + ".py")
 
     # Serialize imports of this name so callers never see a partial module.
@@ -187,7 +196,10 @@ class TritonEmitter:
 
     The emitter does not reproduce CUDA threadIdx/lane/shared-memory semantics.
     One Triton program owns one ``BLOCK_U`` tile of the U dimension, while LARS
-    virtual registers map to Triton SSA tensors/scalars.
+    virtual registers map to Triton SSA tensors/scalars. The default tile is
+    128 channels (one tile for U=128). Callers can pass num_warps from their
+    launch configuration or autotuner; it defaults to four warps per program.
+    block_u and num_warps are independent launch parameters.
     """
 
     def __init__(self, schedule_result: ScheduleResult, *, kernel_name: str):
@@ -209,7 +221,7 @@ class TritonEmitter:
         use_x_src: bool,
         use_y_src: bool,
         use_scatter: bool,
-        block_u: int = 32,
+        block_u: int = 128, num_warps: int = 4,
     ) -> str:
         if mode not in ("u,u,,u", "u,u,u,u"):
             raise ValueError(f"Unsupported Uniform1D Triton mode: {mode}")
@@ -300,8 +312,9 @@ class TritonEmitter:
             ("        out_rows = int(x.size(0))" if use_scatter else "        out_rows = B"),
             "        out = torch.zeros((out_rows, V, U), device=w.device, dtype=w.dtype)",
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
-            f"        {k}[grid](w, x, y, out, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(w.dtype == torch.float64))",
+            f"        {k}[grid](w, x, y, out, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
             "        return out",
         ]
         return self._append_module_footer(lines)
@@ -317,7 +330,7 @@ class TritonEmitter:
         use_x_src: bool,
         use_y_src: bool,
         use_scatter: bool,
-        block_u: int = 32,
+        block_u: int = 128, num_warps: int = 4,
     ) -> str:
         mode_scalar_y = mode == "u,u,,u"
         lines = _triton_source_preamble()
@@ -426,25 +439,26 @@ class TritonEmitter:
             "        WB, Iw, U = int(w.size(0)), int(w.size(1)), int(w.size(2))",
             "        Ix, Ky = int(x.size(1)), int(y.size(1))",
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
             "        outs = []",
         ]
         if need_grad_w:
             lines += [
                 "        gw = torch.zeros_like(w)",
-                f"        {kernel_names['gw']}[grid](w, x, y, grad_out, gw, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(w.dtype == torch.float64))",
+                f"        {kernel_names['gw']}[grid](w, x, y, grad_out, gw, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
                 "        outs.append(gw)",
             ]
         if need_grad_x:
             lines += [
                 "        gx = torch.zeros_like(x)",
-                f"        {kernel_names['gx']}[grid](w, x, y, grad_out, gx, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(w.dtype == torch.float64))",
+                f"        {kernel_names['gx']}[grid](w, x, y, grad_out, gx, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
                 "        outs.append(gx)",
             ]
         if need_grad_y:
             lines += [
                 "        gy = torch.zeros_like(y)",
-                f"        {kernel_names['gy']}[grid](w, x, y, grad_out, gy, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(w.dtype == torch.float64))",
+                f"        {kernel_names['gy']}[grid](w, x, y, grad_out, gy, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
                 "        outs.append(gy)",
             ]
         lines.append("        return outs")
@@ -460,7 +474,7 @@ class TritonEmitter:
         use_x_src: bool,
         use_y_src: bool,
         use_scatter: bool,
-        block_u: int = 32,
+        block_u: int = 128, num_warps: int = 4,
     ) -> str:
         mode_scalar_y = mode == "u,u,,u"
         lines = _triton_source_preamble()
@@ -582,8 +596,9 @@ class TritonEmitter:
             "        dx = torch.zeros_like(x) if " + ("True" if need_grad_x else "False") + " else dgo",
             "        dy = torch.zeros_like(y) if " + ("True" if need_grad_y else "False") + " else dgo",
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
-            f"        {k}[grid](w, x, y, grad_out, ggw, ggx, ggy, dgo, dw, dx, dy, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(w.dtype == torch.float64))",
+            f"        {k}[grid](w, x, y, grad_out, ggw, ggx, ggy, dgo, dw, dx, dy, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
             "        outs = [dgo]",
         ]
         if need_grad_w: lines.append("        outs.append(dw)")
@@ -592,7 +607,7 @@ class TritonEmitter:
         lines.append("        return outs")
         return self._append_module_footer(lines)
 
-    def emit_stc_fwd(self, *, block_u: int = 32) -> str:
+    def emit_stc_fwd(self, *, block_u: int = 128, num_warps: int = 4) -> str:
         lines = _triton_source_preamble()
         k = self.kernel_name
         lines += [
@@ -631,13 +646,14 @@ class TritonEmitter:
             "        X0, V = int(x0.size(1)), int(V)",
             "        out = torch.zeros((B, V, U), device=x1.device, dtype=x1.dtype)",
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
-            f"        {k}[grid](x1, x0, out, B=B, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(x1.dtype == torch.float64))",
+            f"        {k}[grid](x1, x0, out, B=B, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(x1.dtype == torch.float64))",
             "        return out",
         ]
         return self._append_module_footer(lines)
 
-    def emit_stc_bwd(self, *, need_grad_x0: bool, block_u: int = 32) -> str:
+    def emit_stc_bwd(self, *, need_grad_x0: bool, block_u: int = 128, num_warps: int = 4) -> str:
         lines = _triton_source_preamble(); k=self.kernel_name
         lines += [
             "@triton.jit",
@@ -683,13 +699,14 @@ class TritonEmitter:
             "        gx1 = torch.zeros_like(x1)",
             ("        gx0 = torch.zeros_like(x0)" if need_grad_x0 else "        gx0 = gx1"),
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
-            f"        {k}[grid](grad_out, x1, x0, gx1, gx0, B=B, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(x1.dtype == torch.float64))",
+            f"        {k}[grid](grad_out, x1, x0, gx1, gx0, B=B, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(x1.dtype == torch.float64))",
             ("        return [gx1, gx0]" if need_grad_x0 else "        return [gx1]"),
         ]
         return self._append_module_footer(lines)
 
-    def emit_stc_double_bwd(self, *, block_u: int = 32) -> str:
+    def emit_stc_double_bwd(self, *, block_u: int = 128, num_warps: int = 4) -> str:
         lines=_triton_source_preamble(); k=self.kernel_name
         lines += [
             "@triton.jit",
@@ -751,8 +768,9 @@ class TritonEmitter:
             "        dx1 = torch.zeros_like(x1)",
             "        dx0 = torch.zeros_like(x0)",
             f"        BLOCK_U = {int(block_u)}",
+            f"        NUM_WARPS = {_triton_validate_num_warps(num_warps)}",
             "        grid = (B, triton.cdiv(U, BLOCK_U))",
-            f"        {k}[grid](grad_out, x1, x0, i0, grad_grad_x0, grad_grad_x1, dgo, dx1, dx0, B=B, B0=B0, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, IS_FP64=(x1.dtype == torch.float64))",
+            f"        {k}[grid](grad_out, x1, x0, i0, grad_grad_x0, grad_grad_x1, dgo, dx1, dx0, B=B, B0=B0, X1=X1, X0=X0, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(x1.dtype == torch.float64))",
             "        return [dgo, dx1, dx0]",
         ]
         return self._append_module_footer(lines)
@@ -764,13 +782,13 @@ def build_triton_uniform1d_fwd_module_source(
     input_indices: Optional[Dict[int, Any]] = None,
     output_indices: Optional[Dict[int, Any]] = None,
     *, u_dim: int = 1, mode: str = "u,u,,u", path_semantics: str = "wxy",
-    kernel_name: str = "uniform1d_triton_fwd", block_u: int = 32,
+    kernel_name: str = "uniform1d_triton_fwd", block_u: int = 128, num_warps: int = 4,
 ) -> str:
     input_indices={} if input_indices is None else dict(input_indices); output_indices={} if output_indices is None else dict(output_indices)
     paths=_make_lars_paths_from_uniform1d_lists(_to_int_list(i_list),_to_int_list(j_list),_to_int_list(k_list),_to_int_list(v_list),_to_float_list(coeff_list),path_semantics=path_semantics)
     sched=LARSUniform1DScheduler(paths=paths,enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
     placed=_triton_place_register_only(sched,schedule_kind="fwd")
-    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_uniform1d_fwd(mode=mode,use_x_src=1 in input_indices,use_y_src=2 in input_indices,use_scatter=0 in output_indices,block_u=block_u)
+    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_uniform1d_fwd(mode=mode,use_x_src=1 in input_indices,use_y_src=2 in input_indices,use_scatter=0 in output_indices,block_u=block_u,num_warps=num_warps)
 
 
 def build_triton_uniform1d_bwd_module_source(
@@ -782,7 +800,7 @@ def build_triton_uniform1d_bwd_module_source(
     ky_dim: Optional[int] = None, v_dim: Optional[int] = None,
     mode: str = "u,u,,u", need_grad_w: bool = True, need_grad_x: bool = True,
     need_grad_y: bool = True, path_semantics: str = "wxy",
-    kernel_name: str = "uniform1d_triton_bwd", block_u: int = 32,
+    kernel_name: str = "uniform1d_triton_bwd", block_u: int = 128, num_warps: int = 4,
 ) -> str:
     del iw_dim,ix_dim,ky_dim,v_dim
     ctx=_prepare_uniform1d_bwd_codegen_context(i_list=i_list,j_list=j_list,k_list=k_list,v_list=v_list,coeff_list=coeff_list,input_indices=input_indices,output_indices=output_indices,mode=mode,path_semantics=path_semantics)
@@ -793,7 +811,7 @@ def build_triton_uniform1d_bwd_module_source(
         schedules[gkind]=_triton_place_register_only(s,schedule_kind=f"bwd_split:{gkind}")
     if not schedules: raise ValueError("at least one Uniform1D gradient must be requested")
     dummy=next(iter(schedules.values()))
-    return TritonEmitter(dummy,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{ctx.P}").emit_uniform1d_bwd_split_bundle(schedules=schedules,mode=mode,need_grad_w=bool(need_grad_w),need_grad_x=bool(need_grad_x),need_grad_y=bool(need_grad_y),use_x_src=ctx.use_x_src,use_y_src=ctx.use_y_src,use_scatter=ctx.use_scatter,block_u=block_u)
+    return TritonEmitter(dummy,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{ctx.P}").emit_uniform1d_bwd_split_bundle(schedules=schedules,mode=mode,need_grad_w=bool(need_grad_w),need_grad_x=bool(need_grad_x),need_grad_y=bool(need_grad_y),use_x_src=ctx.use_x_src,use_y_src=ctx.use_y_src,use_scatter=ctx.use_scatter,block_u=block_u,num_warps=num_warps)
 
 
 def build_triton_uniform1d_double_bwd_module_source(
@@ -805,33 +823,33 @@ def build_triton_uniform1d_double_bwd_module_source(
     ky_dim: Optional[int] = None, v_dim: Optional[int] = None,
     mode: str = "u,u,,u", need_grad_w: bool = True, need_grad_x: bool = True,
     need_grad_y: bool = True, path_semantics: str = "wxy",
-    kernel_name: str = "uniform1d_triton_double_bwd", block_u: int = 32,
+    kernel_name: str = "uniform1d_triton_double_bwd", block_u: int = 128, num_warps: int = 4,
 ) -> str:
     del iw_dim,ix_dim,ky_dim,v_dim
     ctx=_prepare_uniform1d_bwd_codegen_context(i_list=i_list,j_list=j_list,k_list=k_list,v_list=v_list,coeff_list=coeff_list,input_indices=input_indices,output_indices=output_indices,mode=mode,path_semantics=path_semantics)
     s=LARSUniform1DDoubleBwdScheduler(paths=ctx.bwd_paths,need_grad_w=bool(need_grad_w),need_grad_x=bool(need_grad_x),need_grad_y=bool(need_grad_y),enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
-    return TritonEmitter(s,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{ctx.P}").emit_uniform1d_double_bwd(mode=mode,need_grad_w=bool(need_grad_w),need_grad_x=bool(need_grad_x),need_grad_y=bool(need_grad_y),use_x_src=ctx.use_x_src,use_y_src=ctx.use_y_src,use_scatter=ctx.use_scatter,block_u=block_u)
+    return TritonEmitter(s,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{ctx.P}").emit_uniform1d_double_bwd(mode=mode,need_grad_w=bool(need_grad_w),need_grad_x=bool(need_grad_x),need_grad_y=bool(need_grad_y),use_x_src=ctx.use_x_src,use_y_src=ctx.use_y_src,use_scatter=ctx.use_scatter,block_u=block_u,num_warps=num_warps)
 
 
-def build_triton_stc_fwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, kernel_name: str = "stc_triton_fwd", block_u: int = 32) -> str:
+def build_triton_stc_fwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, kernel_name: str = "stc_triton_fwd", block_u: int = 128, num_warps: int = 4) -> str:
     paths=make_stc_paths_from_padded_lists(idx_lists,coeff_list,path_lens=path_lens,pad_value=pad_value)
     s=LARSUniform1DScheduler(paths,path_kind="stc",enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
     placed=_triton_place_register_only(s,schedule_kind="stc_fwd")
-    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_fwd(block_u=block_u)
+    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_fwd(block_u=block_u,num_warps=num_warps)
 
 
-def build_triton_stc_bwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, need_grad_x0: bool = True, kernel_name: str = "stc_triton_bwd", block_u: int = 32) -> str:
+def build_triton_stc_bwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, need_grad_x0: bool = True, kernel_name: str = "stc_triton_bwd", block_u: int = 128, num_warps: int = 4) -> str:
     paths=make_stc_paths_from_padded_lists(idx_lists,coeff_list,path_lens=path_lens,pad_value=pad_value)
     base=LARSUniform1DScheduler(paths,path_kind="stc",enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
     logical=_make_stc_bwd_logical_schedule(paths,base,need_grad_x0=bool(need_grad_x0))
     placed=_triton_place_register_only(logical,schedule_kind="stc_bwd")
-    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_bwd(need_grad_x0=bool(need_grad_x0),block_u=block_u)
+    return TritonEmitter(placed,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_bwd(need_grad_x0=bool(need_grad_x0),block_u=block_u,num_warps=num_warps)
 
 
-def build_triton_stc_double_bwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, kernel_name: str = "stc_triton_double_bwd", block_u: int = 32) -> str:
+def build_triton_stc_double_bwd_module_source(idx_lists, coeff_list, *, path_lens=None, pad_value: int = STC_PAD_VALUE, num_out_segments: int, u_dim: int, kernel_name: str = "stc_triton_double_bwd", block_u: int = 128, num_warps: int = 4) -> str:
     paths=make_stc_paths_from_padded_lists(idx_lists,coeff_list,path_lens=path_lens,pad_value=pad_value)
     s=LARSSTCDoubleBwdScheduler(paths,enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
-    return TritonEmitter(s,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_double_bwd(block_u=block_u)
+    return TritonEmitter(s,kernel_name=f"{kernel_name}_u{int(u_dim)}_p{len(paths)}").emit_stc_double_bwd(block_u=block_u,num_warps=num_warps)
 
 
 def build_triton_uniform1d_fwd_module(*args, **kwargs):
