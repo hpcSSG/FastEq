@@ -6,7 +6,7 @@ import math
 import os
 import statistics
 
-DEFAULT_SIZES = (256, 1024, 4096, 16384, 65536, 262144, 1048576)
+DEFAULT_SIZES = (256, 1024, 4096, 16384, 65536, 262144)
 
 def tuning_sizes(actual_size):
     actual_size = int(actual_size)

@@ -290,7 +290,21 @@ class GluonEmitter:
         _power_of_two(kwargs.get('block_u', 128), 'block_u')
         if kwargs.get('mode', 'u,u,,u') not in ('u,u,,u', 'u,u,u,u'):
             raise ValueError('Unsupported Uniform1D mode')
-        schedule = _adapt_schedule(self.schedule_result, self.shared_inputs)
+        source_schedule = self.schedule_result
+        if method == 'emit_uniform1d_bwd_fused':
+            # gy is an outer accumulator, independent of placement-token reuse.
+            instructions = []
+            for inst in source_schedule.instructions:
+                if inst.op in ('init_acc', 'store_acc_placed'):
+                    ref = inst.args[1] if inst.op == 'init_acc' else inst.args[0]
+                    if _base()._parse_bwd_lars_label_ref(str(ref))[0] == 'gy':
+                        continue
+                if inst.op == 'bwd_fma_placed':
+                    args = list(inst.args); args[5] = ''
+                    inst = _Instruction(inst.op, tuple(args), getattr(inst, 'comment', ''))
+                instructions.append(inst)
+            source_schedule = SimpleNamespace(instructions=instructions)
+        schedule = _adapt_schedule(source_schedule, self.shared_inputs)
         if 'schedules' in kwargs:
             schedules = kwargs['schedules']
             for kind, needed in (('gw', kwargs['need_grad_w']), ('gx', kwargs['need_grad_x']), ('gy', kwargs['need_grad_y'])):
@@ -302,6 +316,9 @@ class GluonEmitter:
 
     def emit_uniform1d_fwd(self, **kwargs):
         return self._emit('emit_uniform1d_fwd', **kwargs)
+
+    def emit_uniform1d_bwd_fused(self, **kwargs):
+        return self._emit('emit_uniform1d_bwd_fused', **kwargs)
 
     def emit_uniform1d_bwd_split_bundle(self, **kwargs):
         return self._emit('emit_uniform1d_bwd_split_bundle', **kwargs)
@@ -319,7 +336,7 @@ class GluonEmitter:
         return self._emit('emit_stc_double_bwd', **kwargs)
 
 
-def _place(schedule, kind, config, *, already_placed=False):
+def _place(schedule, kind, config, *, already_placed=False, exclusive_outputs=False):
     if already_placed:
         if config is not None:
             raise ValueError('placement_config cannot be combined with already_placed=True')
@@ -327,7 +344,7 @@ def _place(schedule, kind, config, *, already_placed=False):
     enabled = config.get('enabled', True) if isinstance(config, dict) else getattr(config, 'enabled', True)
     if not enabled:
         return _base()._triton_place_register_only(schedule, schedule_kind=kind)
-    return _base().apply_lars_lifetime_placement(schedule, schedule_kind=kind, config=config)
+    return _base().apply_lars_lifetime_placement(schedule, schedule_kind=kind, config=config, exclusive_outputs=exclusive_outputs)
 
 
 def _scheduler_options(options):
@@ -360,10 +377,24 @@ def build_gluon_uniform1d_bwd_module_source(
     path_semantics='wxy', kernel_name='uniform1d_gluon_bwd', block_u=128, num_warps=4,
     placement_config=None, schedules=None, already_placed=False,
     scheduler_options=None, preserve_shared=False, shared_inputs=(),
+    backward_mode="split", channel_chunk=None,
 ):
     b = _base()
     if not any((need_grad_w, need_grad_x, need_grad_y)):
         raise ValueError('At least one gradient must be requested')
+    if backward_mode not in ('split', 'fused'):
+        raise ValueError('backward_mode must be split or fused')
+    if backward_mode == 'fused':
+        if not (need_grad_w and need_grad_x and need_grad_y):
+            raise ValueError('fused backward requires all three gradients; use split for partial backward')
+        if schedules is None:
+            if already_placed: raise ValueError('already_placed requires schedules')
+            ctx = b._prepare_uniform1d_bwd_codegen_context(i_list=i_list,j_list=j_list,k_list=k_list,v_list=v_list,coeff_list=coeff_list,input_indices=input_indices,output_indices=output_indices,mode=mode,path_semantics=path_semantics)
+            schedule = b.LARSUniform1DBwdScheduler(ctx.bwd_paths,need_grad_w=True,**_scheduler_options(scheduler_options)).schedule()
+        else:
+            schedule = schedules['fused']
+        placed = _place(schedule, 'bwd_fused', placement_config, already_placed=already_placed, exclusive_outputs=True)
+        return GluonEmitter(placed,kernel_name=f'{kernel_name}_u{int(u_dim)}_fused',preserve_shared=preserve_shared,shared_inputs=shared_inputs).emit_uniform1d_bwd_fused(mode=mode,use_x_src=1 in (input_indices or {}),use_y_src=2 in (input_indices or {}),use_scatter=0 in (output_indices or {}),block_u=channel_chunk or block_u,num_warps=num_warps)
     if schedules is None:
         if already_placed:
             raise ValueError('already_placed requires schedules')

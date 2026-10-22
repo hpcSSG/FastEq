@@ -4,6 +4,7 @@ import json
 import sys
 import shutil
 import hashlib
+import weakref
 import traceback
 import re
 import io
@@ -46,6 +47,7 @@ from .auto_schedule.multi_size_tuning import (
 _TRITON_FWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
 _TRITON_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
 _TRITON_DOUBLE_BWD_MODULE_CACHE: Dict[Tuple[Any, ...], object] = {}
+_PYTHON_METADATA_CONTENT_CACHE: Dict[int, tuple] = {}
 
 
 def _fasteq_codegen_backend() -> str:
@@ -81,47 +83,36 @@ def _python_codegen_builder(backend: str, phase: str):
 
 
 def _python_codegen_options(backend: str, phase: str):
-    """Return builder kwargs and a stable configuration key for module caching.
-
-    FASTEQ_GLUON_OPTIONS is a JSON object, e.g.
-    {"block_u":128,"num_warps":4,"placement_config":{"max_shared_slots":12}}.
-    The supplied placement pass supports fwd/bwd but not double-bwd records;
-    shared_inputs remains available for double backward.
-    """
-    if backend == "triton":
-        return {}, ""
-    if backend != "gluon":
-        raise ValueError(f"Not a Python codegen backend: {backend!r}")
-    raw = os.environ.get("FASTEQ_GLUON_OPTIONS", "").strip() or "{}"
-    try:
-        options = json.loads(raw)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("FASTEQ_GLUON_OPTIONS must be a JSON object") from exc
-    if not isinstance(options, dict):
-        raise ValueError("FASTEQ_GLUON_OPTIONS must be a JSON object")
-    allowed = {"block_u", "num_warps", "placement_config", "shared_inputs",
-               "preserve_shared", "scheduler_options"}
-    unknown = set(options) - allowed
-    if unknown:
-        raise ValueError(f"Unknown FASTEQ_GLUON_OPTIONS keys: {sorted(unknown)}")
-    options.setdefault("block_u", 128)
-    options.setdefault("num_warps", 4)
-    for name in ("block_u", "num_warps"):
-        value = options[name]
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0 or value & (value - 1):
-            raise ValueError(f"FASTEQ_GLUON_OPTIONS {name} must be a positive power of two")
-    for name in ("placement_config", "scheduler_options"):
-        if name in options and options[name] is not None and not isinstance(options[name], dict):
-            raise ValueError(f"FASTEQ_GLUON_OPTIONS {name} must be an object or null")
-    if "shared_inputs" in options:
-        refs = options["shared_inputs"]
-        if not isinstance(refs, list) or not all(isinstance(ref, str) for ref in refs):
-            raise ValueError("FASTEQ_GLUON_OPTIONS shared_inputs must be a list of strings")
-    if "preserve_shared" in options and not isinstance(options["preserve_shared"], bool):
-        raise ValueError("FASTEQ_GLUON_OPTIONS preserve_shared must be a boolean")
-    if phase == "double_bwd":
-        options.pop("placement_config", None)
-    return options, json.dumps(options, sort_keys=True, separators=(",", ":"))
+    """Explicit settings pin candidate dimensions; unspecified settings are tuned."""
+    if backend not in ('triton','gluon'):
+        raise ValueError(f'Not a Python codegen backend: {backend!r}')
+    env_name = 'FASTEQ_GLUON_OPTIONS' if backend == 'gluon' else 'FASTEQ_TRITON_OPTIONS'
+    try: options = json.loads(os.environ.get(env_name,'{}') or '{}')
+    except ValueError as exc: raise ValueError(f'{env_name} must be a JSON object') from exc
+    if not isinstance(options,dict): raise ValueError(f'{env_name} must be a JSON object')
+    allowed = {'block_u','num_warps','backward_mode','channel_chunk'}
+    if backend == 'gluon': allowed |= {'placement_config','shared_inputs','preserve_shared','scheduler_options'}
+    unknown=set(options)-allowed
+    if unknown: raise ValueError(f'{env_name} unknown keys: {sorted(unknown)}')
+    for name in ('block_u','num_warps','channel_chunk'):
+        if name not in options: continue
+        v=options[name]
+        if isinstance(v,bool) or not isinstance(v,int) or v<1 or v&(v-1):
+            raise ValueError(f'{env_name} {name} must be a positive power of two')
+    if options.get('num_warps',4)>32: raise ValueError(f'{env_name} num_warps cannot exceed 32')
+    if 'backward_mode' in options and options['backward_mode'] not in ('split','fused'):
+        raise ValueError(f'{env_name} backward_mode must be split or fused')
+    for name in ('placement_config','scheduler_options'):
+        if options.get(name) is not None and not isinstance(options[name],dict):
+            raise ValueError(f'{env_name} {name} must be an object or null')
+    if 'shared_inputs' in options and (not isinstance(options['shared_inputs'],list) or not all(isinstance(r,str) for r in options['shared_inputs'])):
+        raise ValueError(f'{env_name} shared_inputs must be a list of strings')
+    if 'preserve_shared' in options and not isinstance(options['preserve_shared'],bool):
+        raise ValueError(f'{env_name} preserve_shared must be boolean')
+    if phase != 'bwd':
+        options.pop('backward_mode',None);options.pop('channel_chunk',None)
+    if phase == 'double_bwd':options.pop('placement_config',None)
+    return options,json.dumps(options,sort_keys=True,separators=(',',':'))
 
 
 # -----------------------------------------------------------------------------
@@ -2485,6 +2476,145 @@ def _select_best_double_bwd_module(
         ),
     )
 
+def _python_metadata_values(value):
+    """Content identity for path metadata, without repeated GPU-to-CPU copies.
+
+    Weak references prevent pointer/object-ID reuse from matching old metadata.
+    Tensor version changes invalidate the memo. Unversioned inference tensors
+    are read again because their in-place mutations cannot be tracked safely.
+    """
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    if not isinstance(value, torch.Tensor):
+        return tuple(_tensor_to_cpu_list(value))
+    identity=id(value)
+    try: version=int(value._version)
+    except (RuntimeError, AttributeError): version=None
+    cached=_PYTHON_METADATA_CONTENT_CACHE.get(identity)
+    if version is not None and cached is not None and cached[0]() is value and cached[1]==version:
+        return cached[2]
+    contents=tuple(_tensor_to_cpu_list(value))
+    if version is not None:
+        def discard(ref, identity=identity):
+            current=_PYTHON_METADATA_CONTENT_CACHE.get(identity)
+            if current is not None and current[0] is ref:
+                _PYTHON_METADATA_CONTENT_CACHE.pop(identity,None)
+        _PYTHON_METADATA_CONTENT_CACHE[identity]=(weakref.ref(value,discard),version,contents)
+    return contents
+
+
+def _python_operator_key(**kwargs):
+    """Use path contents, rather than metadata allocations, for Python modules."""
+    for name in ('i_list','j_list','k_list','v_list','coeff_list'):
+        kwargs[name]=_python_metadata_values(kwargs[name])
+    return _make_candidate_fast_key(**kwargs)
+
+
+def _python_runtime_key(phase, *tensors):
+    """Reuse the selected strategy across batches with the same operator layout."""
+    layouts=tuple((tuple(t.shape[1:]),str(t.dtype),str(t.device)) if t is not None else None for t in tensors)
+    shared_w=bool(tensors and tensors[0] is not None and tensors[0].shape[0]==1)
+    policy=tuple(sorted((k,v) for k,v in os.environ.items() if k.startswith(('FASTEQ_PYTHON_', 'FASTEQ_UNIFORM1D_', 'FASTEQ_JIT_TUNE_'))))
+    return phase,bool(ENABLE_JIT_CANDIDATES),shared_w,layouts,policy
+
+
+def _build_python_tuned_module(*, backend, phase, build_args, build_kwargs,
+                               options, tensors, src_idx, dst_idx,
+                               out_seg_num, fused_scatter, use_x_src, use_y_src):
+    """Use the native multi-size benchmark policy with Python-only persistence."""
+    import statistics
+    import importlib.metadata
+    from .auto_schedule.python_tuning import candidate_configs, select_best
+    w,x,y = (tensors[k] for k in ('w','x','y'))
+    if phase == 'fwd': tune_enabled,warmup,repeat = _get_fwd_tune_params()
+    elif phase == 'bwd': tune_enabled,warmup,repeat = _get_bwd_tune_params()
+    else:
+        tune_enabled = _env_bool('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE', _DEFAULT_UNIFORM1D_BWD_TUNE_ENABLED)
+        warmup = _env_int('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_WARMUP', _DEFAULT_UNIFORM1D_TUNE_WARMUP)
+        repeat = _env_int('FASTEQ_UNIFORM1D_DOUBLE_BWD_TUNE_REPEAT', _DEFAULT_UNIFORM1D_TUNE_REPEAT, min_value=1)
+    enabled = bool(ENABLE_JIT_CANDIDATES and tune_enabled)
+    configs = candidate_configs(backend,phase,options,enabled=enabled,
+        all_gradients=all(build_kwargs.get('need_grad_'+k,True) for k in ('w','x','y')))
+    builder = _python_codegen_builder(backend,phase)
+    try: compiler_version = importlib.metadata.version('triton')
+    except importlib.metadata.PackageNotFoundError: compiler_version = 'unknown'
+    props = torch.cuda.get_device_properties(w.device)
+    signature = dict(cache_policy='first-call-per-operator-v2',metadata=[list(_python_metadata_values(a)) for a in build_args],weight_broadcast=bool(w.size(0)==1),
+        build_kwargs={k:v for k,v in build_kwargs.items() if k not in ('input_indices','output_indices')},
+        input_indices=sorted((build_kwargs.get('input_indices') or {}).keys()),
+        output_indices=sorted((build_kwargs.get('output_indices') or {}).keys()),
+        tensors={k:dict(shape=list(t.shape[1:]),dtype=str(t.dtype),device=str(t.device)) for k,t in tensors.items() if t is not None},
+        indices={k:(dict(shape=list(t.shape[1:]),dtype=str(t.dtype),device=str(t.device)) if t is not None else None) for k,t in (('src',src_idx),('dst',dst_idx))},
+        gpu=dict(name=props.name,major=props.major,minor=props.minor,multi_processor_count=props.multi_processor_count),
+        torch_version=str(torch.__version__),triton_version=compiler_version,
+        tuning_policy=_tuning_policy_signature(),warmup=warmup,repeat=repeat,
+        samples=_env_int('FASTEQ_JIT_TUNE_SAMPLES',3,min_value=1))
+    factory_args = dict(w=w,x=x,y=y,src_idx=src_idx,dst_idx=dst_idx,use_x_src=use_x_src,use_y_src=use_y_src)
+    for k in ('grad_out','grad_grad_w','grad_grad_x','grad_grad_y'):
+        if tensors.get(k) is not None:factory_args[k]=tensors[k]
+    batch,factory = _uniform1d_tuning_factory(**factory_args)
+    def invoke(mod,case):
+        common = {k:case[k] for k in ('w','x','y','src_idx','dst_idx')}
+        common.update(out_seg_num=out_seg_num,fused_scatter=fused_scatter)
+        if phase == 'fwd':return _call_fwd_module(mod,**common)
+        if phase == 'bwd':return _call_bwd_module(mod,grad_out=case['grad_out'],**common)
+        return _call_double_bwd_module(mod,grad_out=case['grad_out'],
+            grad_grad_w=case.get('grad_grad_w'),grad_grad_x=case.get('grad_grad_x'),grad_grad_y=case.get('grad_grad_y'),
+            use_src=use_x_src or use_y_src,
+            need_grad_w=bool(build_kwargs['need_grad_w']),need_grad_x=bool(build_kwargs['need_grad_x']),need_grad_y=bool(build_kwargs['need_grad_y']),**common)
+    def measure(mod,case):
+        # All lazy Triton compilation and allocations in warmup precede timing.
+        # Measure the complete module: split's three kernels and zeroing are included.
+        for _ in range(max(1,int(warmup))):invoke(mod,case)
+        torch.cuda.synchronize(w.device)
+        times=[]
+        for _ in range(signature['samples']):
+            begin=time.perf_counter()
+            for _ in range(max(1,int(repeat))):
+                output=invoke(mod,case)
+                del output
+            torch.cuda.synchronize(w.device)
+            times.append((time.perf_counter()-begin)*1000.0/max(1,int(repeat)))
+        return statistics.median(times)
+    def benchmark(candidates):
+        # Compile and validate a small case first: a lazy JIT failure must not
+        # abort the entire search, regardless of the external size-policy code.
+        probe=factory(min(batch,64))
+        valid=[];reference=None;failures=[]
+        for tag,mod in candidates:
+            output=None
+            try:
+                output=invoke(mod,probe)
+                torch.cuda.synchronize(w.device)
+                if phase=='bwd':
+                    expected=sum(bool(build_kwargs['need_grad_'+k]) for k in ('w','x','y'))
+                    if not isinstance(output,(list,tuple)) or len(output)!=expected:
+                        raise RuntimeError('backward candidate returned an incompatible output ABI')
+                if reference is not None:
+                    # Recursively handles tensors/tuples and double-bwd outputs.
+                    tolerance=dict(rtol=1e-9,atol=1e-10) if w.dtype==torch.float64 else dict(rtol=3e-4,atol=3e-5)
+                    torch.testing.assert_close(output,reference,**tolerance)
+                valid.append((tag,mod))
+                if reference is None:reference=output
+                del output
+            except Exception as exc:
+                failures.append(f'{tag}: {exc}')
+                print(f'[JIT][{backend.upper()}][tune] skip {tag} during compile/check: {exc}')
+            finally:
+                output=None
+        reference=None;probe=None
+        torch.cuda.empty_cache()
+        if not valid:raise RuntimeError('All Python candidates failed compile/check: '+'; '.join(failures))
+        candidates=valid
+        sizes=_tuning_sizes(batch)
+        print(f'[JIT][{backend.upper()}][{phase.upper()}][tune] candidates={len(candidates)} sizes={sizes} selection=largest-feasible')
+        return _benchmark_sizes(candidates,sizes=sizes,actual_size=batch,prepare_case=factory,
+            measure_case=measure,cleanup=torch.cuda.empty_cache)
+    return select_best(backend=backend,phase=phase,signature=signature,configs=configs,
+        builder=lambda config:builder(*build_args,**build_kwargs,**config),
+        benchmark=benchmark,enabled=enabled)
+
+
 def _validate_dense_uniform1d_inputs(w, x, y, input_indices, output_indices):
     """Dense support: w is shared or per row; x and y are per row.
 
@@ -2534,7 +2664,6 @@ def _run_fwd(
     codegen_backend = _fasteq_codegen_backend()
     if codegen_backend in ("triton", "gluon"):
         backend_options, backend_options_key = _python_codegen_options(codegen_backend, "fwd")
-        print(f"[JIT][FWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         fused_scatter = 0 in output_indices
@@ -2548,23 +2677,20 @@ def _run_fwd(
             _as_int32_meta_tensor(output_indices[0]).contiguous()
             if fused_scatter else None
         )
-        key = _make_candidate_fast_key(
+        key = _python_operator_key(
             kind=f"{codegen_backend.upper()}_FWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
             ix_dim=ix_dim, ky_dim=ky_dim, v_dim=v_dim, mode=mode,
             dtype_str=dtype_str, use_multiwarp_candidates=False,
         )
-        key = (codegen_backend, backend_options_key, key)
+        key = (codegen_backend, backend_options_key, _python_runtime_key('fwd', w, x, y, src_idx, dst_idx), key)
         mod = _TRITON_FWD_MODULE_CACHE.get(key)
         if mod is None:
-            builder = _python_codegen_builder(codegen_backend, "fwd")
-            mod = builder(
-                i_list, j_list, k_list, v_list, coeff_list,
-                input_indices=input_indices, output_indices=output_indices,
-                u_dim=u_dim, mode=mode,
-                **backend_options,
-            )
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='fwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,mode=mode),
+                options=backend_options,tensors=dict(w=w,x=x,y=y),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
             _TRITON_FWD_MODULE_CACHE[key] = mod
         return _call_fwd_module(
             mod, w=w, x=x, y=y, src_idx=src_idx, dst_idx=dst_idx,
@@ -2678,7 +2804,6 @@ def _run_bwd(
     codegen_backend = _fasteq_codegen_backend()
     if codegen_backend in ("triton", "gluon"):
         backend_options, backend_options_key = _python_codegen_options(codegen_backend, "bwd")
-        print(f"[JIT][BWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         fused_scatter = 0 in output_indices
@@ -2693,7 +2818,7 @@ def _run_bwd(
             if fused_scatter else None
         )
         grad_out_3d = grad_out.view(-1, out_seg_num, u_dim).contiguous()
-        key = _make_candidate_fast_key(
+        key = _python_operator_key(
             kind=f"{codegen_backend.upper()}_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim,
@@ -2701,18 +2826,13 @@ def _run_bwd(
             dtype_str=dtype_str, grad_w=grad_w, grad_x=grad_x, grad_y=grad_y,
             use_multiwarp_candidates=False,
         )
-        key = (codegen_backend, backend_options_key, key)
+        key = (codegen_backend, backend_options_key, _python_runtime_key('bwd', w, x, y, grad_out_3d, src_idx, dst_idx), key)
         mod = _TRITON_BWD_MODULE_CACHE.get(key)
         if mod is None:
-            builder = _python_codegen_builder(codegen_backend, "bwd")
-            mod = builder(
-                i_list, j_list, k_list, v_list, coeff_list,
-                input_indices=input_indices, output_indices=output_indices,
-                u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
-                v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
-                need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
-                **backend_options,
-            )
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='bwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,iw_dim=iw_dim,ix_dim=ix_dim,ky_dim=ky_dim,v_dim=v_dim,mode=mode,need_grad_w=bool(grad_w),need_grad_x=bool(grad_x),need_grad_y=bool(grad_y)),
+                options=backend_options,tensors=dict(w=w,x=x,y=y,grad_out=grad_out_3d),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
             _TRITON_BWD_MODULE_CACHE[key] = mod
         return _call_bwd_module(
             mod, w=w, x=x, y=y, grad_out=grad_out_3d,
@@ -2829,7 +2949,6 @@ def _run_double_bwd(
     codegen_backend = _fasteq_codegen_backend()
     if codegen_backend in ("triton", "gluon"):
         backend_options, backend_options_key = _python_codegen_options(codegen_backend, "double_bwd")
-        print(f"[JIT][DOUBLE_BWD] using {codegen_backend} backend")
         use_x_src = 1 in input_indices
         use_y_src = 2 in input_indices
         use_src = use_x_src or use_y_src
@@ -2851,25 +2970,20 @@ def _run_double_bwd(
             grad_grad_x = torch.zeros_like(x) if grad_grad_x is None else grad_grad_x.contiguous()
         if bool(grad_y):
             grad_grad_y = torch.zeros_like(y) if grad_grad_y is None else grad_grad_y.contiguous()
-        key = _make_candidate_fast_key(
+        key = _python_operator_key(
             kind=f"{codegen_backend.upper()}_DOUBLE_BWD", i_list=i_list, j_list=j_list, k_list=k_list,
             v_list=v_list, coeff_list=coeff_list, input_indices=input_indices,
             output_indices=output_indices, u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim,
             ky_dim=ky_dim, v_dim=v_dim, mode=mode, dtype_str=dtype_str,
             grad_w=grad_w, grad_x=grad_x, grad_y=grad_y, use_multiwarp_candidates=False,
         )
-        key = (codegen_backend, backend_options_key, key)
+        key = (codegen_backend, backend_options_key, _python_runtime_key('double_bwd', w, x, y, grad_out_3d, grad_grad_w, grad_grad_x, grad_grad_y, src_idx, dst_idx), key)
         mod = _TRITON_DOUBLE_BWD_MODULE_CACHE.get(key)
         if mod is None:
-            builder = _python_codegen_builder(codegen_backend, "double_bwd")
-            mod = builder(
-                i_list, j_list, k_list, v_list, coeff_list,
-                input_indices=input_indices, output_indices=output_indices,
-                u_dim=u_dim, iw_dim=iw_dim, ix_dim=ix_dim, ky_dim=ky_dim,
-                v_dim=v_dim, mode=mode, need_grad_w=bool(grad_w),
-                need_grad_x=bool(grad_x), need_grad_y=bool(grad_y),
-                **backend_options,
-            )
+            mod = _build_python_tuned_module(backend=codegen_backend,phase='double_bwd',
+                build_args=(i_list, j_list, k_list, v_list, coeff_list),build_kwargs=dict(input_indices=input_indices,output_indices=output_indices,u_dim=u_dim,iw_dim=iw_dim,ix_dim=ix_dim,ky_dim=ky_dim,v_dim=v_dim,mode=mode,need_grad_w=bool(grad_w),need_grad_x=bool(grad_x),need_grad_y=bool(grad_y)),
+                options=backend_options,tensors=dict(w=w,x=x,y=y,grad_out=grad_out_3d,grad_grad_w=grad_grad_w,grad_grad_x=grad_grad_x,grad_grad_y=grad_grad_y),src_idx=src_idx,dst_idx=dst_idx,
+                out_seg_num=out_seg_num,fused_scatter=fused_scatter,use_x_src=use_x_src,use_y_src=use_y_src)
             _TRITON_DOUBLE_BWD_MODULE_CACHE[key] = mod
         return _call_double_bwd_module(
             mod, w=w, x=x, y=y, grad_out=grad_out_3d,

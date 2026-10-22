@@ -35,6 +35,7 @@ from .placement import (
 from .schedulers import (
     LARSSTCDoubleBwdScheduler,
     LARSUniform1DBwdSplitScheduler,
+    LARSUniform1DBwdScheduler,
     LARSUniform1DDoubleBwdScheduler,
     LARSUniform1DScheduler,
 )
@@ -317,6 +318,87 @@ class TritonEmitter:
             f"        {k}[grid](w, x, y, out, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U=BLOCK_U, num_warps=NUM_WARPS, IS_FP64=(w.dtype == torch.float64))",
             "        return out",
         ]
+        return self._append_module_footer(lines)
+
+    def emit_uniform1d_bwd_fused(
+        self, *, mode: str, use_x_src: bool, use_y_src: bool,
+        use_scatter: bool, block_u: int = 32, num_warps: int = 1,
+        exclusive_outputs: bool = True,
+    ) -> str:
+        """One edge/program; reuse channel-tile state and reduce scalar gy once."""
+        scalar_y = mode == 'u,u,,u'
+        insts = self.schedule_result.instructions
+        gy_indices = sorted({int(inst.args[2]) for inst in insts if inst.op == 'bwd_fma_placed'})
+        lines = _triton_source_preamble() + [
+            '@triton.jit',
+            f'def {self.kernel_name}(w, x, y, grad_out, gw, gx, gy, src_idx, dst_idx, B: tl.constexpr, WB: tl.constexpr, Iw: tl.constexpr, Ix: tl.constexpr, Ky: tl.constexpr, V: tl.constexpr, U: tl.constexpr, BLOCK_U: tl.constexpr, IS_FP64: tl.constexpr):',
+            '    e = tl.program_id(0)',
+            '    w_row = 0 if WB == 1 else e',
+            '    src = tl.load(src_idx + e)' if use_x_src or use_y_src else '    src = e',
+            '    go_row = tl.load(dst_idx + e)' if use_scatter else '    go_row = e',
+            f"    x_row = {'src' if use_x_src else 'e'}",
+            f"    y_row = {'src' if use_y_src else 'e'}",
+        ]
+        def zero(target, indent):
+            _triton_emit_zero(lines, target, indent=indent)
+        if scalar_y:
+            for k in gy_indices: zero(f'_gy_{k}', '    ')
+        lines += ['    for u_base in range(0, U, BLOCK_U):',
+                  '        offs_u = u_base + tl.arange(0, BLOCK_U)',
+                  '        mask_u = offs_u < U']
+        if not scalar_y:
+            for k in gy_indices: zero(f'_gy_{k}', '        ')
+        def load(ref):
+            kind,k = _parse_bwd_lars_label_ref(str(ref))
+            if kind == 'y' and scalar_y: return f'tl.load(y + y_row * Ky + {k})'
+            ptr,row,dim = {'w':('w','w_row','Iw'),'x':('x','x_row','Ix'),
+                           'y':('y','y_row','Ky'),'go':('grad_out','go_row','V')}[kind]
+            return f'tl.load({ptr} + ({row} * {dim} + {k}) * U + offs_u, mask=mask_u, other=0.0)'
+        for inst in insts:
+            op,args = inst.op,inst.args
+            if op == 'load': lines.append(f'        {args[0]} = {load(args[1])}')
+            elif op == 'init_acc':
+                if _parse_bwd_lars_label_ref(str(args[1]))[0] != 'gy': zero(str(args[0]), '        ')
+            elif op == 'bwd_fma_placed':
+                wi,xj,yk,aw,ax,ay,rw,rx,ry,rgo,c,need_w = args
+                if not need_w: raise ValueError('fused backward requires all three gradients')
+                c = _triton_float(float(c))
+                lines += [f'        {aw} += {c} * {rgo} * {rx} * {ry}',
+                          f'        _wgo = {rw} * {rgo}',
+                          f'        {ax} += {c} * _wgo * {ry}',
+                          f'        _gy_{yk} += {c} * _wgo * {rx}']
+            elif op == 'store_acc_placed':
+                ref,token = args;kind,k = _parse_bwd_lars_label_ref(str(ref))
+                if kind == 'gy': continue
+                row,dim = ('w_row','Iw') if kind == 'gw' else ('x_row','Ix')
+                ptr=f'{kind} + ({row} * {dim} + {k}) * U + offs_u'
+                if exclusive_outputs and kind == 'gw':
+                    lines += ['        if WB == 1:',f'            tl.atomic_add({ptr}, {token}, mask=mask_u)',
+                              '        else:',f'            tl.store({ptr}, {token}, mask=mask_u)']
+                elif exclusive_outputs and kind == 'gx' and not use_x_src:
+                    lines.append(f'        tl.store({ptr}, {token}, mask=mask_u)')
+                else: lines.append(f'        tl.atomic_add({ptr}, {token}, mask=mask_u)')
+            elif op == 'release': pass
+            else: raise ValueError(f'Unsupported fused backward instruction: {op}')
+        for k in gy_indices:
+            if scalar_y:
+                # Each lane has accumulated its channels across all loop iterations.
+                lines += [f'    _red_{k} = tl.sum(_gy_{k}, axis=0)',
+                          f'    tl.atomic_add(gy + y_row * Ky + {k}, _red_{k})']
+            else:
+                ptr=f'gy + (y_row * Ky + {k}) * U + offs_u'
+                lines.append(f'        tl.atomic_add({ptr}, _gy_{k}, mask=mask_u)')
+        lines += ['', 'class _GeneratedTritonModule:', '    def run(self, *args):',
+                  '        w, x, y, grad_out = args[:4]', '        p = 4']
+        lines += ['        src_idx = args[p].contiguous(); p += 1'] if use_x_src or use_y_src else ['        src_idx = w']
+        lines += ['        dst_idx = args[p].contiguous(); p += 1'] if use_scatter else ['        dst_idx = w']
+        count='int(src_idx.numel())' if use_x_src or use_y_src else ('int(dst_idx.numel())' if use_scatter else 'int(grad_out.size(0))')
+        lines += ['        V = int(args[p])',f'        B = {count}',
+                  '        WB, Iw, U = int(w.size(0)), int(w.size(1)), int(w.size(2))',
+                  '        Ix, Ky = int(x.size(1)), int(y.size(1))',
+                  '        gw, gx, gy = torch.zeros_like(w), torch.zeros_like(x), torch.zeros_like(y)',
+                  f'        {self.kernel_name}[(B,)](w, x, y, grad_out, gw, gx, gy, src_idx, dst_idx, B=B, WB=WB, Iw=Iw, Ix=Ix, Ky=Ky, V=V, U=U, BLOCK_U={int(block_u)}, num_warps={_triton_validate_num_warps(num_warps)}, IS_FP64=(w.dtype == torch.float64))',
+                  '        return [gw, gx, gy]']
         return self._append_module_footer(lines)
 
     def emit_uniform1d_bwd_split_bundle(
@@ -801,9 +883,18 @@ def build_triton_uniform1d_bwd_module_source(
     mode: str = "u,u,,u", need_grad_w: bool = True, need_grad_x: bool = True,
     need_grad_y: bool = True, path_semantics: str = "wxy",
     kernel_name: str = "uniform1d_triton_bwd", block_u: int = 128, num_warps: int = 4,
+    backward_mode: str = "split", channel_chunk: Optional[int] = None,
 ) -> str:
     del iw_dim,ix_dim,ky_dim,v_dim
     ctx=_prepare_uniform1d_bwd_codegen_context(i_list=i_list,j_list=j_list,k_list=k_list,v_list=v_list,coeff_list=coeff_list,input_indices=input_indices,output_indices=output_indices,mode=mode,path_semantics=path_semantics)
+    if backward_mode not in ('split', 'fused'):
+        raise ValueError('backward_mode must be split or fused')
+    if backward_mode == 'fused':
+        if not (need_grad_w and need_grad_x and need_grad_y):
+            raise ValueError('fused backward requires all three gradients; use split for partial backward')
+        sched=LARSUniform1DBwdScheduler(ctx.bwd_paths,need_grad_w=True,enable_secondary_affinity=False,topk_candidates=128,profile=False,profile_print=False).schedule()
+        placed=_triton_place_register_only(sched,schedule_kind='bwd_fused')
+        return TritonEmitter(placed,kernel_name=f'{kernel_name}_u{int(u_dim)}_fused').emit_uniform1d_bwd_fused(mode=mode,use_x_src=ctx.use_x_src,use_y_src=ctx.use_y_src,use_scatter=ctx.use_scatter,block_u=channel_chunk or block_u,num_warps=num_warps)
     schedules: Dict[str,ScheduleResult]={}
     for gkind,needed in (("gw",need_grad_w),("gx",need_grad_x),("gy",need_grad_y)):
         if not needed: continue
