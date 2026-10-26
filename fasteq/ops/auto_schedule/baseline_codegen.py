@@ -1379,3 +1379,250 @@ def generate_code_uniform1d_bwd_baseline_unrolled(
             },
         }
     return code
+
+
+# -----------------------------------------------------------------------------
+# STC baseline: original path order, static chunks, block-local accumulators.
+# This backend does not invoke the scheduler or uniform1d code generators.
+# -----------------------------------------------------------------------------
+def _emit_stc_baseline_body(paths, *, backward, need_grad_x0, unroll_size):
+    """Emit per-(batch, channel) work; each chunk has its own register scope."""
+    width = _resolve_baseline_unroll_size(len(paths), unroll_size)
+    lines = []
+    def addr(array, segment):
+        dim = {'x1': 'X1', 'gx1': 'X1', 'x0': 'X0', 'gx0': 'X0',
+               'out': 'V', 'go': 'V'}[array]
+        return f'{array}[((index_t)b * {dim} + {int(segment)}) * U + u]'
+    for start in range(0, len(paths), width):
+        chunk = paths[start:start + width]
+        lines.append(f'            {{ // STC paths [{start}, {start + len(chunk)})')
+        targets = set()
+        for p in chunk:
+            if backward:
+                targets.update(('gx1', int(j)) for j in p.x1_indices)
+                if need_grad_x0:
+                    targets.add(('gx0', int(p.x0_index)))
+            else:
+                targets.add(('out', int(p.v)))
+        for kind, idx in sorted(targets):
+            lines.append(f'                scalar_t acc_{kind}_{idx} = scalar_t(0);')
+        for p in chunk:
+            # A separate path scope bounds temporary live ranges. Repeated input
+            # indices remain repeated factors; differentiate each occurrence.
+            lines.append('                {')
+            xs = [int(j) for j in p.x1_indices]
+            if not backward or xs:
+                lines.append(f'                    const scalar_t a = {addr("x0", p.x0_index)};')
+            for q, j in enumerate(xs):
+                lines.append(f'                    const scalar_t f{q} = {addr("x1", j)};')
+            c = f'scalar_t({_fmt_lars_float(float(p.c))})'
+            if backward:
+                lines.append(f'                    const scalar_t g = {addr("go", p.v)} * {c};')
+                for q, j in enumerate(xs):
+                    expr = ' * '.join(['g', 'a'] + [f'f{r}' for r in range(len(xs)) if r != q])
+                    lines.append(f'                    acc_gx1_{j} += {expr};')
+                if need_grad_x0:
+                    expr = ' * '.join(['g'] + [f'f{r}' for r in range(len(xs))])
+                    lines.append(f'                    acc_gx0_{int(p.x0_index)} += {expr};')
+            else:
+                expr = ' * '.join([c, 'a'] + [f'f{q}' for q in range(len(xs))])
+                lines.append(f'                    acc_out_{int(p.v)} += {expr};')
+            lines.append('                }')
+        for kind, idx in sorted(targets):
+            # One CTA owns b; each lane owns a distinct u. Chunks execute
+            # sequentially, so += preserves contributions without atomics.
+            lines.append(f'                {addr(kind, idx)} += acc_{kind}_{idx};')
+        lines.append('            }')
+    return '\n'.join(lines)
+
+
+def _emit_stc_baseline_module(paths, *, kernel_name, u_dim, num_out_segments,
+                              x0_dim, x1_dim, block_size, unroll_size,
+                              backward, need_grad_x0):
+    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', kernel_name):
+        raise ValueError('kernel_name must be a C++ identifier')
+    if int(block_size) < 32 or int(block_size) > 1024 or int(block_size) % 32:
+        raise ValueError('block_size must be a multiple of 32 in [32, 1024]')
+    if int(u_dim) <= 0 or int(num_out_segments) <= 0:
+        raise ValueError('u_dim and num_out_segments must be positive')
+    min_x0 = max((int(p.x0_index) for p in paths), default=-1) + 1
+    min_x1 = max((int(j) for p in paths for j in p.x1_indices), default=-1) + 1
+    for p in paths:
+        if not 0 <= int(p.v) < int(num_out_segments) or int(p.x0_index) < 0 or any(int(j) < 0 for j in p.x1_indices):
+            raise ValueError('STC path index is out of bounds')
+    if x0_dim is not None and int(x0_dim) < min_x0:
+        raise ValueError('x0_dim is smaller than the largest path index')
+    if x1_dim is not None and int(x1_dim) < min_x1:
+        raise ValueError('x1_dim is smaller than the largest path index')
+    body = _emit_stc_baseline_body(paths, backward=backward,
+                                 need_grad_x0=need_grad_x0, unroll_size=unroll_size)
+    code = r'''#include <torch/extension.h>
+#include <c10/core/DeviceGuard.h>
+#include <cstdint>
+#include <limits>
+#include <vector>
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime.h>
+#include <ATen/hip/HIPContext.h>
+#include <c10/hip/HIPException.h>
+using gpuStream_t = hipStream_t;
+#define getCurrentGPUStream at::hip::getCurrentHIPStream
+#define GPU_KERNEL_LAUNCH_CHECK() C10_HIP_KERNEL_LAUNCH_CHECK()
+#else
+#include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+using gpuStream_t = cudaStream_t;
+#define getCurrentGPUStream at::cuda::getCurrentCUDAStream
+#define GPU_KERNEL_LAUNCH_CHECK() C10_CUDA_KERNEL_LAUNCH_CHECK()
+#endif
+'''
+    ptrs = 'const scalar_t* x1, const scalar_t* x0, scalar_t* out'
+    args = 'x1, x0, out'
+    if backward:
+        ptrs = 'const scalar_t* go, const scalar_t* x1, const scalar_t* x0, scalar_t* gx1'
+        args = 'go, x1, x0, gx1'
+        if need_grad_x0:
+            ptrs += ', scalar_t* gx0'
+            args += ', gx0'
+    dims = 'int B, int X1, int X0, int V, int U'
+    code += f'''// BEGIN STC BASELINE KERNEL
+template <typename scalar_t, typename index_t>
+__global__ void {kernel_name}({ptrs}, {dims}) {{
+    const int b = (int)blockIdx.x;
+    if (b >= B) return;
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp_id = tid >> 5;
+    const int warp_count = blockDim.x >> 5;
+    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {{
+        const int u = u_base + lane;
+        if (u < U) {{
+{body}
+        }}
+    }}
+}}
+// END STC BASELINE KERNEL
+template <typename scalar_t, typename index_t>
+void launch_{kernel_name}_typed({ptrs}, {dims}, gpuStream_t stream) {{
+    if (B == 0) return;
+    dim3 block({int(block_size)});
+    dim3 grid(B);
+    {kernel_name}<scalar_t, index_t><<<grid, block, 0, stream>>>({args}, B, X1, X0, V, U);
+}}
+'''
+    signature = 'torch::Tensor x1, torch::Tensor x0, int64_t V64'
+    if backward:
+        signature = 'torch::Tensor go, ' + signature
+    ret_type = 'std::vector<torch::Tensor>' if backward else 'torch::Tensor'
+    code += f'''{ret_type} launcher_{kernel_name}({signature}) {{
+    TORCH_CHECK(x1.is_cuda() && x0.is_cuda(), "x1/x0 must be CUDA/HIP");
+    TORCH_CHECK(x1.device() == x0.device(), "x1/x0 device mismatch");
+    TORCH_CHECK(x1.is_contiguous() && x0.is_contiguous(), "inputs must be contiguous");
+    TORCH_CHECK(x1.dim() == 3 && x0.dim() == 3, "inputs must be [B,S,U]");
+    TORCH_CHECK(x1.scalar_type() == x0.scalar_type(), "input dtype mismatch");
+    TORCH_CHECK(x0.size(0) == x1.size(0) && x0.size(2) == x1.size(2), "input shape mismatch");
+    TORCH_CHECK(x1.size(0) <= 2147483647LL && x1.size(1) <= 2147483647LL &&
+                x0.size(1) <= 2147483647LL && x1.size(2) < 2147482624LL, "dimension exceeds int32 range");
+    TORCH_CHECK(x1.size(2) == {int(u_dim)} && V64 == {int(num_out_segments)}, "U/V specialization mismatch");
+    TORCH_CHECK(x1.size(1) >= {min_x1} && x0.size(1) >= {min_x0}, "path index exceeds input dimensions");
+'''
+    for name, value in (('x0', x0_dim), ('x1', x1_dim)):
+        if value is not None:
+            code += f'    TORCH_CHECK({name}.size(1) == {int(value)}, "{name} specialization mismatch");\n'
+    code += '''    c10::DeviceGuard guard(x1.device());
+    const int B = (int)x1.size(0), X1 = (int)x1.size(1), X0 = (int)x0.size(1);
+    const int U = (int)x1.size(2), V = (int)V64;
+'''
+    if backward:
+        code += '''    TORCH_CHECK(go.is_cuda() && go.device() == x1.device() && go.is_contiguous(), "grad_out device/layout mismatch");
+    TORCH_CHECK(go.scalar_type() == x1.scalar_type(), "grad_out dtype mismatch");
+    TORCH_CHECK(go.numel() == (int64_t)B * V * U, "grad_out size mismatch");
+    auto gx1 = torch::zeros_like(x1);
+'''
+        if need_grad_x0:
+            code += '    auto gx0 = torch::zeros_like(x0);\n'
+        result = '{gx1, gx0}' if need_grad_x0 else '{gx1}'
+    else:
+        code += '    auto out = torch::zeros({B, V, U}, x1.options());\n'
+        result = 'out'
+    call_args = ', '.join(f'{a}.data_ptr<scalar_t>()' for a in args.split(', '))
+    code += f'''    const bool use_i32 = x1.numel() <= 2147483647LL && x0.numel() <= 2147483647LL &&
+                         (int64_t)B * V * U <= 2147483647LL;
+    gpuStream_t stream = getCurrentGPUStream(x1.device().index());
+    AT_DISPATCH_FLOATING_TYPES(x1.scalar_type(), "{kernel_name}", [&] {{
+        if (use_i32) {{
+            launch_{kernel_name}_typed<scalar_t, int32_t>({call_args}, B, X1, X0, V, U, stream);
+        }} else {{
+            launch_{kernel_name}_typed<scalar_t, int64_t>({call_args}, B, X1, X0, V, U, stream);
+        }}
+    }});
+    GPU_KERNEL_LAUNCH_CHECK();
+    return {result};
+}}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {{
+    m.def("run", &launcher_{kernel_name}, "STC baseline unrolled");
+}}
+'''
+    return code
+
+
+def _generate_code_stc_baseline_unrolled(idx_lists, coeff_list, *, path_lens,
+        pad_value, num_out_segments, u_dim, out_path, kernel_name, x0_dim,
+        x1_dim, unroll_size, block_size, backward, need_grad_x0, return_metadata):
+    # Reuse the authoritative STC parser, including sentinel padding and
+    # multiplicities. Import lazily to leave existing uniform1d imports intact.
+    from .metadata import make_stc_paths_from_padded_lists
+    paths = list(make_stc_paths_from_padded_lists(
+        idx_lists, coeff_list, path_lens=path_lens, pad_value=pad_value))
+    width = _resolve_baseline_unroll_size(len(paths), unroll_size)
+    name = f'{kernel_name}_u{int(u_dim)}_path{len(paths)}_unroll{width}'
+    if backward:
+        name += '_x1_x0' if need_grad_x0 else '_x1_only'
+    code = _emit_stc_baseline_module(paths, kernel_name=name, u_dim=u_dim,
+        num_out_segments=num_out_segments, x0_dim=x0_dim, x1_dim=x1_dim,
+        block_size=block_size, unroll_size=width, backward=backward,
+        need_grad_x0=need_grad_x0)
+    if out_path:
+        Path(out_path).write_text(code, encoding='utf-8')
+    if return_metadata:
+        return dict(name='stc_baseline_unrolled_bwd' if backward else 'stc_baseline_unrolled_fwd',
+                    code=code, kernel_name=name, num_paths=len(paths),
+                    config=dict(unroll_size=width, num_unroll_blocks=(len(paths)+width-1)//width,
+                                block_size=block_size, need_grad_x0=need_grad_x0,
+                                block_local_accumulators=True))
+    return code
+
+
+def generate_code_stc_fwd_baseline_unrolled(idx_lists, coeff_list, *,
+        num_out_segments, u_dim, path_lens=None, pad_value=None,
+        out_path='', kernel_name='stc_baseline_unrolled_fwd',
+        x0_dim=None, x1_dim=None, unroll_size=256, block_size=32,
+        return_metadata=False):
+    """Generate fused multi-factor STC; None unroll_size means all paths."""
+    if pad_value is None:
+        from .models import STC_PAD_VALUE
+        pad_value = STC_PAD_VALUE
+    return _generate_code_stc_baseline_unrolled(idx_lists, coeff_list,
+        path_lens=path_lens, pad_value=pad_value, num_out_segments=num_out_segments,
+        u_dim=u_dim, out_path=out_path, kernel_name=kernel_name, x0_dim=x0_dim,
+        x1_dim=x1_dim, unroll_size=unroll_size, block_size=block_size,
+        backward=False, need_grad_x0=False, return_metadata=return_metadata)
+
+
+def generate_code_stc_bwd_baseline_unrolled(idx_lists, coeff_list, *,
+        num_out_segments, u_dim, path_lens=None, pad_value=None,
+        out_path='', kernel_name='stc_baseline_unrolled_bwd',
+        x0_dim=None, x1_dim=None, unroll_size=256, block_size=32,
+        tile_u=32, need_grad_x0=True, return_metadata=False):
+    """Return [gx1, gx0_g] or [gx1]; repeated factors are differentiated per occurrence."""
+    if int(tile_u) != 32:
+        raise ValueError('tile_u must be 32')
+    if pad_value is None:
+        from .models import STC_PAD_VALUE
+        pad_value = STC_PAD_VALUE
+    return _generate_code_stc_baseline_unrolled(idx_lists, coeff_list,
+        path_lens=path_lens, pad_value=pad_value, num_out_segments=num_out_segments,
+        u_dim=u_dim, out_path=out_path, kernel_name=kernel_name, x0_dim=x0_dim,
+        x1_dim=x1_dim, unroll_size=unroll_size, block_size=block_size,
+        backward=True, need_grad_x0=bool(need_grad_x0), return_metadata=return_metadata)

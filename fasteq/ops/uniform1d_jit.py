@@ -2908,6 +2908,32 @@ def _run_bwd(
     #print(f"uniform1d bwd x:{x.shape}, y:{y.shape}, w:{w.shape}, grad_out:{grad_out.shape}")
 
     
+    # Only for the baseline backward generator:
+    # grad_w=True  -> [gw, gx, gy]
+    # grad_w=False -> [gx, gy]
+    """ expected_baseline = 3 if grad_w else 2
+    if not isinstance(out, (tuple, list)) or len(out) != expected_baseline:
+        raise RuntimeError(
+            f"Baseline backward expected {expected_baseline} outputs, "
+            f"got {len(out) if isinstance(out, (tuple, list)) else type(out).__name__}"
+        )
+
+    if grad_w:
+        gw, gx, gy = out
+    else:
+        gx, gy = out
+        gw = None
+
+    out = tuple(
+        value
+        for enabled, value in (
+            (grad_w, gw),
+            (grad_x, gx),
+            (grad_y, gy),
+        )
+        if enabled
+    ) """
+
     return _validate_backward_result(out, grad_w, grad_x, grad_y)
 
 

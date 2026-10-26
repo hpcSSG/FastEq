@@ -675,7 +675,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         nargs="+",
         #default=[4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 36, 40, 42, 44],
-        default=[8],
+        default=[20],
         help=(
             "Numbers of water molecules along each box dimension. "
             "N_atoms = 3 * n_side^3."

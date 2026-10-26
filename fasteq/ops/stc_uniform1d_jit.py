@@ -34,6 +34,31 @@ from .uniform1d_auto_schedule import (
     build_triton_stc_double_bwd_module,
 )
 
+from .auto_schedule.baseline_codegen import (
+    generate_code_stc_fwd_baseline_unrolled,
+    generate_code_stc_bwd_baseline_unrolled,
+)
+
+
+def _stc_codegen_config():
+    implementation = os.environ.get("FASTEQ_STC_IMPLEMENTATION", "scheduler").strip().lower()
+    if implementation not in ("baseline_unrolled", "scheduler"):
+        raise ValueError("FASTEQ_STC_IMPLEMENTATION must be baseline_unrolled or scheduler")
+    raw = os.environ.get("FASTEQ_STC_UNROLL_SIZE", "256").strip().lower()
+    if raw in ("all", "none"):
+        width = None
+    else:
+        width = int(raw)
+        if width <= 0:
+            raise ValueError("FASTEQ_STC_UNROLL_SIZE must be positive or all")
+    return implementation, width
+
+
+def _stc_codegen_tag():
+    implementation, width = _stc_codegen_config()
+    return f"{implementation}_unroll{width if width is not None else 'all'}_v1"
+
+
 from .uniform1d_jit import (
     _resolve_multiwarp_candidates_enabled,
     _build_jit_candidates_from_sources as _u1d_build_jit_candidates_from_sources,
@@ -425,7 +450,7 @@ def _make_stc_fwd_tune_key(
     if dtype == torch.float64:
         dtype_str = "double"
     warp_tag = "autowarp_global_v1" if bool(use_multiwarp_candidates) else "base_global_v1"
-    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
+    return f"stc_u1d_fwd_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}" + "_" + _stc_codegen_tag()
 
 
 def _make_stc_bwd_tune_key(
@@ -456,7 +481,7 @@ def _make_stc_bwd_tune_key(
         dtype_str = "double"
     warp_tag = "autowarp_global_v1" if bool(use_multiwarp_candidates) else "base_global_v1"
     grad_tag = "x1_x0" if bool(need_grad_x0) else "x1_only"
-    return f"stc_u1d_bwd_{grad_tag}_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}"
+    return f"stc_u1d_bwd_{grad_tag}_path_{idx_lists.shape[1]}_{dtype_str}_{warp_tag}_jit_{key}" + "_" + _stc_codegen_tag()
 
 def _make_stc_double_bwd_tune_key(
     idx_lists: torch.Tensor,
@@ -601,9 +626,16 @@ def _get_or_build_module_candidates(
     num_paths = int(lens.numel())
     _launcher_name = f"{base_name}_u{int(U)}_path{num_paths}_maxlen{max_path_len}"
 
-    code = generate_code_stc_fwd_with_scheduler(
+    implementation, unroll_size = _stc_codegen_config()
+    generator = (generate_code_stc_fwd_baseline_unrolled
+                 if implementation == "baseline_unrolled"
+                 else generate_code_stc_fwd_with_scheduler)
+    codegen_options = ({"unroll_size": unroll_size}
+                       if implementation == "baseline_unrolled" else {})
+    code = generator(
         idx_lists,
         coeffs,
+        **codegen_options,
         path_lens=path_lens,
         pad_value=pad_value,
         num_out_segments=int(V),
@@ -674,9 +706,16 @@ def _get_or_build_bwd_module_candidates(
     if prebuilt_modules:
         return prebuilt_modules
 
-    code = generate_code_stc_bwd_with_scheduler(
+    implementation, unroll_size = _stc_codegen_config()
+    generator = (generate_code_stc_bwd_baseline_unrolled
+                 if implementation == "baseline_unrolled"
+                 else generate_code_stc_bwd_with_scheduler)
+    codegen_options = ({"unroll_size": unroll_size}
+                       if implementation == "baseline_unrolled" else {})
+    code = generator(
         idx_lists,
         coeffs,
+        **codegen_options,
         path_lens=path_lens,
         pad_value=pad_value,
         num_out_segments=int(V),
