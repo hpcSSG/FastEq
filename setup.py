@@ -233,6 +233,24 @@ class CMakeBuild(build_ext):
         # Copy the artifact produced by this build regardless of timestamps.
         shutil.copy2(built, expected)
 
+        # The eqlinear backends are separate DSOs linked by _cuda.so via $ORIGIN.
+        for companion in (
+            "libfasteq_eqlinear_tf32.so",
+            "libfasteq_eqlinear_fp32.so",
+            "libfasteq_eqlinear_fp64.so",
+        ):
+            source = output_dir / companion
+            if source.is_file():
+                # With PEP 660 editable builds `expected.parent` can be a temporary wheel
+                # staging directory; also place the companion in the real source package so
+                # `import fasteq` finds it next to _cuda.so.
+                destinations = {expected.parent, ROOT / "fasteq" / "cuda"}
+                for destination_dir in destinations:
+                    destination = destination_dir / companion
+                    if destination.exists():
+                        destination.unlink()
+                    shutil.copy2(source, destination)
+
 
 def get_ext_modules():
     backend = detect_backend()
@@ -254,6 +272,7 @@ def main():
         description=config["description"],
         python_requires=">=3.10",
         packages=find_packages(where="."),
+        package_data={"fasteq.cuda": ["*.so"]},
         include_package_data=True,
         zip_safe=False,
     )

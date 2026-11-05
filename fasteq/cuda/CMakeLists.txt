@@ -15,6 +15,27 @@ set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development.Module)
 
+# ---- CUTLASS (header-only) ---------------------------------------------------------------
+set(CUTLASS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/cutlass"
+    CACHE PATH "CUTLASS source root")
+if(NOT EXISTS "${CUTLASS_ROOT}/include/cutlass/cutlass.h")
+  message(STATUS "CUTLASS not found at ${CUTLASS_ROOT}; trying FetchContent")
+  include(FetchContent)
+  FetchContent_Declare(cutlass_source
+    GIT_REPOSITORY https://github.com/NVIDIA/cutlass.git
+    GIT_TAG 0b55a2f691d69981583568fd9eb69687b1f0de8a)
+  FetchContent_GetProperties(cutlass_source)
+  if(NOT cutlass_source_POPULATED)
+    FetchContent_Populate(cutlass_source)
+  endif()
+  set(CUTLASS_ROOT "${cutlass_source_SOURCE_DIR}")
+endif()
+message(STATUS "CUTLASS root: ${CUTLASS_ROOT}")
+
+# Build the eqlinear backends BEFORE find_package(Torch): Torch's CMake config rewrites
+# CMAKE_CUDA_ARCHITECTURES to plain sm_90, which breaks the sm_90a TMA/WGMMA kernels.
+add_subdirectory(src/eqlinear)
+
 # Auto-detect Torch_DIR from the active Python
 if(NOT Torch_DIR)
   execute_process(
@@ -29,6 +50,8 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
+# Torch's config may have rewritten the architecture; restore the sm_90a targets.
+set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 if(NOT TARGET CUDA::nvToolsExt)
     add_library(CUDA::nvToolsExt INTERFACE IMPORTED GLOBAL)
 endif()
@@ -70,10 +93,10 @@ include_directories(src)
 set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
-  "${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear.cu"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/dispatch/eqlinear_dispatch.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/common/eqlinear_group_table.cpp"
 )
 
-add_subdirectory(src/equi_linear_kernels)
 add_subdirectory(src/atombit)
 
 # Hard fail early if any source is missing (prevents "No SOURCES given")
@@ -85,7 +108,6 @@ endforeach()
 
 add_library(_cuda MODULE
   ${CUDA_SRCS}
-  $<TARGET_OBJECTS:equi_kernels_obj>
   $<TARGET_OBJECTS:atombit_obj>
 )
 
@@ -93,15 +115,20 @@ add_library(_cuda MODULE
 # Prefer PyTorch-shipped CUDA runtime at runtime
 if(EXISTS "${TORCH_CUDA_RUNTIME_LIBDIR}/libcudart.so.12")
   set_target_properties(_cuda PROPERTIES
-    BUILD_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
-    INSTALL_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR}"
+    BUILD_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR};$ORIGIN"
+    INSTALL_RPATH "${TORCH_CUDA_RUNTIME_LIBDIR};$ORIGIN"
+  )
+else()
+  set_target_properties(_cuda PROPERTIES
+    BUILD_RPATH "$ORIGIN"
+    INSTALL_RPATH "$ORIGIN"
   )
 endif()
 
 target_include_directories(_cuda PRIVATE
   ${Python3_INCLUDE_DIRS}
   ${TORCH_INCLUDE_DIRS}
-  ${CMAKE_CURRENT_SOURCE_DIR}/src/equi_linear_kernels
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/common
   ${CMAKE_CURRENT_SOURCE_DIR}/src/atombit
 )
 
@@ -118,6 +145,9 @@ target_compile_options(_cuda PRIVATE
 target_link_libraries(_cuda PRIVATE
   Python3::Module
   ${TORCH_LIBRARIES}
+  fasteq_eqlinear_tf32
+  fasteq_eqlinear_fp32
+  fasteq_eqlinear_fp64
 )
 
 target_compile_options(_cuda PRIVATE
