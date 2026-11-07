@@ -8,6 +8,7 @@
 #include "bwd.h"
 #include "eqlinear.h"
 #include "eqlinear_backend_api.h"
+#include "device_lifetime.h"
 
 namespace {
 
@@ -16,34 +17,32 @@ using fasteq::eqlinear::EqLinearPlanInfo;
 using fasteq::eqlinear::EqLinearProblemC;
 using fasteq::eqlinear::Status;
 
-struct ForwardPlan {
-  eqlin_fp32::Runner* runner = nullptr;
-};
+using ForwardPlan = fasteq::eqlinear::DeviceOwner<eqlin_fp32::Runner>;
 
-struct DgradPlan {
-  eqlin_fp32::BackwardRunner* runner = nullptr;
-};
+using DgradPlan = fasteq::eqlinear::DeviceOwner<eqlin_fp32::BackwardRunner>;
 
 int forward_create(const EqLinearProblemC* problem, const void* w, const double* cg,
                    cudaStream_t stream, void** plan, EqLinearPlanInfo* info) {
   if (problem == nullptr || w == nullptr || plan == nullptr || info == nullptr) {
     return static_cast<int>(Status::kInvalidArgument);
   }
+  *plan = nullptr;
   try {
     std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
-    auto runner = new eqlin_fp32::Runner(problem->B, problem->I, problem->U, problem->P,
+    auto owner = std::make_unique<ForwardPlan>();
+    owner->runner = std::make_unique<eqlin_fp32::Runner>(problem->B, problem->I, problem->U, problem->P,
                                          problem->V, i_dims, eqlin_fp32::Impl::kFused);
+    auto* runner = owner->runner.get();
     const int rc = runner->prepare_weight(static_cast<const float*>(w), cg, stream);
     if (rc != 0) {
-      delete runner;
       return rc;
     }
-    *plan = new ForwardPlan{runner};
     info->precision = 1;
     info->forward_impl = static_cast<int>(eqlin_fp32::Impl::kFused);
     info->dgrad_impl = static_cast<int>(eqlin_fp32::BwdImpl::kB1);
     info->a_view = 0;
     info->j_rows = runner->j_rows();
+    *plan = owner.release();
     return 0;
   } catch (const std::exception&) {
     return static_cast<int>(Status::kInvalidArgument);
@@ -59,11 +58,7 @@ int forward_run(void* plan, const void* x, void* out, cudaStream_t stream) {
 }
 
 void forward_destroy(void* plan) {
-  auto* p = static_cast<ForwardPlan*>(plan);
-  if (p != nullptr) {
-    delete p->runner;
-    delete p;
-  }
+  delete static_cast<ForwardPlan*>(plan);
 }
 
 int dgrad_create(const EqLinearProblemC* problem, const void* w, const double* cg,
@@ -71,17 +66,20 @@ int dgrad_create(const EqLinearProblemC* problem, const void* w, const double* c
   if (problem == nullptr || w == nullptr || plan == nullptr || info == nullptr) {
     return static_cast<int>(Status::kInvalidArgument);
   }
+  *plan = nullptr;
   try {
     std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
-    auto runner = new eqlin_fp32::BackwardRunner(
+    auto owner = std::make_unique<DgradPlan>();
+    owner->runner = std::make_unique<eqlin_fp32::BackwardRunner>(
         problem->B, problem->I, problem->U, problem->P, problem->V, i_dims,
         eqlin_fp32::BwdImpl::kB1, static_cast<const float*>(w), cg, stream);
-    *plan = new DgradPlan{runner};
+    auto* runner = owner->runner.get();
     info->precision = 1;
     info->forward_impl = -1;
     info->dgrad_impl = static_cast<int>(eqlin_fp32::BwdImpl::kB1);
     info->a_view = 0;
     info->j_rows = runner->j_rows();
+    *plan = owner.release();
     return 0;
   } catch (const std::exception&) {
     return static_cast<int>(Status::kInvalidArgument);
@@ -98,11 +96,7 @@ int dgrad_run(void* plan, const void* dy, void* dx, cudaStream_t stream) {
 }
 
 void dgrad_destroy(void* plan) {
-  auto* p = static_cast<DgradPlan*>(plan);
-  if (p != nullptr) {
-    delete p->runner;
-    delete p;
-  }
+  delete static_cast<DgradPlan*>(plan);
 }
 
 const char* status_string(int code) {

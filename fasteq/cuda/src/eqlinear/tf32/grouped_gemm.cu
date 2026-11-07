@@ -15,6 +15,7 @@
 #include "cutlass/layout/matrix.h"
 
 #include "device_buffer.h"
+#include "pointer_table.cuh"
 
 namespace eqlin {
 namespace {
@@ -58,6 +59,7 @@ using GroupedGemmT = cutlass::gemm::device::GemmGrouped<GroupedKernel<MathOperat
 struct GroupedGemmPlan::ImplBase {
   virtual ~ImplBase() = default;
   virtual int launch(float *out, cudaStream_t stream) = 0;
+  virtual int bind_a(float const *a_base, cudaStream_t stream) = 0;
 };
 
 namespace {
@@ -68,7 +70,7 @@ class PlanImpl : public GroupedGemmPlan::ImplBase {
  public:
   PlanImpl(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
            std::vector<RowPlan> const &rows, float const *a_prep, float const *b_prep)
-      : num_rows_(num_rows), ldc_(ldc), c_col_stride_(V) {
+      : num_rows_(num_rows), a_bound_(a_prep != nullptr), pointers_(pointer_rows(rows, V)) {
     if (num_rows <= 0) throw std::invalid_argument("GroupedGemmPlan: no rows");
 
     host_problem_.resize(num_rows);
@@ -78,16 +80,11 @@ class PlanImpl : public GroupedGemmPlan::ImplBase {
     host_ldb_.resize(num_rows);
     host_ldc_.resize(num_rows);
 
-    // Pinned, so the per-launch pointer update is genuinely asynchronous.
-    if (cudaMallocHost(&host_c_, num_rows * sizeof(float *)) != cudaSuccess) {
-      throw std::runtime_error("GroupedGemmPlan: pinned allocation failed");
-    }
-
     for (int j = 0; j < num_rows; ++j) {
       host_problem_[j] = GemmCoord(B, V, rows[j].K);
-      host_a_[j] = const_cast<float *>(a_prep + rows[j].a_off);
+      host_a_[j] = a_prep ? const_cast<float *>(a_prep + rows[j].a_off) : nullptr;
       host_b_[j] = const_cast<float *>(b_prep + rows[j].b_off);
-      host_lda_[j] = static_cast<LongIndex>(lda);
+      host_lda_[j] = static_cast<LongIndex>(rows[j].lda ? rows[j].lda : lda);
       host_ldb_[j] = static_cast<LongIndex>(ldb);
       host_ldc_[j] = static_cast<LongIndex>(ldc);
     }
@@ -101,7 +98,7 @@ class PlanImpl : public GroupedGemmPlan::ImplBase {
     }
 
     cudaMemcpy(d_problem_.as<GemmCoord>(), host_problem_.data(), n * sizeof(GemmCoord), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_a_.as<float *>(), host_a_.data(), n * sizeof(float *), cudaMemcpyHostToDevice);
+    if (a_prep) cudaMemcpy(d_a_.as<float *>(), host_a_.data(), n * sizeof(float *), cudaMemcpyHostToDevice);
     cudaMemcpy(d_b_.as<float *>(), host_b_.data(), n * sizeof(float *), cudaMemcpyHostToDevice);
     cudaMemcpy(d_lda_.as<LongIndex>(), host_lda_.data(), n * sizeof(LongIndex), cudaMemcpyHostToDevice);
     cudaMemcpy(d_ldb_.as<LongIndex>(), host_ldb_.data(), n * sizeof(LongIndex), cudaMemcpyHostToDevice);
@@ -130,19 +127,21 @@ class PlanImpl : public GroupedGemmPlan::ImplBase {
   PlanImpl(PlanImpl const &) = delete;
   PlanImpl &operator=(PlanImpl const &) = delete;
 
-  ~PlanImpl() override {
-    if (host_c_) cudaFreeHost(host_c_);
+  ~PlanImpl() override = default;
+
+  int bind_a(float const *a_base, cudaStream_t stream) override {
+    if (a_base == last_a_base_ && a_bound_) return 0;
+    if (pointers_.input(a_base, d_a_.as<float *>(), stream) != cudaSuccess)
+      return static_cast<int>(cutlass::Status::kErrorInternal);
+    last_a_base_ = a_base;
+    a_bound_ = true;
+    return 0;
   }
 
   int launch(float *out, cudaStream_t stream) override {
-    // Row j of the output is the column-strip out[:, j, :]: it starts at out + j*V and its rows
-    // are `ldc` apart.  (j*V != j*ldc unless J == 1 -- getting this wrong silently works for a
-    // single output row and corrupts every multi-row case.)
-    for (int j = 0; j < num_rows_; ++j) {
-      host_c_[j] = out + static_cast<long long>(j) * c_col_stride_;
-    }
-    cudaMemcpyAsync(d_c_.as<float *>(), host_c_, num_rows_ * sizeof(float *),
-                    cudaMemcpyHostToDevice, stream);
+    if (!a_bound_) return static_cast<int>(cutlass::Status::kErrorInternal);
+    if (pointers_.output(out, d_c_.as<float *>(), nullptr, stream) != cudaSuccess)
+      return static_cast<int>(cutlass::Status::kErrorInternal);
 
     typename GemmT::Arguments args = arguments_for(d_c_.as<float *>());
     cutlass::Status st = op_->update(args, d_workspace_.as<void>(), stream);
@@ -166,16 +165,16 @@ class PlanImpl : public GroupedGemmPlan::ImplBase {
   }
 
   int num_rows_ = 0;
-  long long ldc_ = 0;
-  long long c_col_stride_ = 0;
+  bool a_bound_ = false;
+  float const *last_a_base_ = nullptr;
   int threadblock_count_ = 0;
   size_t workspace_bytes_ = 0;
 
   std::vector<GemmCoord> host_problem_;
   std::vector<float *> host_a_, host_b_;
-  float **host_c_ = nullptr;  // pinned
   std::vector<LongIndex> host_lda_, host_ldb_, host_ldc_;
 
+  PointerTable<float> pointers_;
   DeviceBuffer d_problem_, d_a_, d_b_, d_c_;
   DeviceBuffer d_lda_, d_ldb_, d_ldc_, d_workspace_;
   std::unique_ptr<GemmT> op_;
@@ -206,6 +205,10 @@ GroupedGemmPlan::GroupedGemmPlan(Impl impl, int B, int V, int num_rows,
 }
 
 GroupedGemmPlan::~GroupedGemmPlan() = default;
+
+int GroupedGemmPlan::bind_a(float const *a_base, cudaStream_t stream) {
+  return p_->bind_a(a_base, stream);
+}
 
 int GroupedGemmPlan::launch(float *out, cudaStream_t stream) {
   return p_->launch(out, stream);

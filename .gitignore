@@ -17,6 +17,7 @@ build/
 .idea/
 .vscode/
 *.txt
+!fasteq/cuda/src/eqlinear/CMakeLists.txt
 *.log
 
 # Distribution
@@ -56,3 +57,6 @@ fasteq/ops/_schedule_stats/
 
 # Generated benchmark report (kept local; test scripts are tracked)
 /doc/fasteq_eqlinear_comparison.md
+
+# Local build caches and benchmark evidence
+/tmp_dev/

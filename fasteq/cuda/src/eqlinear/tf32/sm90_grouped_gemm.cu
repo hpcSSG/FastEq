@@ -38,6 +38,7 @@
 #include "collective/dispatch_policy_tf32x3.hpp"
 #include "collective/tile_scheduler_streamk_group.hpp"
 #include "device_buffer.h"
+#include "pointer_table.cuh"
 
 using namespace cute;
 
@@ -314,8 +315,7 @@ class Sm90PlanImpl : public Sm90GroupedPlan::ImplBase {
   Sm90PlanImpl(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
                std::vector<RowPlan> const &rows, void const *a_data, void const *b_data,
                void const *b_res_data)
-      : num_rows_(num_rows), ldc_(ldc), c_col_stride_(V), rows_(rows),
-        a_bound_(a_data != nullptr) {
+      : num_rows_(num_rows), a_bound_(a_data != nullptr), pointers_(pointer_rows(rows, V)) {
     if (num_rows <= 0) throw std::invalid_argument("Sm90GroupedPlan: no rows");
     if constexpr (kHasBRes<Mode>) {
       if (b_res_data == nullptr) throw std::invalid_argument("Sm90GroupedPlan: missing B residual");
@@ -369,10 +369,6 @@ class Sm90PlanImpl : public Sm90GroupedPlan::ImplBase {
         d_sb_.reset(n * sizeof(StrideB)) || d_sc_.reset(n * sizeof(StrideC)) ||
         (need_b_res && d_b_res_.reset(n * sizeof(ElementB_ const *)))) {
       throw std::runtime_error("Sm90GroupedPlan: device allocation failed");
-    }
-    if (cudaMallocHost(&host_c_pinned_, n * sizeof(ElementC *)) != cudaSuccess ||
-        cudaMallocHost(&host_a_pinned_, n * sizeof(ElementA_ const *)) != cudaSuccess) {
-      throw std::runtime_error("Sm90GroupedPlan: pinned allocation failed");
     }
 
     cudaMemcpy(d_problem_.as<UnderlyingProblemShape>(), host_problem_.data(),
@@ -429,48 +425,23 @@ class Sm90PlanImpl : public Sm90GroupedPlan::ImplBase {
     }
   }
 
-  ~Sm90PlanImpl() override {
-    if (host_c_pinned_) cudaFreeHost(host_c_pinned_);
-    if (host_a_pinned_) cudaFreeHost(host_a_pinned_);
-  }
+  ~Sm90PlanImpl() override = default;
 
   void bind_a(void const *a_base, cudaStream_t stream) override {
     auto const *pa = static_cast<ElementA_ const *>(a_base);
     if (pa == last_a_base_) return;  // steady state: same activation buffer as last call
+    static_assert(sizeof(ElementA_) == sizeof(float));
+    if (pointers_.input(reinterpret_cast<float const *>(pa),
+                        d_a_.as<float *>(), stream)
+        != cudaSuccess) throw std::runtime_error("Sm90GroupedPlan: input pointer update failed");
     last_a_base_ = pa;
-    for (int j = 0; j < num_rows_; ++j) {
-      // Rows that carry their own `a_base` (the fused plan's wgrad rows) keep it; the rest follow
-      // the base being bound (dgrad's dy, which changes every call).
-      auto const *row_row = rows_[j].a_base ? static_cast<ElementA_ const *>(rows_[j].a_base) : pa;
-      host_a_pinned_[j] = row_row + rows_[j].a_off;
-    }
-    cudaMemcpyAsync(d_a_.as<ElementA_ const *>(), host_a_pinned_,
-                    num_rows_ * sizeof(ElementA_ const *), cudaMemcpyHostToDevice, stream);
     a_bound_ = true;
   }
 
   int launch(float *out, cudaStream_t stream) override {
     if (!a_bound_) return static_cast<int>(cutlass::Status::kErrorInternal);
-    for (int j = 0; j < num_rows_; ++j) {
-      // Row j's tile base: `j*ldc` for the forward (row j writes output row j), or the explicit
-      // offset the backward plans carry (dgrad row j writes input row i(j)).
-      // A row with an explicit `c_base` (the fused backward's rows, which land in different
-      // allocations) ignores `out` *and* uses `c_off` as an absolute offset -- 0 is a real offset
-      // there, not "use the default".  Rows without one keep the forward/dgrad behaviour.
-      if (rows_[j].c_base) {
-        host_c_pinned_[j] = static_cast<float *>(rows_[j].c_base) + rows_[j].c_off;
-        continue;
-      }
-      host_c_pinned_[j] = out + (rows_[j].c_off >= 0
-                                     ? rows_[j].c_off
-                                     : static_cast<long long>(j) * c_col_stride_);
-    }
-    cudaMemcpyAsync(d_c_.as<ElementC *>(), host_c_pinned_, num_rows_ * sizeof(ElementC *),
-                    cudaMemcpyHostToDevice, stream);
-    // The epilogue takes C as `ElementC const**` and D as `ElementD**`; C and D alias the same
-    // memory here, so the two device arrays hold the same pointer values.
-    cudaMemcpyAsync(d_cc_.as<ElementC const *>(), host_c_pinned_, num_rows_ * sizeof(ElementC *),
-                    cudaMemcpyHostToDevice, stream);
+    if (pointers_.output(out, d_c_.as<ElementC *>(), d_cc_.as<ElementC const *>(), stream)
+        != cudaSuccess) return static_cast<int>(cutlass::Status::kErrorInternal);
 
     typename Gemm::Arguments args = make_arguments(d_cc_.as<ElementC const *>(),
                                                    d_c_.as<ElementC *>());
@@ -540,11 +511,6 @@ class Sm90PlanImpl : public Sm90GroupedPlan::ImplBase {
   }
 
   int num_rows_ = 0;
-  long long ldc_ = 0;
-  long long c_col_stride_ = 0;
-  /// Kept so `bind_a` can re-derive each row's pointer from a new base.  Cheap: one RowPlan per
-  /// output row.
-  std::vector<RowPlan> rows_;
   /// False until a base is supplied (activation-view mode); `launch` refuses to run before that.
   bool a_bound_ = false;
   /// Last base handed to `bind_a`, so a repeated call with the same activation buffer costs nothing.
@@ -561,8 +527,7 @@ class Sm90PlanImpl : public Sm90GroupedPlan::ImplBase {
   std::vector<StrideA> host_sa_;
   std::vector<StrideB> host_sb_;
   std::vector<StrideC> host_sc_;
-  ElementC **host_c_pinned_ = nullptr;
-  ElementA_ const **host_a_pinned_ = nullptr;
+  PointerTable<float> pointers_;
 
   DeviceBuffer d_problem_, d_a_, d_b_, d_b_res_, d_c_, d_cc_, d_sa_, d_sb_, d_sc_, d_sd_,
       d_workspace_;

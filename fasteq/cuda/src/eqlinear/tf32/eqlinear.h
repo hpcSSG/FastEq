@@ -89,6 +89,8 @@ class Runner {
   /// this belongs to setup rather than to the per-call path.  See `prepare_act` for the other half.
   int prepare_weight(float const *w, double const *cg, cudaStream_t stream);
 
+  bool a_view() const;
+
   /// Activation-side preparation: makes x readable by the GEMM.  Nothing to do when the A operand is
   /// bound straight to x (the activation-view mode); otherwise it permutes x into the packed buffer.
   int prepare_act(float const *x, cudaStream_t stream);

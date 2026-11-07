@@ -40,6 +40,9 @@ class GroupedGemmPlan {
   GroupedGemmPlan(GroupedGemmPlan const &) = delete;
   GroupedGemmPlan &operator=(GroupedGemmPlan const &) = delete;
 
+  /// Rebind the activation view before launching on this stream.
+  int bind_a(float const *a_base, cudaStream_t stream);
+
   /// Launch, writing row j of the output to out + j*V (row stride ldc).
   int launch(float *out, cudaStream_t stream);
 

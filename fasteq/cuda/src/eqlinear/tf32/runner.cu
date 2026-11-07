@@ -54,10 +54,10 @@ struct Runner::Impl_ {
   bool inkernel = false;  // tf32x3 with the A split done inside the mainloop
   /// A is bound straight to x instead of being permuted: possible when every output row draws on
   /// exactly one input path, because then the packed column strip is bit-identical to a slice of x
-  /// (both `a_off` and `lda` come out the same).  `EQLIN_A_VIEW=0` forces the packed path back on.
+  /// (both `a_off` and `lda` come out the same).
   bool a_view = false;
   /// 0 = x is [B, I, U]; 1 = x is P-major [P][B, d_p, U] (one buffer).  Only affects the offsets and
-  /// pitches of the A view -- `EQLIN_A_LAYOUT=pbu` selects it.
+  /// pitches of the A view; the production layout is [B, I, U].
   int a_layout = 0;
   int seg = 1;            // number of K segments per operand (1 or 3)
   GroupTable table;
@@ -101,15 +101,14 @@ struct Runner::Impl_ {
     build_host_tables();
     // Activation-view mode.  With one input path per output row the packed A column strip of row j
     // is exactly x[b, j*U : j*U+U], so the permute would be an identity copy and the kernel can read
-    // x in place.  Only the in-kernel-split mainloops (the ones that consume a plain fp32 A) take
-    // part; the K-concatenated variant needs a 3-segment A and keeps the packed path.
-    if (inkernel) {
+    // x in place.  Grouped FP32-A and in-kernel-split mainloops can both consume this view;
+    // the K-concatenated variant needs a 3-segment A and keeps the packed path.
+    bool const grouped_view = impl == Impl::k3xTF32;
+    if (inkernel || grouped_view) {
       bool const one_path_per_row = std::all_of(table.path_count.begin(), table.path_count.end(),
                                                 [](int m) { return m == 1; });
-      char const *v = nullptr;
-      a_view = one_path_per_row && !(v != nullptr && atoi(v) == 0);
-      char const *l = nullptr;
-      a_layout = (l != nullptr && strcmp(l, "pbu") == 0) ? 1 : 0;
+      a_view = one_path_per_row;
+      a_layout = 0;
       if (a_view) build_view_rows();
     }
     allocate();
@@ -292,8 +291,10 @@ struct Runner::Impl_ {
       }
       sm90_plan = std::move(sm90);
     } else {
-      plan = std::make_unique<GroupedGemmPlan>(impl, B, V, J, lda, ldb, ldc, rows,
-                                               d_a_prep.as<float>(), d_b_prep.as<float>());
+      plan = std::make_unique<GroupedGemmPlan>(impl, B, V, J, lda, ldb, ldc,
+                                               a_view ? rows_view : rows,
+                                               a_view ? nullptr : d_a_prep.as<float>(),
+                                               d_b_prep.as<float>());
     }
   }
 
@@ -330,8 +331,11 @@ struct Runner::Impl_ {
     }
     if (a_view) {
       // Nothing to pack: the GEMM reads x in place.  Only the per-row base pointers move.
-      sm90_plan->bind_a(x, stream);
-      return 0;
+      if (sm90_plan) {
+        sm90_plan->bind_a(x, stream);
+        return 0;
+      }
+      return plan->bind_a(x, stream);
     }
     launch_permute_a(x, d_a_prep.as<float>(), d_src_index.as<int>(), I, U, B, stream);
     return 0;
@@ -355,6 +359,8 @@ Runner::Runner(int B, int I, int U, int P, int V, std::vector<int> i_dims, Impl 
 Runner::~Runner() = default;
 
 int Runner::j_rows() const { return p_->J; }
+
+bool Runner::a_view() const { return p_->a_view; }
 
 int Runner::prepare_weight(float const *w, double const *cg, cudaStream_t stream) {
   return p_->prepare_weight(w, cg, stream);

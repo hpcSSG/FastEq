@@ -162,6 +162,31 @@ def _call(mode, desc, w, x, precision):
     return fast_equi_linear(desc, w, x)
 
 
+
+class IncrementalRows:
+    FIELDS = ("mode", "config", "batch", "precision", "supported", "op_ms", "torch_ms",
+              "speedup", "rel_fro", "torch_rel_fro", "error")
+
+    def __init__(self, path):
+        self.path = path
+        self.count = 0
+
+    def __enter__(self):
+        self.stream = open(self.path, "w", newline="")
+        self.writer = csv.DictWriter(self.stream, fieldnames=self.FIELDS, lineterminator="\n")
+        self.writer.writeheader()
+        self.stream.flush()
+        return self
+
+    def append(self, row):
+        self.writer.writerow(row)
+        self.stream.flush()
+        self.count += 1
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.stream.close()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("before", "after", "torch"), required=True)
@@ -169,78 +194,81 @@ def main():
     args = parser.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    rows = []
     case_index = 0
-    for config, (u, i_dims) in CONFIGS.items():
-        p_count = len(i_dims)
-        cg = [0.01 + 0.001 * p for p in range(p_count)]
-        for batch in BATCHES:
-            for precision in PRECISIONS:
-                case_index += 1
-                torch.manual_seed(1000 + case_index)
-                dtype = torch.float64 if precision == "fp64" else torch.float32
-                x = torch.randn(batch, sum(i_dims) * u, device="cuda", dtype=dtype)
-                w = torch.randn(p_count * u * u, device="cuda", dtype=dtype)
-                desc = _Descriptor(i_dims, u, u, cg)
-                x3 = x.reshape(batch, sum(i_dims), u)
-                w3 = w.reshape(p_count, u, u)
+    with IncrementalRows(args.out) as rows:
+        for config, (u, i_dims) in CONFIGS.items():
+            p_count = len(i_dims)
+            cg = [0.01 + 0.001 * p for p in range(p_count)]
+            for batch in BATCHES:
+                for precision in PRECISIONS:
+                    case_index += 1
+                    torch.manual_seed(1000 + case_index)
+                    dtype = torch.float64 if precision == "fp64" else torch.float32
+                    x = torch.randn(batch, sum(i_dims) * u, device="cuda", dtype=dtype)
+                    w = torch.randn(p_count * u * u, device="cuda", dtype=dtype)
+                    desc = _Descriptor(i_dims, u, u, cg)
+                    x3 = x.reshape(batch, sum(i_dims), u)
+                    w3 = w.reshape(p_count, u, u)
 
-                ref64 = _reference(x3, w3, i_dims, cg, torch.float64)
-                ref_work_dtype = torch.float64 if precision == "fp64" else torch.float32
-                ref_work = _reference(x3, w3, i_dims, cg, ref_work_dtype)
-                torch_fn = lambda: _reference(x3, w3, i_dims, cg, ref_work_dtype)
+                    ref64 = _reference(x3, w3, i_dims, cg, torch.float64)
+                    ref_work_dtype = torch.float64 if precision == "fp64" else torch.float32
+                    ref_work = _reference(x3, w3, i_dims, cg, ref_work_dtype)
+                    torch_fn = lambda: _reference(x3, w3, i_dims, cg, ref_work_dtype)
 
-                supported = False
-                error = "torch reference only" if args.mode == "torch" else ""
-                op_ms = None
-                rel = None
-                out = None
-                if args.mode != "torch":
-                    try:
-                        out = _call(args.mode, desc, w, x, precision)
-                        supported = True
-                    except Exception as exc:  # noqa: BLE001
-                        error = str(exc).splitlines()[0][:160]
+                    supported = False
+                    error = "torch reference only" if args.mode == "torch" else ""
+                    op_ms = None
+                    rel = None
+                    out = None
+                    if args.mode != "torch":
+                        try:
+                            out = _call(args.mode, desc, w, x, precision)
+                            supported = True
+                        except Exception as exc:  # noqa: BLE001
+                            error = str(exc).splitlines()[0][:160]
 
-                if supported:
-                    torch_ms, op_ms = _median_pair_ms(
-                        lambda: _call(args.mode, desc, w, x, precision),
-                        torch_fn,
-                        op_warmup=10 if args.mode == "before" else 5,
-                        iters=20,
+                    torch_rel = _rel_fro(ref_work, ref64)
+                    if supported:
+                        rel = _rel_fro(out.reshape(batch, -1), ref64.reshape(batch, -1))
+                        limit = 1e-12 if precision == "fp64" else 2e-5 if precision == "tf32" else 1.05 * torch_rel
+                        if not torch.isfinite(out).all().item() or rel > limit:
+                            supported = False
+                            error = "accuracy gate failed"
+
+                    if supported:
+                        torch_ms, op_ms = _median_pair_ms(
+                            lambda: _call(args.mode, desc, w, x, precision),
+                            torch_fn,
+                            op_warmup=10 if args.mode == "before" else 5,
+                            iters=20,
+                        )
+                    else:
+                        torch_ms = _median_ms(torch_fn, warmup=3, iters=20 if args.mode == "torch" else 10)
+
+                    speedup = None if op_ms is None else torch_ms / op_ms
+                    rows.append(
+                        {
+                            "mode": args.mode,
+                            "config": config,
+                            "batch": batch,
+                            "precision": precision,
+                            "supported": supported,
+                            "op_ms": op_ms,
+                            "torch_ms": torch_ms,
+                            "speedup": speedup,
+                            "rel_fro": rel,
+                            "torch_rel_fro": torch_rel,
+                            "error": error,
+                        }
                     )
-                    rel = _rel_fro(out.reshape(batch, -1), ref64.reshape(batch, -1))
-                else:
-                    torch_ms = _median_ms(torch_fn, warmup=3, iters=20 if args.mode == "torch" else 10)
+                    print(
+                        f"{args.mode:6s} {config:10s} B={batch:5d} {precision:4s} "
+                        f"supported={supported} op={op_ms} torch={torch_ms:.3f} "
+                        f"speedup={speedup} rel={rel}",
+                        flush=True,
+                    )
 
-                speedup = None if op_ms is None else torch_ms / op_ms
-                rows.append(
-                    {
-                        "mode": args.mode,
-                        "config": config,
-                        "batch": batch,
-                        "precision": precision,
-                        "supported": supported,
-                        "op_ms": op_ms,
-                        "torch_ms": torch_ms,
-                        "speedup": speedup,
-                        "rel_fro": rel,
-                        "torch_rel_fro": _rel_fro(ref_work, ref64),
-                        "error": error,
-                    }
-                )
-                print(
-                    f"{args.mode:6s} {config:10s} B={batch:5d} {precision:4s} "
-                    f"supported={supported} op={op_ms} torch={torch_ms:.3f} "
-                    f"speedup={speedup} rel={rel}",
-                    flush=True,
-                )
-
-    with open(args.out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"wrote {args.out} ({len(rows)} rows)")
+    print(f"wrote {args.out} ({rows.count} rows)")
 
 
 if __name__ == "__main__":

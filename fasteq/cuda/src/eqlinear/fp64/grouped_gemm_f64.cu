@@ -33,6 +33,7 @@
 #include "cutlass/epilogue/thread/linear_combination.h"
 
 #include "device_buffer.h"
+#include "pointer_table.cuh"
 
 #ifndef F64_TB_M
 #define F64_TB_M 64
@@ -275,8 +276,8 @@ class PlanImplT : public GroupedGemmPlan::ImplBase {
 
   PlanImplT(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
             std::vector<RowPlan> const &rows, double const *a_data, double const *b_data)
-      : num_rows_(num_rows), ldc_(ldc), c_col_stride_(V), rows_(rows),
-        a_base_(a_data), a_bound_(a_data != nullptr) {
+      : num_rows_(num_rows), a_base_(a_data), a_bound_(a_data != nullptr),
+        pointers_(pointer_rows(rows, V)) {
     if (num_rows <= 0) throw std::invalid_argument("GroupedGemmPlan: no rows");
     if (b_data == nullptr) throw std::invalid_argument("GroupedGemmPlan: missing B");
 
@@ -287,16 +288,10 @@ class PlanImplT : public GroupedGemmPlan::ImplBase {
     host_ldb_.resize(num_rows);
     host_ldc_.resize(num_rows);
 
-    if (cudaMallocHost(&host_c_, num_rows * sizeof(double *)) != cudaSuccess ||
-        cudaMallocHost(&host_a_pinned_, num_rows * sizeof(double *)) != cudaSuccess) {
-      throw std::runtime_error("GroupedGemmPlan: pinned allocation failed");
-    }
-
     for (int j = 0; j < num_rows; ++j) {
       host_problem_[j] = GemmCoord(rows[j].M ? rows[j].M : B,
                                    rows[j].N ? rows[j].N : V, rows[j].K);
       host_a_[j] = a_data ? const_cast<double *>(a_data + rows[j].a_off) : nullptr;
-      host_a_pinned_[j] = host_a_[j];
       host_b_[j] = const_cast<double *>(b_data + rows[j].b_off);
       host_lda_[j] = static_cast<LongIndex>(rows[j].lda ? rows[j].lda : lda);
       host_ldb_[j] = static_cast<LongIndex>(rows[j].ldb ? rows[j].ldb : ldb);
@@ -355,19 +350,13 @@ class PlanImplT : public GroupedGemmPlan::ImplBase {
   PlanImplT(PlanImplT const &) = delete;
   PlanImplT &operator=(PlanImplT const &) = delete;
 
-  ~PlanImplT() override {
-    if (host_c_) cudaFreeHost(host_c_);
-    if (host_a_pinned_) cudaFreeHost(host_a_pinned_);
-  }
+  ~PlanImplT() override = default;
 
   void bind_a(double const *a_base, cudaStream_t stream) override {
     if (a_base == a_base_) return;  // steady state: the same activation buffer as last call
+    if (pointers_.input(a_base, d_a_.as<double *>(), stream) != cudaSuccess)
+      throw std::runtime_error("GroupedGemmPlan: input pointer update failed");
     a_base_ = a_base;
-    for (int j = 0; j < num_rows_; ++j) {
-      host_a_pinned_[j] = const_cast<double *>(a_base + rows_[j].a_off);
-    }
-    cudaMemcpyAsync(d_a_.as<double *>(), host_a_pinned_, num_rows_ * sizeof(double *),
-                    cudaMemcpyHostToDevice, stream);
     a_bound_ = true;
   }
 
@@ -377,13 +366,8 @@ class PlanImplT : public GroupedGemmPlan::ImplBase {
       return static_cast<int>(cutlass::Status::kErrorInternal);
     }
 
-    // Row j of the output is the column-strip out[:, j, :]: it starts at out + j*V and its rows are
-    // `ldc` apart.  (j*V != j*ldc unless J == 1.)
-    for (int j = 0; j < num_rows_; ++j)
-      host_c_[j] = out + (rows_[j].c_off >= 0 ? rows_[j].c_off
-                                              : static_cast<long long>(j) * c_col_stride_);
-    cudaMemcpyAsync(d_c_.as<double *>(), host_c_, num_rows_ * sizeof(double *),
-                    cudaMemcpyHostToDevice, stream);
+    if (pointers_.output(out, d_c_.as<double *>(), nullptr, stream) != cudaSuccess)
+      return static_cast<int>(cutlass::Status::kErrorInternal);
 
     typename Gemm::Arguments args = arguments_for(d_c_.as<double *>());
     cutlass::Status st = op_->update(args, d_workspace_.as<void>(), stream);
@@ -414,19 +398,15 @@ class PlanImplT : public GroupedGemmPlan::ImplBase {
   }
 
   int num_rows_ = 0;
-  long long ldc_ = 0;
-  long long c_col_stride_ = 0;
   int threadblock_count_ = 0;
   size_t workspace_bytes_ = 0;
 
-  std::vector<RowPlan> rows_;
   double const *a_base_ = nullptr;
   bool a_bound_ = false;
 
   std::vector<GemmCoord> host_problem_;
   std::vector<double *> host_a_, host_b_;
-  double **host_c_ = nullptr;        // pinned
-  double **host_a_pinned_ = nullptr; // pinned
+  PointerTable<double> pointers_;
   std::vector<LongIndex> host_lda_, host_ldb_, host_ldc_;
 
   DeviceBuffer d_problem_, d_a_, d_b_, d_c_;

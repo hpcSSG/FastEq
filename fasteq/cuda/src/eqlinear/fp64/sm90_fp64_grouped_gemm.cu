@@ -41,6 +41,7 @@
 #include "collective/fp64_dmma_atom.hpp"
 #include "collective/sm90_mma_fp64_array_tma_warpspecialized.hpp"
 #include "device_buffer.h"
+#include "pointer_table.cuh"
 
 using namespace cute;
 
@@ -189,8 +190,8 @@ class PlanImpl : public Sm90Fp64Plan::ImplBase {
   PlanImpl(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
            std::vector<RowPlan> const &rows, double const *a_data, double const *b_data,
            int u, int m_max)
-      : num_rows_(num_rows), ldc_(ldc), c_col_stride_(V), u_(u), m_max_(m_max), rows_(rows),
-        a_bound_(a_data != nullptr) {
+      : num_rows_(num_rows), u_(u), m_max_(m_max), a_bound_(a_data != nullptr),
+        pointers_(pointer_rows(rows, V)) {
     if (num_rows <= 0) throw std::invalid_argument("Sm90Fp64Plan: no rows");
     if (b_data == nullptr) throw std::invalid_argument("Sm90Fp64Plan: missing B");
     if constexpr (Composed) {
@@ -205,16 +206,10 @@ class PlanImpl : public Sm90Fp64Plan::ImplBase {
     host_sb_.resize(num_rows);
     host_sc_.resize(num_rows);
 
-    if (cudaMallocHost(&host_c_, num_rows * sizeof(ElementC *)) != cudaSuccess ||
-        cudaMallocHost(&host_a_pinned_, num_rows * sizeof(ElementA const *)) != cudaSuccess) {
-      throw std::runtime_error("Sm90Fp64Plan: pinned allocation failed");
-    }
-
     for (int j = 0; j < num_rows; ++j) {
       int const row_M = B;
       host_problem_[j] = UnderlyingProblemShape(row_M, V, rows[j].K);
       host_a_[j] = a_data ? static_cast<ElementA const *>(a_data + rows[j].a_off) : nullptr;
-      host_a_pinned_[j] = host_a_[j];
       host_b_[j] = static_cast<ElementB const *>(b_data + rows[j].b_off);
       if constexpr (Composed) {
         long long const ms = rows[j].m_stride != 0 ? rows[j].m_stride : lda;
@@ -281,34 +276,22 @@ class PlanImpl : public Sm90Fp64Plan::ImplBase {
     }
   }
 
-  ~PlanImpl() override {
-    if (host_c_) cudaFreeHost(host_c_);
-    if (host_a_pinned_) cudaFreeHost(host_a_pinned_);
-  }
+  ~PlanImpl() override = default;
 
   void bind_a(double const *a_base, cudaStream_t stream) override {
     auto const *pa = static_cast<ElementA const *>(a_base);
     if (pa == last_a_base_) return;
+    if (pointers_.input(pa, d_a_.as<double *>(), stream) != cudaSuccess)
+      throw std::runtime_error("Sm90Fp64Plan: input pointer update failed");
     last_a_base_ = pa;
-    for (int j = 0; j < num_rows_; ++j) {
-      host_a_pinned_[j] = pa + rows_[j].a_off;
-    }
-    cudaMemcpyAsync(d_a_.as<ElementA const *>(), host_a_pinned_,
-                    num_rows_ * sizeof(ElementA const *), cudaMemcpyHostToDevice, stream);
     a_bound_ = true;
   }
 
   int launch(double *out, cudaStream_t stream) override {
     if (!a_bound_) return static_cast<int>(cutlass::Status::kErrorInternal);
 
-    for (int j = 0; j < num_rows_; ++j) {
-      host_c_[j] = out + (rows_[j].c_off >= 0 ? rows_[j].c_off
-                                               : static_cast<long long>(j) * c_col_stride_);
-    }
-    cudaMemcpyAsync(d_c_.as<ElementC *>(), host_c_, num_rows_ * sizeof(ElementC *),
-                    cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(d_cc_.as<ElementC const *>(), host_c_, num_rows_ * sizeof(ElementC *),
-                    cudaMemcpyHostToDevice, stream);
+    if (pointers_.output(out, d_c_.as<ElementC *>(), d_cc_.as<ElementC const *>(), stream)
+        != cudaSuccess) return static_cast<int>(cutlass::Status::kErrorInternal);
 
     typename Gemm::Arguments args = make_arguments(d_cc_.as<ElementC const *>(),
                                                    d_c_.as<ElementC *>(), u_, m_max_);
@@ -366,13 +349,10 @@ class PlanImpl : public Sm90Fp64Plan::ImplBase {
   }
 
   int num_rows_ = 0;
-  long long ldc_ = 0;
-  long long c_col_stride_ = 0;
   int u_ = 0;
   int m_max_ = 1;
   RasterOrderOptions raster_ = RasterOrderOptions::AlongN;  // measured (see parse_scheduler_env)
   int max_swizzle_ = 1;
-  std::vector<RowPlan> rows_;
   bool a_bound_ = false;
   ElementA const *last_a_base_ = nullptr;
 
@@ -382,8 +362,7 @@ class PlanImpl : public Sm90Fp64Plan::ImplBase {
   std::vector<InternalStrideA> host_sa_;
   std::vector<InternalStrideB> host_sb_;
   std::vector<InternalStrideC> host_sc_;
-  ElementC **host_c_ = nullptr;              // pinned
-  ElementA const **host_a_pinned_ = nullptr; // pinned
+  PointerTable<double> pointers_;
 
   DeviceBuffer d_problem_, d_a_, d_b_, d_c_, d_cc_, d_sa_, d_sb_, d_sc_, d_sd_, d_workspace_;
   std::unique_ptr<Gemm> op_;

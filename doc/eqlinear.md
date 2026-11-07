@@ -28,19 +28,44 @@ required. FP64 inputs always use the FP64 kernel.
   (CUTLASS 2.x SM80 tf32x3); backward uses dgrad B1.
 - FP32: impl 3 (`kFused`); backward uses dgrad B1.
 - FP64: impl 6 (`kAuto4`); backward uses dgrad B1. The FP64 source line's production entry impl 5
-  (`kAuto3`) and the other auto variants were measured to produce wrong output on the 17-path
-  `LARGE_P3` case in the vendored build; impl 6 is bit-correct on all 25 measured points and is
-  the fastest correct variant (25-point forward 3.95 ms in this integration).
+  (`kAuto3`) and the other auto variants produced wrong output on the 17-path
+  `LARGE_P3` case in the vendored build; impl 6 is retained because it passes the supported
+  forward and grad_x accuracy checks.
 
-The backends do not read `EQLIN_*` environment variables; the measured defaults are compiled in.
+The backends do not read runtime `EQLIN_*` or `FASTEQ_EQLINEAR_*` environment variables.
+TF32 impl 0 reads the activation directly when each output row has one input path;
+rows with multiple paths use the packed activation. Impl 5 retains its in-kernel split
+activation view, and K-concatenated variants retain their packed path. These defaults
+are compiled in. Tests exercise both the one-path view and the multi-path fallback
+through their geometry; no runtime test switch is exposed.
 Prepared plans are cached per weight tensor (identity + `_version`), shape and stream, so
 `prepare_weight` is hoisted out of the steady-state call. `eqlinear_clear_plan_cache()` clears the
 cache; `eqlinear_set_plan_cache(max_bytes)` sets its budget (0 disables caching).
+
+Destroying a prepared plan explicitly waits for preceding work on its creation device
+before freeing its pointer tables, prepared operands and workspaces. This protects
+already queued forward and grad_x calls, including calls on non-default streams.
+Destruction and cache eviction can therefore wait for other work on that device;
+the same lifetime owner covers one-shot calls. Each entry selects the tensor/plan device
+and restores the caller's current device. Inputs and outputs must belong to the plan device.
+Independent streams use independent handles; concurrent unsynchronized runs sharing one
+handle's mutable workspace are unsupported. Cleanup errors are reported without throwing
+from destructors; if completion cannot be established, resources are retained until process exit.
+
+Geometry caching accepts the canonical cuEquivariance descriptor, operand and Path classes
+with immutable tuple segments and ordinary integer dimension sets. Every lookup retrieves
+the current dimension dict and checks its identity and values. Dict replacement, structural
+changes and unsupported types use full parsing. Coefficient-only changes can reuse validated
+geometry when dimensions remain identical; coefficients are still read for each call.
+If the canonical classes cannot be imported, geometry caching is disabled.
 
 ## Shape contract
 
 - `x` is `[B, sum(i_dims)*U]` and is viewed as `[B, sum(i_dims), U]`.
 - `w` contains `P*U*V` elements and is viewed as `[P, U, V]`.
+- The flat no-grad fast path requires both `x` and `w` to be contiguous. Non-contiguous
+  weights use the 3D `reshape().contiguous()` fallback, which prepares a contiguous copy.
+  Plan keys use the original weight's actual shape/stride, identity and version.
 - `out` is `[B, J*V]` with `J = out_total_i(i_dims)` (run-length grouping of equal i).
 - TF32/FP32 require `B, V, I*U, P*U, J*V` to be multiples of 4; FP64 requires multiples of 2.
 - FP32 `kFused` additionally requires `U == V`, `U % 16 == 0`, and `V in {96, 128, 224}`.
@@ -53,10 +78,11 @@ CUTLASS is a submodule under `3rdparty/cutlass`, pinned to
 `0b55a2f691d69981583568fd9eb69687b1f0de8a` (v4.8.0-3). Build with:
 
 ```bash
-# uv-created venvs do not ship pip:
-FASTEQ_BACKEND=cuda uv pip install --python /path/to/venv/bin/python -e . --no-build-isolation
-# or, in a venv that has pip:
-FASTEQ_BACKEND=cuda python -m pip install -e . --no-build-isolation
+export TMPDIR=/app/work/fasteq-pub/tmp_dev
+export CUDA_CACHE_PATH=/app/work/fasteq-pub/tmp_dev/cuda_cache
+FASTEQ_BACKEND=cuda timeout --signal=INT --kill-after=10s 600s \
+  uv pip install --python /app/work/fasteq_venv/bin/python \
+  --no-build-isolation --no-deps --reinstall -e .
 ```
 
 The build produces `_cuda.so` plus `libfasteq_eqlinear_{tf32,fp32,fp64}.so`; `fasteq.cuda`
@@ -65,5 +91,26 @@ preloads the companion libraries before loading `_cuda.so`.
 ## Tests
 
 ```bash
-python -m pytest test/test_eqlinear.py -q
+/app/work/fasteq_venv/bin/python -m pytest -q \
+  test/test_eqlinear.py test/test_eqlinear_real_descriptor.py \
+  test/test_eqlinear_descriptor_mutation.py test/test_eqlinear_lifetime.py \
+  test/test_eqlinear_weight_layout.py test/test_eqlinear_benchmark_io.py
 ```
+
+Use the existing editable environment for later rebuilds; do not create a new environment
+for each version. On a shared GPU machine, choose an idle device before tests and wrap
+pytest, compare and smoke runs with appropriate timeouts.
+
+## Performance interpretation
+
+The retained implementation uses the P14 host fast paths with the P27 correctness fixes.
+The merge accepts a three-percentage-point tolerance for improvement targets (or 3%
+relative latency/overhead where applicable), as authorized by the user. P29's strict
+spread and cross-round stability checks failed; acceptance does not mean the measurements
+became stable. Code is unchanged and performance is inherited from P29, not a new scan.
+
+The original CUDA f32 operator is one-pass TF32; this implementation uses tf32x3 by default
+and a separate strict FP32 path. Original/public/prepared timings therefore describe
+both API overhead and different arithmetic work, not same-precision speedups. Raw and
+tolerance-adjusted results, the original CUDA gap, and queued baseline limitations are
+recorded in [the merge report](eqlinear_merge_report.md).

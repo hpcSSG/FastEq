@@ -51,6 +51,8 @@ const EqLinearBackendApi* api_for(int64_t precision) {
 struct Handle {
   const EqLinearBackendApi* api = nullptr;
   int64_t precision = 0;
+  int64_t batch = 0, input_rows = 0, u = 0, output_rows = 0, v = 0;
+  int device_index = -1;
   void* forward_plan = nullptr;
   void* dgrad_plan = nullptr;
   EqLinearPlanInfo forward_info;
@@ -87,8 +89,15 @@ int64_t register_handle(std::shared_ptr<Handle> handle) {
 }
 
 void erase_handle(int64_t id) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  g_handles.erase(id);
+  std::shared_ptr<Handle> retired;
+  {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    auto it = g_handles.find(id);
+    if (it == g_handles.end()) return;
+    retired = std::move(it->second);
+    g_handles.erase(it);
+  }
+  // The last reference may synchronize the device; never hold the registry lock here.
 }
 
 int32_t sum_i_dims(const std::vector<int64_t>& i_dims) {
@@ -197,6 +206,7 @@ torch::Tensor forward_impl(const torch::Tensor& x, const torch::Tensor& w,
   TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
   TORCH_CHECK(x.device() == w.device(), "eqlinear: x and w must be on the same device");
   TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
+  const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
 
   const int64_t B = x.size(0);
@@ -243,6 +253,7 @@ torch::Tensor dgrad_impl(const torch::Tensor& dy, const torch::Tensor& w,
   TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
   TORCH_CHECK(dy.device() == w.device(), "eqlinear: dy and w must be on the same device");
   TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
+  const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
 
   const int64_t B = dy.size(0);
@@ -291,6 +302,7 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   TORCH_CHECK(w.size(0) == P && w.size(1) == U && w.size(2) == V,
               "eqlinear: w shape does not match P,U,V");
   TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
+  const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
   check_alignment(w, "w");
 
@@ -301,6 +313,12 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   auto handle = std::make_shared<Handle>();
   handle->api = api;
   handle->precision = precision;
+  handle->batch = problem.B;
+  handle->input_rows = problem.I;
+  handle->u = problem.U;
+  handle->output_rows = problem.J;
+  handle->v = problem.V;
+  handle->device_index = w.get_device();
   const int rc = api->forward_create(&problem, w.data_ptr(), cg.data(),
                                      c10::cuda::getCurrentCUDAStream().stream(),
                                      &handle->forward_plan, &handle->forward_info);
@@ -316,8 +334,34 @@ void forward_run(int64_t handle, const torch::Tensor& x, const torch::Tensor& ou
   check_dtype(x, h->precision, "x");
   check_dtype(out, h->precision, "out");
   TORCH_CHECK(x.dim() == 3 && out.dim() == 3, "eqlinear: x/out must be 3-D");
+  TORCH_CHECK(x.get_device() == h->device_index &&
+                  out.get_device() == h->device_index,
+              "eqlinear: x/out must be on the plan device");
   check_alignment(x, "x");
   check_alignment(out, "out");
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const int rc = h->api->forward_run(h->forward_plan, x.data_ptr(), out.data_ptr(),
+                                     c10::cuda::getCurrentCUDAStream().stream());
+  TORCH_CHECK(rc == 0, h->api->status_string(rc));
+}
+
+void forward_run_flat(int64_t handle, const torch::Tensor& x, const torch::Tensor& out) {
+  auto h = find_handle(handle);
+  TORCH_CHECK(h->forward_plan != nullptr, "eqlinear: handle has no forward plan");
+  check_contiguous_cuda(x, "x");
+  check_contiguous_cuda(out, "out");
+  check_dtype(x, h->precision, "x");
+  check_dtype(out, h->precision, "out");
+  TORCH_CHECK(x.dim() == 2 && out.dim() == 2, "eqlinear: x/out must be 2-D");
+  TORCH_CHECK(x.get_device() == h->device_index && out.get_device() == h->device_index,
+              "eqlinear: x/out must be on the plan device");
+  TORCH_CHECK(x.size(0) == h->batch && x.size(1) == h->input_rows * h->u,
+              "eqlinear: flat x shape does not match the plan");
+  TORCH_CHECK(out.size(0) == h->batch && out.size(1) == h->output_rows * h->v,
+              "eqlinear: flat out shape does not match the plan");
+  check_alignment(x, "x");
+  check_alignment(out, "out");
+  const c10::cuda::CUDAGuard device_guard(x.device());
   const int rc = h->api->forward_run(h->forward_plan, x.data_ptr(), out.data_ptr(),
                                      c10::cuda::getCurrentCUDAStream().stream());
   TORCH_CHECK(rc == 0, h->api->status_string(rc));
@@ -342,6 +386,7 @@ int64_t dgrad_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
   TORCH_CHECK(w.size(0) == P && w.size(1) == U && w.size(2) == V,
               "eqlinear: w shape does not match P,U,V");
   TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
+  const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
   check_alignment(w, "w");
 
@@ -352,6 +397,12 @@ int64_t dgrad_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
   auto handle = std::make_shared<Handle>();
   handle->api = api;
   handle->precision = precision;
+  handle->batch = problem.B;
+  handle->input_rows = problem.I;
+  handle->u = problem.U;
+  handle->output_rows = problem.J;
+  handle->v = problem.V;
+  handle->device_index = w.get_device();
   const int rc = api->dgrad_create(&problem, w.data_ptr(), cg.data(),
                                    c10::cuda::getCurrentCUDAStream().stream(),
                                    &handle->dgrad_plan, &handle->dgrad_info);
@@ -367,8 +418,12 @@ void dgrad_run(int64_t handle, const torch::Tensor& dy, const torch::Tensor& dx)
   check_dtype(dy, h->precision, "dy");
   check_dtype(dx, h->precision, "dx");
   TORCH_CHECK(dy.dim() == 3 && dx.dim() == 3, "eqlinear: dy/dx must be 3-D");
+  TORCH_CHECK(dy.get_device() == h->device_index &&
+                  dx.get_device() == h->device_index,
+              "eqlinear: dy/dx must be on the plan device");
   check_alignment(dy, "dy");
   check_alignment(dx, "dx");
+  const c10::cuda::CUDAGuard device_guard(dy.device());
   const int rc = h->api->dgrad_run(h->dgrad_plan, dy.data_ptr(), dx.data_ptr(),
                                    c10::cuda::getCurrentCUDAStream().stream());
   TORCH_CHECK(rc == 0, h->api->status_string(rc));
@@ -403,6 +458,7 @@ TORCH_LIBRARY(eqlinear, m) {
   m.def("dgrad", &dgrad);
   m.def("forward_create", &forward_create);
   m.def("forward_run", &forward_run);
+  m.def("forward_run_flat", &forward_run_flat);
   m.def("forward_destroy", &forward_destroy);
   m.def("forward_plan_info", &forward_plan_info);
   m.def("dgrad_create", &dgrad_create);
