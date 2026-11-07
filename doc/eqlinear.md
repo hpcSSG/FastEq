@@ -6,7 +6,7 @@ CUTLASS-backed eqlinear forward and grad_x. The public Python entry point is unc
 from fasteq.ops.so3_linear import fast_equi_linear
 
 out = fast_equi_linear(descriptor, w, x)                 # FP32 -> tf32x3 by default
-out = fast_equi_linear(descriptor, w, x, compute_precision="fp32")  # exact FP32
+out = fast_equi_linear(descriptor, w, x, compute_precision="fp32")  # strict FP32
 out = fast_equi_linear(descriptor, w, x, compute_precision="tf32")  # explicit tf32x3
 ```
 
@@ -19,7 +19,7 @@ out = fast_equi_linear(descriptor, w, x, compute_precision="tf32")  # explicit t
 | float32 / float32 | `"fp32"` | FP32 CUDA-core FFMA |
 | mixed / fp16 / bf16 / other | any | `ValueError` |
 
-FP32 inputs default to tf32x3; pass `compute_precision="fp32"` when exact FP32 numerics are
+FP32 inputs default to tf32x3; pass `compute_precision="fp32"` when strict FP32 numerics are
 required. FP64 inputs always use the FP64 kernel.
 
 ## Frozen backends
