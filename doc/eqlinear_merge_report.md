@@ -4,7 +4,7 @@
 
 按用户2026-11-07确认的决定，**接受±3%性能容差及已知稳定性风险**，以干净文件集合合入
 `xjw/dev_eqlinear`。代码合入点为`a9feaa1309be7a499b35bde6138050e08cc4c58f`，从`229a1ce`
-fast-forward而来；没有把prep的64个实验提交带入目标历史。push实际结果在本报告末尾记录。
+fast-forward而来；没有把prep的64个实验提交带入目标历史。正常push已成功，实绩在本报告末尾记录。
 
 生产代码与P14/P27最终实现保持字节一致，**代码未改，性能沿用P29**，没有伪造新的稳定扫描。
 P29严格spread/跨轮门禁仍失败；本次是用户接受容差及风险后的合入，不是宣称旧严格门禁全部通过。
@@ -176,8 +176,14 @@ CUDA_VISIBLE_DEVICES=7 timeout --signal=INT --kill-after=5s 60s \
 timeout120s。实际日志、原始compare、精度receipt、源码/DSO manifest和最终远端核验在
 `/app/work/fasteq-pub/tmp_dev/eqlinear_merge`及上述fresh accuracy目录。
 
-正常push命令为`git push origin xjw/dev_eqlinear`；此版已完成本地合入与验收，
-远端push实绩在执行后补记，不把计划视为成功。
+正常push已成功：`git push origin xjw/dev_eqlinear`返回0，远端从`229a1ce`更新到
+`136bef88ae5a445eaeeaf2517c6200cfb384a578`（验收报告提交）。随后`git ls-remote origin refs/heads/xjw/dev_eqlinear`
+返回同一完整SHA，与当时本地HEAD一致。确认时间：2026-11-07T06:32:24.586848+00:00。
+未force push，未改origin/main，也未推送prep实验历史。
+
+本push实绩补记以单独文档提交同步；最终报告提交的准确HEAD与远端一致性，另由
+`tmp_dev/eqlinear_merge/completion_audit.json`在最后一次正常push后记录。
+可用`git log -1`和`git ls-remote origin refs/heads/xjw/dev_eqlinear`再次核对。
 
 ## 未合入的历史与过程数据
 
