@@ -1,146 +1,74 @@
 // C ABI adapter for the TF32 (tf32x3 tensor-core) eqlinear backend.
 //
-// The frozen dispatch rule is the measured best from the TF32 line:
+// Frozen dispatch rule (measured best from the TF32 line):
 //   * four-path, small-batch, narrow-N shapes: impl 0 (CUTLASS 2.x SM80 tf32x3)
 //   * everything else:                        impl 5 (SM90 RS tf32x3)
 // Backward is always the dgrad-only B1 path.
 
-#include <exception>
+#include <memory>
 #include <vector>
 
+#include "backend_adapter.h"
 #include "bwd.h"
 #include "eqlinear.h"
 #include "eqlinear_backend_api.h"
-#include "device_lifetime.h"
 
 namespace {
 
 using fasteq::eqlinear::EqLinearBackendApi;
-using fasteq::eqlinear::EqLinearPlanInfo;
 using fasteq::eqlinear::EqLinearProblemC;
-using fasteq::eqlinear::Status;
 
-using ForwardPlan = fasteq::eqlinear::DeviceOwner<eqlin::Runner>;
+struct Tf32Traits {
+  using Scalar = float;
+  using ForwardRunner = eqlin::Runner;
+  using DgradRunner = eqlin::DgradRunner;
 
-using DgradPlan = fasteq::eqlinear::DeviceOwner<eqlin::DgradRunner>;
+  static constexpr int kPrecision = 0;
+  static constexpr int kDgradImpl = static_cast<int>(eqlin::BwdImpl::kB1);
+  static constexpr char const *kStatusMessages[5] = {
+      "eqlinear tf32: ok", "eqlinear tf32: unsupported configuration",
+      "eqlinear tf32: invalid argument", "eqlinear tf32: CUDA error",
+      "eqlinear tf32: internal error"};
 
-eqlin::Impl select_forward_impl(const EqLinearProblemC& p) {
-  if (p.P == 4 && p.B <= 1024 && p.V <= 128) {
-    return eqlin::Impl::k3xTF32;
+  static eqlin::Impl select_impl(EqLinearProblemC const &p) {
+    if (p.P == 4 && p.B <= 1024 && p.V <= 128) return eqlin::Impl::k3xTF32;
+    return eqlin::Impl::kSm90_3xTF32RegSplit;
   }
-  return eqlin::Impl::kSm90_3xTF32RegSplit;
-}
 
-int forward_create(const EqLinearProblemC* problem, const void* w, const double* cg,
-                   cudaStream_t stream, void** plan, EqLinearPlanInfo* info) {
-  if (problem == nullptr || w == nullptr || plan == nullptr || info == nullptr) {
-    return static_cast<int>(Status::kInvalidArgument);
+  static std::unique_ptr<ForwardRunner> make_forward(EqLinearProblemC const &p,
+                                                     std::vector<int> const &dims, void const *,
+                                                     double const *) {
+    return std::make_unique<ForwardRunner>(p.B, p.I, p.U, p.P, p.V, dims, select_impl(p));
   }
-  *plan = nullptr;
-  try {
-    std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
-    const auto impl = select_forward_impl(*problem);
-    auto owner = std::make_unique<ForwardPlan>();
-    owner->runner = std::make_unique<eqlin::Runner>(problem->B, problem->I, problem->U, problem->P, problem->V,
-                                    i_dims, impl);
-    auto* runner = owner->runner.get();
-    const int rc = runner->prepare_weight(static_cast<const float*>(w), cg, stream);
-    if (rc != 0) {
-      return rc;
-    }
-    info->precision = 0;
-    info->forward_impl = static_cast<int>(impl);
-    info->dgrad_impl = static_cast<int>(eqlin::BwdImpl::kB1);
-    info->a_view = runner->a_view() ? 1 : 0;
-    info->j_rows = runner->j_rows();
-    *plan = owner.release();
-    return 0;
-  } catch (const std::exception&) {
-    return static_cast<int>(Status::kInvalidArgument);
-  }
-}
 
-int forward_run(void* plan, const void* x, void* out, cudaStream_t stream) {
-  if (plan == nullptr || x == nullptr || out == nullptr) {
-    return static_cast<int>(Status::kInvalidArgument);
+  static int forward_impl(EqLinearProblemC const &p) {
+    return static_cast<int>(select_impl(p));
   }
-  auto* p = static_cast<ForwardPlan*>(plan);
-  const int prep = p->runner->prepare_act(static_cast<const float*>(x), stream);
-  if (prep != 0) {
-    return prep;
+
+  static bool a_view(ForwardRunner const &runner) { return runner.a_view(); }
+
+  static int forward_run(ForwardRunner &runner, void const *x, void *out, cudaStream_t stream) {
+    const int rc = runner.prepare_act(static_cast<Scalar const *>(x), stream);
+    if (rc != 0) return rc;
+    return runner.run(static_cast<Scalar *>(out), stream);
   }
-  return p->runner->run(static_cast<float*>(out), stream);
-}
 
-void forward_destroy(void* plan) {
-  delete static_cast<ForwardPlan*>(plan);
-}
-
-int dgrad_create(const EqLinearProblemC* problem, const void* w, const double* cg,
-                 cudaStream_t stream, void** plan, EqLinearPlanInfo* info) {
-  if (problem == nullptr || w == nullptr || plan == nullptr || info == nullptr) {
-    return static_cast<int>(Status::kInvalidArgument);
+  static std::unique_ptr<DgradRunner> make_dgrad(EqLinearProblemC const &p,
+                                                 std::vector<int> const &dims, void const *w,
+                                                 double const *cg, cudaStream_t stream) {
+    return std::make_unique<DgradRunner>(p.B, p.I, p.U, p.P, p.V, dims, eqlin::BwdImpl::kB1,
+                                         static_cast<Scalar const *>(w), cg, stream);
   }
-  *plan = nullptr;
-  try {
-    std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
-    auto owner = std::make_unique<DgradPlan>();
-    owner->runner = std::make_unique<eqlin::DgradRunner>(
-        problem->B, problem->I, problem->U, problem->P, problem->V, i_dims,
-        eqlin::BwdImpl::kB1, static_cast<const float*>(w), cg, stream);
-    info->precision = 0;
-    info->forward_impl = -1;
-    info->dgrad_impl = static_cast<int>(eqlin::BwdImpl::kB1);
-    info->a_view = 0;
-    info->j_rows = eqlin::out_total_i(i_dims);
-    *plan = owner.release();
-    return 0;
-  } catch (const std::exception&) {
-    return static_cast<int>(Status::kInvalidArgument);
+
+  static int dgrad_run(DgradRunner &runner, void const *dy, void *dx, cudaStream_t stream) {
+    return runner.run(static_cast<Scalar const *>(dy), static_cast<Scalar *>(dx), stream);
   }
-}
 
-int dgrad_run(void* plan, const void* dy, void* dx, cudaStream_t stream) {
-  if (plan == nullptr || dy == nullptr || dx == nullptr) {
-    return static_cast<int>(Status::kInvalidArgument);
-  }
-  auto* p = static_cast<DgradPlan*>(plan);
-  return p->runner->run(static_cast<const float*>(dy), static_cast<float*>(dx), stream);
-}
-
-void dgrad_destroy(void* plan) {
-  delete static_cast<DgradPlan*>(plan);
-}
-
-const char* status_string(int code) {
-  switch (code) {
-    case static_cast<int>(Status::kOk):
-      return "eqlinear tf32: ok";
-    case static_cast<int>(Status::kUnsupported):
-      return "eqlinear tf32: unsupported configuration";
-    case static_cast<int>(Status::kInvalidArgument):
-      return "eqlinear tf32: invalid argument";
-    case static_cast<int>(Status::kCudaError):
-      return "eqlinear tf32: CUDA error";
-    case static_cast<int>(Status::kInternalError):
-      return "eqlinear tf32: internal error";
-    default:
-      return eqlin::status_string(code);
-  }
-}
-
-const EqLinearBackendApi kApi = {
-    fasteq::eqlinear::kEqLinearAbiVersion,
-    0,
-    &forward_create,
-    &forward_run,
-    &forward_destroy,
-    &dgrad_create,
-    &dgrad_run,
-    &dgrad_destroy,
-    &status_string,
+  static char const *backend_status_string(int code) { return eqlin::status_string(code); }
 };
 
 }  // namespace
 
-FASTEQ_EQLINEAR_EXPORT const EqLinearBackendApi* fasteq_eqlinear_tf32_api() { return &kApi; }
+FASTEQ_EQLINEAR_EXPORT const EqLinearBackendApi *fasteq_eqlinear_tf32_api() {
+  return &fasteq::eqlinear::BackendAdapter<Tf32Traits>::api();
+}
