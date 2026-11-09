@@ -53,18 +53,18 @@ function(fasteq_eqlinear_backend name)
 endfunction()
 
 # ---- TF32 -------------------------------------------------------------------------------------
-set(EQLINEAR_TF32_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tf32")
+set(EQLINEAR_TF32_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backends/tf32")
 fasteq_eqlinear_backend(tf32
   ARCH "90a-real;90a-virtual"
   SOURCES
-    "${EQLINEAR_TF32_DIR}/tf32_api.cpp"
+    "${EQLINEAR_TF32_DIR}/api.cpp"
     "${EQLINEAR_TF32_DIR}/runner.cu"
     "${EQLINEAR_TF32_DIR}/bwd.cu"
     "${EQLINEAR_TF32_DIR}/transpose_kt.cu"
     "${EQLINEAR_TF32_DIR}/reduce_dw.cu"
     "${EQLINEAR_TF32_DIR}/reduce_fwd.cu"
-    "${EQLINEAR_TF32_DIR}/grouped_gemm.cu"
-    "${EQLINEAR_TF32_DIR}/sm90_grouped_gemm.cu"
+    "${EQLINEAR_TF32_DIR}/grouped_gemm_tf32.cu"
+    "${EQLINEAR_TF32_DIR}/sm90_grouped_gemm_tf32.cu"
     "${EQLINEAR_TF32_DIR}/split_k_plan.cu"
     "${EQLINEAR_TF32_DIR}/split_pack.cu"
     "${EQLINEAR_TF32_DIR}/prep_kernels.cu"
@@ -77,11 +77,11 @@ fasteq_eqlinear_backend(tf32
 )
 
 # ---- FP32 -------------------------------------------------------------------------------------
-set(EQLINEAR_FP32_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fp32")
+set(EQLINEAR_FP32_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backends/fp32")
 fasteq_eqlinear_backend(fp32
   ARCH "90a-real;90a-virtual"
   SOURCES
-    "${EQLINEAR_FP32_DIR}/fp32_api.cpp"
+    "${EQLINEAR_FP32_DIR}/api.cpp"
     "${EQLINEAR_FP32_DIR}/runner.cu"
     "${EQLINEAR_FP32_DIR}/grouped_gemm_fp32.cu"
     "${EQLINEAR_FP32_DIR}/simt_gemm.cu"
@@ -97,17 +97,17 @@ fasteq_eqlinear_backend(fp32
 )
 
 # ---- FP64 -------------------------------------------------------------------------------------
-set(EQLINEAR_FP64_DIR "${CMAKE_CURRENT_SOURCE_DIR}/fp64")
+set(EQLINEAR_FP64_DIR "${CMAKE_CURRENT_SOURCE_DIR}/backends/fp64")
 fasteq_eqlinear_backend(fp64
   ARCH "90a-real"
   SOURCES
-    "${EQLINEAR_FP64_DIR}/fp64_api.cpp"
+    "${EQLINEAR_FP64_DIR}/api.cpp"
     "${EQLINEAR_FP64_DIR}/runner.cu"
     "${EQLINEAR_FP64_DIR}/bwd.cu"
     "${EQLINEAR_FP64_DIR}/grouped_gemm_f64.cu"
     "${EQLINEAR_FP64_DIR}/direct_gemm_f64.cu"
     "${EQLINEAR_FP64_DIR}/direct_gemm_f64_tma.cu"
-    "${EQLINEAR_FP64_DIR}/sm90_fp64_grouped_gemm.cu"
+    "${EQLINEAR_FP64_DIR}/sm90_grouped_gemm_fp64.cu"
     "${EQLINEAR_FP64_DIR}/prep_kernels.cu"
     "${EQLINEAR_FP64_DIR}/group_table.cu"
   DEFINES
