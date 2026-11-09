@@ -60,13 +60,9 @@ fasteq_eqlinear_backend(tf32
   SOURCES
     "${EQLINEAR_TF32_DIR}/api.cpp"
     "${EQLINEAR_TF32_DIR}/runner.cu"
-    "${EQLINEAR_TF32_DIR}/bwd.cu"
-    "${EQLINEAR_TF32_DIR}/transpose_kt.cu"
-    "${EQLINEAR_TF32_DIR}/reduce_dw.cu"
-    "${EQLINEAR_TF32_DIR}/reduce_fwd.cu"
+    "${EQLINEAR_TF32_DIR}/dgrad.cu"
     "${EQLINEAR_TF32_DIR}/grouped_gemm_tf32.cu"
     "${EQLINEAR_TF32_DIR}/sm90_grouped_gemm_tf32.cu"
-    "${EQLINEAR_TF32_DIR}/split_k_plan.cu"
     "${EQLINEAR_TF32_DIR}/split_pack.cu"
     "${EQLINEAR_COMMON_DIR}/eqlinear_prep_kernels.cu"
   DEFINES
@@ -102,7 +98,7 @@ fasteq_eqlinear_backend(fp64
   SOURCES
     "${EQLINEAR_FP64_DIR}/api.cpp"
     "${EQLINEAR_FP64_DIR}/runner.cu"
-    "${EQLINEAR_FP64_DIR}/bwd.cu"
+    "${EQLINEAR_FP64_DIR}/dgrad.cu"
     "${EQLINEAR_FP64_DIR}/grouped_gemm_f64.cu"
     "${EQLINEAR_FP64_DIR}/direct_gemm_f64.cu"
     "${EQLINEAR_FP64_DIR}/direct_gemm_f64_tma.cu"

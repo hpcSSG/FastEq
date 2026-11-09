@@ -112,7 +112,6 @@ __global__ void pack_b_split_kernel(float const *__restrict__ w,
 /// x-extent is capped and the kernels grid-stride over the columns.
 inline dim3 grid_for(int cols, int rows) {
   int cap = kPrepBlocksX;
-  if (char const *e = nullptr) cap = atoi(e);
   int blocks = (cols + kThreads - 1) / kThreads;
   if (blocks > cap) blocks = cap;
   if (blocks < 1) blocks = 1;

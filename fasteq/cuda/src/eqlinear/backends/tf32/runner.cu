@@ -34,7 +34,6 @@
 #include "prep_kernels.h"
 #include "row_plan.h"
 #include "sm90_grouped_gemm.cuh"
-#include "split_k_plan.h"
 #include "split_pack.h"
 
 namespace eqlin {
@@ -44,11 +43,6 @@ using fasteq::eqlinear::SegmentSpec;
 
 namespace {
 constexpr int kAlign = 4;  // 128-bit accesses; required by the tf32x3 kernels
-
-/// K granularity of one split-K slice: the tf32x3 mainloop's K-tile.  Slices then start on tile
-/// boundaries and hold a whole number of pipeline stages, and the operand offset keeps its 16-byte
-/// alignment (4 fp32 elements == the TMA minimum).
-constexpr int kSplitKUnit = EQLIN_TB_K3;
 }  // namespace
 
 struct Runner::Impl_ {
@@ -217,38 +211,6 @@ struct Runner::Impl_ {
           a_view ? nullptr : static_cast<void const *>(d_a_prep.as<float>()),
           static_cast<void const *>(d_b_prep.as<float>()),
           static_cast<void const *>(d_b_prep_res.as<float>()));
-      // M5-D ablation: `EQLIN_SPLITK_ABLATION=S` splits every row's K into S pieces to measure
-      // what the extra tiles are worth.  **The partials are never summed, so the output is
-      // wrong** -- this knob exists to size the prize before the reduction (impl 6) is written,
-      // and must not be left set.  The split granularity follows the mainloop K-tile so every
-      // slice keeps its 16-byte operand alignment.
-      if (char const *sk = nullptr) {
-        int const splits = atoi(sk);
-        if (splits > 1) {
-          sm90 = std::make_unique<Sm90SplitKPlan>(operands, B, V, J, lda, ldb,
-                                                  a_view ? rows_view : rows,
-                                                  a_view ? nullptr
-                                                         : static_cast<void const *>(d_a_prep.as<float>()),
-                                                  static_cast<void const *>(d_b_prep.as<float>()),
-                                                  static_cast<void const *>(d_b_prep_res.as<float>()),
-                                                  splits, kSplitKUnit);
-        }
-      }
-      // P1: the same expansion, but with the S partials summed, so this one is a correct operator.
-      // It buys precision by shortening the accumulation chain (`3K` -> `3K/S`) and pays for it in
-      // output traffic, which is why it is a knob and not a default.
-      if (char const *sk = nullptr) {
-        int const splits = atoi(sk);
-        if (splits > 1) {
-          sm90 = std::make_unique<Sm90SplitKPlan>(operands, B, V, J, lda, ldb,
-                                                  a_view ? rows_view : rows,
-                                                  a_view ? nullptr
-                                                         : static_cast<void const *>(d_a_prep.as<float>()),
-                                                  static_cast<void const *>(d_b_prep.as<float>()),
-                                                  static_cast<void const *>(d_b_prep_res.as<float>()),
-                                                  splits, kSplitKUnit, /*reduce=*/true);
-        }
-      }
       sm90_plan = std::move(sm90);
     } else {
       plan = std::make_unique<GroupedGemmPlan>(impl, B, V, J, lda, ldb, ldc,

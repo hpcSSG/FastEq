@@ -88,6 +88,16 @@ FASTEQ_BACKEND=cuda timeout --signal=INT --kill-after=10s 600s \
 The build produces `_cuda.so` plus `libfasteq_eqlinear_{tf32,fp32,fp64}.so`; `fasteq.cuda`
 preloads the companion libraries before loading `_cuda.so`.
 
+## Source layout
+
+`fasteq/cuda/src/eqlinear/` keeps the precision backends under `backends/{tf32,fp32,fp64}/` and the
+cross-precision code under `common/`.  Shared pieces are the group table, the A/B packed index
+tables, the float prep kernels (TF32+FP32) and the traits-driven C ABI adapter; each backend keeps
+its own row plan, runner and CUTLASS kernels.  Unreachable wgrad/split-K implementations are
+archived under `experimental/` and are never compiled.  See
+[`fasteq/cuda/src/eqlinear/README.md`](../fasteq/cuda/src/eqlinear/README.md) for the file map and
+the rules for adding shared code.
+
 ## Tests
 
 ```bash

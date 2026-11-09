@@ -43,7 +43,6 @@ __global__ void pack_b_kernel(double const *__restrict__ w,
 
 inline dim3 grid_for(int cols, int rows) {
   int cap = kPrepBlocksX;
-  if (char const *e = nullptr) cap = atoi(e);
   int blocks = (cols + kThreads - 1) / kThreads;
   if (blocks > cap) blocks = cap;
   if (blocks < 1) blocks = 1;
