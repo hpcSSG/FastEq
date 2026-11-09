@@ -38,12 +38,16 @@
 #include "device_buffer.h"
 #include "eqlinear_group_table.h"
 #include "grouped_gemm_fp32.cuh"
+#include "packed_index_tables.h"
 #include "prep_kernels.h"
 #include "reduce_partials.h"
 #include "simt_gemm.cuh"
 #include "row_plan.h"
 
 namespace eqlin_fp32 {
+
+using fasteq::eqlinear::PackedIndexTables;
+using fasteq::eqlinear::SegmentSpec;
 
 namespace {
 constexpr int kAlign = 4;  // keeps every per-row base 16B-aligned; see the ctor comment
@@ -133,70 +137,42 @@ struct Runner::Impl_ {
   }
 
   void build_host_tables() {
-    int const G = table.num_groups();
-
-    h_src_index.assign(static_cast<size_t>(I) * U, 0);
-    h_b_src_base.assign(static_cast<size_t>(P) * U, 0);
-    h_b_p_of_col.assign(static_cast<size_t>(P) * U, 0);
+    PackedIndexTables const packed(table, U, V, SegmentSpec{});
+    h_src_index = packed.src_index();
+    h_b_src_base = packed.b_src_base();
+    h_b_p_of_col = packed.b_p_of_col();
     if (split) {
       h_rbase.assign(J, 0);
       h_pg.assign(J, 1);
     }
 
     rows.clear();
-    long long a_col = 0;
-    long long b_col = 0;
     int rrow = 0;
-
-    // One pass per group so the rows carry both offsets.  A and B column packing is identical to
-    // the single-problem-per-row version; only the row table differs.
-    for (int g = 0; g < G; ++g) {
-      int const i = table.out_i_dims[g];
-      int const m = table.path_count[g];
-      int const K0 = m * U;
-      int const r0 = table.row_start[g];
-      int const p0 = table.path_istart[g];
-
-      for (int t = 0; t < i; ++t) {
-        for (int mm = 0; mm < m; ++mm) {
-          for (int k = 0; k < U; ++k) {
-            long long const col = a_col + static_cast<long long>(t) * K0 + mm * U + k;
-            h_src_index[col] = (r0 + mm * i + t) * U + k;
-          }
-        }
-      }
-      for (int mm = 0; mm < m; ++mm) {
-        for (int k = 0; k < U; ++k) {
-          long long const col = b_col + static_cast<long long>(mm) * U + k;
-          h_b_src_base[col] = static_cast<long long>(p0 + mm) * U * V + static_cast<long long>(k) * V;
-          h_b_p_of_col[col] = p0 + mm;
-        }
-      }
-
+    for (auto const &block : packed.blocks()) {
       if (split) {
         // Rows of one output row share a contiguous run of m problem indices, in path order, so the
         // reduction can read [rbase, rbase+m).
-        for (int t = 0; t < i; ++t) {
-          int const j = table.out_prefix[g] + t;
+        for (int t = 0; t < block.i; ++t) {
+          int const j = block.j0 + t;
           h_rbase[j] = rrow;
-          h_pg[j] = m;
-          for (int mm = 0; mm < m; ++mm) {
-            rows.push_back(RowPlan{U, a_col + static_cast<long long>(t) * K0 + mm * U,
-                                   b_col + static_cast<long long>(mm) * U});
+          h_pg[j] = block.m;
+          for (int mm = 0; mm < block.m; ++mm) {
+            rows.push_back(RowPlan{U, block.a_base + static_cast<long long>(t) * block.K0 + mm * U,
+                                   block.b_base + static_cast<long long>(mm) * U});
           }
-          rrow += m;
+          rrow += block.m;
         }
       } else {
-        for (int t = 0; t < i; ++t) {
-          rows.push_back(RowPlan{K0, a_col + static_cast<long long>(t) * K0, b_col});
+        for (int t = 0; t < block.i; ++t) {
+          rows.push_back(RowPlan{block.K0,
+                                 block.a_base + static_cast<long long>(t) * block.K0,
+                                 block.b_base});
         }
       }
-
-      a_col += static_cast<long long>(i) * K0;
-      b_col += K0;
     }
 
-    if (a_col != static_cast<long long>(I) * U || b_col != static_cast<long long>(P) * U) {
+    if (packed.a_cols() != static_cast<long long>(I) * U ||
+        packed.b_cols() != static_cast<long long>(P) * U) {
       throw std::runtime_error("Runner: packed column count mismatch");
     }
     if (static_cast<int>(rows.size()) != num_rows) {

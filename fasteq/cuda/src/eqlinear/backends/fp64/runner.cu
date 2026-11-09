@@ -26,11 +26,15 @@
 #include "direct_gemm_f64.cuh"
 #include "direct_gemm_f64_tma.cuh"
 #include "grouped_gemm_f64.cuh"
+#include "packed_index_tables.h"
 #include "prep_kernels.h"
 #include "row_plan.h"
 #include "sm90_fp64_grouped_gemm.cuh"
 
 namespace eqlin {
+
+using fasteq::eqlinear::PackedIndexTables;
+using fasteq::eqlinear::SegmentSpec;
 
 namespace {
 /// 16-byte alignment in units of double.  The 2.x FP64 kernel does 8-byte accesses, but the
@@ -234,51 +238,20 @@ struct Runner::Impl_ {
   }
 
   void build_host_tables() {
-    int const G = table.num_groups();
-
-    h_src_index.assign(static_cast<size_t>(I) * U, 0);
-    h_b_src_base.assign(static_cast<size_t>(P) * U, 0);
-    h_b_p_of_col.assign(static_cast<size_t>(P) * U, 0);
+    PackedIndexTables const packed(table, U, V, SegmentSpec{});
+    h_src_index = packed.src_index();
+    h_b_src_base = packed.b_src_base();
+    h_b_p_of_col = packed.b_p_of_col();
     rows.clear();
-
-    // ---- A columns + per-row plan ----
-    long long a_col = 0;
-    for (int g = 0; g < G; ++g) {
-      int const i = table.out_i_dims[g];
-      int const m = table.path_count[g];
-      int const K = m * U;
-      int const r0 = table.row_start[g];
-      for (int t = 0; t < i; ++t) {
-        for (int mm = 0; mm < m; ++mm) {
-          for (int k = 0; k < U; ++k) {
-            long long const col = a_col + static_cast<long long>(t) * K + mm * U + k;
-            h_src_index[col] = (r0 + mm * i + t) * U + k;
-          }
-        }
-        rows.push_back(RowPlan{K, a_col + static_cast<long long>(t) * K, 0});
+    rows.reserve(static_cast<size_t>(J));
+    for (auto const &block : packed.blocks()) {
+      for (int t = 0; t < block.i; ++t) {
+        rows.push_back(RowPlan{block.K, block.a_base + static_cast<long long>(t) * block.K,
+                               block.b_base});
       }
-      a_col += static_cast<long long>(i) * K;
     }
-
-    // ---- B columns (+ row -> group B block) ----
-    long long b_col = 0;
-    for (int g = 0; g < G; ++g) {
-      int const m = table.path_count[g];
-      int const p0 = table.path_istart[g];
-      int const K0 = m * U;
-      for (int mm = 0; mm < m; ++mm) {
-        for (int k = 0; k < U; ++k) {
-          long long const col = b_col + static_cast<long long>(mm) * U + k;
-          h_b_src_base[col] = static_cast<long long>(p0 + mm) * U * V + static_cast<long long>(k) * V;
-          h_b_p_of_col[col] = p0 + mm;
-        }
-      }
-      for (int t = 0; t < table.out_i_dims[g]; ++t) {
-        rows[table.out_prefix[g] + t].b_off = b_col;
-      }
-      b_col += K0;
-    }
-    if (a_col != static_cast<long long>(I) * U || b_col != static_cast<long long>(P) * U) {
+    if (packed.a_cols() != static_cast<long long>(I) * U ||
+        packed.b_cols() != static_cast<long long>(P) * U) {
       throw std::runtime_error("Runner: packed column count mismatch");
     }
   }

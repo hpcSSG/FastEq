@@ -9,6 +9,7 @@ set(EQLINEAR_COMMON_DIR "${CMAKE_CURRENT_SOURCE_DIR}/common")
 
 add_library(eqlinear_common_obj OBJECT
   "${EQLINEAR_COMMON_DIR}/eqlinear_group_table.cpp"
+  "${EQLINEAR_COMMON_DIR}/packed_index_tables.cpp"
 )
 set_target_properties(eqlinear_common_obj PROPERTIES
   POSITION_INDEPENDENT_CODE ON

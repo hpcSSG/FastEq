@@ -30,6 +30,7 @@
 #include "device_buffer.h"
 #include "eqlinear_group_table.h"
 #include "grouped_gemm.cuh"
+#include "packed_index_tables.h"
 #include "prep_kernels.h"
 #include "row_plan.h"
 #include "sm90_grouped_gemm.cuh"
@@ -37,6 +38,9 @@
 #include "split_pack.h"
 
 namespace eqlin {
+
+using fasteq::eqlinear::PackedIndexTables;
+using fasteq::eqlinear::SegmentSpec;
 
 namespace {
 constexpr int kAlign = 4;  // 128-bit accesses; required by the tf32x3 kernels
@@ -143,69 +147,25 @@ struct Runner::Impl_ {
   }
 
   void build_host_tables() {
-    int const G = table.num_groups();
-
-    h_src_index.assign(a_cols, 0);
-    h_b_src_base.assign(b_cols, 0);
-    h_b_p_of_col.assign(b_cols, 0);
+    PackedIndexTables const packed(
+        table, U, V, SegmentSpec{seg, kconcat, kconcat});
+    h_src_index = packed.src_index();
+    h_b_src_base = packed.b_src_base();
+    h_b_p_of_col = packed.b_p_of_col();
     if (kconcat) {
-      h_a_is_res.assign(a_cols, 0);
-      h_b_is_res.assign(b_cols, 0);
+      h_a_is_res = packed.a_is_res();
+      h_b_is_res = packed.b_is_res();
     }
 
     rows.clear();
-
-    // ---- A columns, group by group; also emits the per-row GEMM plan ----
-    long long a_col = 0;
-    for (int g = 0; g < G; ++g) {
-      int const i = table.out_i_dims[g];
-      int const m = table.path_count[g];
-      int const K = static_cast<int>(seg) * m * U;  // K per output row of this group
-      int const K0 = m * U;                         // one segment
-      int const r0 = table.row_start[g];
-      for (int t = 0; t < i; ++t) {
-        for (int s = 0; s < seg; ++s) {
-          for (int mm = 0; mm < m; ++mm) {
-            for (int k = 0; k < U; ++k) {
-              long long const col = a_col + static_cast<long long>(t) * K + s * K0 + mm * U + k;
-              h_src_index[col] = (r0 + mm * i + t) * U + k;
-              if (kconcat) {
-                // segments are [A_big | A_res | A_big]; segment 1 is the residual
-                h_a_is_res[col] = (s == 1) ? 1 : 0;
-              }
-            }
-          }
-        }
-        rows.push_back(RowPlan{static_cast<int>(K), a_col + static_cast<long long>(t) * K, 0});
+    rows.reserve(static_cast<size_t>(J));
+    for (auto const &block : packed.blocks()) {
+      for (int t = 0; t < block.i; ++t) {
+        rows.push_back(RowPlan{block.K, block.a_base + static_cast<long long>(t) * block.K,
+                               block.b_base});
       }
-      a_col += static_cast<long long>(i) * K;
     }
-
-    // ---- B columns (+ row -> group B block) ----
-    long long b_col = 0;
-    for (int g = 0; g < G; ++g) {
-      int const m = table.path_count[g];
-      int const p0 = table.path_istart[g];
-      int const K0 = m * U;
-      for (int s = 0; s < seg; ++s) {
-        for (int mm = 0; mm < m; ++mm) {
-          for (int k = 0; k < U; ++k) {
-            long long const col = b_col + static_cast<long long>(s) * K0 + mm * U + k;
-            h_b_src_base[col] = static_cast<long long>(p0 + mm) * U * V + static_cast<long long>(k) * V;
-            h_b_p_of_col[col] = p0 + mm;
-            if (kconcat) {
-              // segments are [B_big | B_big | B_res]; segment 2 is the residual
-              h_b_is_res[col] = (s == 2) ? 1 : 0;
-            }
-          }
-        }
-      }
-      for (int t = 0; t < table.out_i_dims[g]; ++t) {
-        rows[table.out_prefix[g] + t].b_off = b_col;
-      }
-      b_col += static_cast<long long>(seg) * K0;
-    }
-    if (a_col != a_cols || b_col != b_cols) {
+    if (packed.a_cols() != a_cols || packed.b_cols() != b_cols) {
       throw std::runtime_error("Runner: packed column count mismatch");
     }
   }
