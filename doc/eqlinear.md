@@ -27,10 +27,7 @@ required. FP64 inputs always use the FP64 kernel.
 - TF32: impl 5 (`sm90_3x_rs`) except `P == 4 and B <= 1024 and V <= 128`, which uses impl 0
   (CUTLASS 2.x SM80 tf32x3); backward uses dgrad B1.
 - FP32: impl 3 (`kFused`); backward uses dgrad B1.
-- FP64: impl 6 (`kAuto4`); backward uses dgrad B1. The FP64 source line's production entry impl 5
-  (`kAuto3`) and the other auto variants produced wrong output on the 17-path
-  `LARGE_P3` case in the vendored build; impl 6 is retained because it passes the supported
-  forward and grad_x accuracy checks.
+- FP64: impl 6 (`kAuto4`); backward uses dgrad B1.
 
 The backends do not read runtime `EQLIN_*` or `FASTEQ_EQLINEAR_*` environment variables.
 TF32 impl 0 reads the activation directly when each output row has one input path;
@@ -78,11 +75,8 @@ CUTLASS is a submodule under `3rdparty/cutlass`, pinned to
 `0b55a2f691d69981583568fd9eb69687b1f0de8a` (v4.8.0-3). Build with:
 
 ```bash
-export TMPDIR=/app/work/fasteq-pub/tmp_dev
-export CUDA_CACHE_PATH=/app/work/fasteq-pub/tmp_dev/cuda_cache
-FASTEQ_BACKEND=cuda timeout --signal=INT --kill-after=10s 600s \
-  uv pip install --python /app/work/fasteq_venv/bin/python \
-  --no-build-isolation --no-deps --reinstall -e .
+git submodule update --init 3rdparty/cutlass
+FASTEQ_BACKEND=cuda pip install -e . --no-build-isolation
 ```
 
 The build produces `_cuda.so` plus `libfasteq_eqlinear_{tf32,fp32,fp64}.so`; `fasteq.cuda`
@@ -90,37 +84,31 @@ preloads the companion libraries before loading `_cuda.so`.
 
 ## Source layout
 
-`fasteq/cuda/src/eqlinear/` keeps the precision backends under `backends/{tf32,fp32,fp64}/` and the
-cross-precision code under `common/`.  Shared pieces are the group table, the A/B packed index
-tables, the float prep kernels (TF32+FP32) and the traits-driven C ABI adapter; each backend keeps
-its own row plan, runner and CUTLASS kernels.  Unreachable wgrad/split-K implementations are
-archived under `experimental/` and are never compiled.  See
-[`fasteq/cuda/src/eqlinear/README.md`](../fasteq/cuda/src/eqlinear/README.md) for the file map and
-the rules for adding shared code.
+`fasteq/cuda/src/eqlinear/` contains:
+
+- `common/`: group table, A/B packed index tables, shared TF32/FP32 prep kernels, C ABI adapter
+  and device lifetime helpers;
+- `backends/{tf32,fp32,fp64}/`: per-precision C ABI entry, runner, dgrad, row plan and CUTLASS
+  kernels;
+- `dispatch/`: torch-facing validation, handle registry and the 12 operator definitions.
+
+Each precision builds its own `libfasteq_eqlinear_<precision>.so` with hidden visibility; the
+three CUTLASS forks never share a symbol table.
 
 ## Tests
 
 ```bash
-/app/work/fasteq_venv/bin/python -m pytest -q \
+python -m pytest -q \
   test/test_eqlinear.py test/test_eqlinear_real_descriptor.py \
   test/test_eqlinear_descriptor_mutation.py test/test_eqlinear_lifetime.py \
   test/test_eqlinear_weight_layout.py test/test_eqlinear_benchmark_io.py
 ```
 
-Use the existing editable environment for later rebuilds; do not create a new environment
-for each version. On a shared GPU machine, choose an idle device before tests and wrap
-pytest, compare and smoke runs with appropriate timeouts.
+Run on an idle Hopper (`sm_90a`) GPU.
 
-## Performance interpretation
+## Numerics
 
-The retained implementation uses the P14 host fast paths with the P27 correctness fixes.
-The merge accepts a three-percentage-point tolerance for improvement targets (or 3%
-relative latency/overhead where applicable), as authorized by the user. P29's strict
-spread and cross-round stability checks failed; acceptance does not mean the measurements
-became stable. Code is unchanged and performance is inherited from P29, not a new scan.
-
-The original CUDA f32 operator is one-pass TF32; this implementation uses tf32x3 by default
-and a separate strict FP32 path. Original/public/prepared timings therefore describe
-both API overhead and different arithmetic work, not same-precision speedups. Raw and
-tolerance-adjusted results, the original CUDA gap, and queued baseline limitations are
-recorded in [the merge report](eqlinear_merge_report.md).
+FP64 inputs use the FP64 kernel. FP32 inputs use tf32x3 by default; pass
+`compute_precision="fp32"` for strict FP32 CUDA-core arithmetic, or `"tf32"`/`"tf32x3"` to select
+tf32x3 explicitly. The original CUDA f32 operator is one-pass TF32, so timings against it compare
+different arithmetic work, not same-precision speedups.

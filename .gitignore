@@ -54,9 +54,3 @@ fasteq/hip/src/uniform1d_jit_codegen/
 fasteq/cuda/src/uniform1d_jit_codegen.baseline/
 fasteq/cuda/src/uniform1d_jit_codegen.unroll/
 fasteq/ops/_schedule_stats/
-
-# Generated benchmark report (kept local; test scripts are tracked)
-/doc/fasteq_eqlinear_comparison.md
-
-# Local build caches and benchmark evidence
-/tmp_dev/

@@ -1,9 +1,11 @@
-"""Benchmark fasteq's eqlinear before/after the CUTLASS integration.
+"""Benchmark eqlinear against the direct per-path torch reference.
 
-Run once from the old tree and once from the new tree:
+Run from the pre-integration tree and the current tree:
 
-  cd /app/work/fasteq_before && PYTHONPATH=. python test/bench_fasteq_compare.py --mode before --out before.csv
-  cd /app/work/fasteq-pub    && python test/bench_fasteq_compare.py --mode after  --out after.csv
+  # on the pre-integration checkout
+  PYTHONPATH=. python test/bench_fasteq_compare.py --mode before --out before.csv
+  # on the current checkout
+  python test/bench_fasteq_compare.py --mode after --out after.csv
 
 The torch reference is the direct per-path torch implementation.  FP32/TF32 use
 torch.backends.cuda.matmul.allow_tf32=False; FP64 uses float64.

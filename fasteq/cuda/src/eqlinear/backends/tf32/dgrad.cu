@@ -1,8 +1,7 @@
 /***************************************************************************************************
  * fasteq eqlinear backends/tf32/dgrad.cu
  *
- * Production B1 dgrad (dx) only.  The wgrad and fused dgrad+wgrad implementations are archived
- * under experimental/tf32/bwd.cu and are not compiled.
+ * Production B1 dgrad (dx) only.
  **************************************************************************************************/
 #include "bwd.h"
 

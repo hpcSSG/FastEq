@@ -1,8 +1,7 @@
 /***************************************************************************************************
  * fasteq eqlinear backends/fp64/dgrad.cu
  *
- * Production B1 dgrad (dx) only.  The wgrad implementations are archived under
- * experimental/fp64/bwd.cu and are not compiled.
+ * Production B1 dgrad (dx) only.
  **************************************************************************************************/
 #include "bwd.h"
 
