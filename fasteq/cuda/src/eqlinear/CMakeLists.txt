@@ -68,7 +68,7 @@ fasteq_eqlinear_backend(tf32
     "${EQLINEAR_TF32_DIR}/sm90_grouped_gemm_tf32.cu"
     "${EQLINEAR_TF32_DIR}/split_k_plan.cu"
     "${EQLINEAR_TF32_DIR}/split_pack.cu"
-    "${EQLINEAR_TF32_DIR}/prep_kernels.cu"
+    "${EQLINEAR_COMMON_DIR}/eqlinear_prep_kernels.cu"
   DEFINES
     EQLIN_TB_M=128 EQLIN_TB_N=128 EQLIN_TB_K=32 EQLIN_TB_K3=16
     EQLIN_CLUSTER_N=1 EQLIN_CLUSTER_M=1 EQLIN_PINGPONG=0 EQLIN_STAGES=0 EQLIN_TMA_HINT=0
@@ -87,7 +87,7 @@ fasteq_eqlinear_backend(fp32
     "${EQLINEAR_FP32_DIR}/simt_gemm.cu"
     "${EQLINEAR_FP32_DIR}/tma_desc.cu"
     "${EQLINEAR_FP32_DIR}/reduce_partials.cu"
-    "${EQLINEAR_FP32_DIR}/prep_kernels.cu"
+    "${EQLINEAR_COMMON_DIR}/eqlinear_prep_kernels.cu"
     "${EQLINEAR_FP32_DIR}/bwd.cu"
     "${EQLINEAR_FP32_DIR}/prep_bwd.cu"
     "${EQLINEAR_FP32_DIR}/reduce_dw.cu"
