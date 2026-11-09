@@ -36,7 +36,7 @@
 #include <vector>
 
 #include "device_buffer.h"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "grouped_gemm_fp32.cuh"
 #include "prep_kernels.h"
 #include "reduce_partials.h"
@@ -396,6 +396,5 @@ float const *Runner::b_prep(long long *numel) const {
   return p_->d_b_prep.as<float>();
 }
 
-int out_total_i(std::vector<int> const &i_dims) { return build_group_table(i_dims).out_total_i; }
 
 }  // namespace eqlin_fp32

@@ -7,7 +7,7 @@
 
 #include "device_buffer.h"
 #include "direct_gemm_f64.cuh"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "grouped_gemm_f64.cuh"
 #include "row_plan.h"
 #include "sm90_fp64_grouped_gemm.cuh"

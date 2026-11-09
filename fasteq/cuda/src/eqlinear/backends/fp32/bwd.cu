@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "device_buffer.h"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "prep_bwd.h"
 #include "reduce_dw.h"
 #include "simt_gemm.cuh"

@@ -15,7 +15,13 @@
 
 #include <cuda_runtime.h>
 
+#include "eqlinear_group_table.h"
+
 namespace eqlin_fp32 {
+
+using fasteq::eqlinear::GroupTable;
+using fasteq::eqlinear::build_group_table;
+using fasteq::eqlinear::out_total_i;
 
 /// Backend selection.  Append-only: `impl` is part of the torch op contract, so an id is never
 /// renumbered or reused.
@@ -35,9 +41,6 @@ enum class Impl : int {
                     ///< kernel.  Same numbers as kAuto (same per-path fp32 chains).
                     ///< EQLIN_FP32_FUSED=0 forces the split path for A/B.
 };
-
-/// Number of output rows J: the sum of the distinct run-length-grouped i values.
-int out_total_i(std::vector<int> const &i_dims);
 
 /// Human-readable form of an error code returned by Runner.
 char const *status_string(int code);

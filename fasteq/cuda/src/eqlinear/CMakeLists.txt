@@ -68,7 +68,6 @@ fasteq_eqlinear_backend(tf32
     "${EQLINEAR_TF32_DIR}/split_k_plan.cu"
     "${EQLINEAR_TF32_DIR}/split_pack.cu"
     "${EQLINEAR_TF32_DIR}/prep_kernels.cu"
-    "${EQLINEAR_TF32_DIR}/group_table.cu"
   DEFINES
     EQLIN_TB_M=128 EQLIN_TB_N=128 EQLIN_TB_K=32 EQLIN_TB_K3=16
     EQLIN_CLUSTER_N=1 EQLIN_CLUSTER_M=1 EQLIN_PINGPONG=0 EQLIN_STAGES=0 EQLIN_TMA_HINT=0
@@ -88,7 +87,6 @@ fasteq_eqlinear_backend(fp32
     "${EQLINEAR_FP32_DIR}/tma_desc.cu"
     "${EQLINEAR_FP32_DIR}/reduce_partials.cu"
     "${EQLINEAR_FP32_DIR}/prep_kernels.cu"
-    "${EQLINEAR_FP32_DIR}/group_table.cu"
     "${EQLINEAR_FP32_DIR}/bwd.cu"
     "${EQLINEAR_FP32_DIR}/prep_bwd.cu"
     "${EQLINEAR_FP32_DIR}/reduce_dw.cu"
@@ -109,7 +107,6 @@ fasteq_eqlinear_backend(fp64
     "${EQLINEAR_FP64_DIR}/direct_gemm_f64_tma.cu"
     "${EQLINEAR_FP64_DIR}/sm90_grouped_gemm_fp64.cu"
     "${EQLINEAR_FP64_DIR}/prep_kernels.cu"
-    "${EQLINEAR_FP64_DIR}/group_table.cu"
   DEFINES
     F64_TB_M=64 F64_TB_N=64 F64_TB_K=16 F64_WARP_M=32 F64_WARP_N=32 F64_INS_K=4
     F64_STAGES=4 F64_EPI_COUNT=2

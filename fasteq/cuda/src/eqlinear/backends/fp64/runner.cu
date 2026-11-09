@@ -22,7 +22,7 @@
 #include <vector>
 
 #include "device_buffer.h"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "direct_gemm_f64.cuh"
 #include "direct_gemm_f64_tma.cuh"
 #include "grouped_gemm_f64.cuh"
@@ -419,6 +419,5 @@ bool Runner::a_view() const {
   return p_->a_view || p_->sm90_direct || p_->direct_plan || p_->tma_plan;
 }
 
-int out_total_i(std::vector<int> const &i_dims) { return build_group_table(i_dims).out_total_i; }
 
 }  // namespace eqlin

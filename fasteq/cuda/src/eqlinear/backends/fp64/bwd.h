@@ -5,6 +5,8 @@
 
 #include <cuda_runtime.h>
 
+#include "eqlinear.h"
+
 namespace eqlin {
 
 enum class BwdImpl : int { kB1 = 1, kB2 = 2 };

@@ -22,7 +22,13 @@
 
 #include <cuda_runtime.h>
 
+#include "eqlinear_group_table.h"
+
 namespace eqlin {
+
+using fasteq::eqlinear::GroupTable;
+using fasteq::eqlinear::build_group_table;
+using fasteq::eqlinear::out_total_i;
 
 /// Backend selection.  Append-only, like the tf32 line's `Impl` contract; this is a separate
 /// sequence from that line's ids.
@@ -48,9 +54,6 @@ namespace eqlin {
 ///                 canonical 8-byte fetch costs more than the fill saves.
 enum class F64Impl : int { k2xGrouped = 0, kSm90Dmma = 1, kAuto = 2, kAuto2 = 3, kDirect = 4,
                            kAuto3 = 5, kAuto4 = 6, kAuto5 = 7 };
-
-/// Number of output rows J: the sum of the distinct run-length-grouped i values.
-int out_total_i(std::vector<int> const &i_dims);
 
 /// Human-readable form of an error code returned by Runner.
 char const *status_string(int code);

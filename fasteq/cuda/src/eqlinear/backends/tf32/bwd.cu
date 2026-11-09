@@ -12,7 +12,7 @@
 #include "cutlass/numeric_conversion.h"
 
 #include "device_buffer.h"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "prep_kernels.h"  // CgVals
 #include "reduce_dw.h"
 #include "row_plan.h"

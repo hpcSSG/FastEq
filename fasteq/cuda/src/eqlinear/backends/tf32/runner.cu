@@ -28,7 +28,7 @@
 #endif
 
 #include "device_buffer.h"
-#include "group_table.h"
+#include "eqlinear_group_table.h"
 #include "grouped_gemm.cuh"
 #include "prep_kernels.h"
 #include "row_plan.h"
@@ -397,8 +397,5 @@ float const *Runner::b_prep(long long *numel) const {
   return p_->d_b_prep.as<float>();
 }
 
-int out_total_i(std::vector<int> const &i_dims) {
-  return build_group_table(i_dims).out_total_i;
-}
 
 }  // namespace eqlin

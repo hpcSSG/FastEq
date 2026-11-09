@@ -15,7 +15,13 @@
 
 #include <cuda_runtime.h>
 
+#include "eqlinear_group_table.h"
+
 namespace eqlin {
+
+using fasteq::eqlinear::GroupTable;
+using fasteq::eqlinear::build_group_table;
+using fasteq::eqlinear::out_total_i;
 
 /// Backend / precision selection.
 ///
@@ -62,9 +68,6 @@ inline bool is_inkernel_tf32x3(Impl impl) {
          impl == Impl::kSm90_3xTF32RegSplitRn || impl == Impl::kSm90_3xTF32RegSplitFold ||
          impl == Impl::kSm90_3xTF32RegSplitRnFold;
 }
-
-/// Number of output rows J: the sum of the distinct run-length-grouped i values.
-int out_total_i(std::vector<int> const &i_dims);
 
 /// Human-readable form of an error code returned by Runner.
 char const *status_string(int code);
