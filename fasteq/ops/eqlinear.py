@@ -497,7 +497,7 @@ class _EqLinearFn(torch.autograd.Function):
 
 
 def fast_equi_linear(descriptor, w, x, *, compute_precision=None):
-    """Forward and grad_x for the uniform uv/iu/iv equi-linear operator."""
+    """Forward and grad_x for the uniform uv/iu/iv eqlinear operator."""
     precision = _resolve_precision(x, w, compute_precision)
     if (type(w) is torch.Tensor and type(x) is torch.Tensor
             and not w.requires_grad and not x.requires_grad

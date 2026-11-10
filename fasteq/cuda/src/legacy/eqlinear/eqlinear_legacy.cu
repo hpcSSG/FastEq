@@ -7,14 +7,14 @@
 #include <torch/torch.h>
 #include <vector>
 
-#include "equi_linear_kernels/impl.h"
+#include "eqlinear_impl.h"
 
 bool is_aligned_128_bitwise(const void *ptr)
 {
     return (reinterpret_cast<uintptr_t>(ptr) & 127) == 0; // 128-1=127
 }
 
-torch::Tensor mutipath_equi_linear_fwd(const torch::Tensor &x,                 // [B, total_i, U]
+torch::Tensor eqlinear_legacy_fwd(const torch::Tensor &x,                 // [B, total_i, U]
                                        const torch::Tensor &w,                 // [num_paths, U, V]
                                        const std::vector<int64_t> &i_dims_vec, // i dims
                                        const std::vector<double> &cg_val_vec)
@@ -43,13 +43,13 @@ torch::Tensor mutipath_equi_linear_fwd(const torch::Tensor &x,                 /
 
     if (x.dtype() == torch::kFloat32)
     {
-        mutipath_equi_linear_fwd_f32_impl(num_paths, static_cast<float *>(out_ptr), static_cast<float *>(x_ptr),
+        eqlinear_legacy_fwd_f32_impl(num_paths, static_cast<float *>(out_ptr), static_cast<float *>(x_ptr),
                                           static_cast<float *>(w_ptr), B, total_i, i_dims_vec, U, V, cg_val_vec,
                                           cur_stream);
     }
     else
     {
-        mutipath_equi_linear_fwd_f64_impl(num_paths, static_cast<double *>(out_ptr), static_cast<double *>(x_ptr),
+        eqlinear_legacy_fwd_f64_impl(num_paths, static_cast<double *>(out_ptr), static_cast<double *>(x_ptr),
                                           static_cast<double *>(w_ptr), B, total_i, i_dims_vec, U, V, cg_val_vec,
                                           cur_stream);
     }
@@ -57,7 +57,7 @@ torch::Tensor mutipath_equi_linear_fwd(const torch::Tensor &x,                 /
     return out;
 }
 
-torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,                  // [B, total_i, V]
+torch::Tensor eqlinear_legacy_bwd(const torch::Tensor &grad,                  // [B, total_i, V]
                                        const torch::Tensor &w,                     // [num_paths, U, V]
                                        const std::vector<int64_t> &out_i_dims_vec, // i dims
                                        const std::vector<double> &cg_val_vec)
@@ -87,7 +87,7 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
 
     if (grad.dtype() == torch::kFloat32)
     {
-        mutipath_equi_linear_bwd_f32_impl(out_num_paths, static_cast<float *>(out_ptr), static_cast<float *>(grad_ptr),
+        eqlinear_legacy_bwd_f32_impl(out_num_paths, static_cast<float *>(out_ptr), static_cast<float *>(grad_ptr),
                                           static_cast<float *>(w_ptr), B, out_total_i, out_i_dims_vec, U, V, cg_val_vec,
                                           cur_stream);
     }
@@ -96,7 +96,7 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
         // Not implimented, fall back to fwd
         torch::Tensor wt = w.transpose(1, 2).contiguous();
         void *wt_ptr = wt.data_ptr();
-        mutipath_equi_linear_fwd_f64_impl(out_num_paths, static_cast<double *>(out_ptr),
+        eqlinear_legacy_fwd_f64_impl(out_num_paths, static_cast<double *>(out_ptr),
                                           static_cast<double *>(grad_ptr), static_cast<double *>(wt_ptr), B,
                                           out_total_i, out_i_dims_vec, V, U, cg_val_vec, cur_stream);
     }
@@ -104,8 +104,8 @@ torch::Tensor mutipath_equi_linear_bwd(const torch::Tensor &grad,               
     return out;
 }
 
-TORCH_LIBRARY(equi_linear, m)
+TORCH_LIBRARY(eqlinear_legacy, m)
 {
-    m.def("forward", &mutipath_equi_linear_fwd);
-    m.def("backward", &mutipath_equi_linear_bwd);
+    m.def("forward", &eqlinear_legacy_fwd);
+    m.def("backward", &eqlinear_legacy_bwd);
 }
