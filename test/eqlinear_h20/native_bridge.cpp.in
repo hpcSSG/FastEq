@@ -1,0 +1,118 @@
+// Test-only Torch dispatcher binding. The native Runner and kernels are unchanged.
+#include <ATen/ATen.h>
+#include <torch/library.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime.h>
+#include <memory>
+#include <mutex>
+#include <numeric>
+#include <unordered_map>
+#include "eqlinear.h"
+
+namespace {
+using Scalar = @SCALAR@;
+using Runner = @BACKEND@::Runner;
+using Impl = @BACKEND@::@ENUM@;
+
+void check_impl(int64_t impl) {
+  TORCH_CHECK(@ALLOWED@, "Excluded or unknown native implementation: ", impl);
+}
+void check_tensor(at::Tensor const& value) {
+  TORCH_CHECK(value.is_cuda() && value.is_contiguous() && value.dim() == 3 &&
+              value.scalar_type() == @DTYPE@, "Expected contiguous CUDA rank-3 native scalar tensor");
+}
+void check_status(int status) {
+  TORCH_CHECK(status == 0, "Native Runner: ", @BACKEND@::status_string(status));
+}
+
+class Plan {
+ public:
+  Plan(at::Tensor x, at::Tensor w, std::vector<int64_t> dims,
+       std::vector<double> cg, int64_t impl) : x_(x), w_(w), cg_(std::move(cg)) {
+    check_impl(impl);  // Must reject x1 before Runner construction or GPU work.
+    check_tensor(x); check_tensor(w);
+    TORCH_CHECK(x.device() == w.device() && x.size(2) == w.size(1) &&
+                dims.size() == static_cast<size_t>(w.size(0)) && cg_.size() == dims.size(),
+                "Native input/weight/path contract differs");
+    std::vector<int> native_dims(dims.begin(), dims.end());
+    TORCH_CHECK(std::all_of(dims.begin(), dims.end(), [](auto n){return n > 0 && n <= INT_MAX;}) &&
+                std::accumulate(dims.begin(), dims.end(), int64_t(0)) == x.size(1), "Invalid path dimensions");
+    c10::cuda::CUDAGuard guard(x.device());
+    runner_ = std::make_unique<Runner>(x.size(0), x.size(1), x.size(2), w.size(0), w.size(2),
+                                       native_dims, static_cast<Impl>(impl));
+    shape_ = {x.size(0), runner_->j_rows(), w.size(2)};
+    check_status(runner_->prepare_weight(w_.data_ptr<Scalar>(), cg_.data(), stream()));
+  }
+  void prepare(at::Tensor x) {
+    check_tensor(x);
+    TORCH_CHECK(x.device() == x_.device() && x.sizes() == x_.sizes(), "Activation differs from native plan");
+    c10::cuda::CUDAGuard guard(x_.device());
+    x_ = x;
+    check_status(runner_->prepare_act(x_.data_ptr<Scalar>(), stream()));
+    prepared_ = true;
+  }
+  void launch(at::Tensor out) {
+    check_tensor(out);
+    TORCH_CHECK(prepared_ && out.device() == x_.device() && out.sizes().vec() == shape_, "Output/prepared contract differs");
+    c10::cuda::CUDAGuard guard(x_.device());
+    check_status(runner_->run(out.data_ptr<Scalar>(), stream()));
+  }
+  void finish() {
+    c10::cuda::CUDAGuard guard(x_.device());
+    TORCH_CHECK(cudaDeviceSynchronize() == cudaSuccess, "Native bridge lifecycle synchronization failed");
+    runner_.reset();
+  }
+ private:
+  cudaStream_t stream() const { return c10::cuda::getCurrentCUDAStream(x_.get_device()).stream(); }
+  at::Tensor x_, w_;
+  std::vector<double> cg_;
+  std::vector<int64_t> shape_;
+  std::unique_ptr<Runner> runner_;
+  bool prepared_ = false;
+};
+std::mutex plans_mutex;
+std::unordered_map<int64_t, std::shared_ptr<Plan>> plans;
+int64_t next_handle = 1;
+std::shared_ptr<Plan> get(int64_t handle) {
+  std::lock_guard<std::mutex> guard(plans_mutex);
+  TORCH_CHECK(plans.count(handle), "Unknown native plan handle");
+  return plans.at(handle);
+}
+int64_t create(at::Tensor x, at::Tensor w, std::vector<int64_t> dims, std::vector<double> cg, int64_t impl) {
+  check_impl(impl);
+  auto plan = std::make_shared<Plan>(x, w, dims, cg, impl);
+  std::lock_guard<std::mutex> guard(plans_mutex);
+  auto handle = next_handle++;
+  plans.emplace(handle, plan);
+  return handle;
+}
+void prepare(int64_t handle, at::Tensor x) { get(handle)->prepare(x); }
+void launch(int64_t handle, at::Tensor out) { get(handle)->launch(out); }
+void run_act(int64_t handle, at::Tensor x, at::Tensor out) { auto p=get(handle); p->prepare(x); p->launch(out); }
+void destroy(int64_t handle) {
+  auto plan = get(handle);
+  plan->finish();
+  std::lock_guard<std::mutex> guard(plans_mutex);
+  plans.erase(handle);
+}
+at::Tensor forward(at::Tensor x, at::Tensor w, std::vector<int64_t> dims, std::vector<double> cg, int64_t impl) {
+  check_impl(impl);
+  Plan plan(x, w, dims, cg, impl);
+  int64_t j=0;
+  for (size_t p=0; p<dims.size(); ++p) if (!p || dims[p] != dims[p-1]) j += dims[p];
+  auto out = at::empty({x.size(0), j, w.size(2)}, x.options());
+  plan.prepare(x); plan.launch(out); plan.finish();
+  return out;
+}
+}  // namespace
+
+TORCH_LIBRARY(@TORCH_NAMESPACE@, m) {
+  m.def("check_impl(int impl) -> ()", &check_impl);
+  m.def("create(Tensor x, Tensor w, int[] dims, float[] cg, int impl) -> int", &create);
+  m.def("prepare_act(int handle, Tensor x) -> ()", &prepare);
+  m.def("launch(int handle, Tensor(a!) out) -> ()", &launch);
+  m.def("run_act(int handle, Tensor x, Tensor(a!) out) -> ()", &run_act);
+  m.def("destroy(int handle) -> ()", &destroy);
+  m.def("forward(Tensor x, Tensor w, int[] dims, float[] cg, int impl) -> Tensor", &forward);
+}
