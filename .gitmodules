@@ -1,7 +1,7 @@
 [submodule "3rdparty/cuequivariance_torch"]
 	path = 3rdparty/cuequivariance_torch
-	url = git@github.com:malixian/cuEquivariance.git
-	branch = fasteq
+	url = git@github.com:JWXiang-404/FastEq.git
+	branch = xjw/cuequivariance-adapt
 [submodule "3rdparty/cutlass"]
 	path = 3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
