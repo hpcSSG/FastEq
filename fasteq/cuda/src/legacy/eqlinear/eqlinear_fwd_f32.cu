@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "./device_cuda_helper.cuh"
-#include "./impl.h"
+#include "./eqlinear_impl.h"
 #include "./ptx_inst.cuh"
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -490,7 +490,7 @@ template <uint32_t IN_NUM_PATHS,        // in path数量
           uint32_t PRODUCER_WG_NUM = 1, // producer warpgroup数量
           uint32_t CONSUMER_WG_NUM = 2  // consumer warpgroup数量
           >
-__global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
+__global__ void eqlinear_legacy_fwd_f32_tf32_kernel(const __grid_constant__ CUtensorMap x_map,   // x tensor maps
                                                          const __grid_constant__ CUtensorMap w_map,   // w tensor maps
                                                          const __grid_constant__ CUtensorMap out_map, // out tensor maps
                                                          cg_T<IN_NUM_PATHS> cg_vals,                  // val
@@ -668,7 +668,7 @@ __global__ void mutipath_equi_linear_fwd_f32_tf32_kernel(const __grid_constant__
 }
 
 template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
-void mutipath_equi_linear_fwd_f32(float *out,                                 // [B, out_total_i, V]
+void eqlinear_legacy_fwd_f32(float *out,                                 // [B, out_total_i, V]
                                   float *x,                                   // [B, in_total_i, U]
                                   float *w,                                   // [IN_NUM_PATHS, U, V]
                                   const std::vector<int64_t> &in_i_dims_vec,  // in i dims
@@ -774,7 +774,7 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
                                         + (TILE_M * TILE_N)        // Out_smem
                                        );
 
-    auto cuda_kernel = mutipath_equi_linear_fwd_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
+    auto cuda_kernel = eqlinear_legacy_fwd_f32_tf32_kernel<IN_NUM_PATHS, OUT_NUM_PATHS, TILE_M, TILE_N, TILE_K,
                                                                 PRODUCER_WG_NUM, CONSUMER_WG_NUM>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x_map, w_map, out_map, cg_vals, in_prefex_i_sum,
@@ -783,7 +783,7 @@ void mutipath_equi_linear_fwd_f32(float *out,                                 //
 }
 
 // wrapper
-void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           // path nums
+void eqlinear_legacy_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           // path nums
                                        float *out,                             // [B, out_total_i, V]
                                        float *x,                               // [B, in_total_i, U]
                                        float *w,                               // [IN_NUM_PATHS, U, V]
@@ -802,13 +802,13 @@ void mutipath_equi_linear_fwd_f32_impl(const uint32_t &IN_NUM_PATHS,           /
         switch (IN_NUM_PATHS)
         {
         case 4: // small
-            mutipath_equi_linear_fwd_f32<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_fwd_f32<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 10: // medium
-            mutipath_equi_linear_fwd_f32<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_fwd_f32<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 17: // large
-            mutipath_equi_linear_fwd_f32<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_fwd_f32<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         default:
             throw std::invalid_argument("Unsupported number of paths: " + std::to_string(IN_NUM_PATHS) +

@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "./device_cuda_helper.cuh"
-#include "./impl.h"
+#include "./eqlinear_impl.h"
 #include "./ptx_inst.cuh"
 
 template <uint32_t WARP_PER_BLOCK>
@@ -168,7 +168,7 @@ template <uint32_t M_WARPS = 2,                                                 
           uint32_t W_TILE_N = 16,                                                       // 每个warp的tile n大小
           uint32_t TILE_K = 16,                                                         // tile k大小
           uint32_t NUM_PATHS = 4>                                                       // path
-__global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
+__global__ void eqlinear_legacy_fwd_f64_f64_kernel(const double *__restrict__ x,   // [B, total_i, U]
                                                         const double *__restrict__ w,   // [num_paths, U, V]
                                                         double *__restrict__ out,       // [B, total_i, V]
                                                         cg_T<NUM_PATHS> cg_vals,        // vals
@@ -433,7 +433,7 @@ __global__ void mutipath_equi_linear_fwd_f64_f64_kernel(const double *__restrict
 }
 
 template <uint32_t IN_NUM_PATHS, uint32_t OUT_NUM_PATHS = 4>
-void mutipath_equi_linear_fwd_f64(double *out,                                // [B, out_total_i, V]
+void eqlinear_legacy_fwd_f64(double *out,                                // [B, out_total_i, V]
                                   double *x,                                  // [B, in_total_i, U]
                                   double *w,                                  // [IN_NUM_PATHS, U, V]
                                   const std::vector<int64_t> &in_i_dims_vec,  // in i dims
@@ -474,14 +474,14 @@ void mutipath_equi_linear_fwd_f64(double *out,                                //
     constexpr uint32_t SMEM_SIZE = (TILE_M * TILE_K + TILE_N * TILE_K) * 2 * 8; // 2 stage, 8 B/Double
 
     auto cuda_kernel =
-        mutipath_equi_linear_fwd_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
+        eqlinear_legacy_fwd_f64_f64_kernel<M_WARPS, N_WARPS, W_TILE_M, W_TILE_N, TILE_K, IN_NUM_PATHS>;
     cudaFuncSetAttribute(cuda_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_SIZE);
 
     cuda_kernel<<<grid, block, SMEM_SIZE, cur_stream>>>(x, w, out, cg_vals, i_dims, prefix_i_sum, in_total_i, B, U, V);
 }
 
 // wrapper
-void mutipath_equi_linear_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           // path nums
+void eqlinear_legacy_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           // path nums
                                        double *out,                            // [B, out_total_i, V]
                                        double *x,                              // [B, in_total_i, U]
                                        double *w,                              // [IN_NUM_PATHS, U, V]
@@ -500,7 +500,7 @@ void mutipath_equi_linear_fwd_f64_impl(const uint32_t &IN_NUM_PATHS,           /
         switch (IN_NUM_PATHS)
         {
         case 4: // small
-            mutipath_equi_linear_fwd_f64<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_fwd_f64<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         // case 10: // medium
         //     printf("F64 eqlinear-Medium not implimented!!!");

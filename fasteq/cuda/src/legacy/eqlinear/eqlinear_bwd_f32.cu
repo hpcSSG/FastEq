@@ -9,7 +9,7 @@
 #include <utility>
 
 #include "./device_cuda_helper.cuh"
-#include "./impl.h"
+#include "./eqlinear_impl.h"
 #include "./ptx_inst.cuh"
 
 using barrier = cuda::barrier<cuda::thread_scope_block>;
@@ -385,7 +385,7 @@ template <uint32_t GRAD_NUM_PATHS,      // in path数量
           uint32_t PRODUCER_WG_NUM = 1, // producer warpgroup数量
           uint32_t CONSUMER_WG_NUM = 2  // consumer warpgroup数量
           >
-__global__ void mutipath_equi_linear_bwd_f32_tf32_kernel(
+__global__ void eqlinear_legacy_bwd_f32_tf32_kernel(
     const __grid_constant__ CUtensorMap grad_map,  // grad tensor maps
     const __grid_constant__ CUtensorMap w_map,     // w tensor maps
     const __grid_constant__ CUtensorMap out_map,   // out tensor maps
@@ -529,7 +529,7 @@ __global__ void mutipath_equi_linear_bwd_f32_tf32_kernel(
 }
 
 template <uint32_t OUT_NUM_PATHS, uint32_t GRAD_NUM_PATHS = 4>
-void mutipath_equi_linear_bwd_f32(float *out,                                  // [B, out_total_i, U]
+void eqlinear_legacy_bwd_f32(float *out,                                  // [B, out_total_i, U]
                                   float *grad,                                 // [B, grad_total_i, V]
                                   float *w,                                    // [OUT_NUM_PATHS, U, V]
                                   const std::vector<int64_t> &grad_i_dims_vec, // in i dims
@@ -625,7 +625,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
     size_t SMEM_SIZE = sizeof(float) * ((TILE_M * TILE_K + TILE_N * TILE_K) * STAGES // A_smem & B_smem
                                         + (TILE_M * TILE_N));                        // Out_smem
 
-    auto cuda_kernel = mutipath_equi_linear_bwd_f32_tf32_kernel<GRAD_NUM_PATHS,  // in path数量
+    auto cuda_kernel = eqlinear_legacy_bwd_f32_tf32_kernel<GRAD_NUM_PATHS,  // in path数量
                                                                 OUT_NUM_PATHS,   // out path数量
                                                                 TILE_M,          // tile m大小
                                                                 TILE_N,          // tile n大小
@@ -650,7 +650,7 @@ void mutipath_equi_linear_bwd_f32(float *out,                                  /
 }
 
 // wrapper
-void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          // path nums
+void eqlinear_legacy_bwd_f32_impl(const uint32_t &out_num_paths,          // path nums
                                        float *out,                             // [B, out_total_i, U]
                                        float *grad,                            // [B, grad_total_i, V]
                                        float *w,                               // [OUT_NUM_PATHS, U, V]
@@ -669,13 +669,13 @@ void mutipath_equi_linear_bwd_f32_impl(const uint32_t &out_num_paths,          /
         switch (out_num_paths)
         {
         case 4: // small
-            mutipath_equi_linear_bwd_f32<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_bwd_f32<4>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 10: // medium
-            mutipath_equi_linear_bwd_f32<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_bwd_f32<10>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         case 17: // large
-            mutipath_equi_linear_bwd_f32<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
+            eqlinear_legacy_bwd_f32<17>(std::forward<decltype(forwarded_args)>(forwarded_args)...);
             break;
         default:
             throw std::invalid_argument("Unsupported number of paths: " + std::to_string(out_num_paths) +

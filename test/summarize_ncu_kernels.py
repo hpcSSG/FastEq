@@ -16,8 +16,8 @@ KERNEL_GROUPS = {
     "stc_fwd": ["stc_fwd_kernel_notiled"],
     "stc_bwd": ["stc_bwd_kernel_v1", "stc_bwd_kernel_tiled"],
 
-    "equi_linear_f64": ["mutipath_equi_linear_f64_f64_kernel"],
-    "equi_linear_f32": ["mutipath_equi_linear_f32_tf32_kernel"],
+    "eqlinear_legacy_f64": ["eqlinear_legacy_fwd_f64_f64_kernel"],
+    "eqlinear_legacy_f32": ["eqlinear_legacy_fwd_f32_tf32_kernel"],
 }
 
 def read_ncu_raw_csv(path: str | Path) -> pd.DataFrame:

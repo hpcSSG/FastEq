@@ -17,6 +17,7 @@ build/
 .idea/
 .vscode/
 *.txt
+!fasteq/cuda/src/eqlinear/CMakeLists.txt
 *.log
 
 # Distribution
