@@ -39,7 +39,9 @@ struct BackendAdapter {
       auto owner = std::make_unique<ForwardPlan>();
       owner->runner = std::make_unique<PlanState<ForwardRunner>>();
       auto* state = owner->runner.get();
-      if (Traits::use_shape_plan(*problem)) {
+      if (Traits::use_single_path_plan(*problem, false)) {
+        state->shape = Traits::make_single_path_plan(*problem, w, cg, false, stream);
+      } else if (Traits::use_shape_plan(*problem)) {
         state->shape = Traits::make_shape_plan(*problem, w, cg, false, stream);
       } else {
         state->legacy = Traits::make_forward(*problem, i_dims, w, cg);
@@ -83,7 +85,9 @@ struct BackendAdapter {
       auto owner = std::make_unique<DgradPlan>();
       owner->runner = std::make_unique<PlanState<DgradRunner>>();
       auto* state = owner->runner.get();
-      if (Traits::use_shape_plan(*problem))
+      if (Traits::use_single_path_plan(*problem, true))
+        state->shape = Traits::make_single_path_plan(*problem, w, cg, true, stream);
+      else if (Traits::use_shape_plan(*problem))
         state->shape = Traits::make_shape_plan(*problem, w, cg, true, stream);
       else
         state->legacy = Traits::make_dgrad(*problem, i_dims, w, cg, stream);

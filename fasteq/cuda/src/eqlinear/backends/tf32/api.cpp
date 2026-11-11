@@ -13,6 +13,7 @@
 #include "eqlinear.h"
 #include "eqlinear_backend_api.h"
 #include "shape_plan.cuh"
+#include "single_path_plan.cuh"
 
 namespace {
 
@@ -30,6 +31,23 @@ struct Tf32Traits {
       "eqlinear tf32: ok", "eqlinear tf32: unsupported configuration",
       "eqlinear tf32: invalid argument", "eqlinear tf32: CUDA error",
       "eqlinear tf32: internal error"};
+
+  static bool use_single_path_plan(EqLinearProblemC const& p, bool dgrad) {
+    // Scalar forward readout keeps the established register-only x3 shape
+    // kernel. The shared-memory P1 engine regressed this measured shape class.
+    if (p.P == 1 && p.V == 1 && p.U >= 128 && !dgrad) return false;
+    // Same-lease eager and graph measurements retain the original Hopper plan
+    // for this full-contiguous shape: both experimental P1 engines were slower.
+    if (p.P == 1 && !p.paths && p.B == 25116 && p.I == 1 && p.J == 1 &&
+        p.U == 224 && p.V == 224)
+      return false;
+    return fasteq::eqlinear::tf32_single::required(p, dgrad);
+  }
+  static std::unique_ptr<fasteq::eqlinear::ShapePlan> make_single_path_plan(
+      EqLinearProblemC const& p, void const* w, double const* cg, bool dgrad,
+      cudaStream_t stream) {
+    return fasteq::eqlinear::tf32_single::create(p, w, cg, dgrad, stream);
+  }
 
   static bool use_shape_plan(EqLinearProblemC const &p) {
     return fasteq::eqlinear::tf32_shape::required(p);

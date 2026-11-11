@@ -2,6 +2,9 @@
 // torch; the per-precision backends are torch-free DSOs reached through a small C ABI.
 
 #include <cstdint>
+#include <atomic>
+#include <array>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -9,9 +12,17 @@
 #include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <torch/extension.h>
+#include <torch/custom_class.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/utils/pybind.h>
+#include <ATen/PythonTorchFunctionTLS.h>
+#include <c10/core/impl/TorchDispatchModeTLS.h>
+#include <pybind11/numpy.h>
+#include <torch/types.h>
 
 #include "eqlinear_backend_api.h"
 #include "eqlinear_group_table.h"
@@ -49,6 +60,7 @@ const EqLinearBackendApi* api_for(int64_t precision) {
 }
 
 struct Handle {
+  std::atomic<bool> registered{true};
   const EqLinearBackendApi* api = nullptr;
   int64_t precision = 0;
   int64_t batch = 0, input_rows = 0, u = 0, output_rows = 0, v = 0;
@@ -57,6 +69,21 @@ struct Handle {
   void* dgrad_plan = nullptr;
   EqLinearPlanInfo forward_info;
   EqLinearPlanInfo dgrad_info;
+
+  // Only single-path forward handles own a lazy dgrad. No second cache/index:
+  // Python's existing LRU and an in-flight autograd node share this same owner.
+  EqLinearProblemC problem;
+  std::vector<int32_t> dimensions;
+  std::vector<fasteq::eqlinear::EqLinearPathC> paths;
+  std::vector<double> coefficients;
+  torch::Tensor weight_snapshot;
+  const void* weight_data = nullptr;
+  int64_t weight_version = 0;
+  cudaStream_t creation_stream = nullptr;
+  cudaStream_t dgrad_stream = nullptr;
+  std::unique_ptr<at::cuda::CUDAEvent> prepared;
+  std::unique_ptr<at::cuda::CUDAEvent> dgrad_done;
+  std::mutex run_mutex;
 
   ~Handle() {
     if (api != nullptr) {
@@ -68,6 +95,11 @@ struct Handle {
       }
     }
   }
+};
+
+struct AutogradPlanOwner : torch::CustomClassHolder {
+  explicit AutogradPlanOwner(std::shared_ptr<Handle> value) : handle(std::move(value)) {}
+  std::shared_ptr<Handle> handle;
 };
 
 std::mutex g_mutex;
@@ -94,6 +126,7 @@ void erase_handle(int64_t id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_handles.find(id);
     if (it == g_handles.end()) return;
+    it->second->registered.store(false, std::memory_order_release);
     retired = std::move(it->second);
     g_handles.erase(it);
   }
@@ -339,12 +372,34 @@ int64_t create_plan(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
   handle->output_rows = problem.J;
   handle->v = problem.V;
   handle->device_index = w.get_device();
+  if (!backward && P == 1) {
+    handle->dimensions = dims32;
+    handle->paths = paths;
+    handle->coefficients = cg;
+    handle->problem = problem;
+    handle->problem.i_dims = handle->dimensions.data();
+    handle->problem.paths = handle->paths.empty() ? nullptr : handle->paths.data();
+    // Own an immutable, original-precision weight for delayed dgrad construction.
+    // Saving a borrowed problem or the caller's mutable storage here is unsafe.
+    handle->weight_snapshot = w.detach().clone();
+    handle->weight_data = w.data_ptr();
+    // Inference-created tensors have no version counter. Python cannot cache
+    // those weights; its cache-disabled path creates a fresh snapshot per call.
+    handle->weight_version = w.is_inference() ? -1 : w._version();
+    handle->creation_stream = c10::cuda::getCurrentCUDAStream().stream();
+  }
   auto create = backward ? api->dgrad_create : api->forward_create;
-  const int rc = create(&problem, w.data_ptr(), cg.data(),
+  const void* weight = handle->weight_snapshot.defined()
+                           ? handle->weight_snapshot.data_ptr() : w.data_ptr();
+  const int rc = create(&problem, weight, cg.data(),
                        c10::cuda::getCurrentCUDAStream().stream(),
                        backward ? &handle->dgrad_plan : &handle->forward_plan,
                        backward ? &handle->dgrad_info : &handle->forward_info);
   TORCH_CHECK(rc == 0, api->status_string(rc));
+  if (handle->weight_snapshot.defined()) {
+    handle->prepared = std::make_unique<at::cuda::CUDAEvent>();
+    handle->prepared->record(c10::cuda::getCurrentCUDAStream());
+  }
   return register_handle(std::move(handle));
 }
 
@@ -405,6 +460,105 @@ void forward_run_flat(int64_t handle, const torch::Tensor& x, const torch::Tenso
                                      c10::cuda::getCurrentCUDAStream().stream());
   TORCH_CHECK(rc == 0, h->api->status_string(rc));
 }
+
+torch::Tensor allocate_forward(const std::shared_ptr<Handle>& h, const torch::Tensor& x) {
+  check_contiguous_cuda(x, "x");
+  check_dtype(x, h->precision, "x");
+  TORCH_CHECK(x.dim() == 2 && x.size(0) == h->batch &&
+                  x.size(1) == h->input_rows * h->u,
+              "eqlinear: flat x shape does not match the plan");
+  TORCH_CHECK(x.get_device() == h->device_index, "eqlinear: x must be on the plan device");
+  check_alignment(x, "x");
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream();
+  // The Python LRU keys forward plans by stream. Reject a stale/private call
+  // rather than share a forward workspace between independently running streams.
+  TORCH_CHECK(stream.stream() == h->creation_stream,
+              "eqlinear: allocating forward must use the plan creation stream");
+  auto out = torch::empty({h->batch, h->output_rows * h->v}, x.options());
+  std::lock_guard<std::mutex> lock(h->run_mutex);
+  const int rc = h->api->forward_run(h->forward_plan, x.data_ptr(), out.data_ptr(), stream.stream());
+  TORCH_CHECK(rc == 0, h->api->status_string(rc));
+  return out;
+}
+
+torch::Tensor allocate_dgrad(const std::shared_ptr<Handle>& h, const torch::Tensor& gradient) {
+  check_contiguous_cuda(gradient, "dy");
+  check_dtype(gradient, h->precision, "dy");
+  TORCH_CHECK(gradient.get_device() == h->device_index,
+              "eqlinear: dy must be on the plan device");
+  TORCH_CHECK(gradient.dim() == 2 && gradient.size(0) == h->batch &&
+                  gradient.size(1) == h->output_rows * h->v,
+              "eqlinear: flat dy shape does not match the plan");
+  check_alignment(gradient, "dy");
+  const c10::cuda::CUDAGuard device_guard(gradient.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream();
+  auto dx = torch::empty({h->batch, h->input_rows * h->u}, gradient.options());
+  std::lock_guard<std::mutex> lock(h->run_mutex);
+  if (h->dgrad_plan == nullptr) {
+    if (stream.stream() != h->creation_stream) h->prepared->block(stream);
+    const int rc = h->api->dgrad_create(&h->problem, h->weight_snapshot.data_ptr(),
+                                       h->coefficients.data(), stream.stream(),
+                                       &h->dgrad_plan, &h->dgrad_info);
+    TORCH_CHECK(rc == 0, h->api->status_string(rc));
+    h->dgrad_done = std::make_unique<at::cuda::CUDAEvent>();
+  } else if (stream.stream() != h->dgrad_stream) {
+    // An autograd node can outlive its LRU entry and be reused on another stream.
+    // Order workspace use on-device; never synchronize the host on a cache hit.
+    h->dgrad_done->block(stream);
+  }
+  const int rc = h->api->dgrad_run(h->dgrad_plan, gradient.data_ptr(), dx.data_ptr(), stream.stream());
+  h->dgrad_done->record(stream);
+  h->dgrad_stream = stream.stream();
+  TORCH_CHECK(rc == 0, h->api->status_string(rc));
+  return dx;
+}
+
+class SinglePathAutograd : public torch::autograd::Function<SinglePathAutograd> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               const torch::Tensor& x, const torch::Tensor& w,
+                               std::shared_ptr<Handle> h) {
+    // SavedVariable performs PyTorch's usual version check, including view mutations.
+    ctx->save_for_backward({w});
+    ctx->saved_data["owner"] = c10::make_intrusive<AutogradPlanOwner>(h);
+    return allocate_forward(h, x);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* ctx, torch::autograd::variable_list gradients) {
+    (void)ctx->get_saved_variables();  // Check the saved weight version before any launch.
+    if (!ctx->needs_input_grad(0)) return {torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    const auto owner = ctx->saved_data.at("owner").toCustomClass<AutogradPlanOwner>();
+    // Expanded and transposed incoming gradients must still be accepted.
+    auto dx = allocate_dgrad(owner->handle, gradients[0].contiguous());
+    return {dx, torch::Tensor(), torch::Tensor()};  // Historical grad_x-only contract.
+  }
+};
+
+
+torch::Tensor run_forward_autograd(const std::shared_ptr<Handle>& h,
+                                  const torch::Tensor& x, const torch::Tensor& w) {
+  if (!torch::GradMode::is_enabled() || (!x.requires_grad() && !w.requires_grad()))
+    return allocate_forward(h, x);
+  return SinglePathAutograd::apply(x, w, h);
+}
+
+torch::Tensor forward_allocate(int64_t handle, const torch::Tensor& x, const torch::Tensor& w) {
+  auto h = find_handle(handle);
+  TORCH_CHECK(h->forward_plan != nullptr && h->weight_snapshot.defined(),
+              "eqlinear: allocating forward requires a single-path forward handle");
+  check_contiguous_cuda(w, "w");
+  check_dtype(w, h->precision, "w");
+  TORCH_CHECK(w.get_device() == h->device_index && w.numel() == h->u * h->v,
+              "eqlinear: w does not match the plan");
+  const int64_t weight_version = w.is_inference() ? -1 : w._version();
+  TORCH_CHECK(w.data_ptr() == h->weight_data && weight_version == h->weight_version,
+              "eqlinear: allocating forward weight identity/version does not match the plan");
+  return run_forward_autograd(h, x, w);
+}
+
+#include "host_frontend.h"
 
 void forward_destroy(int64_t handle) { erase_handle(handle); }
 
@@ -474,7 +628,27 @@ torch::Tensor dgrad(const torch::Tensor& dy, const torch::Tensor& w,
 
 }  // namespace
 
+// Called by the optional host-only pybind module in this same DSO. No backend
+// includes Torch/Python, and no independent plan registry is introduced.
+void fasteq_bind_eqlinear_host(pybind11::module_& module) {
+  namespace py = pybind11;
+  module.def("make_guarded_call", [](int64_t handle, py::object descriptor, py::dict snapshot,
+                                     py::object weight, py::object operand_type,
+                                     py::object path_type, py::object array_type) -> py::object {
+    if (at::impl::torch_function_mode_enabled() || c10::impl::TorchDispatchModeTLS::any_modes_set())
+      return py::none();
+    auto guard = std::make_shared<SinglePathFrontend>(find_handle(handle), descriptor, snapshot,
+                                                     weight, operand_type, path_type, array_type);
+    if (!guard->eligible()) return py::none();
+    return py::cpp_function([guard](py::handle descriptor, py::handle w, py::handle x,
+                                    py::handle precision) { return guard->call(descriptor, w, x, precision); });
+  });
+}
+
 TORCH_LIBRARY(eqlinear, m) {
+  // Private context owner, without a public constructor or a separate registry.
+  m.class_<AutogradPlanOwner>("_AutogradPlanOwner");
+  m.def("_forward_allocate", &forward_allocate);
   m.def("out_rows", &out_rows);
   m.def("forward", &forward);
   m.def("dgrad", &dgrad);

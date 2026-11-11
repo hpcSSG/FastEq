@@ -13,6 +13,8 @@ runs on every call because ``x`` changes.
 from __future__ import annotations
 
 import operator
+import importlib
+import sys
 import weakref
 from collections import OrderedDict
 from functools import lru_cache
@@ -23,10 +25,11 @@ try:
     from cuequivariance import SegmentedOperand as _CueOperand
     from cuequivariance import SegmentedTensorProduct as _CueDescriptor
     from cuequivariance.segmented_polynomials import Path as _CuePath
+    from numpy import ndarray as _CoefficientArray
 except ImportError:
     # Different cue versions may still implement the public descriptor protocol.
     # Keep full parsing available, but disable structural caching.
-    _CueOperand = _CueDescriptor = _CuePath = None
+    _CueOperand = _CueDescriptor = _CuePath = _CoefficientArray = None
 
 _TF32 = 0
 _FP32 = 1
@@ -39,6 +42,40 @@ _PLAN_CACHE_BYTES = 0
 _PLAN_CACHE_MAX_BYTES = 2 << 30
 _PLAN_CACHE_LAST_ENTRY = None
 _GET_CURRENT_RAW_STREAM = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+_HOST_FRONTEND_FACTORY = None
+_HOST_FRONTEND_PROBED = False
+
+
+def _install_host_frontend(factory):
+    """Optional parent loader hook; LRU entries remain the only callable index."""
+    global _HOST_FRONTEND_FACTORY, _HOST_FRONTEND_PROBED
+    _HOST_FRONTEND_FACTORY = factory
+    _HOST_FRONTEND_PROBED = True
+    for entry in _PLAN_CACHE.values():
+        entry["call"] = None
+
+
+def _bind_host_frontend(handle, descriptor, w):
+    global _HOST_FRONTEND_PROBED
+    if (not _HOST_FRONTEND_PROBED and _HOST_FRONTEND_FACTORY is None
+            and "fasteq.cuda" in sys.modules):
+        _HOST_FRONTEND_PROBED = True
+        try:
+            frontend = importlib.import_module("fasteq.cuda._cuda")
+        except ImportError:
+            # Older DSOs only register torch.ops and have no optional PyInit.
+            pass
+        else:
+            _install_host_frontend(frontend.make_guarded_call)
+    if _HOST_FRONTEND_FACTORY is None:
+        return
+    entry = _PLAN_CACHE_LAST_ENTRY
+    snapshot = _DESCRIPTOR_GEOMETRY_CACHE._entry
+    if (entry is not None and entry["handle"] == handle and entry["ref"]() is w
+            and snapshot is not None and snapshot["descriptor"]() is descriptor
+            and len(snapshot["paths"]) == 1):
+        entry["call"] = _HOST_FRONTEND_FACTORY(
+            handle, descriptor, snapshot, w, _CueOperand, _CuePath, _CoefficientArray)
 
 
 class _DescriptorGeometryCache:
@@ -49,7 +86,19 @@ class _DescriptorGeometryCache:
 
     @staticmethod
     def _coefficient_signature(paths):
+        if len(paths) == 1:
+            coefficient = paths[0].coefficients
+            if type(coefficient) is _CoefficientArray:
+                # dtype can change in-place without changing bytes or cue's hash.
+                return (coefficient.dtype.str, coefficient.shape, coefficient.tobytes())
+            return (coefficient.tobytes(),)
         return tuple(path.coefficients.tobytes() for path in paths)
+
+    @staticmethod
+    def _single_coefficient(paths):
+        if len(paths) == 1 and type(paths[0].coefficients) is _CoefficientArray:
+            return (float(paths[0].coefficients),)
+        return None
 
     @staticmethod
     def _dimension_state(dimensions, path_count):
@@ -61,9 +110,17 @@ class _DescriptorGeometryCache:
         values = []
         for name in names:
             dims = dimensions.get(name)
-            if type(dims) is not set or any(type(value) is not int for value in dims):
+            if type(dims) is not set:
                 return None
-            values.append(tuple(dims))
+            if len(dims) == 1:
+                value = next(iter(dims))
+                if type(value) is not int:
+                    return None
+                values.append((value,))
+            else:
+                if any(type(value) is not int for value in dims):
+                    return None
+                values.append(tuple(dims))
         return tuple(values)
 
     @staticmethod
@@ -109,6 +166,7 @@ class _DescriptorGeometryCache:
             # changes produce a fresh dict too. Equal geometry remains reusable.
             entry["dimensions"] = dimensions
             entry["coefficient_signature"] = coefficient_signature
+            entry["cg"] = self._single_coefficient(paths)
         return entry["geometry"]
 
     def put(self, descriptor, geometry):
@@ -146,8 +204,22 @@ class _DescriptorGeometryCache:
                        "segments": tuple(segments), "geometry": geometry,
                        "dimensions": dimensions, "dimension_state": dimension_state,
                        "coefficient_signature": self._coefficient_signature(paths),
+                       "cg": self._single_coefficient(paths),
                        "coefficient_subscripts": descriptor.coefficient_subscripts,
                        "path_indices": tuple(getattr(path, "indices", None) for path in paths)}
+
+    def problem(self, descriptor):
+        geometry = self.get(descriptor)
+        if geometry is None:
+            geometry = _descriptor_geometry_uncached(descriptor)
+            self.put(descriptor, geometry)
+        entry = self._entry
+        # Reuse the scalar conversion only after get() has checked the current
+        # coefficient bytes AND the live dimension dict, including cache_clear.
+        cg = (entry["cg"] if entry is not None and entry["cg"] is not None
+              else tuple(float(path.coefficients) for path in descriptor.paths))
+        i_dims, u, v, j_rows = geometry
+        return i_dims, cg, u, v, j_rows
 
     def clear(self):
         self._entry = None
@@ -320,13 +392,7 @@ def _descriptor_geometry_uncached(descriptor):
 
 def _descriptor_problem(descriptor):
     """Translate a descriptor, reusing geometry only while its immutable sources match."""
-    geometry = _DESCRIPTOR_GEOMETRY_CACHE.get(descriptor)
-    if geometry is None:
-        geometry = _descriptor_geometry_uncached(descriptor)
-        _DESCRIPTOR_GEOMETRY_CACHE.put(descriptor, geometry)
-    i_dims, u, v, j_rows = geometry
-    cg = tuple(float(path.coefficients) for path in descriptor.paths)
-    return i_dims, cg, u, v, j_rows
+    return _DESCRIPTOR_GEOMETRY_CACHE.problem(descriptor)
 
 
 def _resolve_precision(x, w, compute_precision):
@@ -456,6 +522,10 @@ def _cache_insert(kind, handle, ref_tensor, w3d, shape, i_dims, cg, precision, j
         return
     key = _make_key(kind, ref_tensor, w3d, shape, i_dims, cg, precision)
     size = _estimate_bytes(w3d, shape, j_rows, v)
+    if kind == "f" and len(i_dims) == 1:
+        # Reserve the lazy C++ dgrad and its immutable weight snapshot up front.
+        # It shares the forward entry's budget/eviction, with no new cache index.
+        size = size * 2 + w3d.numel() * w3d.element_size()
     entry = {"kind": kind, "handle": handle, "ref": weakref.ref(ref_tensor), "bytes": size,
              "key": key}
     _PLAN_CACHE[key] = entry
@@ -508,9 +578,7 @@ def _dgrad_handle(w_ref, w3d, shape, i_dims, cg, precision, j_rows, v):
     return handle
 
 
-def _forward(w, x, descriptor, precision, ctx=None):
-    i_dims, cg, u, v, j_rows = _descriptor_problem(descriptor)
-    batch = x.shape[0]
+def _validate_flat_problem(w, x, i_dims, u, v):
     if x.ndim != 2:
         raise ValueError(f"eqlinear: x must be [B, sum(i*u)]; got {tuple(x.shape)}")
     i_total = _input_rows(i_dims)
@@ -520,6 +588,28 @@ def _forward(w, x, descriptor, precision, ctx=None):
         raise ValueError(
             f"eqlinear: w must contain {len(i_dims) * u * v} elements; got {w.numel()}"
         )
+    return (int(x.shape[0]), i_total, u)
+
+
+def _forward_single_path(w, x, descriptor, precision):
+    i_dims, cg, u, v, j_rows = _descriptor_problem(descriptor)
+    shape = _validate_flat_problem(w, x, i_dims, u, v)
+    if _PLAN_CACHE_MAX_BYTES > 0:
+        handle = _forward_handle_flat(w, shape, i_dims, cg, precision, j_rows, v)
+        _bind_host_frontend(handle, descriptor, w)
+        return torch.ops.eqlinear._forward_allocate(handle, x, w)
+    w3d = w.reshape(1, u, v).contiguous()
+    handle = _create_handle("f", w3d, i_dims, cg, shape[0], u, v, precision, j_rows)
+    try:
+        return torch.ops.eqlinear._forward_allocate(handle, x, w)
+    finally:
+        # The C++ autograd node holds a shared owner until its graph is released.
+        torch.ops.eqlinear.forward_destroy(handle)
+
+
+def _forward(w, x, descriptor, precision, ctx=None):
+    i_dims, cg, u, v, j_rows = _descriptor_problem(descriptor)
+    batch, i_total, _ = _validate_flat_problem(w, x, i_dims, u, v)
 
     flat_path = (_PLAN_CACHE_MAX_BYTES > 0 and type(x) is torch.Tensor
                  and x.is_contiguous() and w.is_contiguous())
@@ -587,7 +677,20 @@ class _EqLinearFn(torch.autograd.Function):
 
 def fast_equi_linear(descriptor, w, x, *, compute_precision=None):
     """Forward and grad_x for the uniform uv/iu/iv eqlinear operator."""
+    entry = _PLAN_CACHE_LAST_ENTRY
+    if entry is not None:
+        call = entry.get("call")
+        if call is not None:
+            result = call(descriptor, w, x, compute_precision)
+            if result is not None:
+                return result
     precision = _resolve_precision(x, w, compute_precision)
+    if (type(w) is torch.Tensor and type(x) is torch.Tensor
+            and len(getattr(descriptor, "paths", ())) == 1
+            and x.is_contiguous() and w.is_contiguous()
+            and torch.autograd.forward_ad._current_level < 0
+            and not torch._C._are_functorch_transforms_active()):
+        return _forward_single_path(w, x, descriptor, precision)
     if (type(w) is torch.Tensor and type(x) is torch.Tensor
             and not w.requires_grad and not x.requires_grad
             and torch.autograd.forward_ad._current_level < 0

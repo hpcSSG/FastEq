@@ -60,6 +60,7 @@ fasteq_eqlinear_backend(tf32
   SOURCES
     "${EQLINEAR_TF32_DIR}/api.cpp"
     "${EQLINEAR_TF32_DIR}/shape_plan.cu"
+    "${EQLINEAR_TF32_DIR}/single_path_plan.cu"
     "${EQLINEAR_TF32_DIR}/runner.cu"
     "${EQLINEAR_TF32_DIR}/dgrad.cu"
     "${EQLINEAR_TF32_DIR}/grouped_gemm_tf32.cu"
@@ -80,6 +81,7 @@ fasteq_eqlinear_backend(fp32
   SOURCES
     "${EQLINEAR_FP32_DIR}/api.cpp"
     "${EQLINEAR_FP32_DIR}/shape_plan.cu"
+    "${EQLINEAR_FP32_DIR}/single_path_plan.cu"
     "${EQLINEAR_FP32_DIR}/runner.cu"
     "${EQLINEAR_FP32_DIR}/grouped_gemm_fp32.cu"
     "${EQLINEAR_FP32_DIR}/simt_gemm.cu"
@@ -101,6 +103,7 @@ fasteq_eqlinear_backend(fp64
   SOURCES
     "${EQLINEAR_FP64_DIR}/api.cpp"
     "${EQLINEAR_FP64_DIR}/shape_plan.cu"
+    "${EQLINEAR_FP64_DIR}/single_path_plan.cu"
     "${EQLINEAR_FP64_DIR}/runner.cu"
     "${EQLINEAR_FP64_DIR}/dgrad.cu"
     "${EQLINEAR_FP64_DIR}/grouped_gemm_f64.cu"

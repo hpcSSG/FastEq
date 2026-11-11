@@ -572,6 +572,17 @@ struct CfgS96 {
   static constexpr int kThreads = kWarpsM * kWarpsN * 32;
 };
 
+// Eight numerical chains need their own tile budget. Halving N halves the
+// accumulator state without changing K-to-chain assignment or fold_chains.
+// Four adjacent K values are loaded together to reduce LDS/MIO pressure.
+struct Cfg128Short : NumericConfig<Cfg128, 8> {
+  static constexpr int kTbN = 64, kWarpN = 32, kChunk = 4;
+  static constexpr int kMinBlocks = 3;
+};
+struct Cfg224Short : NumericConfig<Cfg224N, 8> {
+  static constexpr int kChunk = 4, kMinBlocks = 3;
+};
+
 /// Which kernel shape, and how deep its pipeline.  Read once per plan so both can be A/B'd in one
 /// process; 2/3/4 are the only depths that are instantiated (a deeper pipeline is not always
 /// better: a multi-path problem's K is only U, so the prologue fill is a larger share of it).
@@ -1038,6 +1049,10 @@ template <class Cfg>
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_numeric(
     int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, float const *a, float const *b, bool a_view) {
+  // Independent 1+3 component problems; retain the established arithmetic and
+  // use a smaller resource tile only on the profiled large-batch shape class.
+  if (M >= 1024 && N == 128 && num_rows == 4)
+    return make<Cfg128Short>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
   if (NumericPolicy::short_chains(M, N, num_rows))
     return make<NumericConfig<Cfg, 8>>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
   return make<NumericConfig<Cfg, 1>>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
@@ -1061,6 +1076,10 @@ std::unique_ptr<BwdPlan> make_numeric_bwd(int N, std::vector<BwdProblem> const &
                                          int stages, int batch) {
   bool const dgrad_only = std::all_of(problems.begin(), problems.end(),
                                     [](BwdProblem const &p) { return p.kind == 0; });
+  if (dgrad_only && batch >= 1024 && N == 128 && problems.size() == 4)
+    return make_bwd_cfg<Cfg128Short>(N, problems, stages);
+  if (dgrad_only && batch >= 1024 && N == 224 && problems.size() == 9)
+    return make_bwd_cfg<Cfg224Short>(N, problems, stages);
   if (dgrad_only && NumericPolicy::short_chains(batch, N, static_cast<int>(problems.size()), true))
     return make_bwd_cfg<NumericConfig<Cfg, 8>>(N, problems, stages);
   return make_bwd_cfg<NumericConfig<Cfg, 1>>(N, problems, stages);
