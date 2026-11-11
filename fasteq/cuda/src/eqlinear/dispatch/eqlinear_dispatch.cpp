@@ -130,14 +130,23 @@ std::vector<int32_t> to_int32_dims(const std::vector<int64_t>& i_dims) {
 
 EqLinearProblemC make_problem(const std::vector<int64_t>& i_dims,
                               const std::vector<int32_t>& i_dims32, int64_t B, int64_t U,
-                              int64_t V, int64_t P) {
+                              int64_t V, int64_t P, int64_t I = 0, int64_t J = 0) {
+  TORCH_CHECK(B > 0 && B <= INT32_MAX,
+              "eqlinear: B must be a positive int32 value; got ", B);
+  TORCH_CHECK(U > 0 && U <= INT32_MAX && V > 0 && V <= INT32_MAX &&
+                  P > 0 && P <= 32, "eqlinear: invalid or overflowing U,V,P");
   EqLinearProblemC problem;
   problem.B = static_cast<int32_t>(B);
-  problem.I = sum_i_dims(i_dims);
+  for (int64_t rows : i_dims)
+    TORCH_CHECK(rows > 0 && rows <= INT32_MAX, "eqlinear: i_dims must be positive int32");
+  TORCH_CHECK(I >= 0 && I <= INT32_MAX && J >= 0 && J <= INT32_MAX,
+              "eqlinear: invalid full operand extents");
+  problem.I = I ? static_cast<int32_t>(I) : sum_i_dims(i_dims);
   problem.U = static_cast<int32_t>(U);
   problem.P = static_cast<int32_t>(P);
   problem.V = static_cast<int32_t>(V);
-  problem.J = fasteq::eqlinear::out_total_i(to_int_dims(i_dims));
+  problem.J = J ? static_cast<int32_t>(J)
+                : fasteq::eqlinear::out_total_i(to_int_dims(i_dims));
   problem.i_dims = i_dims32.data();
   return problem;
 }
@@ -162,31 +171,12 @@ void check_dtype(const torch::Tensor& t, int64_t precision, const char* name) {
   }
 }
 
-void check_multiple(int64_t value, int64_t alignment, const char* name) {
-  TORCH_CHECK(value % alignment == 0,
-              "eqlinear: ", name, "=", value, " must be a multiple of ", alignment);
-}
-
 void validate_problem(const EqLinearProblemC& p, int64_t precision) {
+  TORCH_CHECK(precision >= 0 && precision <= 2, "eqlinear: invalid precision");
   TORCH_CHECK(p.P >= 1 && p.P <= 32, "eqlinear: P must be in [1,32]; got ", p.P);
-  TORCH_CHECK(p.B > 0 && p.I > 0 && p.U > 0 && p.V > 0, "eqlinear: empty problem");
-  const int64_t alignment = precision == 2 ? 2 : 4;
-  check_multiple(p.B, alignment, "B");
-  check_multiple(p.V, alignment, "V");
-  check_multiple(static_cast<int64_t>(p.I) * p.U, alignment, "I*U");
-  check_multiple(static_cast<int64_t>(p.P) * p.U, alignment, "P*U");
-  check_multiple(static_cast<int64_t>(p.J) * p.V, alignment, "J*V");
-  if (precision == 1) {
-    TORCH_CHECK(p.U == p.V,
-                "eqlinear fp32: backward/forward kFused requires U == V; got U=", p.U,
-                " V=", p.V);
-    check_multiple(p.U, 16, "U");
-    TORCH_CHECK(p.V == 96 || p.V == 128 || p.V == 224,
-                "eqlinear fp32: V=", p.V, " is outside the measured kFused tile set {96,128,224}");
-  }
-  if (precision == 2 && p.V <= 128) {
-    check_multiple(p.U, 16, "U");
-  }
+  TORCH_CHECK(p.B > 0 && p.I > 0 && p.J > 0 && p.U > 0 && p.V > 0,
+              "eqlinear: empty problem");
+  // Vector, TMA and pipeline restrictions belong to the selected backend plan.
 }
 
 void check_capability() {
@@ -292,9 +282,11 @@ int64_t out_rows(const std::vector<int64_t>& i_dims) {
   return static_cast<int64_t>(fasteq::eqlinear::out_total_i(to_int_dims(i_dims)));
 }
 
-int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
-                       const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
-                       int64_t V, int64_t precision) {
+int64_t create_plan(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                    const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
+                    int64_t V, int64_t precision, bool backward,
+                    int64_t I = 0, int64_t J = 0,
+                    const std::vector<int64_t>& mapping = {}) {
   check_contiguous_cuda(w, "w");
   check_dtype(w, precision, "w");
   TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
@@ -305,9 +297,37 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
   check_alignment(w, "w");
-
-  const std::vector<int32_t> i_dims32 = to_int32_dims(i_dims);
-  const EqLinearProblemC problem = make_problem(i_dims, i_dims32, B, U, V, P);
+  const auto dims32 = to_int32_dims(i_dims);
+  if (!mapping.empty())
+    TORCH_CHECK(I > 0 && I <= INT32_MAX && J > 0 && J <= INT32_MAX,
+                "eqlinear: invalid full operand extents");
+  auto problem = make_problem(i_dims, dims32, B, U, V, P,
+                              mapping.empty() ? 0 : I, mapping.empty() ? 0 : J);
+  std::vector<fasteq::eqlinear::EqLinearPathC> paths;
+  if (!mapping.empty()) {
+    TORCH_CHECK(I > 0 && I <= INT32_MAX && J > 0 && J <= INT32_MAX,
+                "eqlinear: invalid full operand extents");
+    TORCH_CHECK(mapping.size() == static_cast<size_t>(P) * 4,
+                "eqlinear: mapping must have four integers per path");
+    paths.reserve(P);
+    for (int q = 0; q < P; ++q) {
+      for (int k = 0; k < 4; ++k)
+        TORCH_CHECK(mapping[4*q+k] >= 0 && mapping[4*q+k] <= INT32_MAX,
+                    "eqlinear: invalid path mapping integer");
+      paths.push_back({static_cast<int32_t>(mapping[4*q]),
+                       static_cast<int32_t>(mapping[4*q+1]),
+                       static_cast<int32_t>(mapping[4*q+2]),
+                       static_cast<int32_t>(mapping[4*q+3])});
+      const auto& path = paths.back();
+      TORCH_CHECK(path.rows == i_dims[q] && path.weight_path < P &&
+                      int64_t(path.input_row) + path.rows <= I &&
+                      int64_t(path.output_row) + path.rows <= J,
+                  "eqlinear: path outside operand bounds");
+    }
+    problem.I = I;
+    problem.J = J;
+    problem.paths = paths.data();
+  }
   validate_problem(problem, precision);
   const auto* api = api_for(precision);
   auto handle = std::make_shared<Handle>();
@@ -319,11 +339,27 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   handle->output_rows = problem.J;
   handle->v = problem.V;
   handle->device_index = w.get_device();
-  const int rc = api->forward_create(&problem, w.data_ptr(), cg.data(),
-                                     c10::cuda::getCurrentCUDAStream().stream(),
-                                     &handle->forward_plan, &handle->forward_info);
+  auto create = backward ? api->dgrad_create : api->forward_create;
+  const int rc = create(&problem, w.data_ptr(), cg.data(),
+                       c10::cuda::getCurrentCUDAStream().stream(),
+                       backward ? &handle->dgrad_plan : &handle->forward_plan,
+                       backward ? &handle->dgrad_info : &handle->forward_info);
   TORCH_CHECK(rc == 0, api->status_string(rc));
   return register_handle(std::move(handle));
+}
+
+int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                       const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
+                       int64_t V, int64_t precision) {
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, false);
+}
+
+int64_t forward_create_geometry(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                                const std::vector<double>& cg, int64_t B, int64_t U,
+                                int64_t P, int64_t V, int64_t precision, int64_t I, int64_t J,
+                                const std::vector<int64_t>& mapping) {
+  TORCH_CHECK(!mapping.empty(), "eqlinear: explicit geometry requires path mapping");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, false, I, J, mapping);
 }
 
 void forward_run(int64_t handle, const torch::Tensor& x, const torch::Tensor& out) {
@@ -337,6 +373,9 @@ void forward_run(int64_t handle, const torch::Tensor& x, const torch::Tensor& ou
   TORCH_CHECK(x.get_device() == h->device_index &&
                   out.get_device() == h->device_index,
               "eqlinear: x/out must be on the plan device");
+  TORCH_CHECK(x.size(0) == h->batch && x.size(1) == h->input_rows && x.size(2) == h->u &&
+                  out.size(0) == h->batch && out.size(1) == h->output_rows && out.size(2) == h->v,
+              "eqlinear: x/out shape does not match the plan");
   check_alignment(x, "x");
   check_alignment(out, "out");
   const c10::cuda::CUDAGuard device_guard(x.device());
@@ -379,35 +418,15 @@ std::tuple<int64_t, int64_t, int64_t, int64_t> forward_plan_info(int64_t handle)
 int64_t dgrad_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
                      const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
                      int64_t V, int64_t precision) {
-  check_contiguous_cuda(w, "w");
-  check_dtype(w, precision, "w");
-  TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
-  TORCH_CHECK(P == static_cast<int64_t>(i_dims.size()), "eqlinear: P must equal len(i_dims)");
-  TORCH_CHECK(w.size(0) == P && w.size(1) == U && w.size(2) == V,
-              "eqlinear: w shape does not match P,U,V");
-  TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
-  const c10::cuda::CUDAGuard device_guard(w.device());
-  check_capability();
-  check_alignment(w, "w");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, true);
+}
 
-  const std::vector<int32_t> i_dims32 = to_int32_dims(i_dims);
-  const EqLinearProblemC problem = make_problem(i_dims, i_dims32, B, U, V, P);
-  validate_problem(problem, precision);
-  const auto* api = api_for(precision);
-  auto handle = std::make_shared<Handle>();
-  handle->api = api;
-  handle->precision = precision;
-  handle->batch = problem.B;
-  handle->input_rows = problem.I;
-  handle->u = problem.U;
-  handle->output_rows = problem.J;
-  handle->v = problem.V;
-  handle->device_index = w.get_device();
-  const int rc = api->dgrad_create(&problem, w.data_ptr(), cg.data(),
-                                   c10::cuda::getCurrentCUDAStream().stream(),
-                                   &handle->dgrad_plan, &handle->dgrad_info);
-  TORCH_CHECK(rc == 0, api->status_string(rc));
-  return register_handle(std::move(handle));
+int64_t dgrad_create_geometry(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                              const std::vector<double>& cg, int64_t B, int64_t U,
+                              int64_t P, int64_t V, int64_t precision, int64_t I, int64_t J,
+                              const std::vector<int64_t>& mapping) {
+  TORCH_CHECK(!mapping.empty(), "eqlinear: explicit geometry requires path mapping");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, true, I, J, mapping);
 }
 
 void dgrad_run(int64_t handle, const torch::Tensor& dy, const torch::Tensor& dx) {
@@ -421,6 +440,9 @@ void dgrad_run(int64_t handle, const torch::Tensor& dy, const torch::Tensor& dx)
   TORCH_CHECK(dy.get_device() == h->device_index &&
                   dx.get_device() == h->device_index,
               "eqlinear: dy/dx must be on the plan device");
+  TORCH_CHECK(dy.size(0) == h->batch && dy.size(1) == h->output_rows && dy.size(2) == h->v &&
+                  dx.size(0) == h->batch && dx.size(1) == h->input_rows && dx.size(2) == h->u,
+              "eqlinear: dy/dx shape does not match the plan");
   check_alignment(dy, "dy");
   check_alignment(dx, "dx");
   const c10::cuda::CUDAGuard device_guard(dy.device());
@@ -457,11 +479,13 @@ TORCH_LIBRARY(eqlinear, m) {
   m.def("forward", &forward);
   m.def("dgrad", &dgrad);
   m.def("forward_create", &forward_create);
+  m.def("forward_create_geometry", &forward_create_geometry);
   m.def("forward_run", &forward_run);
   m.def("forward_run_flat", &forward_run_flat);
   m.def("forward_destroy", &forward_destroy);
   m.def("forward_plan_info", &forward_plan_info);
   m.def("dgrad_create", &dgrad_create);
+  m.def("dgrad_create_geometry", &dgrad_create_geometry);
   m.def("dgrad_run", &dgrad_run);
   m.def("dgrad_destroy", &dgrad_destroy);
   m.def("dgrad_plan_info", &dgrad_plan_info);

@@ -97,6 +97,8 @@ class _DescriptorGeometryCache:
             # A rejected temporary mutation can then be restored without rebuilding;
             # every lookup still verifies the current dict and its values first.
             return None
+        if tuple(getattr(path, "indices", None) for path in paths) != entry["path_indices"]:
+            return None
         coefficient_signature = self._coefficient_signature(paths)
         if coefficient_signature == entry["coefficient_signature"]:
             if dimensions is not entry["dimensions"]:
@@ -144,7 +146,8 @@ class _DescriptorGeometryCache:
                        "segments": tuple(segments), "geometry": geometry,
                        "dimensions": dimensions, "dimension_state": dimension_state,
                        "coefficient_signature": self._coefficient_signature(paths),
-                       "coefficient_subscripts": descriptor.coefficient_subscripts}
+                       "coefficient_subscripts": descriptor.coefficient_subscripts,
+                       "path_indices": tuple(getattr(path, "indices", None) for path in paths)}
 
     def clear(self):
         self._entry = None
@@ -200,6 +203,83 @@ def _cached_out_rows(i_dims):
     return int(torch.ops.eqlinear.out_rows(i_dims))
 
 
+class _PathDimensions(tuple):
+    """Immutable path lengths plus full operand extents and explicit row mapping."""
+
+    def __new__(cls, dims, input_rows, output_rows, mapping):
+        value = super().__new__(cls, dims)
+        value.input_rows = input_rows
+        value.output_rows = output_rows
+        value.mapping = tuple(mapping)
+        value.cache_key = (tuple(dims), input_rows, output_rows, value.mapping)
+        return value
+
+
+def _geometry_key(dims):
+    return dims.cache_key if isinstance(dims, _PathDimensions) else tuple(dims)
+
+
+def _input_rows(dims):
+    return dims.input_rows if isinstance(dims, _PathDimensions) else sum(dims)
+
+
+def _create_handle(kind, w3d, dims, cg, batch, u, v, precision, j_rows):
+    if isinstance(dims, _PathDimensions):
+        create = (torch.ops.eqlinear.forward_create_geometry if kind == "f"
+                  else torch.ops.eqlinear.dgrad_create_geometry)
+        return create(w3d, dims, cg, batch, u, len(dims), v, precision,
+                      dims.input_rows, j_rows, dims.mapping)
+    create = torch.ops.eqlinear.forward_create if kind == "f" else torch.ops.eqlinear.dgrad_create
+    return create(w3d, dims, cg, batch, u, len(dims), v, precision)
+
+
+def _mapped_geometry(descriptor, input_segments, output_segments, u, v):
+    subscripts = tuple(subscripts for _, subscripts in descriptor.operands_and_subscripts)
+    if subscripts != ("uv", "iu", "iv") or descriptor.coefficient_subscripts:
+        raise NotImplementedError("eqlinear requires scalar coefficients and uv,iu,iv subscripts")
+    weight_segments = _operand_segments(descriptor.operands[0])
+    paths = descriptor.paths
+    if len(weight_segments) != len(paths):
+        raise NotImplementedError("eqlinear requires one weight block per path")
+    if (any(len(seg) != 2 or seg[1] != u for seg in input_segments)
+            or any(len(seg) != 2 or seg[1] != v for seg in output_segments)
+            or any(tuple(seg) != (u, v) for seg in weight_segments)):
+        raise ValueError("eqlinear: inconsistent uniform operand segment dimensions")
+    dimensions = descriptor.get_dimensions_dict()
+    if set(dimensions["i"]) != {seg[0] for seg in input_segments + output_segments}:
+        raise ValueError("eqlinear: descriptor i_dims disagree with the operand segments")
+    in_offsets, out_offsets = [], []
+    I = J = 0
+    for seg in input_segments:
+        in_offsets.append(I)
+        I += seg[0]
+    for seg in output_segments:
+        out_offsets.append(J)
+        J += seg[0]
+    dims, mapping = [], []
+    for path in paths:
+        wp, ip, op = (operator.index(index) for index in path.indices)
+        if not (0 <= wp < len(weight_segments) and 0 <= ip < len(input_segments)
+                and 0 <= op < len(output_segments)):
+            raise ValueError("eqlinear: invalid descriptor path index")
+        i = input_segments[ip][0]
+        if i <= 0 or i != output_segments[op][0]:
+            raise ValueError("eqlinear: path i dimensions disagree")
+        dims.append(i)
+        mapping.extend((in_offsets[ip], out_offsets[op], wp, i))
+    expected, input_row, output_row, previous = [], 0, 0, None
+    for q, i in enumerate(dims):
+        if previous is not None and previous != i:
+            output_row += previous
+        expected.extend((input_row, output_row, q, i))
+        input_row += i
+        previous = i
+    dense_j = output_row + dims[-1]
+    if input_row == I and dense_j == J and mapping == expected:
+        return tuple(dims), u, v, J
+    return _PathDimensions(dims, I, J, mapping), u, v, J
+
+
 def _descriptor_geometry_uncached(descriptor):
     """Validate and translate a ``uv,iu,iv`` descriptor's geometry."""
     if len(descriptor.operands) != 3:
@@ -210,6 +290,11 @@ def _descriptor_geometry_uncached(descriptor):
     paths = len(descriptor.paths)
     if paths == 0:
         raise ValueError("eqlinear descriptor must contain at least one path")
+
+    if all(hasattr(path, "indices") for path in descriptor.paths):
+        u = _single_dimension(descriptor, "u")
+        v = _single_dimension(descriptor, "v")
+        return _mapped_geometry(descriptor, input_segments, output_segments, u, v)
 
     if paths <= 4:
         i_dims = tuple(operator.index(v) for v in descriptor.get_dimensions_dict()["i"])
@@ -283,7 +368,7 @@ def _make_key_view(kind, ref_tensor, w_shape, w_stride, w_dtype, shape, i_dims, 
         int(shape[0]),
         int(shape[1]),
         int(shape[2]),
-        tuple(i_dims),
+        _geometry_key(i_dims),
         tuple(cg),
         ref_tensor.data_ptr(),
         ref_tensor._version,
@@ -305,7 +390,7 @@ def _cache_entry_matches(entry, kind, ref_tensor, w_shape, w_stride, w_dtype, sh
         and key[3] == int(shape[0])
         and key[4] == int(shape[1])
         and key[5] == int(shape[2])
-        and key[6] == tuple(i_dims)
+        and key[6] == _geometry_key(i_dims)
         and key[7] == tuple(cg)
         and key[8] == ref_tensor.data_ptr()
         and key[9] == ref_tensor._version
@@ -394,9 +479,7 @@ def _forward_handle_shape(w_ref, w3d, shape, i_dims, cg, precision, j_rows, v):
     handle = _cache_lookup("f", w_ref, w3d, shape, i_dims, cg, precision)
     if handle is not None:
         return handle
-    handle = torch.ops.eqlinear.forward_create(
-        w3d, i_dims, cg, shape[0], shape[2], len(i_dims), v, precision
-    )
+    handle = _create_handle("f", w3d, i_dims, cg, shape[0], shape[2], v, precision, j_rows)
     _cache_insert("f", handle, w_ref, w3d, shape, i_dims, cg, precision, j_rows, v)
     return handle
 
@@ -411,9 +494,7 @@ def _forward_handle_flat(w_ref, shape, i_dims, cg, precision, j_rows, v):
     if handle is not None:
         return handle
     w3d = w_ref.reshape(*w_shape).contiguous()
-    handle = torch.ops.eqlinear.forward_create(
-        w3d, i_dims, cg, shape[0], u, len(i_dims), v, precision
-    )
+    handle = _create_handle("f", w3d, i_dims, cg, shape[0], u, v, precision, j_rows)
     _cache_insert("f", handle, w_ref, w3d, shape, i_dims, cg, precision, j_rows, v)
     return handle
 
@@ -422,9 +503,7 @@ def _dgrad_handle(w_ref, w3d, shape, i_dims, cg, precision, j_rows, v):
     handle = _cache_lookup("d", w_ref, w3d, shape, i_dims, cg, precision)
     if handle is not None:
         return handle
-    handle = torch.ops.eqlinear.dgrad_create(
-        w3d, i_dims, cg, shape[0], shape[2], len(i_dims), v, precision
-    )
+    handle = _create_handle("d", w3d, i_dims, cg, shape[0], shape[2], v, precision, j_rows)
     _cache_insert("d", handle, w_ref, w3d, shape, i_dims, cg, precision, j_rows, v)
     return handle
 
@@ -434,8 +513,9 @@ def _forward(w, x, descriptor, precision, ctx=None):
     batch = x.shape[0]
     if x.ndim != 2:
         raise ValueError(f"eqlinear: x must be [B, sum(i*u)]; got {tuple(x.shape)}")
-    if x.shape[1] != sum(i_dims) * u:
-        raise ValueError(f"eqlinear: x.shape[1] must be {sum(i_dims) * u}; got {x.shape[1]}")
+    i_total = _input_rows(i_dims)
+    if x.shape[1] != i_total * u:
+        raise ValueError(f"eqlinear: x.shape[1] must be {i_total * u}; got {x.shape[1]}")
     if w.numel() != len(i_dims) * u * v:
         raise ValueError(
             f"eqlinear: w must contain {len(i_dims) * u * v} elements; got {w.numel()}"
@@ -444,19 +524,23 @@ def _forward(w, x, descriptor, precision, ctx=None):
     flat_path = (_PLAN_CACHE_MAX_BYTES > 0 and type(x) is torch.Tensor
                  and x.is_contiguous() and w.is_contiguous())
     if flat_path and ctx is None:
-        shape = (int(batch), sum(i_dims), u)
+        shape = (int(batch), i_total, u)
         out = torch.empty((batch, j_rows * v), dtype=x.dtype, device=x.device)
         handle = _forward_handle_flat(w, shape, i_dims, cg, precision, j_rows, v)
         torch.ops.eqlinear.forward_run_flat(handle, x, out)
     else:
         w3d = w.reshape(len(i_dims), u, v).contiguous()
-        x3d = x.reshape(batch, sum(i_dims), u).contiguous()
+        x3d = x.reshape(batch, i_total, u).contiguous()
         out3d = torch.empty((batch, j_rows, v), dtype=x.dtype, device=x.device)
         if _PLAN_CACHE_MAX_BYTES > 0:
             handle = _forward_handle(w, w3d, x3d, i_dims, cg, precision, j_rows, v)
             torch.ops.eqlinear.forward_run(handle, x3d, out3d)
         else:
-            out3d = torch.ops.eqlinear.forward(x3d, w3d, i_dims, cg, precision)
+            handle = _create_handle("f", w3d, i_dims, cg, int(batch), u, v, precision, j_rows)
+            try:
+                torch.ops.eqlinear.forward_run(handle, x3d, out3d)
+            finally:
+                torch.ops.eqlinear.forward_destroy(handle)
         if out3d.shape != (batch, j_rows, v):
             raise RuntimeError(f"eqlinear: kernel returned {tuple(out3d.shape)}, expected {(batch, j_rows, v)}")
         out = out3d.reshape(batch, j_rows * v)
@@ -468,7 +552,7 @@ def _forward(w, x, descriptor, precision, ctx=None):
         ctx.cg = cg
         ctx.precision = precision
         ctx.batch = batch
-        ctx.i_total = sum(i_dims)
+        ctx.i_total = i_total
         ctx.j_rows = j_rows
         ctx.u = u
         ctx.v = v
@@ -492,7 +576,12 @@ class _EqLinearFn(torch.autograd.Function):
             )
             torch.ops.eqlinear.dgrad_run(handle, grad3d, dx3d)
         else:
-            dx3d = torch.ops.eqlinear.dgrad(grad3d, w3d, ctx.i_dims, ctx.cg, ctx.precision)
+            handle = _create_handle("d", w3d, ctx.i_dims, ctx.cg, int(ctx.batch), ctx.u,
+                                    ctx.v, ctx.precision, ctx.j_rows)
+            try:
+                torch.ops.eqlinear.dgrad_run(handle, grad3d, dx3d)
+            finally:
+                torch.ops.eqlinear.dgrad_destroy(handle)
         return None, dx3d.reshape(ctx.batch, ctx.i_total * ctx.u), None, None
 
 
@@ -528,10 +617,7 @@ def eqlinear_debug_info(descriptor, w, x, *, compute_precision=None) -> dict:
     i_dims, cg, u, v, j_rows = _descriptor_problem(descriptor)
     precision = _resolve_precision(x, w, compute_precision)
     w3d = w.reshape(len(i_dims), u, v).contiguous()
-    x3d = x.reshape(x.shape[0], sum(i_dims), u).contiguous()
-    handle = torch.ops.eqlinear.forward_create(
-        w3d, i_dims, cg, int(x3d.shape[0]), u, len(i_dims), v, precision
-    )
+    handle = _create_handle("f", w3d, i_dims, cg, int(x.shape[0]), u, v, precision, j_rows)
     try:
         info = torch.ops.eqlinear.forward_plan_info(handle)
     finally:

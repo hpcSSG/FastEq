@@ -12,6 +12,7 @@
 #include "bwd.h"
 #include "eqlinear.h"
 #include "eqlinear_backend_api.h"
+#include "shape_plan.cuh"
 
 namespace {
 
@@ -29,6 +30,16 @@ struct Tf32Traits {
       "eqlinear tf32: ok", "eqlinear tf32: unsupported configuration",
       "eqlinear tf32: invalid argument", "eqlinear tf32: CUDA error",
       "eqlinear tf32: internal error"};
+
+  static bool use_shape_plan(EqLinearProblemC const &p) {
+    return fasteq::eqlinear::tf32_shape::required(p);
+  }
+
+  static std::unique_ptr<fasteq::eqlinear::ShapePlan> make_shape_plan(
+      EqLinearProblemC const &p, void const *w, double const *cg, bool dgrad,
+      cudaStream_t stream) {
+    return fasteq::eqlinear::tf32_shape::create(p, w, cg, dgrad, stream);
+  }
 
   static eqlin::Impl select_impl(EqLinearProblemC const &p) {
     if (p.P == 4 && p.B <= 1024 && p.V <= 128) return eqlin::Impl::k3xTF32;

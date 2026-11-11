@@ -8,6 +8,7 @@
 #include "eqlinear_backend_api.h"
 #include "eqlinear_common.h"
 #include "eqlinear_group_table.h"
+#include "shape_plan.h"
 
 namespace fasteq::eqlinear {
 
@@ -19,8 +20,13 @@ struct BackendAdapter {
   using Scalar = typename Traits::Scalar;
   using ForwardRunner = typename Traits::ForwardRunner;
   using DgradRunner = typename Traits::DgradRunner;
-  using ForwardPlan = DeviceOwner<ForwardRunner>;
-  using DgradPlan = DeviceOwner<DgradRunner>;
+  template <typename Runner>
+  struct PlanState {
+    std::unique_ptr<Runner> legacy;
+    std::unique_ptr<ShapePlan> shape;
+  };
+  using ForwardPlan = DeviceOwner<PlanState<ForwardRunner>>;
+  using DgradPlan = DeviceOwner<PlanState<DgradRunner>>;
 
   static int forward_create(const EqLinearProblemC *problem, const void *w, const double *cg,
                             cudaStream_t stream, void **plan, EqLinearPlanInfo *info) {
@@ -31,17 +37,24 @@ struct BackendAdapter {
     try {
       std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
       auto owner = std::make_unique<ForwardPlan>();
-      owner->runner = Traits::make_forward(*problem, i_dims, w, cg);
-      auto *runner = owner->runner.get();
-      const int rc = runner->prepare_weight(static_cast<Scalar const *>(w), cg, stream);
-      if (rc != 0) return rc;
+      owner->runner = std::make_unique<PlanState<ForwardRunner>>();
+      auto* state = owner->runner.get();
+      if (Traits::use_shape_plan(*problem)) {
+        state->shape = Traits::make_shape_plan(*problem, w, cg, false, stream);
+      } else {
+        state->legacy = Traits::make_forward(*problem, i_dims, w, cg);
+        const int rc = state->legacy->prepare_weight(static_cast<Scalar const*>(w), cg, stream);
+        if (rc != 0) return rc;
+      }
       info->precision = Traits::kPrecision;
-      info->forward_impl = Traits::forward_impl(*problem);
+      info->forward_impl = state->shape ? state->shape->impl() : Traits::forward_impl(*problem);
       info->dgrad_impl = Traits::kDgradImpl;
-      info->a_view = Traits::a_view(*runner) ? 1 : 0;
-      info->j_rows = out_total_i(i_dims);
+      info->a_view = state->shape ? 1 : (Traits::a_view(*state->legacy) ? 1 : 0);
+      info->j_rows = problem->J;
       *plan = owner.release();
       return 0;
+    } catch (UnsupportedConfiguration const &) {
+      return static_cast<int>(Status::kUnsupported);
     } catch (std::exception const &) {
       return static_cast<int>(Status::kInvalidArgument);
     }
@@ -52,7 +65,9 @@ struct BackendAdapter {
       return static_cast<int>(Status::kInvalidArgument);
     }
     auto *p = static_cast<ForwardPlan *>(plan);
-    return Traits::forward_run(*p->runner, x, out, stream);
+    auto& state = *p->runner;
+    return state.shape ? state.shape->run(x, out, stream)
+                       : Traits::forward_run(*state.legacy, x, out, stream);
   }
 
   static void forward_destroy(void *plan) { delete static_cast<ForwardPlan *>(plan); }
@@ -66,14 +81,21 @@ struct BackendAdapter {
     try {
       std::vector<int> i_dims(problem->i_dims, problem->i_dims + problem->P);
       auto owner = std::make_unique<DgradPlan>();
-      owner->runner = Traits::make_dgrad(*problem, i_dims, w, cg, stream);
+      owner->runner = std::make_unique<PlanState<DgradRunner>>();
+      auto* state = owner->runner.get();
+      if (Traits::use_shape_plan(*problem))
+        state->shape = Traits::make_shape_plan(*problem, w, cg, true, stream);
+      else
+        state->legacy = Traits::make_dgrad(*problem, i_dims, w, cg, stream);
       info->precision = Traits::kPrecision;
       info->forward_impl = -1;
-      info->dgrad_impl = Traits::kDgradImpl;
+      info->dgrad_impl = state->shape ? state->shape->impl() : Traits::kDgradImpl;
       info->a_view = 0;
-      info->j_rows = out_total_i(i_dims);
+      info->j_rows = problem->J;
       *plan = owner.release();
       return 0;
+    } catch (UnsupportedConfiguration const &) {
+      return static_cast<int>(Status::kUnsupported);
     } catch (std::exception const &) {
       return static_cast<int>(Status::kInvalidArgument);
     }
@@ -84,7 +106,9 @@ struct BackendAdapter {
       return static_cast<int>(Status::kInvalidArgument);
     }
     auto *p = static_cast<DgradPlan *>(plan);
-    return Traits::dgrad_run(*p->runner, dy, dx, stream);
+    auto& state = *p->runner;
+    return state.shape ? state.shape->run(dy, dx, stream)
+                       : Traits::dgrad_run(*state.legacy, dy, dx, stream);
   }
 
   static void dgrad_destroy(void *plan) { delete static_cast<DgradPlan *>(plan); }

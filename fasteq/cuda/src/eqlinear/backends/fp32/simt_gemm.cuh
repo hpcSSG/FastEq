@@ -46,6 +46,7 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_fused_plan(
 /// Backward plan: one tile per (problem, m, n), every problem carrying its own A/C offsets and
 /// strides.  Reuses the same SIMT mainloop; the forward plans are untouched.
 std::unique_ptr<BwdPlan> make_simt_bwd_plan(int N, int B,
-                                            std::vector<BwdProblem> const &problems);
+                                            std::vector<BwdProblem> const &problems,
+                                            float const *weights);
 
 }  // namespace eqlin_fp32

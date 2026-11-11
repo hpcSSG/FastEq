@@ -36,6 +36,10 @@ class GroupedGemmPlan {
       (void)stream;
       return 0;
     }
+    /// Immutable per-path epilogue scales, prepared once with the weight.
+    virtual int set_scales(std::vector<double> const &, cudaStream_t) { return 0; }
+    virtual bool scales_after_dot() const { return false; }
+    virtual bool original_weight_layout() const { return false; }
   };
 
   /// `mode` selects the backend: 0 = stock CUTLASS with its tile read from
@@ -55,6 +59,9 @@ class GroupedGemmPlan {
 
   /// Forward to the backend; see `ImplBase::bind_a`.
   int bind_a(float const *x, cudaStream_t stream);
+  int set_scales(std::vector<double> const &scales, cudaStream_t stream);
+  bool scales_after_dot() const;
+  bool original_weight_layout() const;
 
  private:
   std::unique_ptr<ImplBase> p_;

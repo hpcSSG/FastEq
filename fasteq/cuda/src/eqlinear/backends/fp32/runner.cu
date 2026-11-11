@@ -42,6 +42,8 @@
 #include "prep_kernels.h"
 #include "reduce_partials.h"
 #include "simt_gemm.cuh"
+#include "tiny_linear.cuh"
+#include "numeric_policy.h"
 #include "row_plan.h"
 
 namespace eqlin_fp32 {
@@ -126,8 +128,8 @@ struct Runner::Impl_ {
     // Not required by the SIMT mainloop (its operands are 4-byte scalar accesses), but kept so the
     // FP32 line accepts exactly the shapes the tf32 line accepts -- and so a later vectorized or
     // TMA-based mainloop can assume 16B-aligned row starts without changing the contract.
-    if (lda % kAlign || ldb % kAlign || ldc % kAlign || V % kAlign || B % kAlign) {
-      throw std::invalid_argument("Runner: strides/V/B must be multiples of 4");
+    if (lda % kAlign || ldb % kAlign || ldc % kAlign || V % kAlign) {
+      throw std::invalid_argument("Runner: strides/V must be multiples of 4");
     }
 
     want_fused_ = want_fused;
@@ -246,7 +248,11 @@ struct Runner::Impl_ {
     // Fused (M5): chain the per-path problems in one CTA, so there is no slab and no reduction.
     // The plan declines when its coarser tile grid would not fill the machine; then the split
     // path below runs instead.
-    if (want_fused_ && split) {
+    if (want_fused_ && NumericPolicy::tiny_batch(B)) {
+      fused_plan = make_tiny_forward_plan(B, U, V, J, lda, plan_rows, h_rbase, h_pg,
+                                          plan_a, d_b_prep.as<float>());
+      fused = true;
+    } else if (want_fused_ && split) {
       fused_plan = make_simt_fused_plan(B, V, num_rows, J, lda, ldb,
                                         static_cast<long long>(J) * V, plan_rows, h_rbase, h_pg,
                                         plan_a, d_b_prep.as<float>(), a_view);
@@ -284,6 +290,20 @@ struct Runner::Impl_ {
     // cg travels as a kernel argument -- no host->device copy on the critical path.
     CgVals cg_vals{};
     for (int p = 0; p < P; ++p) cg_vals.v[p] = cg ? static_cast<float>(cg[p]) : 1.f;
+    if (fused ? fused_plan->scales_after_dot() : plan->scales_after_dot()) {
+      std::vector<double> scales(rows.size());
+      for (size_t r = 0; r < rows.size(); ++r) {
+        int const p = static_cast<int>(rows[r].b_off / U);
+        scales[r] = cg ? cg[p] : 1.;
+      }
+      int const rc = fused ? fused_plan->set_scales(scales, stream)
+                           : plan->set_scales(scales, stream);
+      if (rc != 0) return rc;
+      for (int p = 0; p < P; ++p) cg_vals.v[p] = 1.f;
+    }
+    if (fused ? fused_plan->original_weight_layout() : plan->original_weight_layout())
+      return cudaMemcpyAsync(d_b_prep.as<float>(), w, static_cast<size_t>(P) * U * V * sizeof(float),
+                             cudaMemcpyDeviceToDevice, stream) == cudaSuccess ? 0 : 1;
     launch_pack_b(w, d_b_prep.as<float>(), d_b_src_base.as<int>(), d_b_p_of_col.as<int>(), cg_vals,
                   P, U, V, stream);
     return 0;
