@@ -121,7 +121,7 @@ struct BackwardRunner::Impl_ {
       build_dgrad();
     }
     if (problems.empty()) throw std::runtime_error("backward: empty problem table");
-    plan = make_simt_bwd_plan(V, B, problems, d_cgw.as<float>());
+    plan = make_simt_bwd_plan(V, B, problems, d_cgw.as<float>(), P);
     if (has_dgrad) {
       if (plan->transposes_weight()) {
         if (launch_tiny_weight_transpose(w, d_cgw.as<float>(), P, U, V, stream) != 0)

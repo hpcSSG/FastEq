@@ -13,6 +13,26 @@ class NumericPolicy {
   /// A small/unaligned M can select a more accurate strict-Torch contraction. Use the short
   /// chains there; retain the measured fast contraction on large established geometries.
   /// `rows` is the actual per-path problem count, never a captured configuration identifier.
+  /// Multi-path forward rows are split per path; once `B` is large enough the accumulated
+  /// round-off crosses the strict-FP32 gate (1.05x torch) while every reference stays green.
+  /// Measured onset: U=V=96/128 fail from B=1584, U=V=224 from B=396. Keep the established fast
+  /// contraction below those sizes and on single-path rows; this is a numeric policy keyed on the
+  /// shape, never on a configuration id.
+  static bool split_path_accuracy(int batch, int channels, bool split_paths) {
+    if (!split_paths) return false;
+    if (channels <= 128) return batch >= 1584;
+    return batch >= 396;
+  }
+
+  /// Dgrad of a multi-path operator: keep the strict-FP32 contraction accurate at the measured
+  /// onset. The dgrad `rows` argument is the problem count (I*P for K-concatenated rows), not the
+  /// operator's path count, so the caller passes the path count explicitly.
+  static bool dgrad_path_accuracy(int batch, int channels, int paths) {
+    if (paths <= 1) return false;
+    if (channels <= 128) return batch >= 1584;
+    return batch >= 396;
+  }
+
   static bool short_chains(int batch, int channels, int rows, bool dgrad = false) {
     if (batch % 4 != 0 || batch <= 256) return true;
     if (batch <= 512) {

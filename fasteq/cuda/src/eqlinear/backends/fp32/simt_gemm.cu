@@ -1003,7 +1003,7 @@ template <class Cfg, int STAGES>
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_fused_stages(
     int M, int N, int num_problems, int num_out_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, std::vector<int> const &rbase, std::vector<int> const &pg,
-    float const *a, float const *b, bool a_view) {
+    float const *a, float const *b, bool a_view, bool split_paths) {
   auto plan = build<Cfg, STAGES>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, &rbase,
                                  &pg, a, b, a_view);
   if (!plan->fills_machine()) return nullptr;
@@ -1018,17 +1018,17 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_fused(int M, int N, int num_prob
                                                       std::vector<int> const &rbase,
                                                       std::vector<int> const &pg, float const *a,
                                                       float const *b, int def_stages,
-                                                      bool a_view) {
+                                                      bool a_view, bool split_paths) {
   switch (stages_from_env(def_stages)) {
     case 2:
       return make_fused_stages<Cfg, 2>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase,
-                                       pg, a, b, a_view);
+                                       pg, a, b, a_view, split_paths);
     case 3:
       return make_fused_stages<Cfg, 3>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase,
-                                       pg, a, b, a_view);
+                                       pg, a, b, a_view, split_paths);
     default:
       return make_fused_stages<Cfg, 4>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase,
-                                       pg, a, b, a_view);
+                                       pg, a, b, a_view, split_paths);
   }
 }
 
@@ -1048,12 +1048,14 @@ std::unique_ptr<BwdPlan> make_bwd_cfg(int N, std::vector<BwdProblem> const &prob
 template <class Cfg>
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_numeric(
     int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
-    std::vector<RowPlan> const &rows, float const *a, float const *b, bool a_view) {
+    std::vector<RowPlan> const &rows, float const *a, float const *b, bool a_view,
+    bool split_paths) {
   // Independent 1+3 component problems; retain the established arithmetic and
   // use a smaller resource tile only on the profiled large-batch shape class.
   if (M >= 1024 && N == 128 && num_rows == 4)
     return make<Cfg128Short>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
-  if (NumericPolicy::short_chains(M, N, num_rows))
+  if (NumericPolicy::short_chains(M, N, num_rows) ||
+      NumericPolicy::split_path_accuracy(M, N, split_paths))
     return make<NumericConfig<Cfg, 8>>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
   return make<NumericConfig<Cfg, 1>>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
 }
@@ -1062,20 +1064,23 @@ template <class Cfg>
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_numeric_fused(
     int M, int N, int num_problems, int num_out_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, std::vector<int> const &rbase, std::vector<int> const &pg,
-    float const *a, float const *b, int stages, bool a_view) {
+    float const *a, float const *b, int stages, bool a_view, bool split_paths) {
   if (NumericPolicy::tiny_batch(M)) return nullptr;  // Runner uses the Tiny forward plan here.
-  if (NumericPolicy::short_chains(M, N, num_problems))
+  if (NumericPolicy::short_chains(M, N, num_problems) ||
+      NumericPolicy::split_path_accuracy(M, N, split_paths))
     return make_fused<NumericConfig<Cfg, 8>>(M, N, num_problems, num_out_rows, lda, ldb, ldc,
-                                            rows, rbase, pg, a, b, stages, a_view);
+                                            rows, rbase, pg, a, b, stages, a_view, split_paths);
   return make_fused<NumericConfig<Cfg, 1>>(M, N, num_problems, num_out_rows, lda, ldb, ldc,
-                                          rows, rbase, pg, a, b, stages, a_view);
+                                          rows, rbase, pg, a, b, stages, a_view, split_paths);
 }
 
 template <class Cfg>
 std::unique_ptr<BwdPlan> make_numeric_bwd(int N, std::vector<BwdProblem> const &problems,
-                                         int stages, int batch) {
+                                         int stages, int batch, int paths) {
   bool const dgrad_only = std::all_of(problems.begin(), problems.end(),
                                     [](BwdProblem const &p) { return p.kind == 0; });
+  if (dgrad_only && NumericPolicy::dgrad_path_accuracy(batch, N, paths))
+    return make_bwd_cfg<NumericConfig<Cfg, 8>>(N, problems, stages);
   if (dgrad_only && batch >= 1024 && N == 128 && problems.size() == 4)
     return make_bwd_cfg<Cfg128Short>(N, problems, stages);
   if (dgrad_only && batch >= 1024 && N == 224 && problems.size() == 9)
@@ -1089,28 +1094,29 @@ std::unique_ptr<BwdPlan> make_numeric_bwd(int N, std::vector<BwdProblem> const &
 
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_custom_plan(
     int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
-    std::vector<RowPlan> const &rows, float const *a_data, float const *b_data, bool a_view) {
+    std::vector<RowPlan> const &rows, float const *a_data, float const *b_data, bool a_view,
+    bool split_paths) {
   bool const small = (M <= 1024);
   if (N <= 96) {
-    if (small) return make_numeric<CfgS96>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
-    return make_numeric<Cfg96>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+    if (small) return make_numeric<CfgS96>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
+    return make_numeric<Cfg96>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
   }
   if (N <= 128) {
-    if (small) return make_numeric<CfgS128>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
-    return make_numeric<Cfg128>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+    if (small) return make_numeric<CfgS128>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
+    return make_numeric<Cfg128>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
   }
   // V > 128: one 8x14 shape for every B (TB_M=64 already doubles the grid at small B; splitting
   // N was measured 7% slower at B=512).  EQLIN_FP32_CFG=wide swaps in the 8-warp / 128-row variant.
   if (strcmp(cfg_from_env(), "wide") == 0) {
-    return make_numeric<Cfg224W>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+    return make_numeric<Cfg224W>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
   }
-  return make_numeric<Cfg224>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+  return make_numeric<Cfg224>(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view, split_paths);
 }
 
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_fused_plan(
     int M, int N, int num_problems, int num_out_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, std::vector<int> const &rbase, std::vector<int> const &pg,
-    float const *a_data, float const *b_data, bool a_view) {
+    float const *a_data, float const *b_data, bool a_view, bool split_paths) {
   if (N < 128) return nullptr;  // N=96 uses the exact-fit split plan, never an N=128 tile.
   // Shape per V.  Both are 8x14 / 8x16 thread tiles, i.e. the same mainloop the plain kernel uses;
   // what differs is where the running-sum slab fits.  V=224: 128 rows over 8 warps leaves 25 KB of
@@ -1121,36 +1127,36 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_fused_plan(
   if (N > 128) {
     if (want_narrow) {
       return make_numeric_fused<Cfg224>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase, pg,
-                                a_data, b_data, 2, a_view);
+                                a_data, b_data, 2, a_view, split_paths);
     }
     return make_numeric_fused<Cfg224W>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase, pg,
-                               a_data, b_data, 3, a_view);
+                               a_data, b_data, 3, a_view, split_paths);
   }
   if (N <= 128) {
     if (want_wide) {
       return make_numeric_fused<Cfg128W>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase, pg,
-                                 a_data, b_data, 3, a_view);
+                                 a_data, b_data, 3, a_view, split_paths);
     }
     return make_numeric_fused<Cfg128>(M, N, num_problems, num_out_rows, lda, ldb, ldc, rows, rbase, pg,
-                              a_data, b_data, 2, a_view);
+                              a_data, b_data, 2, a_view, split_paths);
   }
   return nullptr;
 }
 
 std::unique_ptr<BwdPlan> make_simt_bwd_plan(int N, int B,
                                             std::vector<BwdProblem> const &problems,
-                                            float const *weights) {
+                                            float const *weights, int paths) {
   if (NumericPolicy::tiny_batch(B) && std::all_of(problems.begin(), problems.end(),
                                               [](BwdProblem const &p) { return p.kind == 0; }))
     return make_tiny_dgrad_plan(B, N, problems, weights);
   bool const small = (B <= 1024);
   if (N <= 96) {
-    return small ? make_numeric_bwd<CfgS96>(N, problems, 2, B)
-                 : make_numeric_bwd<Cfg96>(N, problems, 3, B);
+    return small ? make_numeric_bwd<CfgS96>(N, problems, 2, B, paths)
+                 : make_numeric_bwd<Cfg96>(N, problems, 3, B, paths);
   }
   if (N <= 128) {
-    return small ? make_numeric_bwd<CfgS128>(N, problems, 2, B)
-                 : make_numeric_bwd<Cfg128>(N, problems, 3, B);
+    return small ? make_numeric_bwd<CfgS128>(N, problems, 2, B, paths)
+                 : make_numeric_bwd<Cfg128>(N, problems, 3, B, paths);
   }
   // Backward's default is the narrow 64-row tile: wgrad's M is only U (96/128/224), so the
   // 128-row tile wastes 12.5% of the MMA rows and leaves half the SM idle at small B.  The
@@ -1160,16 +1166,16 @@ std::unique_ptr<BwdPlan> make_simt_bwd_plan(int N, int B,
   // M12: the per-point M10 data says the wide/4 win is confined to N>128 with B>=2048; keep the
   // narrow/3 shape everywhere else.  This is the shape rule the global wide/4 could not express.
   if (strcmp(cfg_from_env(), "hybrid") == 0) {
-    if (B >= 2048) return make_numeric_bwd<Cfg224W>(N, problems, 4, B);
-    return make_numeric_bwd<Cfg224>(N, problems, 3, B);
+    if (B >= 2048) return make_numeric_bwd<Cfg224W>(N, problems, 4, B, paths);
+    return make_numeric_bwd<Cfg224>(N, problems, 3, B, paths);
   }
   if (strcmp(cfg_from_env(), "halfn") == 0) {
-    return make_numeric_bwd<Cfg224N>(N, problems, 3, B);
+    return make_numeric_bwd<Cfg224N>(N, problems, 3, B, paths);
   }
   if (strcmp(cfg_from_env(), "wide") == 0) {
-    return make_numeric_bwd<Cfg224W>(N, problems, 3, B);
+    return make_numeric_bwd<Cfg224W>(N, problems, 3, B, paths);
   }
-  return make_numeric_bwd<Cfg224>(N, problems, 3, B);
+  return make_numeric_bwd<Cfg224>(N, problems, 3, B, paths);
 }
 
 }  // namespace eqlin_fp32

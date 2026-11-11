@@ -312,10 +312,13 @@ char const *status_string(int code) {
 
 GroupedGemmPlan::GroupedGemmPlan(int M, int N, int num_rows, long long lda, long long ldb,
                                  long long ldc, std::vector<RowPlan> const &rows,
-                                 float const *a_data, float const *b_data, int mode, bool a_view) {
+                                 float const *a_data, float const *b_data, int mode, bool a_view,
+                                 bool split_paths) {
   if (mode == 1 || (mode == 2 && (N <= 96 || N > 128 ||
-                                 NumericPolicy::short_chains(M, N, num_rows)))) {
-    p_ = make_simt_custom_plan(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+                                 NumericPolicy::short_chains(M, N, num_rows) ||
+                                 NumericPolicy::split_path_accuracy(M, N, split_paths)))) {
+    p_ = make_simt_custom_plan(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view,
+                               split_paths);
   } else {
     // mode 2's stock half is policy 2 (24x8 / exact-fit N), not the environment's default.
     p_ = make_impl(mode == 2 ? 2 : policy_from_env(), M, N, num_rows, lda, ldb, ldc, rows, a_data,

@@ -31,7 +31,7 @@ namespace eqlin_fp32 {
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_custom_plan(
     int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, float const *a_data, float const *b_data,
-    bool a_view = false);
+    bool a_view = false, bool split_paths = false);
 
 /// Build the path-chained plan (M5): one tile covers an output row's `pg` per-path problems, which
 /// it accumulates in smem between paths, so there is no partial slab and no reduction kernel.
@@ -41,12 +41,12 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_custom_plan(
 std::unique_ptr<GroupedGemmPlan::ImplBase> make_simt_fused_plan(
     int M, int N, int num_problems, int num_out_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, std::vector<int> const &rbase, std::vector<int> const &pg,
-    float const *a_data, float const *b_data, bool a_view = false);
+    float const *a_data, float const *b_data, bool a_view = false, bool split_paths = false);
 
 /// Backward plan: one tile per (problem, m, n), every problem carrying its own A/C offsets and
 /// strides.  Reuses the same SIMT mainloop; the forward plans are untouched.
 std::unique_ptr<BwdPlan> make_simt_bwd_plan(int N, int B,
                                             std::vector<BwdProblem> const &problems,
-                                            float const *weights);
+                                            float const *weights, int paths);
 
 }  // namespace eqlin_fp32

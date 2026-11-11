@@ -113,6 +113,7 @@ struct Runner::Impl_ {
     // K-concatenated problem table).
     char const *env = nullptr;
     split = multi_path && !(env != nullptr && atoi(env) == 0);
+    multi_path_ = (P > 1);
     char const *fenv = nullptr;
     bool const want_fused =
         impl == Impl::kFused && !(fenv != nullptr && atoi(fenv) == 0);
@@ -225,6 +226,10 @@ struct Runner::Impl_ {
   }
 
   bool want_fused_ = false;
+  /// More than one input path feeds the operator; drives the strict-FP32 contraction policy. Note
+  /// that descriptors can have P>1 while every output row still belongs to one path (`path_count`
+  /// all 1); this flag follows the operator's path count, not the per-row grouping.
+  bool multi_path_ = false;
 
   void allocate() {
     size_t const n_a = static_cast<size_t>(B) * I * U;
@@ -255,7 +260,7 @@ struct Runner::Impl_ {
     } else if (want_fused_ && split) {
       fused_plan = make_simt_fused_plan(B, V, num_rows, J, lda, ldb,
                                         static_cast<long long>(J) * V, plan_rows, h_rbase, h_pg,
-                                        plan_a, d_b_prep.as<float>(), a_view);
+                                        plan_a, d_b_prep.as<float>(), a_view, multi_path_);
       fused = (fused_plan != nullptr);
     }
     if (split && !fused) {
@@ -282,7 +287,7 @@ struct Runner::Impl_ {
     int const plan_mode = impl == Impl::kFused ? static_cast<int>(Impl::kAuto)
                                                : static_cast<int>(impl);
     plan = std::make_unique<GroupedGemmPlan>(B, V, num_rows, lda, ldb, ldc, plan_rows, plan_a,
-                                             d_b_prep.as<float>(), plan_mode, a_view);
+                                             d_b_prep.as<float>(), plan_mode, a_view, multi_path_);
   }
 
   /// Weight side: constant across calls, so a caller can hoist it.

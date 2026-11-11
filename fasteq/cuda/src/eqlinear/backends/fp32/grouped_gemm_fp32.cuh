@@ -46,9 +46,11 @@ class GroupedGemmPlan {
   /// `EQLIN_FP32_TILE_POLICY`, 1 = the hand-written SIMT kernel, 2 = per-shape choice between the
   /// two (custom where the stock path has no exact-fit 16x8 tile: V <= 96 or V > 128).
   /// `a_view` says `a_data` is a placeholder and the real A base arrives through `bind_a`.
+  /// `split_paths` marks a multi-path row table whose output rows are split per path; the numeric
+  /// policy uses it to keep the strict-FP32 contraction accurate at the measured large-batch sizes.
   GroupedGemmPlan(int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
                   std::vector<RowPlan> const &rows, float const *a_data, float const *b_data,
-                  int mode = 0, bool a_view = false);
+                  int mode = 0, bool a_view = false, bool split_paths = false);
   ~GroupedGemmPlan();
 
   GroupedGemmPlan(GroupedGemmPlan const &) = delete;
