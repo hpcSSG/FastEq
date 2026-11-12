@@ -7,6 +7,16 @@ namespace eqlin_fp32 {
 /// constant.  The plan still describes the real batch size; this is a CTA resource policy.
 class NumericPolicy {
  public:
+  // Blocked dots retain the full M tile. Small problems keep the existing
+  // resource policy until there is enough work to amortize the wider tile.
+  static bool blocked(int batch, int channels, int rows, bool dgrad = false) {
+    if (batch < 512) return false;
+    // Few output components leave the wider tile underoccupied. Keep the
+    // existing narrow/multi-chain kernels on this measured small-work class.
+    if (channels == 128 && rows <= 9 && batch < 4096) return false;
+    if (dgrad && channels <= 128 && batch < 1024) return false;
+    return true;
+  }
   static constexpr int kTinyBatch = 64;
   static bool tiny_batch(int batch) { return batch <= kTinyBatch; }
 
@@ -46,9 +56,25 @@ class NumericPolicy {
 template <class Base, int Chains>
 struct NumericConfig : Base {
   static constexpr int kChains = Chains;
+  static constexpr int kBlockK = 0;
+  static constexpr bool kContinuous = false;
+  static constexpr bool kPostScale = Chains > 1;
   static constexpr int kWarpM = Base::kWarpM / kChains;
   static constexpr int kTbM = Base::kTbM / kChains;
   static_assert(kWarpM >= 8 && kWarpM % 8 == 0);
+};
+
+/// One persistent output state, plus one short-lived scalar dot per element.
+/// Forward weights include each path's coefficient before crossing boundaries;
+/// independent dgrad problems can instead retain post-dot scaling.
+template <class Base, int BlockK = 8, bool PostScale = false>
+struct BlockedConfig : Base {
+  static constexpr int kChains = 1;
+  static constexpr int kBlockK = BlockK;
+  static constexpr int kChunk = BlockK;
+  static constexpr bool kContinuous = !PostScale;
+  static constexpr bool kPostScale = PostScale;
+  static_assert(BlockK == 8 || BlockK == 16);
 };
 
 }  // namespace eqlin_fp32

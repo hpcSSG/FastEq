@@ -6,6 +6,7 @@
 #include <string>
 
 #include "../../common/single_path.h"
+#include "block_accumulator.cuh"
 #include "device_buffer.h"
 #include "shape_plan.cuh"
 #include "single_path_math.cuh"
@@ -20,6 +21,20 @@ struct Parameters {
   int K, N;
   int64_t M, tiles;
   float2 coefficient;
+};
+
+struct BlockedTile {
+  static constexpr int kM = 64, kN = 64, kK = 16, kBlockK = 8;
+  static constexpr int kRows = 8, kColumns = 4;
+
+  static bool accepts(const Parameters& p, bool dgrad) {
+    if (p.K < 32 || p.N < kN || p.M < 1024) return false;
+    // Small square contractions are sensitive to tile parallelism and public
+    // autograd overhead; retain their established kernels below this work size.
+    if (p.K == p.N && p.N <= 128)
+      return !dgrad && p.M >= 4096;
+    return true;
+  }
 };
 
 // Static, unscaled weights in true [K,N] order: no K16/N32 padding and no
@@ -298,6 +313,71 @@ __global__ void __launch_bounds__(kThreads, 4) square_dot(
   }
 }
 
+// Dense, sufficiently large single-path GEMMs: one 8x4 output accumulator per
+// thread. Each K8 dot rounds before joining that accumulator; the final CG
+// multiply retains both coefficient components. The original kernels remain
+// available for short K, narrow N, small M and numerical/performance fallback.
+__global__ void __launch_bounds__(kThreads, 2) blocked_dot(
+    Parameters p, const float* __restrict__ input, float* __restrict__ output) {
+  using Tile = BlockedTile;
+  __shared__ float a[Tile::kM][Tile::kK + 1];
+  __shared__ float w[Tile::kK][Tile::kN];
+  const int lane_m = (threadIdx.x & 31) / 8;
+  const int lane_n = threadIdx.x % 8;
+  const int warp_m = (threadIdx.x / 32) / 2;
+  const int warp_n = (threadIdx.x / 32) % 2;
+  const int64_t nt = (int64_t(p.N) + Tile::kN - 1) / Tile::kN;
+  for (int64_t tile = blockIdx.x; tile < p.tiles; tile += gridDim.x) {
+    const int64_t m0 = (tile / nt) * Tile::kM, n0 = (tile % nt) * Tile::kN;
+    float acc[Tile::kRows][Tile::kColumns]{};
+    for (int64_t k0 = 0; k0 < p.K; k0 += Tile::kK) {
+#pragma unroll
+      for (int i = threadIdx.x; i < Tile::kM * Tile::kK; i += kThreads) {
+        const int m = i / Tile::kK, k = i % Tile::kK;
+        a[m][k] = m0 + m < p.M && k0 + k < p.K
+            ? input[(m0 + m) * p.K + k0 + k] : 0.f;
+      }
+#pragma unroll
+      for (int i = threadIdx.x; i < Tile::kK * Tile::kN; i += kThreads) {
+        const int k = i / Tile::kN, n = i % Tile::kN;
+        w[k][n] = k0 + k < p.K && n0 + n < p.N
+            ? p.weights[(k0 + k) * p.N + n0 + n] : 0.f;
+      }
+      __syncthreads();
+#pragma unroll
+      for (int chunk = 0; chunk < Tile::kK; chunk += Tile::kBlockK) {
+        float av[Tile::kRows][Tile::kBlockK];
+        float bv[Tile::kColumns][Tile::kBlockK];
+#pragma unroll
+        for (int m = 0; m < Tile::kRows; ++m)
+#pragma unroll
+          for (int k = 0; k < Tile::kBlockK; ++k)
+            av[m][k] = a[warp_m * (Tile::kM / 2) + lane_m + 4 * m][chunk + k];
+#pragma unroll
+        for (int n = 0; n < Tile::kColumns; ++n)
+#pragma unroll
+          for (int k = 0; k < Tile::kBlockK; ++k)
+            bv[n][k] = w[chunk + k][warp_n * (Tile::kN / 2) + lane_n + 8 * n];
+#pragma unroll
+        for (int m = 0; m < Tile::kRows; ++m)
+#pragma unroll
+          for (int n = 0; n < Tile::kColumns; ++n)
+            eqlin_fp32::BlockAccumulator::add<Tile::kBlockK>(acc[m][n], av[m], bv[n]);
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int m = 0; m < Tile::kRows; ++m)
+#pragma unroll
+      for (int n = 0; n < Tile::kColumns; ++n) {
+        const int64_t row = m0 + warp_m * (Tile::kM / 2) + lane_m + 4 * m;
+        const int64_t col = n0 + warp_n * (Tile::kN / 2) + lane_n + 8 * n;
+        if (row < p.M && col < p.N)
+          output[row * p.N + col] = FloatPair{acc[m][n], 0.f}.scale(p.coefficient);
+      }
+  }
+}
+
 void check_cuda(cudaError_t status, const char* operation) {
   if (status != cudaSuccess)
     throw std::runtime_error(std::string("eqlinear FP32 single: ") + operation + ": " +
@@ -332,6 +412,10 @@ class Plan final : public ShapePlan {
     } else if (p_.K > 16 && p_.M <= 512) {
       p_.tiles = checked_product(p_.M, (int64_t(p_.N) + 7) / 8);
       launch_ = &launch_cooperative<2, 4>;
+    } else if (BlockedTile::accepts(p_, dgrad)) {
+      p_.tiles = checked_product((p_.M + BlockedTile::kM - 1) / BlockedTile::kM,
+                                 (int64_t(p_.N) + BlockedTile::kN - 1) / BlockedTile::kN);
+      launch_ = &launch_blocked;
     } else if (p_.K == p_.N && (p_.K == 96 || p_.K == 128 || p_.K == 224)) {
       p_.tiles = checked_product((p_.M + 15) / 16, (int64_t(p_.N) + 63) / 64);
       launch_ = &launch_square;
@@ -398,6 +482,10 @@ class Plan final : public ShapePlan {
   }
   static int launch_square(Parameters p, const float* x, float* y, cudaStream_t s) {
     square_dot<<<blocks(p.tiles), kThreads, 0, s>>>(p, x, y);
+    return static_cast<int>(cudaGetLastError());
+  }
+  static int launch_blocked(Parameters p, const float* x, float* y, cudaStream_t s) {
+    blocked_dot<<<blocks(p.tiles), kThreads, 0, s>>>(p, x, y);
     return static_cast<int>(cudaGetLastError());
   }
   static int launch_ten_chains(Parameters p, const float* x, float* y, cudaStream_t s) {

@@ -3,8 +3,8 @@
  *
  * M2: hand-written grouped SIMT GEMM (impl 1).
  *
- * Shape-selected FP32 FMA chains, with compensated merging on the accuracy path. The single-chain
- * specialization retains the original ascending-K arithmetic. The tile is chosen per shape (exact-fit N),
+ * Shape-selected FP32 accumulation: register-local K8 dots on the wide-tile path, or the legacy
+ * independent FMA chains with compensated merging. The tile is chosen per shape (exact-fit N),
  * and the accumulator/operand register budget is the only thing the compiler has to allocate -- no
  * stock iterator or epilogue state -- so a 96-128 accumulator thread tile still fits a CTA with
  * 2-3 blocks per SM instead of the stock path's 255 registers.
@@ -24,6 +24,7 @@
 
 #include "device_buffer.h"
 #include "numeric_policy.h"
+#include "block_accumulator.cuh"
 #include "tiny_linear.cuh"
 #include "tma_desc.h"
 
@@ -41,7 +42,7 @@ struct SharedPlan {
   static constexpr int kPayload = (kElements + 3) & ~3;
   static constexpr int kStride = kPayload + 4;
   static constexpr int kOperands = Stages * (Cfg::kTbM + Cfg::kTbN) * kLds;
-  static constexpr int kSlab = Fused ? Cfg::kThreads * kStride : 0;
+  static constexpr int kSlab = Fused && !Cfg::kContinuous ? Cfg::kThreads * kStride : 0;
   static constexpr int kFloats = kOperands + kSlab;
   static constexpr int kBarrierOffset = (kFloats + 1) & ~1;
 };
@@ -171,8 +172,8 @@ __device__ __forceinline__ void fold_chains(float (&acc)[CHAINS][TM][TN]) {
 }
 
 /// \param FUSED  chain the `pg` per-path problems of one output row inside one CTA, summing them
-///        in smem between paths instead of in a second kernel.  Each path keeps its own fp32
-///        accumulator, so the accumulation order is torch's (and identical to the split table's).
+///        without an intermediate global output. Blocked dots accumulate across paths in
+///        registers; the legacy policy retains a shared per-path running sum.
 template <class Cfg, int STAGES, bool FUSED, bool TMA, bool BWD = false>
 __global__ void __launch_bounds__(Cfg::kThreads, Cfg::kMinBlocks)
 simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
@@ -181,6 +182,7 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
   constexpr int TM = Cfg::kWarpM / 8;  // 8 M-lanes per warp
   constexpr int TN = Cfg::kWarpN / 4;  // 4 N-lanes per warp
   constexpr int KC = Cfg::kChunk;      // k values consumed per smem pass
+  static_assert(kK % KC == 0, "micro dots must divide the shared K tile");
   constexpr int CHAINS = Cfg::kChains;
   using Shared = SharedPlan<Cfg, STAGES, FUSED>;
   constexpr int THREADS = Cfg::kThreads;
@@ -396,9 +398,12 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
 #pragma unroll
         for (int r = 0; r < TM; ++r) {
           float const *src = sA + smem_off(m_base + r * 8, kc);
-          if constexpr (KC == 4) {
-            float4 const v = *reinterpret_cast<float4 const *>(src);
-            a[r][0] = v.x; a[r][1] = v.y; a[r][2] = v.z; a[r][3] = v.w;
+          if constexpr (KC >= 4) {
+#pragma unroll
+            for (int q = 0; q < KC; q += 4) {
+              float4 const v = *reinterpret_cast<float4 const *>(src + q);
+              a[r][q] = v.x; a[r][q + 1] = v.y; a[r][q + 2] = v.z; a[r][q + 3] = v.w;
+            }
           } else if constexpr (KC == 2) {
             float2 const v = *reinterpret_cast<float2 const *>(src);
             a[r][0] = v.x; a[r][1] = v.y;
@@ -414,9 +419,12 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
           for (int c = 0; c < 4; ++c) {
             if (g * 4 + c < TN) {
               float const *src = sB + smem_off(n_base + (g * 4 + c) * 4, kc);
-              if constexpr (KC == 4) {
-                float4 const v = *reinterpret_cast<float4 const *>(src);
-                b[c][0] = v.x; b[c][1] = v.y; b[c][2] = v.z; b[c][3] = v.w;
+              if constexpr (KC >= 4) {
+#pragma unroll
+                for (int q = 0; q < KC; q += 4) {
+                  float4 const v = *reinterpret_cast<float4 const *>(src + q);
+                  b[c][q] = v.x; b[c][q + 1] = v.y; b[c][q + 2] = v.z; b[c][q + 3] = v.w;
+                }
               } else if constexpr (KC == 2) {
                 float2 const v = *reinterpret_cast<float2 const *>(src);
                 b[c][0] = v.x; b[c][1] = v.y;
@@ -430,17 +438,21 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
               if (g * 4 + c < TN) {
+                if constexpr (Cfg::kBlockK > 0) {
+                  BlockAccumulator::add(acc[0][r][g * 4 + c], a[r], b[c]);
+                } else {
 #pragma unroll
-                for (int j = 0; j < KC; ++j)
-                  acc[(kc + j) % CHAINS][r][g * 4 + c] += a[r][j] * b[c][j];
+                  for (int j = 0; j < KC; ++j)
+                    acc[(kc + j) % CHAINS][r][g * 4 + c] += a[r][j] * b[c][j];
+                }
               }
             }
           }
         }
       }
 
-      // Path boundary: park this path's accumulator in the smem running sum and start a fresh one,
-      // so every path is a full fp32 chain of its own -- torch's accumulation order.  A thread
+      // Advance the operand pipeline at every path boundary. The legacy policy also parks
+      // its folded partial in shared memory; continuous blocked dots keep the register sum. A thread
       // owns slab elements [tid*RES_STRIDE, +TM*TN), written as float4s; the stride is chosen so
       // the 8 lanes of a 128-bit phase land on distinct bank groups.
       if constexpr (FUSED) {
@@ -454,9 +466,9 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
         if (++cur_k == nk) {
           cur_k = 0;
           ++cur_path;
-          if (cur_path < np) {
+          if (cur_path < np && !Cfg::kContinuous) {
             fold_chains(acc);
-            if constexpr (CHAINS > 1) {
+            if constexpr (Cfg::kPostScale) {
               float const scale = p.scales ? p.scales[base + cur_path - 1] : 1.f;
 #pragma unroll
               for (int r = 0; r < TM; ++r)
@@ -494,7 +506,7 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
 
     // Epilogue: scalar stores; the stores are a small fraction of the runtime and TN is not always
     // a multiple of 4 (V=224 gives TN=14), so vectorising them is not worth the tail handling.
-    // FUSED folds in the running sum here, so the output tile is written exactly once.
+    // Only legacy FUSED folds in the shared sum. Both policies write the output tile once.
     fold_chains(acc);
     float const *slab = &smem[RES_OFF + tid * RES_STRIDE];
 #pragma unroll
@@ -504,8 +516,8 @@ simt_gemm_kernel(SimtParams p, __grid_constant__ const CUtensorMap map_a,
 #pragma unroll
       for (int c = 0; c < TN; ++c) {
         float v = acc[0][r][c];
-        if constexpr (CHAINS > 1) v *= p.scales ? p.scales[base + np - 1] : 1.f;
-        if constexpr (FUSED) {
+        if constexpr (Cfg::kPostScale) v *= p.scales ? p.scales[base + np - 1] : 1.f;
+        if constexpr (FUSED && !Cfg::kContinuous) {
           if (np > 1) v += slab[r * TN + c];
         }
         crow[n_base + c * 4] = v;
@@ -727,10 +739,10 @@ class SimtPlanImpl : public GroupedGemmPlan::ImplBase {
   }
 
   ~SimtPlanImpl() override = default;
-  bool scales_after_dot() const override { return Cfg::kChains > 1; }
+  bool scales_after_dot() const override { return Cfg::kPostScale; }
 
   int set_scales(std::vector<double> const &scales, cudaStream_t) override {
-    if constexpr (Cfg::kChains > 1) {
+    if constexpr (Cfg::kPostScale) {
       if (static_cast<int>(scales.size()) != NP_ ||
           d_scales_.reset(scales.size() * sizeof(float)) != 0) return 1;
       std::vector<float> const rounded(scales.begin(), scales.end());
@@ -854,7 +866,7 @@ class SimtPlanImpl : public GroupedGemmPlan::ImplBase {
 template <class Cfg, int STAGES>
 class SimtBwdPlanImpl : public BwdPlan {
  public:
-  bool scales_after_dot() const override { return Cfg::kChains > 1; }
+  bool scales_after_dot() const override { return Cfg::kPostScale; }
   SimtBwdPlanImpl(int N, std::vector<BwdProblem> const &problems) {
     int const np = static_cast<int>(problems.size());
     if (np <= 0) throw std::invalid_argument("SimtBwdPlanImpl: empty problem table");
@@ -912,7 +924,7 @@ class SimtBwdPlanImpl : public BwdPlan {
     cudaMemcpy(d_c_off_.as<long long>(), h_c_off.data(), n * sizeof(long long),
                cudaMemcpyHostToDevice);
     cudaMemcpy(d_tiles_.as<int4>(), h_tiles.data(), nt * sizeof(int4), cudaMemcpyHostToDevice);
-    if constexpr (Cfg::kChains > 1) {
+    if constexpr (Cfg::kPostScale) {
       if (d_scales_.reset(n * sizeof(float)) != 0)
         throw std::runtime_error("SimtBwdPlanImpl: scale allocation failed");
       if (cudaMemcpy(d_scales_.as<float>(), h_scales.data(), n * sizeof(float),
@@ -1050,6 +1062,8 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_numeric(
     int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
     std::vector<RowPlan> const &rows, float const *a, float const *b, bool a_view,
     bool split_paths) {
+  if (NumericPolicy::blocked(M, N, num_rows))
+    return make<BlockedConfig<Cfg, 8, true>>(M, N, num_rows, lda, ldb, ldc, rows, a, b, a_view);
   // Independent 1+3 component problems; retain the established arithmetic and
   // use a smaller resource tile only on the profiled large-batch shape class.
   if (M >= 1024 && N == 128 && num_rows == 4)
@@ -1066,6 +1080,11 @@ std::unique_ptr<GroupedGemmPlan::ImplBase> make_numeric_fused(
     std::vector<RowPlan> const &rows, std::vector<int> const &rbase, std::vector<int> const &pg,
     float const *a, float const *b, int stages, bool a_view, bool split_paths) {
   if (NumericPolicy::tiny_batch(M)) return nullptr;  // Runner uses the Tiny forward plan here.
+  if (NumericPolicy::blocked(M, N, num_out_rows)) {
+    auto plan = make_fused<BlockedConfig<Cfg>>(M, N, num_problems, num_out_rows, lda, ldb, ldc,
+                                               rows, rbase, pg, a, b, stages, a_view, split_paths);
+    if (plan) return plan;
+  }
   if (NumericPolicy::short_chains(M, N, num_problems) ||
       NumericPolicy::split_path_accuracy(M, N, split_paths))
     return make_fused<NumericConfig<Cfg, 8>>(M, N, num_problems, num_out_rows, lda, ldb, ldc,
@@ -1079,6 +1098,8 @@ std::unique_ptr<BwdPlan> make_numeric_bwd(int N, std::vector<BwdProblem> const &
                                          int stages, int batch, int paths) {
   bool const dgrad_only = std::all_of(problems.begin(), problems.end(),
                                     [](BwdProblem const &p) { return p.kind == 0; });
+  if (dgrad_only && NumericPolicy::blocked(batch, N, static_cast<int>(problems.size()), true))
+    return make_bwd_cfg<BlockedConfig<Cfg, 8, true>>(N, problems, stages);
   if (dgrad_only && NumericPolicy::dgrad_path_accuracy(batch, N, paths))
     return make_bwd_cfg<NumericConfig<Cfg, 8>>(N, problems, stages);
   if (dgrad_only && batch >= 1024 && N == 128 && problems.size() == 4)
