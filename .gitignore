@@ -55,3 +55,4 @@ fasteq/cuda/src/uniform1d_jit_codegen.baseline/
 fasteq/cuda/src/uniform1d_jit_codegen.unroll/
 fasteq/ops/_schedule_stats/
 tmp_dev/
+/test/eqlinear_h20/
