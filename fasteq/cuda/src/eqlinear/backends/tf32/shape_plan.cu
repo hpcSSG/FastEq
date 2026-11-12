@@ -70,14 +70,56 @@ __global__ void split_weights(const float* __restrict__ w,
 // warp computes [16 batches, 8 channels]; masked scalars fill only registers.
 using Mma = cute::MMA_Atom<cute::SM80_16x8x8_F32TF32TF32F32_TN>;
 
-template <bool Dgrad>
+template <class Fragment>
+__device__ void path_dot(const float* input, const WeightSplit* weights,
+                         KernelGeometry g, const ShapePath& path, int source_row,
+                         int b0, int n0, Fragment& dot) {
+  const int lane = threadIdx.x % 32;
+  Mma mma;
+  cutlass::NumericConverterFastF32<> split;
+  // A whole warp follows each path/K loop, including K=1 readout dgrad.
+  for (int64_t k0 = 0; k0 < g.k; k0 += 8) {
+    auto a_big = cute::make_tensor<cutlass::tfloat32_t>(cute::Shape<cute::_4>{});
+    auto a_small = cute::make_tensor_like(a_big);
+    auto b_big = cute::make_tensor<cutlass::tfloat32_t>(cute::Shape<cute::_2>{});
+    auto b_small = cute::make_tensor_like(b_big);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int coordinate = Mma::LayoutA_TV{}(lane, i);
+      const int batch = b0 + coordinate % 16;
+      const int64_t k = k0 + coordinate / 16;
+      float value = 0.f;
+      if (batch < g.batch && k < g.k)
+        value = input[(uint64_t(batch) * g.source_rows + source_row) * g.k + k];
+      const auto pair = split(value);
+      a_big(i) = pair[0];
+      a_small(i) = pair[1];
+    }
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int coordinate = Mma::LayoutB_TV{}(lane, i);
+      const int n = n0 + coordinate % 8;
+      const int64_t k = k0 + coordinate / 8;
+      WeightSplit value{cutlass::tfloat32_t::bitcast(0), cutlass::tfloat32_t::bitcast(0)};
+      if (n < g.n && k < g.k)
+        value = weights[(uint64_t(path.weight_path) * g.n + n) * g.k + k];
+      b_big(i) = value.big;
+      b_small(i) = value.small;
+    }
+    // True TF32x3 TensorCore arithmetic: two cross terms, then the high
+    // product. The small*small term is intentionally absent, as in legacy.
+    mma.call(a_big, b_small, dot);
+    mma.call(a_small, b_big, dot);
+    mma.call(a_big, b_big, dot);
+  }
+}
+
+template <bool Dgrad, bool SingleContribution>
 __global__ void fused_shape(const float* __restrict__ input, float* __restrict__ output,
                             const WeightSplit* __restrict__ weights,
                             const ShapePath* __restrict__ paths, KernelGeometry g) {
   const int lane = threadIdx.x % 32;
   const uint64_t warp = uint64_t(blockIdx.x) * kWarps + threadIdx.x / 32;
-  Mma mma;
-  cutlass::NumericConverterFastF32<> split;
   for (uint64_t tile = warp; tile < g.tiles; tile += uint64_t(gridDim.x) * kWarps) {
     const int n0 = (tile % g.column_tiles) * 8;
     const uint64_t row_batch = tile / g.column_tiles;
@@ -86,51 +128,33 @@ __global__ void fused_shape(const float* __restrict__ input, float* __restrict__
     auto total = cute::make_tensor<float>(cute::Shape<cute::_4>{});
     cute::clear(total);
 
-    for (int q = 0; q < g.paths; ++q) {
-      const ShapePath path = paths[q];
-      const int destination = Dgrad ? path.input_row : path.output_row;
-      if (row < destination || row - destination >= path.rows) continue;
-      const int source_row = (Dgrad ? path.output_row : path.input_row) + row - destination;
-      auto dot = cute::make_tensor<float>(cute::Shape<cute::_4>{});
-      cute::clear(dot);
-      // A whole warp follows each path/K loop, including K=1 readout dgrad.
-      for (int64_t k0 = 0; k0 < g.k; k0 += 8) {
-        auto a_big = cute::make_tensor<cutlass::tfloat32_t>(cute::Shape<cute::_4>{});
-        auto a_small = cute::make_tensor_like(a_big);
-        auto b_big = cute::make_tensor<cutlass::tfloat32_t>(cute::Shape<cute::_2>{});
-        auto b_small = cute::make_tensor_like(b_big);
+    if constexpr (SingleContribution) {
+      // With at most one contributing path, total itself is the MMA dot.
+      for (int q = 0; q < g.paths; ++q) {
+        const ShapePath path = paths[q];
+        const int destination = Dgrad ? path.input_row : path.output_row;
+        if (row < destination || row - destination >= path.rows) continue;
+        const int source_row = (Dgrad ? path.output_row : path.input_row) + row - destination;
+        path_dot(input, weights, g, path, source_row, b0, n0, total);
         #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-          const int coordinate = Mma::LayoutA_TV{}(lane, i);
-          const int batch = b0 + coordinate % 16;
-          const int64_t k = k0 + coordinate / 16;
-          float value = 0.f;
-          if (batch < g.batch && k < g.k)
-            value = input[(uint64_t(batch) * g.source_rows + source_row) * g.k + k];
-          const auto pair = split(value);
-          a_big(i) = pair[0];
-          a_small(i) = pair[1];
-        }
-        #pragma unroll
-        for (int i = 0; i < 2; ++i) {
-          const int coordinate = Mma::LayoutB_TV{}(lane, i);
-          const int n = n0 + coordinate % 8;
-          const int64_t k = k0 + coordinate / 8;
-          WeightSplit value{cutlass::tfloat32_t::bitcast(0), cutlass::tfloat32_t::bitcast(0)};
-          if (n < g.n && k < g.k)
-            value = weights[(uint64_t(path.weight_path) * g.n + n) * g.k + k];
-          b_big(i) = value.big;
-          b_small(i) = value.small;
-        }
-        // True TF32x3 TensorCore arithmetic: two cross terms, then the high
-        // product. The small*small term is intentionally absent, as in legacy.
-        mma.call(a_big, b_small, dot);
-        mma.call(a_small, b_big, dot);
-        mma.call(a_big, b_big, dot);
+        for (int i = 0; i < 4; ++i)
+          // Preserve the generic path's positive-zero addition, including -0.
+          total(i) = __fadd_rn(0.f, static_cast<float>(static_cast<double>(total(i)) * path.coefficient));
+        break;
       }
-      #pragma unroll
-      for (int i = 0; i < 4; ++i)
-        total(i) += static_cast<float>(static_cast<double>(dot(i)) * path.coefficient);
+    } else {
+      for (int q = 0; q < g.paths; ++q) {
+        const ShapePath path = paths[q];
+        const int destination = Dgrad ? path.input_row : path.output_row;
+        if (row < destination || row - destination >= path.rows) continue;
+        const int source_row = (Dgrad ? path.output_row : path.input_row) + row - destination;
+        auto dot = cute::make_tensor<float>(cute::Shape<cute::_4>{});
+        cute::clear(dot);
+        path_dot(input, weights, g, path, source_row, b0, n0, dot);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i)
+          total(i) += static_cast<float>(static_cast<double>(dot(i)) * path.coefficient);
+      }
     }
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -147,7 +171,9 @@ class Tf32ShapePlan final : public ShapePlan {
  public:
   Tf32ShapePlan(const EqLinearProblemC& p, const void* w, const double* cg,
                 bool dgrad, cudaStream_t stream)
-      : geometry_(p, cg), dgrad_(dgrad) {
+      : geometry_(p, cg), dgrad_(dgrad),
+        single_contribution_(!dgrad && p.P == 1 && p.U == 224 && p.V == 1) {
+    // P=1 guarantees at most one contribution per output row, including explicit maps.
     if (!w) throw std::invalid_argument("eqlinear tf32 shape: null weight");
     // Validate pointer arithmetic without touching input/output or the GPU.
     (void)elements(p.B, p.I, p.U);
@@ -179,12 +205,16 @@ class Tf32ShapePlan final : public ShapePlan {
     if (!input || !output) return static_cast<int>(cudaErrorInvalidValue);
     const int blocks = static_cast<int>(std::min<uint64_t>(
         (kernel_.tiles + kWarps - 1) / kWarps, kMaxBlocks));
-    if (dgrad_)
-      fused_shape<true><<<blocks, kThreads, 0, stream>>>(
+    if (single_contribution_)
+      fused_shape<false, true><<<blocks, kThreads, 0, stream>>>(
+          static_cast<const float*>(input), static_cast<float*>(output),
+          weights_.as<WeightSplit>(), paths_.as<ShapePath>(), kernel_);
+    else if (dgrad_)
+      fused_shape<true, false><<<blocks, kThreads, 0, stream>>>(
           static_cast<const float*>(input), static_cast<float*>(output),
           weights_.as<WeightSplit>(), paths_.as<ShapePath>(), kernel_);
     else
-      fused_shape<false><<<blocks, kThreads, 0, stream>>>(
+      fused_shape<false, false><<<blocks, kThreads, 0, stream>>>(
           static_cast<const float*>(input), static_cast<float*>(output),
           weights_.as<WeightSplit>(), paths_.as<ShapePath>(), kernel_);
     return static_cast<int>(cudaGetLastError());
@@ -192,7 +222,7 @@ class Tf32ShapePlan final : public ShapePlan {
 
  private:
   ShapeGeometry geometry_;
-  bool dgrad_;
+  bool dgrad_, single_contribution_;
   KernelGeometry kernel_{};
   DeviceBuffer paths_, weights_;
 };
