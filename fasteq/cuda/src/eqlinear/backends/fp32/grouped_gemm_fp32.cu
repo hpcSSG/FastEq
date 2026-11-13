@@ -47,6 +47,7 @@
 
 #include "device_buffer.h"
 #include "simt_gemm.cuh"
+#include "numeric_policy.h"
 
 namespace eqlin_fp32 {
 namespace {
@@ -311,9 +312,13 @@ char const *status_string(int code) {
 
 GroupedGemmPlan::GroupedGemmPlan(int M, int N, int num_rows, long long lda, long long ldb,
                                  long long ldc, std::vector<RowPlan> const &rows,
-                                 float const *a_data, float const *b_data, int mode, bool a_view) {
-  if (mode == 1 || (mode == 2 && (N <= 96 || N > 128))) {
-    p_ = make_simt_custom_plan(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view);
+                                 float const *a_data, float const *b_data, int mode, bool a_view,
+                                 bool split_paths) {
+  if (mode == 1 || (mode == 2 && (N <= 96 || N > 128 ||
+                                 NumericPolicy::short_chains(M, N, num_rows) ||
+                                 NumericPolicy::split_path_accuracy(M, N, split_paths)))) {
+    p_ = make_simt_custom_plan(M, N, num_rows, lda, ldb, ldc, rows, a_data, b_data, a_view,
+                               split_paths);
   } else {
     // mode 2's stock half is policy 2 (24x8 / exact-fit N), not the environment's default.
     p_ = make_impl(mode == 2 ? 2 : policy_from_env(), M, N, num_rows, lda, ldb, ldc, rows, a_data,
@@ -326,5 +331,12 @@ GroupedGemmPlan::~GroupedGemmPlan() = default;
 int GroupedGemmPlan::launch(float *out, cudaStream_t stream) { return p_->launch(out, stream); }
 
 int GroupedGemmPlan::bind_a(float const *x, cudaStream_t stream) { return p_->bind_a(x, stream); }
+
+int GroupedGemmPlan::set_scales(std::vector<double> const &scales, cudaStream_t stream) {
+  return p_->set_scales(scales, stream);
+}
+
+bool GroupedGemmPlan::scales_after_dot() const { return p_->scales_after_dot(); }
+bool GroupedGemmPlan::original_weight_layout() const { return p_->original_weight_layout(); }
 
 }  // namespace eqlin_fp32

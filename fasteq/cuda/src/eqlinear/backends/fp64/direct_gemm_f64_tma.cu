@@ -284,7 +284,6 @@ class PlanImplT : public TmaGemmPlan::ImplBase {
   PlanImplT(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
             std::vector<RowPlan> const &rows, double const *a_data, double const *b_data, int u)
       : B_(B), V_(V), lda_(lda), ldb_(ldb), ldc_(ldc), u_(u) {
-    if (num_rows <= 0 || num_rows > kMaxPaths) throw std::invalid_argument("TmaGemmPlan: bad rows");
     rows_ = rows;
     for (int j = 0; j < num_rows; ++j) m_max_ = std::max<int>(m_max_, rows[j].m);
     params_.num_probs = num_rows;
@@ -381,6 +380,7 @@ class PlanImplT : public TmaGemmPlan::ImplBase {
 TmaGemmPlan::TmaGemmPlan(int B, int V, int num_rows, long long lda, long long ldb, long long ldc,
                          std::vector<RowPlan> const &rows, double const *a_data,
                          double const *b_data, int u, bool exact_n) {
+  validate_shape(num_rows, rows, u);
   if (exact_n) {
     p_ = std::make_unique<PlanImplT<128, 32>>(B, V, num_rows, lda, ldb, ldc, rows, a_data, b_data,
                                               u);

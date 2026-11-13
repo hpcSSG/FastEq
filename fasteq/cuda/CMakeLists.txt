@@ -50,6 +50,8 @@ if(NOT Torch_DIR)
 endif()
 
 find_package(Torch REQUIRED)
+find_library(EQLINEAR_TORCH_PYTHON_LIBRARY NAMES torch_python
+  HINTS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 # Torch's config may have rewritten the architecture; restore the sm_90a targets.
 set(CMAKE_CUDA_ARCHITECTURES "90a-real")
 if(NOT TARGET CUDA::nvToolsExt)
@@ -94,6 +96,7 @@ set(CUDA_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_fwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/fctp_bwd.cu"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/dispatch/eqlinear_dispatch.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/dispatch/eqlinear_host_module.cpp"
   "${CMAKE_CURRENT_SOURCE_DIR}/src/eqlinear/common/eqlinear_group_table.cpp"
 )
 
@@ -145,6 +148,7 @@ target_compile_options(_cuda PRIVATE
 target_link_libraries(_cuda PRIVATE
   Python3::Module
   ${TORCH_LIBRARIES}
+  ${EQLINEAR_TORCH_PYTHON_LIBRARY}
   fasteq_eqlinear_tf32
   fasteq_eqlinear_fp32
   fasteq_eqlinear_fp64

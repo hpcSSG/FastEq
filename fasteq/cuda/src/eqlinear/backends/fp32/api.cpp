@@ -9,6 +9,8 @@
 #include "bwd.h"
 #include "eqlinear.h"
 #include "eqlinear_backend_api.h"
+#include "shape_plan.cuh"
+#include "single_path_plan.cuh"
 
 namespace {
 
@@ -26,6 +28,25 @@ struct Fp32Traits {
       "eqlinear fp32: ok", "eqlinear fp32: unsupported configuration",
       "eqlinear fp32: invalid argument", "eqlinear fp32: CUDA error",
       "eqlinear fp32: internal error"};
+
+  static bool use_single_path_plan(EqLinearProblemC const& p, bool dgrad) {
+    return fasteq::eqlinear::fp32_single::required(p, dgrad);
+  }
+  static std::unique_ptr<fasteq::eqlinear::ShapePlan> make_single_path_plan(
+      EqLinearProblemC const& p, void const* w, double const* cg, bool dgrad,
+      cudaStream_t stream) {
+    return fasteq::eqlinear::fp32_single::create(p, w, cg, dgrad, stream);
+  }
+
+  static bool use_shape_plan(EqLinearProblemC const &p) {
+    return fasteq::eqlinear::fp32_shape::required(p);
+  }
+
+  static std::unique_ptr<fasteq::eqlinear::ShapePlan> make_shape_plan(
+      EqLinearProblemC const &p, void const *w, double const *cg,
+      bool dgrad, cudaStream_t stream) {
+    return fasteq::eqlinear::fp32_shape::create(p, w, cg, dgrad, stream);
+  }
 
   static std::unique_ptr<ForwardRunner> make_forward(EqLinearProblemC const &p,
                                                      std::vector<int> const &dims, void const *,

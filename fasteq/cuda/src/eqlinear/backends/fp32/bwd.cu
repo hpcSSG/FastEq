@@ -21,6 +21,7 @@
 #include "prep_bwd.h"
 #include "reduce_dw.h"
 #include "simt_gemm.cuh"
+#include "tiny_linear.cuh"
 
 namespace eqlin_fp32 {
 namespace {
@@ -71,6 +72,7 @@ struct BackwardRunner::Impl_ {
   BwdImpl impl;
   GroupTable table;
   CgVals cg{};
+  std::vector<double> coefficients;
   int max_rows = 0;
   int max_splits = 0;
 
@@ -99,7 +101,11 @@ struct BackwardRunner::Impl_ {
     if (U % 16 || V % 16) throw std::invalid_argument("backward: U and V must be multiples of 16");
     if (U != V) throw std::invalid_argument("backward: U != V is not supported yet");
 
-    for (int p = 0; p < P; ++p) cg.v[p] = cgd ? static_cast<float>(cgd[p]) : 1.f;
+    coefficients.resize(P);
+    for (int p = 0; p < P; ++p) {
+      coefficients[p] = cgd ? cgd[p] : 1.;
+      cg.v[p] = static_cast<float>(coefficients[p]);
+    }
     for (int p = 0; p < P; ++p) max_rows = std::max(max_rows, table.i_dims[p]);
 
     bool const has_dgrad = impl != BwdImpl::kB2;
@@ -107,10 +113,6 @@ struct BackwardRunner::Impl_ {
 
     if (has_dgrad) {
       require_alloc(d_cgw, static_cast<size_t>(P) * U * V * sizeof(float), "cgW allocation");
-      launch_pack_cgw(w, d_cgw.as<float>(), cg, P, U, V, stream);
-      if (cudaGetLastError() != cudaSuccess) {
-        throw std::runtime_error("backward: cgW pack launch failed");
-      }
     }
     if (has_wgrad) {
       build_wgrad(stream);
@@ -119,7 +121,20 @@ struct BackwardRunner::Impl_ {
       build_dgrad();
     }
     if (problems.empty()) throw std::runtime_error("backward: empty problem table");
-    plan = make_simt_bwd_plan(V, B, problems);
+    plan = make_simt_bwd_plan(V, B, problems, d_cgw.as<float>(), P);
+    if (has_dgrad) {
+      if (plan->transposes_weight()) {
+        if (launch_tiny_weight_transpose(w, d_cgw.as<float>(), P, U, V, stream) != 0)
+          throw std::runtime_error("backward: tiny weight transpose failed");
+        return;
+      }
+      CgVals weight_scales = cg;
+      if (plan->scales_after_dot())
+        for (int p = 0; p < P; ++p) weight_scales.v[p] = 1.f;
+      launch_pack_cgw(w, d_cgw.as<float>(), weight_scales, P, U, V, stream);
+      if (cudaGetLastError() != cudaSuccess)
+        throw std::runtime_error("backward: cgW pack launch failed");
+    }
   }
 
   int group_of_path(int p) const {
@@ -232,6 +247,8 @@ struct BackwardRunner::Impl_ {
           q.lda = static_cast<int>(lda);
           q.ldb = V;
           q.ldc = static_cast<int>(ldc);
+          q.scale = coefficients[p];
+          q.weight_path = p;
           problems.push_back(q);
         }
       }
