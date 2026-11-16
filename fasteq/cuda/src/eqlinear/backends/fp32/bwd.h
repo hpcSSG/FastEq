@@ -54,6 +54,8 @@ struct BwdProblem {
   long long a_off = 0;
   long long c_off = 0;
   int lda = 0, ldb = 0, ldc = 0;
+  double scale = 1.;  // preserve the descriptor coefficient until the selected plan encodes it
+  int weight_path = 0;
 };
 
 /// Per-call transpose prep descriptor.  One entry per input path (x -> Xt) or per output group
@@ -73,6 +75,8 @@ struct TransposeDesc {
 class BwdPlan {
  public:
   virtual ~BwdPlan() = default;
+  virtual bool scales_after_dot() const { return false; }
+  virtual bool transposes_weight() const { return false; }
   virtual int launch(float const *dy, float *dx, float const *xt, float *partials,
                      cudaStream_t stream) = 0;
 };

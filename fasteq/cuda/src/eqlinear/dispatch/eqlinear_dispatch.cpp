@@ -2,6 +2,9 @@
 // torch; the per-precision backends are torch-free DSOs reached through a small C ABI.
 
 #include <cstdint>
+#include <atomic>
+#include <array>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -9,9 +12,17 @@
 #include <vector>
 
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAEvent.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
-#include <torch/extension.h>
+#include <torch/custom_class.h>
+#include <torch/csrc/autograd/custom_function.h>
+#include <torch/csrc/autograd/python_variable.h>
+#include <torch/csrc/utils/pybind.h>
+#include <ATen/PythonTorchFunctionTLS.h>
+#include <c10/core/impl/TorchDispatchModeTLS.h>
+#include <pybind11/numpy.h>
+#include <torch/types.h>
 
 #include "eqlinear_backend_api.h"
 #include "eqlinear_group_table.h"
@@ -49,6 +60,7 @@ const EqLinearBackendApi* api_for(int64_t precision) {
 }
 
 struct Handle {
+  std::atomic<bool> registered{true};
   const EqLinearBackendApi* api = nullptr;
   int64_t precision = 0;
   int64_t batch = 0, input_rows = 0, u = 0, output_rows = 0, v = 0;
@@ -57,6 +69,21 @@ struct Handle {
   void* dgrad_plan = nullptr;
   EqLinearPlanInfo forward_info;
   EqLinearPlanInfo dgrad_info;
+
+  // Only single-path forward handles own a lazy dgrad. No second cache/index:
+  // Python's existing LRU and an in-flight autograd node share this same owner.
+  EqLinearProblemC problem;
+  std::vector<int32_t> dimensions;
+  std::vector<fasteq::eqlinear::EqLinearPathC> paths;
+  std::vector<double> coefficients;
+  torch::Tensor weight_snapshot;
+  const void* weight_data = nullptr;
+  int64_t weight_version = 0;
+  cudaStream_t creation_stream = nullptr;
+  cudaStream_t dgrad_stream = nullptr;
+  std::unique_ptr<at::cuda::CUDAEvent> prepared;
+  std::unique_ptr<at::cuda::CUDAEvent> dgrad_done;
+  std::mutex run_mutex;
 
   ~Handle() {
     if (api != nullptr) {
@@ -68,6 +95,11 @@ struct Handle {
       }
     }
   }
+};
+
+struct AutogradPlanOwner : torch::CustomClassHolder {
+  explicit AutogradPlanOwner(std::shared_ptr<Handle> value) : handle(std::move(value)) {}
+  std::shared_ptr<Handle> handle;
 };
 
 std::mutex g_mutex;
@@ -94,6 +126,7 @@ void erase_handle(int64_t id) {
     std::lock_guard<std::mutex> lock(g_mutex);
     auto it = g_handles.find(id);
     if (it == g_handles.end()) return;
+    it->second->registered.store(false, std::memory_order_release);
     retired = std::move(it->second);
     g_handles.erase(it);
   }
@@ -130,14 +163,23 @@ std::vector<int32_t> to_int32_dims(const std::vector<int64_t>& i_dims) {
 
 EqLinearProblemC make_problem(const std::vector<int64_t>& i_dims,
                               const std::vector<int32_t>& i_dims32, int64_t B, int64_t U,
-                              int64_t V, int64_t P) {
+                              int64_t V, int64_t P, int64_t I = 0, int64_t J = 0) {
+  TORCH_CHECK(B > 0 && B <= INT32_MAX,
+              "eqlinear: B must be a positive int32 value; got ", B);
+  TORCH_CHECK(U > 0 && U <= INT32_MAX && V > 0 && V <= INT32_MAX &&
+                  P > 0 && P <= 32, "eqlinear: invalid or overflowing U,V,P");
   EqLinearProblemC problem;
   problem.B = static_cast<int32_t>(B);
-  problem.I = sum_i_dims(i_dims);
+  for (int64_t rows : i_dims)
+    TORCH_CHECK(rows > 0 && rows <= INT32_MAX, "eqlinear: i_dims must be positive int32");
+  TORCH_CHECK(I >= 0 && I <= INT32_MAX && J >= 0 && J <= INT32_MAX,
+              "eqlinear: invalid full operand extents");
+  problem.I = I ? static_cast<int32_t>(I) : sum_i_dims(i_dims);
   problem.U = static_cast<int32_t>(U);
   problem.P = static_cast<int32_t>(P);
   problem.V = static_cast<int32_t>(V);
-  problem.J = fasteq::eqlinear::out_total_i(to_int_dims(i_dims));
+  problem.J = J ? static_cast<int32_t>(J)
+                : fasteq::eqlinear::out_total_i(to_int_dims(i_dims));
   problem.i_dims = i_dims32.data();
   return problem;
 }
@@ -162,31 +204,12 @@ void check_dtype(const torch::Tensor& t, int64_t precision, const char* name) {
   }
 }
 
-void check_multiple(int64_t value, int64_t alignment, const char* name) {
-  TORCH_CHECK(value % alignment == 0,
-              "eqlinear: ", name, "=", value, " must be a multiple of ", alignment);
-}
-
 void validate_problem(const EqLinearProblemC& p, int64_t precision) {
+  TORCH_CHECK(precision >= 0 && precision <= 2, "eqlinear: invalid precision");
   TORCH_CHECK(p.P >= 1 && p.P <= 32, "eqlinear: P must be in [1,32]; got ", p.P);
-  TORCH_CHECK(p.B > 0 && p.I > 0 && p.U > 0 && p.V > 0, "eqlinear: empty problem");
-  const int64_t alignment = precision == 2 ? 2 : 4;
-  check_multiple(p.B, alignment, "B");
-  check_multiple(p.V, alignment, "V");
-  check_multiple(static_cast<int64_t>(p.I) * p.U, alignment, "I*U");
-  check_multiple(static_cast<int64_t>(p.P) * p.U, alignment, "P*U");
-  check_multiple(static_cast<int64_t>(p.J) * p.V, alignment, "J*V");
-  if (precision == 1) {
-    TORCH_CHECK(p.U == p.V,
-                "eqlinear fp32: backward/forward kFused requires U == V; got U=", p.U,
-                " V=", p.V);
-    check_multiple(p.U, 16, "U");
-    TORCH_CHECK(p.V == 96 || p.V == 128 || p.V == 224,
-                "eqlinear fp32: V=", p.V, " is outside the measured kFused tile set {96,128,224}");
-  }
-  if (precision == 2 && p.V <= 128) {
-    check_multiple(p.U, 16, "U");
-  }
+  TORCH_CHECK(p.B > 0 && p.I > 0 && p.J > 0 && p.U > 0 && p.V > 0,
+              "eqlinear: empty problem");
+  // Vector, TMA and pipeline restrictions belong to the selected backend plan.
 }
 
 void check_capability() {
@@ -292,9 +315,11 @@ int64_t out_rows(const std::vector<int64_t>& i_dims) {
   return static_cast<int64_t>(fasteq::eqlinear::out_total_i(to_int_dims(i_dims)));
 }
 
-int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
-                       const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
-                       int64_t V, int64_t precision) {
+int64_t create_plan(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                    const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
+                    int64_t V, int64_t precision, bool backward,
+                    int64_t I = 0, int64_t J = 0,
+                    const std::vector<int64_t>& mapping = {}) {
   check_contiguous_cuda(w, "w");
   check_dtype(w, precision, "w");
   TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
@@ -305,9 +330,37 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   const c10::cuda::CUDAGuard device_guard(w.device());
   check_capability();
   check_alignment(w, "w");
-
-  const std::vector<int32_t> i_dims32 = to_int32_dims(i_dims);
-  const EqLinearProblemC problem = make_problem(i_dims, i_dims32, B, U, V, P);
+  const auto dims32 = to_int32_dims(i_dims);
+  if (!mapping.empty())
+    TORCH_CHECK(I > 0 && I <= INT32_MAX && J > 0 && J <= INT32_MAX,
+                "eqlinear: invalid full operand extents");
+  auto problem = make_problem(i_dims, dims32, B, U, V, P,
+                              mapping.empty() ? 0 : I, mapping.empty() ? 0 : J);
+  std::vector<fasteq::eqlinear::EqLinearPathC> paths;
+  if (!mapping.empty()) {
+    TORCH_CHECK(I > 0 && I <= INT32_MAX && J > 0 && J <= INT32_MAX,
+                "eqlinear: invalid full operand extents");
+    TORCH_CHECK(mapping.size() == static_cast<size_t>(P) * 4,
+                "eqlinear: mapping must have four integers per path");
+    paths.reserve(P);
+    for (int q = 0; q < P; ++q) {
+      for (int k = 0; k < 4; ++k)
+        TORCH_CHECK(mapping[4*q+k] >= 0 && mapping[4*q+k] <= INT32_MAX,
+                    "eqlinear: invalid path mapping integer");
+      paths.push_back({static_cast<int32_t>(mapping[4*q]),
+                       static_cast<int32_t>(mapping[4*q+1]),
+                       static_cast<int32_t>(mapping[4*q+2]),
+                       static_cast<int32_t>(mapping[4*q+3])});
+      const auto& path = paths.back();
+      TORCH_CHECK(path.rows == i_dims[q] && path.weight_path < P &&
+                      int64_t(path.input_row) + path.rows <= I &&
+                      int64_t(path.output_row) + path.rows <= J,
+                  "eqlinear: path outside operand bounds");
+    }
+    problem.I = I;
+    problem.J = J;
+    problem.paths = paths.data();
+  }
   validate_problem(problem, precision);
   const auto* api = api_for(precision);
   auto handle = std::make_shared<Handle>();
@@ -319,11 +372,49 @@ int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dim
   handle->output_rows = problem.J;
   handle->v = problem.V;
   handle->device_index = w.get_device();
-  const int rc = api->forward_create(&problem, w.data_ptr(), cg.data(),
-                                     c10::cuda::getCurrentCUDAStream().stream(),
-                                     &handle->forward_plan, &handle->forward_info);
+  if (!backward && P == 1) {
+    handle->dimensions = dims32;
+    handle->paths = paths;
+    handle->coefficients = cg;
+    handle->problem = problem;
+    handle->problem.i_dims = handle->dimensions.data();
+    handle->problem.paths = handle->paths.empty() ? nullptr : handle->paths.data();
+    // Own an immutable, original-precision weight for delayed dgrad construction.
+    // Saving a borrowed problem or the caller's mutable storage here is unsafe.
+    handle->weight_snapshot = w.detach().clone();
+    handle->weight_data = w.data_ptr();
+    // Inference-created tensors have no version counter. Python cannot cache
+    // those weights; its cache-disabled path creates a fresh snapshot per call.
+    handle->weight_version = w.is_inference() ? -1 : w._version();
+    handle->creation_stream = c10::cuda::getCurrentCUDAStream().stream();
+  }
+  auto create = backward ? api->dgrad_create : api->forward_create;
+  const void* weight = handle->weight_snapshot.defined()
+                           ? handle->weight_snapshot.data_ptr() : w.data_ptr();
+  const int rc = create(&problem, weight, cg.data(),
+                       c10::cuda::getCurrentCUDAStream().stream(),
+                       backward ? &handle->dgrad_plan : &handle->forward_plan,
+                       backward ? &handle->dgrad_info : &handle->forward_info);
   TORCH_CHECK(rc == 0, api->status_string(rc));
+  if (handle->weight_snapshot.defined()) {
+    handle->prepared = std::make_unique<at::cuda::CUDAEvent>();
+    handle->prepared->record(c10::cuda::getCurrentCUDAStream());
+  }
   return register_handle(std::move(handle));
+}
+
+int64_t forward_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                       const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
+                       int64_t V, int64_t precision) {
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, false);
+}
+
+int64_t forward_create_geometry(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                                const std::vector<double>& cg, int64_t B, int64_t U,
+                                int64_t P, int64_t V, int64_t precision, int64_t I, int64_t J,
+                                const std::vector<int64_t>& mapping) {
+  TORCH_CHECK(!mapping.empty(), "eqlinear: explicit geometry requires path mapping");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, false, I, J, mapping);
 }
 
 void forward_run(int64_t handle, const torch::Tensor& x, const torch::Tensor& out) {
@@ -337,6 +428,9 @@ void forward_run(int64_t handle, const torch::Tensor& x, const torch::Tensor& ou
   TORCH_CHECK(x.get_device() == h->device_index &&
                   out.get_device() == h->device_index,
               "eqlinear: x/out must be on the plan device");
+  TORCH_CHECK(x.size(0) == h->batch && x.size(1) == h->input_rows && x.size(2) == h->u &&
+                  out.size(0) == h->batch && out.size(1) == h->output_rows && out.size(2) == h->v,
+              "eqlinear: x/out shape does not match the plan");
   check_alignment(x, "x");
   check_alignment(out, "out");
   const c10::cuda::CUDAGuard device_guard(x.device());
@@ -367,6 +461,105 @@ void forward_run_flat(int64_t handle, const torch::Tensor& x, const torch::Tenso
   TORCH_CHECK(rc == 0, h->api->status_string(rc));
 }
 
+torch::Tensor allocate_forward(const std::shared_ptr<Handle>& h, const torch::Tensor& x) {
+  check_contiguous_cuda(x, "x");
+  check_dtype(x, h->precision, "x");
+  TORCH_CHECK(x.dim() == 2 && x.size(0) == h->batch &&
+                  x.size(1) == h->input_rows * h->u,
+              "eqlinear: flat x shape does not match the plan");
+  TORCH_CHECK(x.get_device() == h->device_index, "eqlinear: x must be on the plan device");
+  check_alignment(x, "x");
+  const c10::cuda::CUDAGuard device_guard(x.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream();
+  // The Python LRU keys forward plans by stream. Reject a stale/private call
+  // rather than share a forward workspace between independently running streams.
+  TORCH_CHECK(stream.stream() == h->creation_stream,
+              "eqlinear: allocating forward must use the plan creation stream");
+  auto out = torch::empty({h->batch, h->output_rows * h->v}, x.options());
+  std::lock_guard<std::mutex> lock(h->run_mutex);
+  const int rc = h->api->forward_run(h->forward_plan, x.data_ptr(), out.data_ptr(), stream.stream());
+  TORCH_CHECK(rc == 0, h->api->status_string(rc));
+  return out;
+}
+
+torch::Tensor allocate_dgrad(const std::shared_ptr<Handle>& h, const torch::Tensor& gradient) {
+  check_contiguous_cuda(gradient, "dy");
+  check_dtype(gradient, h->precision, "dy");
+  TORCH_CHECK(gradient.get_device() == h->device_index,
+              "eqlinear: dy must be on the plan device");
+  TORCH_CHECK(gradient.dim() == 2 && gradient.size(0) == h->batch &&
+                  gradient.size(1) == h->output_rows * h->v,
+              "eqlinear: flat dy shape does not match the plan");
+  check_alignment(gradient, "dy");
+  const c10::cuda::CUDAGuard device_guard(gradient.device());
+  const auto stream = c10::cuda::getCurrentCUDAStream();
+  auto dx = torch::empty({h->batch, h->input_rows * h->u}, gradient.options());
+  std::lock_guard<std::mutex> lock(h->run_mutex);
+  if (h->dgrad_plan == nullptr) {
+    if (stream.stream() != h->creation_stream) h->prepared->block(stream);
+    const int rc = h->api->dgrad_create(&h->problem, h->weight_snapshot.data_ptr(),
+                                       h->coefficients.data(), stream.stream(),
+                                       &h->dgrad_plan, &h->dgrad_info);
+    TORCH_CHECK(rc == 0, h->api->status_string(rc));
+    h->dgrad_done = std::make_unique<at::cuda::CUDAEvent>();
+  } else if (stream.stream() != h->dgrad_stream) {
+    // An autograd node can outlive its LRU entry and be reused on another stream.
+    // Order workspace use on-device; never synchronize the host on a cache hit.
+    h->dgrad_done->block(stream);
+  }
+  const int rc = h->api->dgrad_run(h->dgrad_plan, gradient.data_ptr(), dx.data_ptr(), stream.stream());
+  h->dgrad_done->record(stream);
+  h->dgrad_stream = stream.stream();
+  TORCH_CHECK(rc == 0, h->api->status_string(rc));
+  return dx;
+}
+
+class SinglePathAutograd : public torch::autograd::Function<SinglePathAutograd> {
+ public:
+  static torch::Tensor forward(torch::autograd::AutogradContext* ctx,
+                               const torch::Tensor& x, const torch::Tensor& w,
+                               std::shared_ptr<Handle> h) {
+    // SavedVariable performs PyTorch's usual version check, including view mutations.
+    ctx->save_for_backward({w});
+    ctx->saved_data["owner"] = c10::make_intrusive<AutogradPlanOwner>(h);
+    return allocate_forward(h, x);
+  }
+
+  static torch::autograd::variable_list backward(
+      torch::autograd::AutogradContext* ctx, torch::autograd::variable_list gradients) {
+    (void)ctx->get_saved_variables();  // Check the saved weight version before any launch.
+    if (!ctx->needs_input_grad(0)) return {torch::Tensor(), torch::Tensor(), torch::Tensor()};
+    const auto owner = ctx->saved_data.at("owner").toCustomClass<AutogradPlanOwner>();
+    // Expanded and transposed incoming gradients must still be accepted.
+    auto dx = allocate_dgrad(owner->handle, gradients[0].contiguous());
+    return {dx, torch::Tensor(), torch::Tensor()};  // Historical grad_x-only contract.
+  }
+};
+
+
+torch::Tensor run_forward_autograd(const std::shared_ptr<Handle>& h,
+                                  const torch::Tensor& x, const torch::Tensor& w) {
+  if (!torch::GradMode::is_enabled() || (!x.requires_grad() && !w.requires_grad()))
+    return allocate_forward(h, x);
+  return SinglePathAutograd::apply(x, w, h);
+}
+
+torch::Tensor forward_allocate(int64_t handle, const torch::Tensor& x, const torch::Tensor& w) {
+  auto h = find_handle(handle);
+  TORCH_CHECK(h->forward_plan != nullptr && h->weight_snapshot.defined(),
+              "eqlinear: allocating forward requires a single-path forward handle");
+  check_contiguous_cuda(w, "w");
+  check_dtype(w, h->precision, "w");
+  TORCH_CHECK(w.get_device() == h->device_index && w.numel() == h->u * h->v,
+              "eqlinear: w does not match the plan");
+  const int64_t weight_version = w.is_inference() ? -1 : w._version();
+  TORCH_CHECK(w.data_ptr() == h->weight_data && weight_version == h->weight_version,
+              "eqlinear: allocating forward weight identity/version does not match the plan");
+  return run_forward_autograd(h, x, w);
+}
+
+#include "host_frontend.h"
+
 void forward_destroy(int64_t handle) { erase_handle(handle); }
 
 std::tuple<int64_t, int64_t, int64_t, int64_t> forward_plan_info(int64_t handle) {
@@ -379,35 +572,15 @@ std::tuple<int64_t, int64_t, int64_t, int64_t> forward_plan_info(int64_t handle)
 int64_t dgrad_create(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
                      const std::vector<double>& cg, int64_t B, int64_t U, int64_t P,
                      int64_t V, int64_t precision) {
-  check_contiguous_cuda(w, "w");
-  check_dtype(w, precision, "w");
-  TORCH_CHECK(w.dim() == 3, "eqlinear: w must be [P,U,V]");
-  TORCH_CHECK(P == static_cast<int64_t>(i_dims.size()), "eqlinear: P must equal len(i_dims)");
-  TORCH_CHECK(w.size(0) == P && w.size(1) == U && w.size(2) == V,
-              "eqlinear: w shape does not match P,U,V");
-  TORCH_CHECK(cg.size() == i_dims.size(), "eqlinear: cg length must equal len(i_dims)");
-  const c10::cuda::CUDAGuard device_guard(w.device());
-  check_capability();
-  check_alignment(w, "w");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, true);
+}
 
-  const std::vector<int32_t> i_dims32 = to_int32_dims(i_dims);
-  const EqLinearProblemC problem = make_problem(i_dims, i_dims32, B, U, V, P);
-  validate_problem(problem, precision);
-  const auto* api = api_for(precision);
-  auto handle = std::make_shared<Handle>();
-  handle->api = api;
-  handle->precision = precision;
-  handle->batch = problem.B;
-  handle->input_rows = problem.I;
-  handle->u = problem.U;
-  handle->output_rows = problem.J;
-  handle->v = problem.V;
-  handle->device_index = w.get_device();
-  const int rc = api->dgrad_create(&problem, w.data_ptr(), cg.data(),
-                                   c10::cuda::getCurrentCUDAStream().stream(),
-                                   &handle->dgrad_plan, &handle->dgrad_info);
-  TORCH_CHECK(rc == 0, api->status_string(rc));
-  return register_handle(std::move(handle));
+int64_t dgrad_create_geometry(const torch::Tensor& w, const std::vector<int64_t>& i_dims,
+                              const std::vector<double>& cg, int64_t B, int64_t U,
+                              int64_t P, int64_t V, int64_t precision, int64_t I, int64_t J,
+                              const std::vector<int64_t>& mapping) {
+  TORCH_CHECK(!mapping.empty(), "eqlinear: explicit geometry requires path mapping");
+  return create_plan(w, i_dims, cg, B, U, P, V, precision, true, I, J, mapping);
 }
 
 void dgrad_run(int64_t handle, const torch::Tensor& dy, const torch::Tensor& dx) {
@@ -421,6 +594,9 @@ void dgrad_run(int64_t handle, const torch::Tensor& dy, const torch::Tensor& dx)
   TORCH_CHECK(dy.get_device() == h->device_index &&
                   dx.get_device() == h->device_index,
               "eqlinear: dy/dx must be on the plan device");
+  TORCH_CHECK(dy.size(0) == h->batch && dy.size(1) == h->output_rows && dy.size(2) == h->v &&
+                  dx.size(0) == h->batch && dx.size(1) == h->input_rows && dx.size(2) == h->u,
+              "eqlinear: dy/dx shape does not match the plan");
   check_alignment(dy, "dy");
   check_alignment(dx, "dx");
   const c10::cuda::CUDAGuard device_guard(dy.device());
@@ -452,16 +628,38 @@ torch::Tensor dgrad(const torch::Tensor& dy, const torch::Tensor& w,
 
 }  // namespace
 
+// Called by the optional host-only pybind module in this same DSO. No backend
+// includes Torch/Python, and no independent plan registry is introduced.
+void fasteq_bind_eqlinear_host(pybind11::module_& module) {
+  namespace py = pybind11;
+  module.def("make_guarded_call", [](int64_t handle, py::object descriptor, py::dict snapshot,
+                                     py::object weight, py::object operand_type,
+                                     py::object path_type, py::object array_type) -> py::object {
+    if (at::impl::torch_function_mode_enabled() || c10::impl::TorchDispatchModeTLS::any_modes_set())
+      return py::none();
+    auto guard = std::make_shared<SinglePathFrontend>(find_handle(handle), descriptor, snapshot,
+                                                     weight, operand_type, path_type, array_type);
+    if (!guard->eligible()) return py::none();
+    return py::cpp_function([guard](py::handle descriptor, py::handle w, py::handle x,
+                                    py::handle precision) { return guard->call(descriptor, w, x, precision); });
+  });
+}
+
 TORCH_LIBRARY(eqlinear, m) {
+  // Private context owner, without a public constructor or a separate registry.
+  m.class_<AutogradPlanOwner>("_AutogradPlanOwner");
+  m.def("_forward_allocate", &forward_allocate);
   m.def("out_rows", &out_rows);
   m.def("forward", &forward);
   m.def("dgrad", &dgrad);
   m.def("forward_create", &forward_create);
+  m.def("forward_create_geometry", &forward_create_geometry);
   m.def("forward_run", &forward_run);
   m.def("forward_run_flat", &forward_run_flat);
   m.def("forward_destroy", &forward_destroy);
   m.def("forward_plan_info", &forward_plan_info);
   m.def("dgrad_create", &dgrad_create);
+  m.def("dgrad_create_geometry", &dgrad_create_geometry);
   m.def("dgrad_run", &dgrad_run);
   m.def("dgrad_destroy", &dgrad_destroy);
   m.def("dgrad_plan_info", &dgrad_plan_info);

@@ -91,9 +91,9 @@ struct Runner::Impl_ {
     lda = a_cols;
     ldb = b_cols;
     ldc = static_cast<long long>(J) * V;
-    if (lda % kAlign || ldb % kAlign || ldc % kAlign || V % kAlign || B % kAlign) {
+    if (lda % kAlign || ldb % kAlign || ldc % kAlign || V % kAlign) {
       throw std::invalid_argument(
-          "Runner: tf32x3 needs M=N=K=4k and 4-aligned strides (I*U, P*U, J*V)");
+          "Runner: tf32x3 needs 4-aligned V and strides (I*U, P*U, J*V)");
     }
 
     build_host_tables();

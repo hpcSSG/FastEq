@@ -101,8 +101,8 @@ struct DgradRunner::Impl_ {
     if (!sm90_available()) throw std::runtime_error("DgradRunner: SM90 collective unavailable");
     long long const lda = static_cast<long long>(J) * V;  // dy row pitch
     long long const ldc = static_cast<long long>(I) * U;  // dx row pitch
-    if (lda % kAlign || ldc % kAlign || V % kAlign || B % kAlign) {
-      throw std::invalid_argument("DgradRunner: needs 4-aligned dy/dx strides and V/B");
+    if (lda % kAlign || ldc % kAlign || V % kAlign) {
+      throw std::invalid_argument("DgradRunner: needs 4-aligned dy/dx strides and V");
     }
 
     rows = make_dgrad_rows(table, B, U, V);

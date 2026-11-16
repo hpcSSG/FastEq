@@ -36,15 +36,21 @@ class GroupedGemmPlan {
       (void)stream;
       return 0;
     }
+    /// Immutable per-path epilogue scales, prepared once with the weight.
+    virtual int set_scales(std::vector<double> const &, cudaStream_t) { return 0; }
+    virtual bool scales_after_dot() const { return false; }
+    virtual bool original_weight_layout() const { return false; }
   };
 
   /// `mode` selects the backend: 0 = stock CUTLASS with its tile read from
   /// `EQLIN_FP32_TILE_POLICY`, 1 = the hand-written SIMT kernel, 2 = per-shape choice between the
   /// two (custom where the stock path has no exact-fit 16x8 tile: V <= 96 or V > 128).
   /// `a_view` says `a_data` is a placeholder and the real A base arrives through `bind_a`.
+  /// `split_paths` marks a multi-path row table whose output rows are split per path; the numeric
+  /// policy uses it to keep the strict-FP32 contraction accurate at the measured large-batch sizes.
   GroupedGemmPlan(int M, int N, int num_rows, long long lda, long long ldb, long long ldc,
                   std::vector<RowPlan> const &rows, float const *a_data, float const *b_data,
-                  int mode = 0, bool a_view = false);
+                  int mode = 0, bool a_view = false, bool split_paths = false);
   ~GroupedGemmPlan();
 
   GroupedGemmPlan(GroupedGemmPlan const &) = delete;
@@ -55,6 +61,9 @@ class GroupedGemmPlan {
 
   /// Forward to the backend; see `ImplBase::bind_a`.
   int bind_a(float const *x, cudaStream_t stream);
+  int set_scales(std::vector<double> const &scales, cudaStream_t stream);
+  bool scales_after_dot() const;
+  bool original_weight_layout() const;
 
  private:
   std::unique_ptr<ImplBase> p_;
