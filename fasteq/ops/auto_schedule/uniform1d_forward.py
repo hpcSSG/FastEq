@@ -58,6 +58,7 @@ def emit_launcher(
     use_y_src: bool,
     use_scatter: bool,
     schedule_result: Optional[ScheduleResult] = None,
+    optimize_indexed: bool = False,
 ) -> str:
     if mode == "u,u,,u":
         y_comment = "[B,Ky,1] or [S,Ky,1]"
@@ -109,7 +110,8 @@ def emit_launcher(
     else:
         out_alloc = "    auto out = torch::zeros({B, V, U}, w.options());"
 
-    if _dense_forward_writeback_enabled() and schedule_result is not None and not (use_x_src or use_y_src or use_scatter):
+    if (_dense_forward_writeback_enabled() and schedule_result is not None
+            and not use_scatter and (optimize_indexed or not (use_x_src or use_y_src))):
         summary = schedule_result.placement_summary
         count = summary.get("fully_written_segment_counts", {}).get("out")
         if summary.get("exclusive_outputs") and count is not None:
@@ -262,6 +264,7 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     w_dim: Optional[int] = None,
     v_dim: Optional[int] = None,
     block_size: int = 32,
+    optimize_indexed: bool = False,
 ) -> str:
     """Emit forward code from either a legacy or lifetime-placed schedule."""
     block_size = int(block_size)
@@ -273,9 +276,9 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     mode_scalar_y = mode == "u,u,,u"
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
-    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
-        use_x_src or use_y_src or use_scatter
-    )
+    exclusive = (bool(schedule_result.placement_summary.get("exclusive_outputs"))
+                 and not use_scatter
+                 and (optimize_indexed or not (use_x_src or use_y_src)))
     has_placed = any(
         inst.op == "fma_u1d_placed" for inst in schedule_result.instructions
     )
@@ -390,9 +393,10 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    if (e_local >= B) return;")
     ap("")
     ap("    const int tid  = (int)threadIdx.x;")
-    ap("    const int lane = tid & 31;")
-    ap("    const int warp_id = tid >> 5;")
-    ap("    const int warp_count = blockDim.x >> 5;")
+    if not optimize_indexed:
+        ap("    const int lane = tid & 31;")
+        ap("    const int warp_id = tid >> 5;")
+        ap("    const int warp_count = blockDim.x >> 5;")
     if shared_slots:
         ap("    extern __shared__ unsigned char lars_smem_raw[];")
         ap("    scalar_t* lars_smem = reinterpret_cast<scalar_t*>(lars_smem_raw);")
@@ -417,8 +421,12 @@ def emit_fused_fwd_kernel_from_lars_schedule(
     ap("    const index_t out_base = (index_t)out_row * (index_t)V * (index_t)U;")
     ap("")
 
-    ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
-    ap("        const int u = u_base + lane;")
+    if optimize_indexed:
+        # Each thread owns its channels; forward has no cross-lane reduction.
+        ap("    for (int u = tid; u < U; u += (int)blockDim.x) {")
+    else:
+        ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
+        ap("        const int u = u_base + lane;")
     ap("        if (u < U) {")
     for rid in range(reg_count):
         ap(f"            scalar_t r{rid};")
@@ -646,6 +654,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
     topk_candidates: Optional[int] = 128,
     block_size: int = 32,
     placement_config: Optional[Union[LARSPlacementConfig, Dict[str, Any]]] = None,
+    optimize_indexed: bool = False,
 ):
     """
     Generate one LARS forward CUDA implementation.
@@ -703,7 +712,13 @@ def generate_code_uniform1d_fwd_with_scheduler(
         schedule_result,
         schedule_kind="fwd",
         config=resolved_placement,
-        exclusive_outputs=_dense_forward_writeback_enabled() and not (input_indices or output_indices),
+        # Source gathers do not change output-row ownership. Accumulate all
+        # paths for a segment locally, then store it once. Output scatter must
+        # retain atomic accumulation and initialized output storage.
+        exclusive_outputs=_dense_forward_writeback_enabled() and (
+            not (input_indices or output_indices)
+            or (optimize_indexed and not output_indices)
+        ),
     )
     dump_lars_variable_stats(
         schedule_result,
@@ -736,6 +751,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
         w_dim=None,
         v_dim=None,
         block_size=int(block_size),
+        optimize_indexed=bool(optimize_indexed),
     )
 
     code = code + "\n" + emit_launcher(
@@ -745,6 +761,7 @@ def generate_code_uniform1d_fwd_with_scheduler(
         use_y_src=use_y_src,
         use_scatter=use_scatter,
         schedule_result=schedule_result,
+        optimize_indexed=bool(optimize_indexed),
     )
 
     if out_path:

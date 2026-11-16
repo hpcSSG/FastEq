@@ -1596,6 +1596,21 @@ def _build_jit_module_common(
         cache=cache,
     )
 
+def _hip_cwtp_fwd_block_size(input_indices, output_indices, u_dim):
+    """Channel tile for indexed HIP forward with exclusive output rows.
+
+    The flat channel loop handles tails without assuming a warp width. The
+    64/128-thread sizes target the measured gfx936 CWTP workloads. Leave dense,
+    output-scatter and other backends on their existing policies.
+    """
+    if _detect_gpu_backend() != "hip" or not _env_flag("FASTEQ_HIP_CWTP_FWD", "1"):
+        return None
+    if (not input_indices or not set(input_indices).issubset({1, 2})
+            or output_indices):
+        return None
+    return min(128, max(64, ((int(u_dim) + 63) // 64) * 64))
+
+
 def _build_fwd_jit_candidates(
     *,
     i_list: torch.Tensor,
@@ -1647,6 +1662,10 @@ def _build_fwd_jit_candidates(
         dtype_str=dtype_str,
         use_multiwarp_candidates=use_multiwarp_candidates,
     )
+    hip_block = _hip_cwtp_fwd_block_size(input_indices, output_indices, u_dim)
+    hip_writeback = _env_flag("FASTEQ_DENSE_FWD_WRITEBACK", "1") if hip_block else False
+    # Both the process cache and disk module identity include this policy.
+    fast_key = (hip_block, hip_writeback, fast_key)
     cached_tune_key = _FWD_TUNE_KEY_FAST_CACHE.get(fast_key)
     if cached_tune_key is not None:
         cached_best = _FWD_BEST_CANDIDATE_CACHE.get(cached_tune_key)
@@ -1688,6 +1707,8 @@ def _build_fwd_jit_candidates(
         use_y_src = 2 in input_indices
         use_scatter = 0 in output_indices
         layout_tag = f"xsrc{int(use_x_src)}_ysrc{int(use_y_src)}_scatter{int(use_scatter)}"
+        if hip_block is not None:
+            layout_tag += f"_hipcwtp_v1_b{hip_block}_wb{int(hip_writeback)}"
 
         tune_key = _make_fwd_module_name(
             P=P,
@@ -1743,6 +1764,8 @@ def _build_fwd_jit_candidates(
             output_indices=output_indices,
             u_dim=u_dim,
             mode=mode,
+            block_size=hip_block or 32,
+            optimize_indexed=hip_block is not None,
         )
 
         """ return generate_code_uniform1d_fwd_baseline_unrolled(
