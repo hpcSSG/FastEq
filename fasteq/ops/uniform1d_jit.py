@@ -1494,7 +1494,7 @@ def _make_bwd_module_name(
     gw_tag = "gradw" if grad_w else "nogradw"
     gx_tag = "gradx" if grad_x else "nogradx"
     gy_tag = "grady" if grad_y else "nogrady"
-    warp_tag = "autowarp_global_v3_pathsplit" if use_multiwarp_candidates else "base_global_v3_pathsplit"
+    warp_tag = "autowarp_global_v5_pathsplit" if use_multiwarp_candidates else "base_global_v5_pathsplit"
     return f"uniform1d_bwd_sched_{mode_str}_u{u_dim}_path{P}_{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
 
 
@@ -1533,7 +1533,7 @@ def _make_double_bwd_module_name(
     gw_tag = "gradw" if grad_w else "nogradw"
     gx_tag = "gradx" if grad_x else "nogradx"
     gy_tag = "grady" if grad_y else "nogrady"
-    warp_tag = "autowarp_global_v1" if use_multiwarp_candidates else "base_global_v1"
+    warp_tag = "autowarp_global_v2" if use_multiwarp_candidates else "base_global_v2"
     return (
         f"uniform1d_double_bwd_sched_{mode_str}_u{u_dim}_path{P}_"
         f"{layout_tag}_{gw_tag}_{gx_tag}_{gy_tag}_{warp_tag}_jit_{dtype_str}_{h}"
@@ -3123,6 +3123,7 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         gw = next(result_iter) if bool(need_grad_w) else w.new_empty((0,))
         gx = next(result_iter) if bool(need_grad_x) else x.new_empty((0,))
         gy = next(result_iter) if bool(need_grad_y) else y.new_empty((0,))
+        ctx.set_materialize_grads(False)
 
         ctx.save_for_backward(
             grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list
@@ -3152,15 +3153,12 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
         grad_out, w, x, y, i_list, j_list, k_list, v_list, coeff_list = ctx.saved_tensors
         
 
-        torch.cuda.synchronize()
-        start_time = time.perf_counter() * 1000.0
-
         result = _run_double_bwd(
             grad_out=grad_out,
             w=w, x=x, y=y,
             grad_grad_w=grad_grad_w if ctx.need_grad_w else None,
-            grad_grad_x=grad_grad_x,
-            grad_grad_y=grad_grad_y,
+            grad_grad_x=grad_grad_x if ctx.need_grad_x else None,
+            grad_grad_y=grad_grad_y if ctx.need_grad_y else None,
             i_list=i_list, j_list=j_list, k_list=k_list, v_list=v_list,
             coeff_list=coeff_list,
             input_indices=ctx.input_indices,
@@ -3178,10 +3176,6 @@ class FastUniform1dBackwardFunction(torch.autograd.Function):
             use_multiwarp_candidates=ctx.use_multiwarp_candidates,
         )
 
-        torch.cuda.synchronize()
-        end_time = time.perf_counter() * 1000.0
-        print(f"<< fasteq uniform1d fused backward-backward cost: {end_time - start_time:.3f} ms >>")
-        
         result_iter = iter(result)
         d_go = next(result_iter)
         d_w = next(result_iter) if ctx.need_grad_w else None
@@ -3241,6 +3235,7 @@ class FastUniform1dJITFunction(torch.autograd.Function):
         out_irreps = int(meta["size_list"][3] / out_seg_num)
 
 
+        ctx.save_for_backward(w, x, y)
         w = w.view(-1, w_seg_num, w_irreps)
         x = x.view(-1, x_seg_num, x_irreps) # [node_num, x_seg_num, u_dim]
 
@@ -3281,7 +3276,6 @@ class FastUniform1dJITFunction(torch.autograd.Function):
 
         #print(f"uniform1d fwd x:{x.shape}, y:{y.shape}, w:{w.shape}")
 
-        ctx.save_for_backward(w, x, y)
         ctx.i_list = i_list
         ctx.j_list = j_list
         ctx.k_list = k_list
@@ -3309,6 +3303,11 @@ class FastUniform1dJITFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         w, x, y = ctx.saved_tensors
+        # Record these views when create_graph=True to connect mixed gradients
+        # to the original inputs saved by the forward function.
+        w = w.view(-1, ctx.w_seg_num, ctx.w_irreps)
+        x = x.view(-1, ctx.x_seg_num, ctx.x_irreps)
+        y = y.view(-1, ctx.y_seg_num, ctx.y_irreps)
         grad_out = grad_out.view(-1, ctx.out_seg_num, ctx.u_dim)
 
         gw3, gx3, gy3 = FastUniform1dBackwardFunction.apply(

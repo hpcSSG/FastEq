@@ -200,6 +200,20 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
         ap("    const index_t dx_base = x_base;")
     if need_grad_y:
         ap("    const index_t dy_base = y_base;")
+    # HIP scalar dY shares an address across channels. Accumulate per lane
+    # across paths and channel tiles, then reduce after tails reconverge.
+    scalar_y_targets = sorted({
+        int(inst.args[2])
+        for inst in schedule_result.instructions
+        if inst.op == "double_bwd_fma_resident"
+        and mode_scalar_y and inst.args[-1]
+        and (inst.args[-3] or inst.args[-2])
+    })
+    if scalar_y_targets:
+        ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+        for idx in scalar_y_targets:
+            ap(f"    scalar_t dy_lane_{idx} = scalar_t(0);")
+        ap("#endif")
     ap("")
     ap("    for (int u_base = warp_id * 32; u_base < U; u_base += warp_count * 32) {")
     ap("        const int u = u_base + lane;")
@@ -248,7 +262,14 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
                 if bool(inst_need_gx):
                     t_dy.append(f"({rggx} * {rgo} * {rw})")
                 if t_dy:
-                    _emit_backend_gradient_atomic(ap, f"&d_y[{output_index('dy', int(yk))}]", f"scalar_t({c}) * ({' + '.join(t_dy)})", scalar_channel=mode_scalar_y)
+                    value = f"scalar_t({c}) * ({' + '.join(t_dy)})"
+                    if mode_scalar_y:
+                        ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+                        ap(f"            dy_lane_{int(yk)} += {value};")
+                        ap("#else")
+                    _emit_backend_gradient_atomic(ap, f"&d_y[{output_index('dy', int(yk))}]", value, scalar_channel=mode_scalar_y)
+                    if mode_scalar_y:
+                        ap("#endif")
         elif inst.op == "release":
             pass
         else:
@@ -256,6 +277,21 @@ def emit_uniform1d_double_bwd_kernel_from_lars_schedule(
 
     ap("        }")
     ap("    }")
+    if scalar_y_targets:
+        ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
+        ap("    const int dy_width = blockDim.x < warpSize ? (int)blockDim.x : warpSize;")
+        ap("    const int dy_lane = tid % dy_width;")
+        ap("    const int dy_active = min(dy_width, (int)blockDim.x - (tid - dy_lane));")
+        ap("    for (int offset = dy_width / 2; offset > 0; offset >>= 1) {")
+        for idx in scalar_y_targets:
+            ap(f"        const scalar_t other_{idx} = __shfl_down(dy_lane_{idx}, offset, dy_width);")
+            ap(f"        if (dy_lane + offset < dy_active) dy_lane_{idx} += other_{idx};")
+        ap("    }")
+        ap("    if (dy_lane == 0 && tid < U) {")
+        for idx in scalar_y_targets:
+            ap(f"        atomicAdd(&d_y[{output_index('dy', idx)}], dy_lane_{idx});")
+        ap("    }")
+        ap("#endif")
     ap("}")
     ap("")
     grad_grad_names = []

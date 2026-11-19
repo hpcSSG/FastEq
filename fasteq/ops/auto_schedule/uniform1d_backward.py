@@ -204,8 +204,18 @@ class _BwdOuterAccumulators:
                           if kind == "gy" and self.scalar_y]
         if scalar_targets:
             ap("#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)")
-            # HIP retains lane-wise atomic accumulation; no CUDA warp assumptions.
-            ap("    if (warp_id * 32 + lane < U) {")
+            # The scalar accumulators are initialized before the channel loop.
+            # All lanes, including channel tails, reach this epilogue together.
+            ap("    const int grad_y_width = blockDim.x < warpSize ? (int)blockDim.x : warpSize;")
+            ap("    const int grad_y_lane = tid % grad_y_width;")
+            ap("    const int grad_y_active = min(grad_y_width, (int)blockDim.x - (tid - grad_y_lane));")
+            ap("    for (int offset = grad_y_width / 2; offset > 0; offset >>= 1) {")
+            for kind, idx in scalar_targets:
+                name = self.name(kind, idx)
+                ap(f"        const scalar_t other_{idx} = __shfl_down({name}, offset, grad_y_width);")
+                ap(f"        if (grad_y_lane + offset < grad_y_active) {name} += other_{idx};")
+            ap("    }")
+            ap("    if (grad_y_lane == 0 && tid < U) {")
             for kind, idx in scalar_targets:
                 ap(f"        atomicAdd(&grad_y[{index_expr(kind, idx)}], {self.name(kind, idx)});")
             ap("    }")
@@ -1117,8 +1127,8 @@ def emit_lars_bwd_split_kernel_from_schedule(
         u_dim=u_dim, block_size=block_size, grad_kind=grad_kind)
     reg_count = _max_lars_reg_count_any(schedule_result)
     shared_slots = int(getattr(schedule_result, "shared_slots", 0) or 0)
-    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and not (
-        use_x_src or use_y_src or use_scatter
+    exclusive = bool(schedule_result.placement_summary.get("exclusive_outputs")) and (
+        grad_kind == "gw" or not (use_x_src or use_y_src or use_scatter)
     )
 
     target_use: Counter[int] = Counter()
@@ -1956,7 +1966,9 @@ def _generate_code_uniform1d_bwd_split_from_context(
                 schedule_result,
                 schedule_kind=f"bwd_split:{gkind}",
                 config=resolved_placement,
-                exclusive_outputs=not (ctx.input_indices or ctx.output_indices),
+                # Edge indexing changes reads, not ownership of per-edge weights.
+                # Broadcast weights still use atomic accumulation in the emitter.
+                exclusive_outputs=gkind == "gw" or not (ctx.input_indices or ctx.output_indices),
             )
             stats_path = None
             if resolved_placement.stats_path:
@@ -2115,12 +2127,34 @@ def _generate_code_uniform1d_bwd_fused_from_context(
         ),
     )
     resolved_placement = _resolve_lars_placement_config(placement_config)
+
+    register_only = bool(torch.version.hip) and os.environ.get("FASTEQ_HIP_FUSED_REGISTER_ONLY") == "1"
+    if register_only:
+        resolved_placement = LARSPlacementConfig(
+            enabled=True,
+            direct_use_threshold=0,
+            input_low_freq_threshold=-1,
+            input_long_lifetime_threshold=1,
+            accumulator_low_freq_threshold=-1,
+            accumulator_long_lifetime_threshold=1,
+            max_shared_slots=0,
+            stats_print=False,
+            stats_path=None,
+        )
     schedule_result = apply_lars_lifetime_placement(
         schedule_result,
         schedule_kind="bwd_fused",
         config=resolved_placement,
         exclusive_outputs=not (ctx.input_indices or ctx.output_indices),
     )
+
+    if register_only:
+        assert not schedule_result.shared_slots
+        assert not any(
+            isinstance(arg, str) and arg.startswith(("s", "d:"))
+            for inst in schedule_result.instructions for arg in inst.args
+        )
+        print("[CWTP][HIP] fused register-only placement verified", flush=True)
     dump_lars_variable_stats(
         schedule_result,
         print_stats=resolved_placement.stats_print,
@@ -2334,6 +2368,9 @@ def generate_code_uniform1d_bwd_with_scheduler(
             continue
         if path_split not in strategies:
             strategies.append(path_split)
+    if (False in strategies and bool(torch.version.hip) and mode == "u,u,,u"
+            and os.environ.get("FASTEQ_HIP_FUSED_REGISTER_ONLY") == "1"):
+        strategies = [False]
     if not strategies:
         raise ValueError("path_split_space contains no legal backward candidate")
     if not generate_candidates:
